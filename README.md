@@ -9,17 +9,31 @@ questions on your wrist; this helper is the small bridge on the computer
 that makes it possible. It is open source on purpose: a tool that reads
 your sessions and carries your approvals should be auditable.
 
-## Install (one command, then forget it)
+## Install — no manual setup
 
-On the computer where Claude Code runs — any Mac or Linux machine, a
-laptop counts:
+You already have an agent on that computer. Tell Claude Code, in its
+own chat (from your phone works too):
+
+> Install the Tapproval helper from github.com/marcobelini/tapproval-helper
+
+Approve what it asks, start a new session, done.
+
+**As a Claude Code plugin** (two slash commands, hooks registered
+automatically):
+
+```
+/plugin marketplace add marcobelini/tapproval-helper
+/plugin install tapproval-helper@marcobelini/tapproval-helper
+```
+
+**Or by hand** (one command, then forget it):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash
 ```
 
-That registers the permission hook and wires the relay to start itself
-with every Claude Code session. There is nothing to keep running by
+Every path registers the same permission hook and wires the relay to
+start itself with every Claude Code session. Nothing to keep running by
 hand. Then install **Tapproval** on your Apple Watch and open it once on
 the same Wi-Fi — it finds this computer by itself, pairs automatically,
 and quietly learns how to reach it when you're away from home.
