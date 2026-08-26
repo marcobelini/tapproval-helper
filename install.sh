@@ -9,6 +9,19 @@
 # Standard library Python only; Bonjour + a secure tunnel handle the rest.
 set -euo pipefail
 
+echo "Tapproval Base installer — here is everything it will do:"
+echo "  1. Clone github.com/marcobelini/tapproval-helper to ~/.tapproval"
+echo "  2. Back up ~/.claude/settings.json, then register the hooks"
+echo "  3. Start the local relay (it restarts itself with every session)"
+echo "  No sudo. No dependencies. Undo anytime:"
+echo "  python3 ~/.tapproval/ClaudeRiskClassifier.py --uninstall"
+echo ""
+
+command -v python3 >/dev/null || {
+  echo "python3 is required and was not found on PATH." >&2; exit 1; }
+command -v git >/dev/null || {
+  echo "git is required and was not found on PATH." >&2; exit 1; }
+
 DIR="$HOME/.tapproval"
 REPO="https://github.com/marcobelini/tapproval-helper.git"
 

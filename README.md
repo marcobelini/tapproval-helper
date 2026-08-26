@@ -1,20 +1,24 @@
-# Tapproval helper
+# Tapproval Base
 
-**The computer half of [Tapproval](https://github.com/marcobelini/tapproval-helper)
-— answer Claude Code from your Apple Watch.**
+**The computer half of Tapproval — answer Claude Code from your Apple
+Watch.**
 
 When Claude Code works on your computer, it stops and asks before doing
 anything that needs permission. The Tapproval watch app puts those
-questions on your wrist; this helper is the small bridge on the computer
+questions on your wrist; **Base** is the small bridge on the computer
 that makes it possible. It is open source on purpose: a tool that reads
-your sessions and carries your approvals should be auditable.
+your sessions and carries your approvals should be auditable — every
+line of it is in this repository.
+
+*(Technical id: `tapproval-helper` — the repo and plugin keep that name;
+the product name is Tapproval Base.)*
 
 ## Install — no manual setup
 
 You already have an agent on that computer. Tell Claude Code, in its
 own chat (from your phone works too):
 
-> Install the Tapproval helper from github.com/marcobelini/tapproval-helper
+> Install Tapproval Base from github.com/marcobelini/tapproval-helper
 
 Approve what it asks, start a new session, done.
 
@@ -38,33 +42,57 @@ hand. Then install **Tapproval** on your Apple Watch and open it once on
 the same Wi-Fi — it finds this computer by itself, pairs automatically,
 and quietly learns how to reach it when you're away from home.
 
-## What the helper is
+## If you are an AI agent installing this
+
+Run exactly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash
+```
+
+The script clones this repository to `~/.tapproval`, backs up
+`~/.claude/settings.json`, registers the `PermissionRequest` and
+`SessionStart` hooks, and starts the relay. It needs no sudo and no
+dependencies beyond Python 3. When it prints "Done", tell your user to
+**start a new Claude Code session** so the hooks take effect, and to
+open Tapproval on their watch on the same Wi-Fi.
+
+## Why you can trust this
+
+- **Read it all.** Base is two standard-library Python files — no
+  dependencies, so there is no supply chain to worry about. What you
+  can read here is everything that runs.
+- **Nothing leaves your machines.** No accounts, no servers, no
+  telemetry. Prompts travel between your computer and your watch; the
+  away-from-home path runs through your own iCloud, private to your
+  Apple ID.
+- **Nothing is decided for you.** The risk tiers are labels for your
+  glance, not decisions — nothing is auto-allowed by default, and the
+  CRITICAL tier can never be. Fail closed: a bridge that is down, slow
+  or confused never grants an approval.
+- **Your networks are the boundary.** The relay answers your LAN and
+  tailnet; beyond them every request must carry the pairing key your
+  watch received on first local contact, and the optional travel tunnel
+  hides behind its own secret path. The hook itself talks over loopback
+  only.
+- **Everything is on the record.** Every decision lands in a local
+  audit log (`~/.claude/risk-audit.jsonl`) you can read — only the
+  project folder's name is recorded, never paths above it.
+- **Leaving is one command.**
+  `python3 ~/.tapproval/ClaudeRiskClassifier.py --uninstall` restores
+  your settings; delete `~/.tapproval` and it is as if Base was never
+  here.
+
+## What Base is
 
 | File | Purpose |
 |------|---------|
 | `ClaudeRiskClassifier.py` | A Claude Code `PermissionRequest` hook: mirrors exactly the prompts the phone shows, labels each with a risk tier, and offers them to the watch |
 | `watch_relay.py` | A tiny local HTTP bridge: the hook posts cards, the watch answers; also serves your sessions, live conversation and daily activity |
 | `install.sh` | The one-command installer above |
+| `.claude-plugin/` + `hooks/` | The same, packaged as a Claude Code plugin |
 | `site-rules.example.json` | Optional: name your own sensitive hosts so commands touching them always escalate |
 | `test_claude_risk_classifier.py` | The test suite — standard library only |
-
-Standard-library Python throughout: no dependencies, nothing to update,
-no accounts, no servers. Your prompts and conversations never leave your
-own machines — the away-from-home path runs through your own iCloud,
-private to your Apple ID.
-
-## Security model, briefly
-
-- Your own networks are the trust boundary: the relay answers your LAN
-  and tailnet. Beyond them every request must carry the pairing key the
-  watch received on first local contact, and the optional travel tunnel
-  hides behind its own secret path.
-- The hook talks to the relay over loopback only, and nothing is ever
-  auto-allowed by default — the risk tiers are labels for your glance,
-  not decisions made for you. Every decision lands in a local audit log
-  you can read.
-- Fail closed: a relay that is down, slow or confused never grants an
-  approval.
 
 ## Tests
 
@@ -74,9 +102,9 @@ pytest
 
 ## Known upstream quirks
 
-Two Claude Code behaviors can look wrong from the outside and aren't —
-they are explained in the watch app the moment they first appear
-(Settings → Known quirks), and tracked upstream as
+One Claude Code behavior can look wrong from the outside and isn't — it
+is explained in the watch app the moment it first appears (Settings →
+Known quirks), and tracked upstream as
 [anthropics/claude-code#32493](https://github.com/anthropics/claude-code/issues/32493)
 and [#89761](https://github.com/anthropics/claude-code/issues/89761).
 
