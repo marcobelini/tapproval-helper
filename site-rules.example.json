@@ -1,0 +1,13 @@
+{
+  "_comment": "Copy to site-rules.json and point CLAUDE_RISK_CONFIG at it. site-rules.json is gitignored, so your infrastructure names never reach the repository.",
+
+  "mode": "shadow",
+  "auto_allow_at_or_below": "LOW",
+  "critical_action": "escalate",
+
+  "sensitive_hosts": [
+    "db-prod-01",
+    "fileserver-01",
+    "internal.example.com"
+  ]
+}
