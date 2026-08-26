@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CLAUDE_RISK_MODE=enforce CLAUDE_RISK_RELAY=http://127.0.0.1:8977 CLAUDE_RISK_RELAY_WAIT=3600 python3 \"${CLAUDE_PLUGIN_ROOT}/ClaudeRiskClassifier.py\"",
+            "timeout": 3660
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/watch_relay.py\" --ensure"
+          }
+        ]
+      }
+    ]
+  }
+}
