@@ -32,6 +32,10 @@ else
 fi
 
 python3 "$DIR/ClaudeRiskClassifier.py" --install
+# --watch wires enforce mode and the relay address, so the first card
+# reaches the wrist without a second command — same behaviour as the
+# plugin path.
+python3 "$DIR/ClaudeRiskClassifier.py" --watch
 python3 "$DIR/watch_relay.py" --ensure
 
 echo ""

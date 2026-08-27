@@ -111,8 +111,11 @@ def advertise_txt(port):
     ts = tailscale_url(port)
     if ts:
         txt["ts"] = ts
-    if TUNNEL_URL:
-        txt["tunnel"] = TUNNEL_URL
+    # The tunnel URL is deliberately NOT broadcast: its path carries the
+    # travel secret, and a TXT record hands it to every device on the
+    # network — hostile café Wi-Fi included. The watch learns it over an
+    # authenticated LAN fetch (/tunnel) or through the owner's own
+    # iCloud instead.
     txt["port"] = str(port)
     return txt
 
@@ -1561,11 +1564,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                              "running_tool": tool_now,
                              "modified_seconds_ago": active})
         elif path == "/tunnel" and self.required_token is None:
-            # LAN only: hand the watch its away-addresses while it's home,
-            # from the same address book the Bonjour TXT record publishes.
-            book = advertise_txt(self.server.server_address[1])
-            self._send_json({"url": book.get("tunnel"),
-                             "tailscale": book.get("ts")})
+            # LAN only: hand the watch its away-addresses while it's
+            # home. Deliberately NOT in the Bonjour TXT record — this
+            # fetch is the one place the travel secret changes hands.
+            self._send_json({"url": TUNNEL_URL,
+                             "tailscale": tailscale_url(
+                                 self.server.server_address[1])})
         else:
             self._send_json({"error": "not found"}, 404)
 

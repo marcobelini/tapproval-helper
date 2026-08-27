@@ -1204,17 +1204,15 @@ class TestBonjourTXTAddresses:
         txt = watch_relay.advertise_txt(8977)
         assert txt["port"] == "8977"
 
-    def test_txt_includes_tunnel_when_known(self, monkeypatch):
+    def test_txt_never_carries_the_tunnel(self, monkeypatch):
+        """The tunnel URL embeds the travel secret; a TXT record would
+        hand it to every device on the network. Never broadcast."""
         import watch_relay
         monkeypatch.setattr(watch_relay, "TUNNEL_URL",
-                            "https://example.trycloudflare.com/t/tok")
+                            "https://x.trycloudflare.com/t/tok")
         txt = watch_relay.advertise_txt(8977)
-        assert txt["tunnel"].endswith("/t/tok")
-
-    def test_txt_omits_tunnel_when_unknown(self, monkeypatch):
-        import watch_relay
-        monkeypatch.setattr(watch_relay, "TUNNEL_URL", None)
-        assert "tunnel" not in watch_relay.advertise_txt(8977)
+        assert "tunnel" not in txt
+        assert "tok" not in json.dumps(txt)
 
     def test_lan_ips_never_returns_tailnet_addresses(self, monkeypatch):
         import watch_relay

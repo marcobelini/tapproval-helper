@@ -66,19 +66,23 @@ supported path and are safe to repeat (the installer is idempotent).
 - **Read it all.** Base is two standard-library Python files — no
   dependencies, so there is no supply chain to worry about. What you
   can read here is everything that runs.
-- **Nothing leaves your machines.** No accounts, no servers, no
-  telemetry. Prompts travel between your computer and your watch; the
-  away-from-home path runs through your own iCloud, private to your
-  Apple ID.
+- **No Tapproval servers, ever.** No accounts, no telemetry. At home,
+  prompts travel directly between your computer and your watch. Away
+  from home they ride either your own iCloud (private to your Apple
+  ID) or an encrypted tunnel (Cloudflare) hidden behind a secret path —
+  in transit only, stored nowhere.
 - **Nothing is decided for you.** The risk tiers are labels for your
   glance, not decisions — nothing is auto-allowed by default, and the
   CRITICAL tier can never be. Fail closed: a bridge that is down, slow
   or confused never grants an approval.
 - **Your networks are the boundary.** The relay answers your LAN and
   tailnet; beyond them every request must carry the pairing key your
-  watch received on first local contact, and the optional travel tunnel
-  hides behind its own secret path. The hook itself talks over loopback
-  only.
+  watch received on first local contact, and the travel tunnel hides
+  behind its own secret path — which is handed over only on a direct
+  local fetch, never broadcast. The hook itself talks over loopback
+  only. One honest caveat: on a network you don't control (café
+  Wi-Fi), anyone on it is inside the boundary — run Base on networks
+  you trust.
 - **Everything is on the record.** Every decision lands in a local
   audit log (`~/.claude/risk-audit.jsonl`) you can read — only the
   project folder's name is recorded, never paths above it.
