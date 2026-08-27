@@ -727,8 +727,13 @@ BASH_VERBS = {
 
 
 def _fit(text, limit):
-    """Truncate to ``limit`` characters with an ellipsis."""
-    text = " ".join(str(text or "").split())
+    """Truncate to ``limit`` characters with an ellipsis.
+
+    Every field that reaches a card or the audit log passes through here, so
+    this is where credential-shaped fragments are stripped: one place, no
+    way to add a new field that forgets.
+    """
+    text = " ".join(redact_secrets(str(text or "")).split())
     if len(text) <= limit:
         return text
     if limit <= 1:
@@ -785,6 +790,30 @@ DETAIL_CHARS = 80
 def _card_budgets(policy):
     return (int(policy.get("headline_chars", HEADLINE_CHARS)),
             int(policy.get("detail_chars", DETAIL_CHARS)))
+
+
+# Secrets that show up in ordinary commands. The card and the audit log
+# both carry command text, and the card also travels through iCloud, so a
+# token pasted into a curl call should not ride along with it. The command
+# still reads clearly — only the secret becomes "…".
+SECRET_PATTERNS = [
+    re.compile(r"(?i)\b(authorization\s*:\s*(?:bearer|basic)\s+)\S+"),
+    re.compile(r"(?i)\b(sk-[A-Za-z0-9_\-]{8})[A-Za-z0-9_\-]+"),
+    re.compile(r"(?i)\b(gh[pousr]_)[A-Za-z0-9]{16,}"),
+    re.compile(r"(?i)(--(?:password|token|api-key|secret)[= ])\S+"),
+    re.compile(r"(?i)\b([A-Z_]*(?:TOKEN|SECRET|PASSWORD|API_KEY)=)\S+"),
+]
+
+
+def redact_secrets(text):
+    """Replace credential-shaped fragments with an ellipsis. Never raises."""
+    try:
+        result = str(text or "")
+        for pattern in SECRET_PATTERNS:
+            result = pattern.sub(lambda m: m.group(1) + "…", result)
+        return result
+    except Exception:
+        return str(text or "")
 
 
 def wrist_card(tool, tool_input, risk,
@@ -929,6 +958,11 @@ def write_audit(entry, policy):
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
+        # The log records the command text a decision was made about, so it
+        # is as sensitive as the commands themselves. Create it readable by
+        # its owner only; on a shared machine the default umask is not.
+        if not os.path.exists(path):
+            os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError as error:

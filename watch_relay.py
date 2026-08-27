@@ -35,6 +35,7 @@ approval. "none" is the only answer it gives on any doubt.
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import functools
 import os
@@ -46,13 +47,20 @@ import sys
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8977
 TUNNEL_PORT = 8978
 TOKEN_FILE = os.path.expanduser("~/.tapproval-token")
+AUTH_FILE = os.path.expanduser("~/.tapproval-auth.json")
+# Bumped whenever the wire contract or the auth rules change, so a running
+# relay from before an update can be recognised — and replaced — instead of
+# quietly serving the old rules forever (see ensure_running).
+RELAY_VERSION = 2
+PAIR_WINDOW_SECONDS = 600   # a deliberately opened window, not a standing door
+PAIR_WINDOW_CLAIMS = 2      # one watch, plus one retry
 DEFAULT_WAIT = 6.0     # how long POST /card blocks by default
 try:
     # One number, one owner: the hook's wait, its timeout and this clamp
@@ -169,6 +177,83 @@ def _spawn_detached(command, log_path, cwd=None):
     return ""
 
 
+def _probe_relay(timeout=2):
+    """What the running relay says about itself, or None if none is up.
+
+    Asks over loopback, which the relay trusts, so the answer carries the
+    version and the pending count rather than the anonymous liveness reply.
+    """
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                "http://127.0.0.1:%d/health" % DEFAULT_PORT,
+                timeout=timeout) as reply:
+            return json.loads(reply.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _stop_relay(deadline=8.0):
+    """Ask the running relay to exit, then wait for the port to come free."""
+    try:
+        subprocess.run(["pkill", "-f", "watch_relay.py --host"],
+                       capture_output=True, timeout=5)
+    except Exception:
+        return False
+    end = time.time() + deadline
+    while time.time() < end:
+        if _probe_relay(timeout=1) is None:
+            return True
+        time.sleep(0.4)
+    return False
+
+
+def _admin_call(path):
+    """Loopback-only administration: the relay owns the state, this just
+    asks it. Returns the parsed reply or None."""
+    import urllib.request
+    request = urllib.request.Request(
+        "http://127.0.0.1:%d%s" % (DEFAULT_PORT, path),
+        data=b"{}", method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=5) as reply:
+            return json.loads(reply.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def run_admin(args):
+    """The `--pair` / `--pair-reset` / `--rotate-token` commands.
+
+    Each is one sentence of recovery, meant to be run *by the user's agent*
+    on their behalf ("tell Claude Code: open Tapproval pairing") rather than
+    typed. The relay must be running: it owns the state, and asking it means
+    a live change with no restart and no dropped card.
+    """
+    if _probe_relay() is None:
+        print("Tapproval Base is not running. Start a Claude Code session "
+              "(or run --ensure) and try again.", file=sys.stderr)
+        return 1
+    if args.rotate_token:
+        if _admin_call("/admin/rotate") is None:
+            print("Could not rotate the keys.", file=sys.stderr)
+            return 1
+        print("New keys in place. Your watch re-pairs by itself — over "
+              "Wi-Fi at once, or within a couple of minutes when away.")
+        return 0
+    path = "/admin/pair-reset" if args.pair_reset else "/admin/pair-open"
+    reply = _admin_call(path)
+    if reply is None:
+        print("Could not open pairing.", file=sys.stderr)
+        return 1
+    if args.pair_reset:
+        print("Forgot every paired device.")
+    print("Pairing is open for %d minutes — open Tapproval on your watch."
+          % (int(reply.get("seconds", PAIR_WINDOW_SECONDS)) // 60))
+    return 0
+
+
 def ensure_running():
     """Start the relay in the background unless one is already up.
 
@@ -177,13 +262,22 @@ def ensure_running():
     line to stderr and exits immediately either way. Never raises.
     """
     import urllib.request
-    try:
-        with urllib.request.urlopen(
-                "http://127.0.0.1:%d/health" % DEFAULT_PORT, timeout=2):
+    running = _probe_relay()
+    if running is not None:
+        version = running.get("version") or 0
+        if version >= RELAY_VERSION:
             print("relay: already running", file=sys.stderr)
             return 0
-    except Exception:
-        pass
+        # An older relay is serving. Without this the machine keeps running
+        # yesterday's rules forever — an update that never arrives is not an
+        # update. But a relay holding a card is holding someone's approval:
+        # replace it only when nothing is waiting.
+        if running.get("pending"):
+            print("relay: update deferred — a card is waiting", file=sys.stderr)
+            return 0
+        print("relay: replacing an older relay (v%s -> v%d)"
+              % (version or "?", RELAY_VERSION), file=sys.stderr)
+        _stop_relay()
     log_path = os.path.expanduser("~/.tapproval-relay.log")
     error = _spawn_detached(
         [sys.executable, os.path.abspath(__file__),
@@ -1406,15 +1500,16 @@ def host_allowed(host_header):
     if hostname in ("localhost", "127.0.0.1", "::1"):
         return True
     # Only a bare IP literal may match — and only one of our own ranges.
-    return _is_ip_literal(hostname) and _is_local_source(hostname)
+    return _is_ip_literal(hostname) and _is_private_address(hostname)
 
 
-def _is_local_source(ip):
-    """The user's own networks: LAN, tailnet, link-local.
+def _is_private_address(ip):
+    """True for a LAN, tailnet or link-local address.
 
-    This is the pairing boundary. Anything that can hear the Bonjour
-    broadcast could read a TXT secret anyway, so first contact from here
-    may fetch the key; everything beyond it must already hold the key.
+    This is NOT an authorization rule and must never become one again: a
+    café network is full of private addresses belonging to strangers. Its
+    only job is the DNS-rebinding check in :func:`host_allowed`, where the
+    question is "does this Host header name this machine".
     """
     ip = str(ip or "")
     if _is_loopback(ip):
@@ -1435,21 +1530,90 @@ def _is_local_source(ip):
 
 
 def authorize_request(client_ip, path, header_token,
-                      tunnel_authed, auth_token):
+                      tunnel_authed, auth, via_tunnel=False):
     """May this request touch real data? One rule for every listener.
 
-    The trust boundary is the user's own networks: loopback is the hook's
-    machine, LAN/tailnet sources may talk (they could fetch the key from
-    the Bonjour broadcast or /pair anyway, so demanding it there would be
-    theatre — and would strand watches running older builds). Beyond that
-    boundary the credential is mandatory: the tunnel URL's own token
-    prefix, or the paired key in the header.
+    Loopback is the local-process boundary the project documents and
+    accepts: the hook, the Mac bridge and the liveness probe all run as the
+    same user on the same machine. Everything else — LAN, tailnet, or the
+    travel tunnel — must present a device token, whatever its address.
+
+    Being on the user's Wi-Fi used to be enough. On a home network that
+    reads as "me"; on café Wi-Fi it reads as "everyone here", which is how
+    a stranger could read a transcript, answer a CRITICAL prompt, or speak
+    into a live session.
+
+    On the tunnel listener loopback means cloudflared, not a local process,
+    so the exemption is deliberately withheld there: the secret path proves
+    where the request came from, and the token proves who sent it.
     """
-    if tunnel_authed or _is_local_source(client_ip):
+    def _credential_ok():
+        if auth is None:
+            return False
+        if hasattr(auth, "matches"):
+            return auth.matches(header_token)
+        return _token_matches(header_token, auth)
+
+    if via_tunnel:
+        return bool(tunnel_authed) and _credential_ok()
+    if _is_loopback(client_ip):
         return True
-    if path == "/health":            # harmless liveness, no user data
+    if path == "/health":            # liveness only; the body is trimmed
         return True
-    return auth_token is not None and header_token == auth_token
+    return _credential_ok()
+
+
+class _Limits:
+    """Sliding-window rate limits and concurrency caps, standard library only.
+
+    The map is LRU-bounded so a spray of forged source addresses cannot grow
+    it without limit — a rate limiter that can be exhausted by the traffic it
+    is meant to limit is not one.
+    """
+
+    MAX_KEYS = 512
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._hits = OrderedDict()
+        self._gates = {}
+
+    def allow(self, bucket, key, limit, window):
+        """(ok, retry_after_seconds) for one more request in this bucket."""
+        now = time.time()
+        mapkey = (bucket, str(key))
+        with self._lock:
+            hits = self._hits.get(mapkey)
+            if hits is None:
+                hits = deque()
+                self._hits[mapkey] = hits
+            self._hits.move_to_end(mapkey)
+            while hits and now - hits[0] > window:
+                hits.popleft()
+            if len(hits) >= limit:
+                return False, max(1, int(window - (now - hits[0])))
+            hits.append(now)
+            while len(self._hits) > self.MAX_KEYS:
+                self._hits.popitem(last=False)
+            return True, 0
+
+    def gate(self, name, size):
+        """A named concurrency cap. Never queues: callers get a refusal
+        immediately, because a queued approval is a stalled terminal."""
+        with self._lock:
+            gate = self._gates.get(name)
+            if gate is None:
+                gate = threading.BoundedSemaphore(size)
+                self._gates[name] = gate
+            return gate
+
+    def reset(self):
+        with self._lock:
+            self._hits.clear()
+            self._gates.clear()
+
+
+LIMITS = _Limits()
 
 
 def _socket_alive(sock):
@@ -1462,10 +1626,18 @@ def _socket_alive(sock):
         return False
 
 
+# Routes that exist only for this machine and must never appear on the
+# public tunnel — not even as a refusal, which would confirm what lives here.
+# /pair is on this list because on the tunnel listener the caller looks like
+# loopback (it is cloudflared), which once made the pairing key reachable
+# from the whole internet.
+TUNNEL_HIDDEN = ("/card", "/heartbeat", "/pair", "/enroll", "/tunnel")
+
+
 class RelayHandler(BaseHTTPRequestHandler):
     queue = None            # installed by serve()
     required_token = None   # when set, only /t/<token>/... paths are served
-    auth_token = None       # when set, non-local callers must present it
+    auth = None             # the Auth object: device tokens and pairing
     protocol_version = "HTTP/1.1"
 
     def _host_ok(self):
@@ -1482,7 +1654,28 @@ class RelayHandler(BaseHTTPRequestHandler):
         return authorize_request(
             self.client_address[0], path,
             self.headers.get("X-Tapproval-Token", ""),
-            getattr(self, "tunnel_authed", False), self.auth_token)
+            getattr(self, "tunnel_authed", False), self.auth,
+            via_tunnel=self.required_token is not None)
+
+    def _credentialed(self):
+        """Did this caller prove anything at all? Decides how much /health
+        is willing to say — a pending count and "is a watch on the wrist
+        right now" is a presence oracle, not liveness."""
+        if self.required_token is None and _is_loopback(self.client_address[0]):
+            return True
+        auth = self.auth
+        token = self.headers.get("X-Tapproval-Token", "")
+        if auth is None:
+            return False
+        if hasattr(auth, "matches"):
+            return auth.matches(token)
+        return _token_matches(token, auth)
+
+    def _is_local_process(self):
+        """Loopback on the LAN listener — the hook and the bridge. False on
+        the tunnel listener, where loopback is only cloudflared."""
+        return (self.required_token is None
+                and _is_loopback(self.client_address[0]))
 
     def _route(self):
         """Return ``(path, query)``, enforcing the token prefix if set."""
@@ -1506,11 +1699,13 @@ class RelayHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quiet: diagnostics only on stderr
         print("relay: %s" % (fmt % args), file=sys.stderr)
 
-    def _send_json(self, payload, status=200):
+    def _send_json(self, payload, status=200, headers=None):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -1529,18 +1724,86 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     # -- routes ------------------------------------------------------------
 
+    def _handle_pair(self):
+        """Hand over the bootstrap token — but only through a door the owner
+        deliberately opened, and never from the travel tunnel.
+
+        This endpoint used to answer any private address, which meant every
+        stranger on a café network could simply ask for the key. Worse, on
+        the tunnel listener the caller looks like loopback, so the whole
+        internet could ask too. The normal path no longer comes through here
+        at all: a watch reads the bootstrap from the owner's own iCloud and
+        enrols. This is the fallback for when iCloud is not available.
+        """
+        if self.required_token is not None:
+            self._send_json({"error": "pairing is not available here"}, 403)
+            return
+        auth = self.auth
+        if auth is None or not hasattr(auth, "claim_window"):
+            self._send_json({"error": "pairing closed"}, 403)
+            return
+        client = self.client_address[0]
+        allowed, retry = LIMITS.allow("pair", client, 5, 600)
+        if not allowed:
+            # A burst is an attack, not a retry: shut the door rather than
+            # let it be ground down for the rest of the window.
+            auth.close_window()
+            self._send_json({"error": "too many attempts"}, 429,
+                            headers={"Retry-After": str(int(retry))})
+            return
+        token = auth.claim_window(client)
+        if token:
+            self._send_json({"token": token})
+            return
+        if auth.paired_ever and not auth.window_open():
+            self._send_json({"error": "already paired",
+                             "devices": len(auth.devices)}, 403)
+        else:
+            self._send_json({"error": "pairing closed"}, 403)
+
+    def _handle_enroll(self, body):
+        """Trade a bootstrap token for this device's own token.
+
+        Per-device tokens mean one watch can be revoked without disturbing
+        another, and the relay can say how many devices are paired.
+        """
+        if self.required_token is not None:
+            self._send_json({"error": "enrolment is not available here"}, 403)
+            return
+        auth = self.auth
+        if auth is None or not hasattr(auth, "issue_device"):
+            self._send_json({"error": "pairing closed"}, 403)
+            return
+        client = self.client_address[0]
+        allowed, retry = LIMITS.allow("pair", client, 5, 600)
+        if not allowed:
+            self._send_json({"error": "too many attempts"}, 429,
+                            headers={"Retry-After": str(int(retry))})
+            return
+        presented = self.headers.get("X-Tapproval-Token", "")
+        if not (auth.is_bootstrap(presented) or auth.matches(presented)):
+            self._send_json({"error": "not paired"}, 403)
+            return
+        token = auth.issue_device(body.get("device_id"),
+                                  body.get("label") or "Apple Watch",
+                                  source=str(body.get("source") or "icloud"))
+        self._send_json({"token": token})
+
     def do_GET(self):
         if not self._host_ok():
             self._send_json({"error": "bad host"}, 403)
             return
         path, query = self._route()
+        if path is not None and self.required_token is not None and (
+                path in TUNNEL_HIDDEN or path.startswith("/admin/")):
+            path = None
+        if path is None:
+            # Wrong (or absent) secret prefix on the tunnel listener: say
+            # nothing about what lives here.
+            self._send_json({"error": "not found"}, 404)
+            return
         if path == "/pair":
-            # First contact from the user's own network hands over the key —
-            # the same boundary the Bonjour broadcast already crosses.
-            if _is_local_source(self.client_address[0]) and self.auth_token:
-                self._send_json({"token": self.auth_token})
-            else:
-                self._send_json({"error": "pairing is local-network only"}, 403)
+            self._handle_pair()
             return
         if not self._authorized(path):
             self._send_json({"error": "not paired"}, 403)
@@ -1551,9 +1814,17 @@ class RelayHandler(BaseHTTPRequestHandler):
             from_watch = query.get("source", [""])[0] != "bridge"
             self._send_json({"cards": self.queue.pending(from_watch=from_watch)})
         elif path == "/health":
-            self._send_json({"ok": True, "pending": len(self.queue.pending()),
-                             "watch_seen_seconds_ago":
-                                 self.queue.watch_seen_seconds_ago()})
+            # Liveness is public; the details are not. A pending count plus
+            # "is a watch on the wrist right now" tells a stranger when
+            # nobody is looking.
+            if self._credentialed():
+                self._send_json({"ok": True,
+                                 "pending": len(self.queue.pending()),
+                                 "watch_seen_seconds_ago":
+                                     self.queue.watch_seen_seconds_ago(),
+                                 "version": RELAY_VERSION})
+            else:
+                self._send_json({"ok": True})
         elif path == "/sessions":
             rows = recent_sessions()
             prewarm_threads([row["session_id"] for row in rows])
@@ -1595,8 +1866,24 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "bad host"}, 403)
             return
         path, _ = self._route()
+        if path is not None and self.required_token is not None and (
+                path in TUNNEL_HIDDEN or path.startswith("/admin/")):
+            path = None
+        if path is None:
+            self._send_json({"error": "not found"}, 404)
+            return
+        if path == "/enroll":
+            self._handle_enroll(self._read_json() or {})
+            return
         if not self._authorized(path):
             self._send_json({"error": "not paired"}, 403)
+            return
+        # Cards and heartbeats come from processes on this machine — the
+        # hook and the Mac bridge. Accepting them from the network let a
+        # stranger on the same Wi-Fi forge a wrist card (a fake prompt
+        # harvesting a real tap) or fake the watch's presence.
+        if path in ("/card", "/heartbeat") and not self._is_local_process():
+            self._send_json({"error": "local processes only"}, 403)
             return
         if path == "/card" and self.required_token is None:
             body = self._read_json()
@@ -1609,18 +1896,42 @@ class RelayHandler(BaseHTTPRequestHandler):
                 wait = DEFAULT_WAIT
             wait = max(0.0, min(wait, MAX_WAIT))
 
-            card_id, decision, answer = self.queue.submit(
-                body["card"], wait,
-                caller_alive=functools.partial(_socket_alive, self.connection),
-                resolved_elsewhere=_prompt_resolver(body["card"]))
+            gate = LIMITS.gate("card", 32)
+            if not gate.acquire(blocking=False):
+                # Fail closed, exactly as a dead relay does: the terminal
+                # asks instead. Better a prompt than a stalled hook.
+                self._send_json({"id": "", "decision": "none"})
+                return
+            try:
+                card_id, decision, answer = self.queue.submit(
+                    body["card"], wait,
+                    caller_alive=functools.partial(_socket_alive, self.connection),
+                    resolved_elsewhere=_prompt_resolver(body["card"]))
+            finally:
+                gate.release()
             payload = {"id": card_id, "decision": decision}
             if answer:
                 payload["answer"] = answer
             self._send_json(payload)
         elif path == "/say":
-            body = self._read_json() or {}
-            status = say_to_session(str(body.get("session_id", ""))[:64],
-                                    body.get("text", ""))
+            # Each call spawns `claude --resume`: serialising them is
+            # correctness, not politeness.
+            who = self.headers.get("X-Tapproval-Token", "") or self.client_address[0]
+            allowed, retry = LIMITS.allow("say", who, 6, 60)
+            if not allowed:
+                self._send_json({"error": "too many messages"}, 429,
+                                headers={"Retry-After": str(int(retry))})
+                return
+            gate = LIMITS.gate("say", 1)
+            if not gate.acquire(blocking=False):
+                self._send_json({"error": "a message is already being sent"}, 429)
+                return
+            try:
+                body = self._read_json() or {}
+                status = say_to_session(str(body.get("session_id", ""))[:64],
+                                        body.get("text", ""))
+            finally:
+                gate.release()
             self._send_json({"ok": status == "sent", "status": status})
         elif path == "/decision":
             body = self._read_json()
@@ -1632,6 +1943,28 @@ class RelayHandler(BaseHTTPRequestHandler):
             accepted = self.queue.decide(card_id, decision,
                                          answer=(body or {}).get("answer"))
             self._send_json({"ok": accepted})
+        elif path in ("/admin/pair-open", "/admin/rotate",
+                      "/admin/pair-reset"):
+            # Administration is for a process on this machine only — the
+            # `--pair` / `--rotate-token` commands, never the network.
+            if not self._is_local_process() or not hasattr(self.auth, "rotate"):
+                self._send_json({"error": "local processes only"}, 403)
+                return
+            if path == "/admin/pair-open":
+                until = self.auth.open_window()
+                self._send_json({"ok": True, "seconds": PAIR_WINDOW_SECONDS,
+                                 "until": int(until)})
+            elif path == "/admin/pair-reset":
+                self.auth.revoke_all()
+                self.auth.open_window()
+                self._send_json({"ok": True, "devices": 0,
+                                 "seconds": PAIR_WINDOW_SECONDS})
+            else:
+                secret = self.auth.rotate()
+                type(self).required_token = None   # main listener unchanged
+                _rotate_tunnel_prefix(secret)
+                self.auth.open_window()
+                self._send_json({"ok": True, "rotated": True})
         elif path == "/heartbeat" and self.required_token is None:
             # The bridge relays the watch's CloudKit heartbeat: how many
             # seconds ago the watch last checked iCloud. Main server only —
@@ -1643,19 +1976,37 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, 404)
 
 
+# The tunnel listener's handler class, so a rotation can change the secret
+# path in place instead of restarting cloudflared (whose hostname is stable).
+_TUNNEL_HANDLER = None
+
+
+def _rotate_tunnel_prefix(secret):
+    """Point the live tunnel listener at the new secret path."""
+    global TUNNEL_URL
+    if _TUNNEL_HANDLER is not None:
+        _TUNNEL_HANDLER.required_token = secret
+    if TUNNEL_URL:
+        base = TUNNEL_URL.split("/t/")[0]
+        TUNNEL_URL = "%s/t/%s" % (base, secret)
+
+
 def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, queue=None, token=None,
-          auth_token=None):
+          auth=None, auth_token=None):
     """Build a server (does not block). Caller runs serve_forever().
 
-    With ``token`` set, the server answers only under ``/t/<token>/…`` and
-    refuses card injection — the shape exposed through a public tunnel.
-    With ``auth_token`` set, non-local callers must present it in the
-    X-Tapproval-Token header.
+    With ``token`` set, the server answers only under ``/t/<token>/…`` — the
+    shape exposed through a public tunnel, where that path is a rendezvous
+    address rather than a credential. ``auth`` carries the device tokens
+    every non-local caller must present. (``auth_token`` accepts a bare
+    string for callers that predate per-device tokens.)
     """
     queue = queue if queue is not None else CardQueue()
+    if auth is None:
+        auth = auth_token
     handler = type("BoundRelayHandler", (RelayHandler,),
                    {"queue": queue, "required_token": token,
-                    "auth_token": auth_token})
+                    "auth": auth})
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
     return server, queue
@@ -1690,6 +2041,199 @@ def tailscale_url(port):
             except (OSError, subprocess.SubprocessError, IndexError):
                 pass
     return None
+
+
+class Auth:
+    """The relay's credentials, and the only thing that may hand one out.
+
+    Two secrets with two different jobs. The *tunnel secret* is the
+    unguessable ``/t/<secret>`` path the travel URL rides on — a rendezvous
+    address, never a credential. A *device token* is the credential, and it
+    is demanded of every caller that is not a local process, whichever
+    network it arrives from. They were one string until it became clear that
+    anyone who had ever seen the travel URL therefore held the key to the
+    LAN as well.
+
+    The *bootstrap* token exists so a new watch can obtain its own device
+    token without a human typing anything: the Mac bridge mirrors it into
+    the owner's private iCloud, where only the owner can read it. A stranger
+    on the same Wi-Fi has no path to it. The LAN pairing door is only for
+    when iCloud is unavailable, and it stays shut unless deliberately opened.
+    """
+
+    def __init__(self, path=None):
+        self.path = path or AUTH_FILE
+        self._lock = threading.RLock()
+        self.tunnel_secret = ""
+        self.bootstrap = ""
+        self.devices = []
+        self.paired_ever = False
+        self._window_until = 0.0
+        self._window_claims = 0
+        self._window_ips = set()
+        self._load()
+
+    # ---- persistence -------------------------------------------------
+
+    def _load(self):
+        data = None
+        try:
+            with open(self.path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict) and data.get("version") == 1:
+            self.tunnel_secret = str(data.get("tunnel_secret") or "")
+            self.bootstrap = str(data.get("bootstrap") or "")
+            self.paired_ever = bool(data.get("paired_ever"))
+            devices = data.get("devices")
+            if isinstance(devices, list):
+                self.devices = [d for d in devices
+                                if isinstance(d, dict) and d.get("token")]
+        if not self.tunnel_secret or not self.bootstrap:
+            self._seed()
+
+    def _seed(self):
+        """First run — or a file we cannot read, which fails closed to a
+        fresh identity rather than to an open door."""
+        self.tunnel_secret = self.tunnel_secret or uuid.uuid4().hex
+        self.bootstrap = self.bootstrap or uuid.uuid4().hex
+        # An install from before per-device tokens keeps working: its one
+        # token becomes a device entry, so the watch on the owner's wrist
+        # never notices the upgrade.
+        legacy = ""
+        try:
+            with open(TOKEN_FILE, encoding="utf-8") as handle:
+                legacy = handle.read().strip()
+        except OSError:
+            legacy = ""
+        if legacy and not self.devices:
+            self.devices = [{"id": "legacy", "token": legacy,
+                             "label": "Existing watch", "issued": int(time.time()),
+                             "last_seen": 0, "source": "migrated"}]
+            self.paired_ever = True
+        self.save()
+
+    def save(self):
+        payload = {
+            "version": 1,
+            "tunnel_secret": self.tunnel_secret,
+            "bootstrap": self.bootstrap,
+            "devices": self.devices,
+            "paired_ever": self.paired_ever,
+        }
+        body = json.dumps(payload, indent=2)
+        # 0600 from the moment it exists: writing first and chmod-ing after
+        # leaves a readable window, however brief.
+        try:
+            fd = os.open(self.path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        except OSError:
+            return
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(body + "\n")
+        except OSError:
+            pass
+
+    # ---- credentials -------------------------------------------------
+
+    def device_for(self, token):
+        """The device row a presented token belongs to, or None.
+
+        Compared in constant time: a plain ``==`` on a secret is a timing
+        oracle, and fixing it costs one stdlib call.
+        """
+        token = str(token or "")
+        if not token:
+            return None
+        with self._lock:
+            for device in self.devices:
+                if _token_matches(token, device.get("token")):
+                    device["last_seen"] = int(time.time())
+                    return device
+        return None
+
+    def matches(self, token):
+        return self.device_for(token) is not None
+
+    def is_bootstrap(self, token):
+        return bool(self.bootstrap) and _token_matches(token, self.bootstrap)
+
+    def issue_device(self, device_id=None, label="Apple Watch", source="icloud"):
+        """Mint a token for one device. Re-enrolling the same device id
+        replaces its token rather than growing the list forever."""
+        token = uuid.uuid4().hex
+        device_id = str(device_id or uuid.uuid4().hex)[:64]
+        with self._lock:
+            self.devices = [d for d in self.devices
+                            if d.get("id") != device_id]
+            self.devices.append({"id": device_id, "token": token,
+                                 "label": str(label or "Apple Watch")[:40],
+                                 "issued": int(time.time()), "last_seen": 0,
+                                 "source": source})
+            self.paired_ever = True
+            self.save()
+        return token
+
+    def revoke_all(self):
+        with self._lock:
+            self.devices = []
+            self.save()
+
+    def rotate(self):
+        """New tunnel path, new bootstrap, every device token revoked."""
+        with self._lock:
+            self.tunnel_secret = uuid.uuid4().hex
+            self.bootstrap = uuid.uuid4().hex
+            self.devices = []
+            self.save()
+            return self.tunnel_secret
+
+    # ---- the pairing window -----------------------------------------
+
+    def open_window(self, seconds=PAIR_WINDOW_SECONDS):
+        with self._lock:
+            self._window_until = time.time() + float(seconds)
+            self._window_claims = 0
+            self._window_ips = set()
+            return self._window_until
+
+    def close_window(self):
+        with self._lock:
+            self._window_until = 0.0
+
+    def window_open(self):
+        with self._lock:
+            return time.time() < self._window_until
+
+    def claim_window(self, client_ip):
+        """Hand out the bootstrap, once per address and twice at most.
+
+        Returns the token, or None with the window left shut. A burst is an
+        attack, not a retry, so the caller closes the window on a rate-limit
+        rejection rather than letting it be ground down.
+        """
+        with self._lock:
+            if time.time() >= self._window_until:
+                return None
+            if self._window_claims >= PAIR_WINDOW_CLAIMS:
+                return None
+            if client_ip in self._window_ips:
+                return None
+            self._window_ips.add(client_ip)
+            self._window_claims += 1
+            return self.bootstrap
+
+
+def _token_matches(given, expected):
+    """Constant-time secret comparison. False on anything unusable."""
+    try:
+        if not given or not expected:
+            return False
+        return hmac.compare_digest(str(given).encode("utf-8"),
+                                   str(expected).encode("utf-8"))
+    except (UnicodeError, TypeError):
+        return False
 
 
 def load_or_create_token():
@@ -1830,28 +2374,51 @@ def main(argv=None):
     parser.add_argument("--ensure", action="store_true",
                         help="start the relay in the background if it is "
                              "not already running, then exit")
+    parser.add_argument("--pair", action="store_true",
+                        help="open a short pairing window so a new watch can "
+                             "connect, then exit")
+    parser.add_argument("--pair-reset", action="store_true",
+                        help="forget every paired device and open a fresh "
+                             "pairing window")
+    parser.add_argument("--rotate-token", action="store_true",
+                        help="replace the travel address and every device "
+                             "key; paired watches re-pair by themselves")
     args = parser.parse_args(argv)
 
     if args.ensure:
         return ensure_running()
 
+    if args.pair or args.pair_reset or args.rotate_token:
+        return run_admin(args)
+
     # One machine-wide key gates every non-local caller, whichever
     # listener they arrive on. First contact from the user's own network
     # fetches it via /pair — pairing is automatic and never broadcast.
-    auth_token = load_or_create_token()
+    auth = Auth()
+    if not auth.devices:
+        # Nothing has ever paired: leave the door open for ten minutes so a
+        # first watch can connect even where iCloud is unavailable. Once a
+        # device is enrolled this never happens again.
+        auth.open_window()
+        print("relay: pairing open for %d minutes (no device paired yet)"
+              % (PAIR_WINDOW_SECONDS // 60), file=sys.stderr)
 
-    server, queue = serve(args.host, args.port, auth_token=auth_token)
+    server, queue = serve(args.host, args.port, auth=auth)
     print("relay: listening on http://%s:%d" % (args.host, args.port),
           file=sys.stderr)
 
     tunnel_proc = None
     if args.tunnel:
+        # Two independent secrets on the public path: the unguessable
+        # rendezvous prefix says where, the device token says who.
+        global _TUNNEL_HANDLER
         tunnel_server, _ = serve("127.0.0.1", TUNNEL_PORT,
-                                 queue=queue, token=auth_token,
-                                 auth_token=auth_token)
+                                 queue=queue, token=auth.tunnel_secret,
+                                 auth=auth)
+        _TUNNEL_HANDLER = tunnel_server.RequestHandlerClass
         threading.Thread(target=tunnel_server.serve_forever,
                          daemon=True).start()
-        tunnel_proc = start_tunnel(TUNNEL_PORT, auth_token)
+        tunnel_proc = start_tunnel(TUNNEL_PORT, auth.tunnel_secret)
 
     advertiser = None
     if not args.no_bonjour:

@@ -1097,11 +1097,17 @@ class TestRelayTunnelToken:
         assert self._get(base + "/pending") == 404
         assert self._get(base + "/health") == 404
 
-    def test_token_prefix_serves_normally(self, tokened):
+    def test_token_prefix_alone_is_no_longer_enough(self, tokened):
+        """The secret path says WHERE, the device token says WHO. Holding a
+        leaked travel URL must not be holding the key: the URL is printed to
+        stderr and written to the relay log, so it is not a secret worth
+        betting a session on."""
         base, _ = tokened
-        assert self._get(base + "/t/s3cret/pending") == 200
-        assert self._get(base + "/t/s3cret/health") == 200
+        assert self._get(base + "/t/s3cret/pending") == 403
         assert self._get(base + "/t/wrong/pending") == 404
+        # /health stays anonymous-friendly for liveness, but only under the
+        # correct prefix.
+        assert self._get(base + "/t/s3cret/health") == 403
 
     def test_card_injection_refused_through_tunnel(self, tokened):
         import json as _json
@@ -1888,9 +1894,10 @@ class TestLabellerByDefault:
 
 
 class TestRelayPairing:
-    """Shippable trust model: the hook's own machine is trusted, the
-    user's own networks may pair once, and everyone else must already
-    hold the key. One rule for every listener."""
+    """The trust model: a local process is trusted because it is already
+    inside the machine; everyone else must hold a device key, whichever
+    network they arrive from. Being on the same Wi-Fi proves nothing — on a
+    café network that is a room full of strangers."""
 
     def test_loopback_needs_nothing(self):
         import watch_relay
@@ -1906,15 +1913,20 @@ class TestRelayPairing:
         assert watch_relay.authorize_request(
             "203.0.113.9", "/health", "", False, "secret")
 
-    def test_own_networks_are_the_trust_boundary(self):
-        """LAN and tailnet callers can read the key from the broadcast
-        anyway; demanding it there is theatre, and would strand watches
-        running builds that predate the key."""
+    @pytest.mark.parametrize("ip", [
+        "192.168.1.50", "10.0.0.5", "172.20.1.1", "169.254.9.9",
+        "100.99.1.2", "fe80::1",
+    ])
+    @pytest.mark.parametrize("path", [
+        "/pending", "/sessions", "/thread", "/activity", "/usage",
+        "/decision", "/say", "/tunnel",
+    ])
+    def test_a_private_address_is_not_a_credential(self, ip, path):
+        """The café-Wi-Fi hole, closed. Every one of these once answered a
+        stranger on the same subnet: transcripts, the session list, and the
+        power to answer a prompt or speak into a live session."""
         import watch_relay
-        assert watch_relay.authorize_request(
-            "192.168.1.50", "/pending", "", False, "secret")
-        assert watch_relay.authorize_request(
-            "100.99.1.2", "/say", "", False, "secret")
+        assert not watch_relay.authorize_request(ip, path, "", False, "secret")
 
     def test_the_paired_key_opens_everything(self):
         import watch_relay
@@ -1923,10 +1935,22 @@ class TestRelayPairing:
         assert watch_relay.authorize_request(
             "100.99.1.2", "/decision", "secret", False, "secret")
 
-    def test_the_tunnel_path_is_its_own_credential(self):
+    def test_the_tunnel_path_is_an_address_not_a_credential(self):
+        """The travel URL is printed to stderr and written to the relay log,
+        so it is not a secret worth betting a session on. It says where to
+        knock; the device key still says who is knocking."""
         import watch_relay
+        assert not watch_relay.authorize_request(
+            "203.0.113.9", "/pending", "", True, "secret", via_tunnel=True)
         assert watch_relay.authorize_request(
-            "203.0.113.9", "/pending", "", True, "secret")
+            "203.0.113.9", "/pending", "secret", True, "secret", via_tunnel=True)
+
+    def test_loopback_is_not_a_pass_on_the_tunnel_listener(self):
+        """cloudflared connects from 127.0.0.1, so on that listener loopback
+        means "the internet", not "a local process"."""
+        import watch_relay
+        assert not watch_relay.authorize_request(
+            "127.0.0.1", "/pending", "", True, "secret", via_tunnel=True)
 
     def test_no_configured_key_never_admits_strangers(self):
         import watch_relay
@@ -1939,10 +1963,220 @@ class TestRelayPairing:
         ("100.127.9.9", True), ("100.128.0.1", False), ("8.8.8.8", False),
         ("169.254.1.1", True), ("", False),
     ])
-    def test_local_source_boundary(self, ip, local):
+    def test_private_address_detection(self, ip, local):
+        """Still needed — but only for the Host-header rebinding check, never
+        as an authorization decision."""
         import watch_relay
-        assert watch_relay._is_local_source(ip) is local
+        assert watch_relay._is_private_address(ip) is local
 
+    def test_the_old_boundary_helper_is_gone(self):
+        """Guard against a merge resurrecting the function whose docstring
+        called itself "the pairing boundary"."""
+        import watch_relay
+        assert not hasattr(watch_relay, "_is_local_source")
+
+
+
+class TestSecretsDoNotRideAlong:
+    """A card carries command text to the wrist and through iCloud, and the
+    audit log keeps it on disk. A token pasted into a command should not be
+    copied to any of those places."""
+
+    @pytest.mark.parametrize("command,leak", [
+        ('curl -H "Authorization: Bearer sk-live-9f8e7d6c5b4a" https://api.x',
+         "sk-live-9f8e7d6c5b4a"),
+        ("gh auth login --token ghp_ABCDEFGHIJKLMNOPQRSTUVWX",
+         "ghp_ABCDEFGHIJKLMNOPQRSTUVWX"),
+        ("API_TOKEN=hunter2hunter2 ./deploy.sh", "hunter2hunter2"),
+        ("psql --password swordfish99 -h db", "swordfish99"),
+    ])
+    def test_the_secret_never_reaches_the_card(self, command, leak):
+        card = crc.wrist_card("Bash", {"command": command}, Risk.HIGH)
+        assert leak not in card["detail"]
+        assert leak not in card["headline"]
+
+    def test_the_command_is_still_recognisable(self):
+        """Redaction must not turn the card into a riddle — the point of the
+        card is that a human can judge it at a glance."""
+        card = crc.wrist_card(
+            "Bash", {"command": "gh auth login --token ghp_" + "A" * 20},
+            Risk.HIGH)
+        assert "gh auth login" in card["detail"]
+
+    def test_ordinary_commands_are_untouched(self):
+        card = crc.wrist_card("Bash", {"command": "rm -rf build dist"},
+                              Risk.HIGH)
+        assert card["detail"] == "rm -rf build dist"
+
+    def test_the_audit_log_is_not_world_readable(self, tmp_path):
+        """It records what each card showed; on a shared machine the default
+        umask leaves that readable by everyone."""
+        import os
+        path = tmp_path / "audit.jsonl"
+        policy = dict(crc.DEFAULT_POLICY, audit_log=str(path))
+        crc.write_audit({"tier": "HIGH", "detail": "rm -rf /"}, policy)
+        assert path.exists()
+        assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+
+
+class TestLanSourceIsNotTrusted:
+    """The café-Wi-Fi hole, proved closed against a real server.
+
+    The relay binds 0.0.0.0 because the watch reaches it over the LAN, so
+    the defence has to be authentication rather than binding. These tests
+    speak to a live server while its peer address reads as a LAN address.
+    """
+
+    @pytest.fixture
+    def lan(self):
+        import threading
+        import watch_relay
+        # Rate-limit counters are module-wide, like site rules: reset them or
+        # one test's burst becomes the next test's mysterious 429.
+        watch_relay.LIMITS.reset()
+        auth = watch_relay.Auth.__new__(watch_relay.Auth)
+        auth.path = "/dev/null"
+        auth._lock = threading.RLock()
+        auth.tunnel_secret = "tunnelsecret"
+        auth.bootstrap = "bootstraptoken"
+        auth.devices = [{"id": "w1", "token": "devicetoken",
+                         "label": "Watch", "issued": 0, "last_seen": 0,
+                         "source": "test"}]
+        auth.paired_ever = True
+        auth._window_until = 0.0
+        auth._window_claims = 0
+        auth._window_ips = set()
+        auth.save = lambda: None
+        server, queue = watch_relay.serve(port=0, auth=auth)
+        # Rewrite the peer address on the server instance: a LAN client with
+        # no production test seam, and the Host header still names loopback
+        # so the rebinding defence is not what is under test here.
+        real = server.get_request
+
+        def spoofed():
+            sock, addr = real()
+            return sock, ("192.168.1.77", addr[1])
+
+        server.get_request = spoofed
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        yield "http://127.0.0.1:%d" % server.server_address[1], queue, auth
+        server.shutdown()
+        server.server_close()
+
+    def _call(self, url, token=None, method="GET", body=None):
+        import json as _json
+        import urllib.error
+        import urllib.request
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["X-Tapproval-Token"] = token
+        data = _json.dumps(body or {}).encode() if method == "POST" else None
+        request = urllib.request.Request(url, data=data, headers=headers,
+                                         method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as reply:
+                return reply.status, _json.loads(reply.read().decode())
+        except urllib.error.HTTPError as error:
+            try:
+                return error.code, _json.loads(error.read().decode())
+            except Exception:
+                return error.code, {}
+
+    @pytest.mark.parametrize("path", [
+        "/pending", "/sessions", "/activity", "/usage", "/thread?id=x",
+        "/tunnel",
+    ])
+    def test_reads_are_refused_without_a_key(self, lan, path):
+        base, _, _ = lan
+        status, _body = self._call(base + path)
+        assert status == 403
+
+    @pytest.mark.parametrize("path,body", [
+        ("/decision", {"id": "x", "decision": "allow"}),
+        ("/say", {"session_id": "x", "text": "hello"}),
+    ])
+    def test_writes_are_refused_without_a_key(self, lan, path, body):
+        base, _, _ = lan
+        status, _body = self._call(base + path, method="POST", body=body)
+        assert status == 403
+
+    def test_a_valid_key_still_works(self, lan):
+        """Hardened, not bricked: the watch's own key opens the same doors."""
+        base, _, _ = lan
+        assert self._call(base + "/pending", token="devicetoken")[0] == 200
+        assert self._call(base + "/sessions", token="devicetoken")[0] == 200
+
+    def test_card_injection_is_local_processes_only(self, lan):
+        """A forged card is a fake prompt harvesting a real tap — even a
+        correctly-keyed LAN device may not post one."""
+        base, queue, _ = lan
+        status, _body = self._call(
+            base + "/card", token="devicetoken", method="POST",
+            body={"card": {"tier": "HIGH", "headline": "x", "detail": "x"},
+                  "wait": 0})
+        assert status == 403
+        assert queue.pending() == []
+
+    def test_heartbeat_is_local_processes_only(self, lan):
+        base, _, _ = lan
+        status, _body = self._call(base + "/heartbeat", token="devicetoken",
+                                   method="POST",
+                                   body={"watch_seen_seconds_ago": 1})
+        assert status == 403
+
+    def test_admin_is_local_processes_only(self, lan):
+        base, _, auth = lan
+        status, _body = self._call(base + "/admin/pair-open", method="POST")
+        assert status == 403
+        assert not auth.window_open()
+
+    def test_health_tells_a_stranger_nothing_but_alive(self, lan):
+        """Liveness is public; a pending count and "is a watch on the wrist
+        right now" is a presence oracle."""
+        base, _, _ = lan
+        status, body = self._call(base + "/health")
+        assert status == 200 and body == {"ok": True}
+        status, body = self._call(base + "/health", token="devicetoken")
+        assert status == 200 and "pending" in body and "version" in body
+
+    def test_pairing_is_shut_once_a_device_is_enrolled(self, lan):
+        base, _, _ = lan
+        status, body = self._call(base + "/pair")
+        assert status == 403 and body.get("error") == "already paired"
+
+    def test_an_open_window_hands_over_the_bootstrap_once_per_address(self, lan):
+        base, _, auth = lan
+        auth.open_window(60)
+        status, body = self._call(base + "/pair")
+        assert status == 200 and body["token"] == "bootstraptoken"
+        assert self._call(base + "/pair")[0] == 403   # same address, again
+
+    def test_a_burst_shuts_the_window(self, lan):
+        """A flood is an attack, not a retry."""
+        base, _, auth = lan
+        auth.open_window(60)
+        for _ in range(8):
+            self._call(base + "/pair")
+        assert not auth.window_open()
+
+    def test_enrolment_trades_the_bootstrap_for_a_device_key(self, lan):
+        base, _, auth = lan
+        status, body = self._call(base + "/enroll", token="bootstraptoken",
+                                  method="POST",
+                                  body={"device_id": "w2", "label": "Watch 2"})
+        assert status == 200
+        issued = body["token"]
+        assert issued not in ("bootstraptoken", "devicetoken", "tunnelsecret")
+        assert self._call(base + "/pending", token=issued)[0] == 200
+        # The bootstrap alone opens nothing else.
+        assert self._call(base + "/pending", token="bootstraptoken")[0] == 403
+
+    def test_the_three_secrets_are_distinct(self, lan):
+        """A future refactor must not quietly merge them again."""
+        _base, _queue, auth = lan
+        assert len({auth.tunnel_secret, auth.bootstrap,
+                    auth.devices[0]["token"]}) == 3
 
 
 class TestGhostCards:
