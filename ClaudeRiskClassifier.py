@@ -69,6 +69,7 @@ import re
 import shlex
 import shutil
 import sys
+import tempfile
 from collections import Counter
 from datetime import datetime, timezone
 from enum import IntEnum
@@ -377,7 +378,7 @@ WHOLE_LINE_RULES = [
     ("pipe-to-shell", re.compile(r"\|\s*(sudo\s+)?(ba|z|k|fi|da)?sh\b"), Risk.CRITICAL),
     ("fork-bomb", re.compile(r":\s*\(\s*\)\s*\{.*\}\s*;\s*:"), Risk.CRITICAL),
     ("history-rewrite", re.compile(r"\bgit\s+filter-(branch|repo)\b"), Risk.CRITICAL),
-    ("cmd-substitution", re.compile(r"\$\(|`"), Risk.MEDIUM),
+    ("cmd-substitution", re.compile(r"\$\(|`"), Risk.MEDIUM),  # inner cmd classified in classify_bash()
     ("redirect-write", re.compile(r"(?<![0-9<>])>>?(?!\s*/dev/null)"), Risk.MEDIUM),
 ]
 
@@ -419,13 +420,30 @@ SEGMENT_RULES = [
 ]
 
 RM_RE = re.compile(r"\brm\b((?:\s+-{1,2}[A-Za-z-]+)*)\s*(.*)")
-GIT_RE = re.compile(r"\bgit\s+(?:-\S+\s+)*([a-z][a-z-]*)\b(.*)", re.I)
+# Skip git's global options before the subcommand — including the ones
+# that take a value as a SEPARATE word (`git -C <dir> push …`, `git -c
+# <name>=<val> push …`). The old `(?:-\S+\s+)*` swallowed only the flag,
+# so `-C /repo` left `/repo` looking like the subcommand and a protected
+# force-push slipped from CRITICAL down to an unknown-command MEDIUM.
+_GIT_VALUE_GLOBALS = r"-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix"
+GIT_RE = re.compile(
+    r"\bgit\s+"
+    r"(?:(?:%s)\s+\S+\s+"   # value-taking global + its separate-word value
+    r"|--\S+\s+"             # --long or --long=value (value attached)
+    r"|-\w+\s+)*"           # bare short flag(s)
+    r"([a-z][a-z-]*)\b(.*)" % _GIT_VALUE_GLOBALS, re.I)
 
 # Targets that mean "wipe the machine" or "wipe my home directory".
 CATASTROPHIC_TARGETS = re.compile(
     r"^(/|//|/\*|~|~/|~/\*|\$HOME|\$HOME/\*|\.|\.\.|\*|"
     r"/(bin|boot|dev|etc|home|lib|opt|root|sbin|srv|usr|var|Users|Windows)/?\*?)$"
 )
+
+
+# Contents of an innermost `$(…)` (no nested parens) or a backtick pair.
+# Innermost-first means nested substitutions surface one layer per pass and
+# recursion in classify_bash() reaches the rest.
+_SUBSTITUTION_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
 
 
 def _segments(command):
@@ -506,6 +524,19 @@ def classify_bash(command):
     for rule_id, pattern, level in WHOLE_LINE_RULES + SITE_RULES:
         if pattern.search(command):
             bump(rule_id, level)
+
+    # A command substitution runs its OWN command — `echo $(rm -rf /)` is a
+    # catastrophic delete wearing an echo. The segment splitter doesn't
+    # descend into `$(…)`/backticks, so classify the inner command in its
+    # own right and take the max; recursion handles nesting. Without this a
+    # destructive payload hid behind the blunt MEDIUM "cmd-substitution"
+    # cap and could be auto-allowed under a raised threshold.
+    for dollar_form, backtick_form in _SUBSTITUTION_RE.findall(command):
+        inner = (dollar_form or backtick_form).strip()
+        if inner:
+            sub_risk, sub_rules = classify_bash(inner)
+            bump("cmd-substitution-inner:" + (sub_rules[0] if sub_rules
+                 else "?"), sub_risk)
 
     for segment in _segments(command):
         token = os.path.basename(_first_token(segment)).lower()
@@ -1457,8 +1488,22 @@ def _write_settings(path, data):
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(data, indent=2) + "\n")
+    # Atomic: this file holds every hook and setting the user has, not just
+    # ours. A crash mid-write would corrupt all of it, so render to a temp
+    # file in the same directory and rename — os.replace() is atomic on the
+    # same filesystem, so the settings are always either the old or the new.
+    payload = json.dumps(data, indent=2) + "\n"
+    fd, tmp = tempfile.mkstemp(dir=directory or ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def run_install():

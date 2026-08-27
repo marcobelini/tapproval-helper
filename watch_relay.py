@@ -1778,7 +1778,7 @@ DEMO_CARDS = [
     {"tier": "CRITICAL", "headline": "git push --force origin main",
      "detail": "git push --force origin main", "project": "acme-platform"},
     {"tier": "HIGH", "headline": "Delete build -r",
-     "detail": "rm -r build dist", "project": "ClaudeWatch"},
+     "detail": "rm -r build dist", "project": "acme-platform"},
     {"tier": "MEDIUM", "headline": "Edit handlers.py",
      "detail": "Edit src/api/handlers.py", "project": "acme-platform"},
     {"tier": "HIGH", "headline": "SUDO systemctl restart nginx",
@@ -1802,7 +1802,7 @@ def _classified_card(command):
 
 def _inject(queue, card, wait):
     def worker():
-        card_id, decision = queue.submit(card, wait)
+        card_id, decision, _answer = queue.submit(card, wait)
         print("card %s [%s] %-40s -> %s"
               % (card_id, card.get("tier"), card.get("headline"), decision),
               file=sys.stderr)

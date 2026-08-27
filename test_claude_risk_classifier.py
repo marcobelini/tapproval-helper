@@ -122,6 +122,41 @@ class TestClassifyBashDestructive:
         risk, _ = crc.classify_bash("ls -la && rm -rf / && echo done")
         assert risk == Risk.CRITICAL
 
+    @pytest.mark.parametrize("command", [
+        "git -C /repo push --force origin main",
+        "git -c user.name=x push --force origin main",
+        "git --git-dir=/repo/.git push --force origin main",
+        "git --git-dir /repo/.git push --force origin main",
+        "git -C /repo -c core.pager=cat push --force origin main",
+    ])
+    def test_git_global_flags_do_not_hide_a_protected_force_push(self, command):
+        """`-C <dir>` / `-c <k>=<v>` and friends must not smuggle a
+        protected force-push past the subcommand parser down to MEDIUM."""
+        risk, rules = crc.classify_bash(command)
+        assert risk == Risk.CRITICAL
+        assert "git-force-push-protected" in rules
+
+    def test_git_global_flag_keeps_read_only_subcommand_safe(self):
+        risk, _ = crc.classify_bash("git -C /repo status")
+        assert risk == Risk.SAFE
+
+    @pytest.mark.parametrize("command", [
+        "echo $(rm -rf /)",
+        "x=`mkfs.ext4 /dev/sda`",
+        "echo $(git push --force origin main)",
+        "echo $(echo $(rm -rf /))",
+    ])
+    def test_command_substitution_descends_into_the_inner_command(self, command):
+        """A destructive command inside `$(…)`/backticks runs for real, so
+        its tier must surface — not hide behind the MEDIUM substitution cap."""
+        risk, _ = crc.classify_bash(command)
+        assert risk == Risk.CRITICAL
+
+    def test_benign_command_substitution_stays_capped_at_medium(self):
+        risk, rules = crc.classify_bash("echo $(date)")
+        assert risk == Risk.MEDIUM
+        assert "cmd-substitution" in rules
+
 
 class TestSiteRules:
     """Deployment-specific rules. The tool ships knowing nothing about any
@@ -1583,6 +1618,26 @@ class TestWatchPresence:
         queue.decide(cards[0]["id"], "allow")    # ...and can still answer
         thread.join(timeout=5)
         assert result["decision"] == "allow"
+
+    def test_inject_worker_matches_submit_arity(self):
+        """`_inject`'s worker unpacks submit()'s return; a 2/3-tuple
+        mismatch killed the --demo/--card path silently (worker thread
+        died after the wait, outcome never printed)."""
+        import threading
+        import time as _time
+        import watch_relay
+        queue = watch_relay.CardQueue()
+        thread = watch_relay._inject(
+            queue, {"tier": "HIGH", "headline": "x", "detail": "x"}, wait=10)
+        for _ in range(200):
+            if queue.pending():
+                break
+            _time.sleep(0.01)
+        cards = queue.pending(from_watch=True)
+        assert cards
+        queue.decide(cards[0]["id"], "allow")
+        thread.join(timeout=5)
+        assert not thread.is_alive()      # would still be alive if it raised
 
     def test_a_recent_poll_counts_as_present(self):
         import watch_relay
