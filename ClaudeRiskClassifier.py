@@ -237,7 +237,13 @@ def phone_would_auto_allow(tool, tool_input):
     ours recognise more tools than the phone forgives.
     """
     if tool not in ("Bash", "BashOutput"):
-        return True
+        # Only the tools Claude Code genuinely answers by itself. This used
+        # to return True for EVERY non-Bash tool, including Write, Edit and
+        # every mcp__* call — safe today only because the single caller
+        # gates on tier == SAFE first, which a write can never be. That
+        # invariant lived in a different function; a second caller would
+        # have inherited a silent yes for writes.
+        return tool in READ_ONLY_TOOLS
     command = " ".join(str((tool_input or {}).get("command", "")).split())
     if not command or "$(" in command or "`" in command:
         return False

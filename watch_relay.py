@@ -51,7 +51,7 @@ from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8977
+DEFAULT_PORT = 8977          # also referenced by the classifier's --watch/--status
 TUNNEL_PORT = 8978
 TOKEN_FILE = os.path.expanduser("~/.tapproval-token")
 AUTH_FILE = os.path.expanduser("~/.tapproval-auth.json")
@@ -786,7 +786,20 @@ def live_sessions(sessions_dir=None):
     return live
 
 
-def repo_slug(cwd, _cache={}):
+_REPO_SLUG_CACHE = OrderedDict()
+_REPO_SLUG_MAX = 128
+
+
+def _remember_repo_slug(cwd, slug):
+    """Bounded cache: a project's remote rarely changes, but the map must
+    not grow for the life of a process that runs for weeks."""
+    _REPO_SLUG_CACHE[cwd] = slug
+    _REPO_SLUG_CACHE.move_to_end(cwd)
+    while len(_REPO_SLUG_CACHE) > _REPO_SLUG_MAX:
+        _REPO_SLUG_CACHE.popitem(last=False)
+
+
+def repo_slug(cwd):
     """``Owner/repo`` from the git remote — what the Claude app shows.
 
     Cached per directory: this shells out to git, and a project's remote
@@ -794,8 +807,9 @@ def repo_slug(cwd, _cache={}):
     """
     if not cwd:
         return ""
-    if cwd in _cache:
-        return _cache[cwd]
+    if cwd in _REPO_SLUG_CACHE:
+        _REPO_SLUG_CACHE.move_to_end(cwd)
+        return _REPO_SLUG_CACHE[cwd]
     slug = ""
     try:
         out = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"],
@@ -806,7 +820,7 @@ def repo_slug(cwd, _cache={}):
             slug = match.group(1)
     except (OSError, subprocess.SubprocessError):
         pass
-    _cache[cwd] = slug
+    _remember_repo_slug(cwd, slug)
     return slug
 
 
@@ -878,11 +892,21 @@ def _session_meta(path, scan_lines=600):
 
 
 def _audit_log_path():
-    """The audit log the hook actually writes — honoring the same
-    CLAUDE_RISK_AUDIT_LOG override the hook itself honors, so a custom
-    location does not leave the Today screen empty forever."""
-    return os.path.expanduser(os.environ.get("CLAUDE_RISK_AUDIT_LOG")
-                              or "~/.claude/risk-audit.jsonl")
+    """Where the audit log lives — the hook's answer, not a second one.
+
+    The environment variable was honoured but a path set in the policy file
+    was not, so a user who moved their log saw a permanently empty Today
+    screen with nothing to explain it. Ask the classifier when it is
+    importable (the normal deployment) and fall back to the same default.
+    """
+    explicit = os.environ.get("CLAUDE_RISK_AUDIT_LOG")
+    if explicit:
+        return os.path.expanduser(explicit)
+    try:
+        from ClaudeRiskClassifier import _audit_path, load_policy
+        return _audit_path(load_policy())
+    except Exception:
+        return os.path.expanduser("~/.claude/risk-audit.jsonl")
 
 
 # Running per-day totals per audit log, so each request reads only the
@@ -2070,6 +2094,9 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, queue=None, token=None,
 
 
 _TAILSCALE_CACHE = {}
+# A miss expires: the relay runs for weeks, and Tailscale started an hour
+# after it would otherwise never be discovered.
+_TAILSCALE_MISS_TTL = 600
 
 
 def tailscale_url(port):
@@ -2083,9 +2110,14 @@ def tailscale_url(port):
     watch learns it automatically (served at /tunnel alongside the public
     URL). Never raises.
     """
-    if port in _TAILSCALE_CACHE:
-        return _TAILSCALE_CACHE[port]
-    _TAILSCALE_CACHE[port] = None
+    cached = _TAILSCALE_CACHE.get(port)
+    if cached is not None:
+        value, found_at = cached
+        # A hit is stable for the life of the process; a miss expires, so
+        # Tailscale brought up later is still found.
+        if value or time.time() - found_at < _TAILSCALE_MISS_TTL:
+            return value
+    _TAILSCALE_CACHE[port] = (None, time.time())
     for candidate in ("tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"):
         if shutil.which(candidate) or os.path.exists(candidate):
             try:
@@ -2093,8 +2125,9 @@ def tailscale_url(port):
                                      capture_output=True, text=True, timeout=3)
                 ip = out.stdout.strip().splitlines()[0].strip() if out.stdout else ""
                 if ip.startswith("100."):
-                    _TAILSCALE_CACHE[port] = "http://%s:%d" % (ip, port)
-                    return _TAILSCALE_CACHE[port]
+                    url = "http://%s:%d" % (ip, port)
+                    _TAILSCALE_CACHE[port] = (url, time.time())
+                    return url
             except (OSError, subprocess.SubprocessError, IndexError):
                 pass
     return None

@@ -1422,7 +1422,10 @@ class TestSessionsLikeTheApp:
         class Out:
             stdout = url
         monkeypatch.setattr(watch_relay.subprocess, "run", lambda *a, **k: Out())
-        watch_relay.repo_slug.__defaults__[0].clear()
+        # Module-wide cache, so reset it like the site rules — this used to
+        # reach into the function's mutable default argument, which is the
+        # thing that made the cache invisible and unbounded.
+        watch_relay._REPO_SLUG_CACHE.clear()
         assert watch_relay.repo_slug("/some/path") == expected
 
     @pytest.mark.parametrize("text,expected", [
@@ -1975,6 +1978,24 @@ class TestRelayPairing:
         import watch_relay
         assert not hasattr(watch_relay, "_is_local_source")
 
+
+
+class TestParityCheckIsHonestAboutItsScope:
+    """`phone_would_auto_allow` answers "would Claude Code itself stay
+    silent?". It used to say yes for every non-Bash tool — Write, Edit,
+    every mcp__* call — and was safe only because its one caller checks the
+    SAFE tier first. That invariant lived in another function."""
+
+    @pytest.mark.parametrize("tool", ["Read", "Glob", "Grep", "NotebookRead"])
+    def test_read_tools_are_silent(self, tool):
+        assert crc.phone_would_auto_allow(tool, {})
+
+    @pytest.mark.parametrize("tool", [
+        "Write", "Edit", "MultiEdit", "NotebookEdit", "mcp__github__create_pr",
+        "WebFetch", "Task",
+    ])
+    def test_everything_else_is_not(self, tool):
+        assert not crc.phone_would_auto_allow(tool, {"file_path": "/tmp/x"})
 
 
 class TestLogsDoNotGrowForever:
