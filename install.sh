@@ -14,7 +14,15 @@ DIR="$HOME/.tapproval"
 REPO="https://github.com/marcobelini/tapproval-helper.git"
 
 if [ -d "$DIR/.git" ]; then
-  git -C "$DIR" pull -q --ff-only || true
+  # A fast-forward can fail for good reasons (a rewritten history, a local
+  # edit, a half-finished clone). Swallowing that with `|| true` left the
+  # install frozen on old code forever, with nothing said — so fall back to
+  # a fresh clone, keeping the old one aside rather than deleting it.
+  if ! git -C "$DIR" pull -q --ff-only 2>/dev/null; then
+    echo "update: fetching a fresh copy (the existing one could not fast-forward)"
+    mv "$DIR" "$DIR.superseded-$(date +%Y%m%d-%H%M%S)"
+    git clone -q --depth 1 "$REPO" "$DIR"
+  fi
 else
   git clone -q --depth 1 "$REPO" "$DIR"
 fi

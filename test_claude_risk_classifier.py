@@ -1704,7 +1704,7 @@ class TestWaitsOnlyWhileWatched:
 
     def test_a_lowered_wrist_does_not_cost_the_question(self):
         """Once asked, the card stands until answered — a wrist that stops
-        polling for a while must never retract it. (Marc's rule, twice.)"""
+        polling for a while must never retract it. (The owner's rule, twice.)"""
         import threading
         import watch_relay
         queue = watch_relay.CardQueue()
@@ -2797,7 +2797,7 @@ class TestOnlyActiveSessionsAreListed:
 
 
 class TestCompoundCommandParity:
-    """The bug that reached Marc's wrist as silence: `Bash(grep *)`
+    """The bug that reached the wrist as silence: `Bash(grep *)`
     prefix-matched a whole `grep … && sed "$(grep …)"` compound, so the
     wrist skipped a prompt the phone showed. Claude Code judges every
     segment on its own, and command substitution always prompts."""

@@ -67,9 +67,11 @@ try:
     # must move together, or cards expire on the wrist while the terminal
     # keeps waiting. Same directory, stdlib-only either way.
     from ClaudeRiskClassifier import RELAY_WAIT_SECONDS as MAX_WAIT
+    from ClaudeRiskClassifier import __version__ as HELPER_VERSION
     MAX_WAIT = float(MAX_WAIT)
 except Exception:                                  # standalone deployment
     MAX_WAIT = 3600.0
+    HELPER_VERSION = "unknown"
 MAX_BODY = 64 * 1024   # nobody's wrist card is 64KB
 
 VALID_DECISIONS = ("allow", "deny", "answer", "always")
@@ -1822,7 +1824,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                                  "pending": len(self.queue.pending()),
                                  "watch_seen_seconds_ago":
                                      self.queue.watch_seen_seconds_ago(),
-                                 "version": RELAY_VERSION})
+                                 "version": RELAY_VERSION,
+                                 "helper": HELPER_VERSION})
             else:
                 self._send_json({"ok": True})
         elif path == "/sessions":

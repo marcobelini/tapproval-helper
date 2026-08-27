@@ -1,0 +1,38 @@
+# The hook runs under whatever python3 is on the user's PATH — which is why
+# this matrix exists rather than a single "latest" job. macOS still ships
+# 3.9, and a syntax feature from 3.10 would break the tool silently on the
+# machines it is meant to protect.
+name: tests
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Refuse third-party dependencies
+        run: |
+          # Standard library only is a hard constraint: hooks run under an
+          # interpreter we do not control. Guard it in CI, not in review.
+          test ! -f requirements.txt
+          test ! -f pyproject.toml
+      - run: pip install pytest
+      - run: pytest -q
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck install.sh uninstall.sh

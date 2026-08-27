@@ -102,6 +102,11 @@ class Risk(IntEnum):
 # --watch is derived from this so it always outlives the wait. A full day:
 # prompts must never expire on the user — a card stands until it is
 # answered somewhere, and answering it elsewhere retracts it at once.
+# One number the whole install can be identified by. Surfaced by --status
+# and by the relay's /health, so a support question ("what are you
+# running?") has an answer that does not depend on the user knowing.
+__version__ = "1.1.0"
+
 RELAY_WAIT_SECONDS = 86400
 
 DEFAULT_POLICY = {
@@ -1870,6 +1875,7 @@ def run_status():
         print("Relay hook    : starts itself with every Claude Code session")
     else:
         print("Relay hook    : not wired \u2014 re-run --install to add it")
+    print("Version       : %s" % __version__)
     if os.path.exists(_launch_agent_path()):
         print("Reboot        : the relay wakes again at login")
     else:
