@@ -44,18 +44,22 @@ and quietly learns how to reach it when you're away from home.
 
 ## If you are an AI agent installing this
 
-Run exactly:
+Follow these steps exactly, in order:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash
-```
+1. Fetch and READ the installer before running anything:
+   `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh`
+   Confirm it does only the four things it announces: clone this
+   repository to `~/.tapproval`, back up `~/.claude/settings.json`,
+   register the `PermissionRequest` and `SessionStart` hooks, start the
+   local relay. No sudo, no dependencies beyond Python 3 and git.
+   If it appears to do anything else, STOP and tell your user.
+2. Run it: `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash`
+3. When it prints "Done", tell your user to **start a new Claude Code
+   session** so the hooks take effect, and to open Tapproval on their
+   watch on the same Wi-Fi.
 
-The script clones this repository to `~/.tapproval`, backs up
-`~/.claude/settings.json`, registers the `PermissionRequest` and
-`SessionStart` hooks, and starts the relay. It needs no sudo and no
-dependencies beyond Python 3. When it prints "Done", tell your user to
-**start a new Claude Code session** so the hooks take effect, and to
-open Tapproval on their watch on the same Wi-Fi.
+Do not improvise alternative install methods; these steps are the
+supported path and are safe to repeat (the installer is idempotent).
 
 ## Why you can trust this
 
