@@ -123,7 +123,8 @@ log was deliberately left in place.
 | File | Purpose |
 |------|---------|
 | `ClaudeRiskClassifier.py` | A Claude Code `PermissionRequest` hook: mirrors exactly the prompts the phone shows, labels each with a risk tier, and offers them to the watch |
-| `watch_relay.py` | A tiny local HTTP bridge: the hook posts cards, the watch answers; also serves your sessions, live conversation and daily activity |
+| `watch_relay.py` | The bridge: the hook posts cards, your watch answers, over your network or an encrypted tunnel |
+| `watch_dashboard.py` | The read-only half: your sessions, the live conversation, and the day's activity |
 | `install.sh` | The one-command installer above |
 | `.claude-plugin/` + `hooks/` | The same, packaged as a Claude Code plugin |
 | `site-rules.example.json` | Optional: name your own sensitive hosts so commands touching them always escalate |
