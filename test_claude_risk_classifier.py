@@ -1045,8 +1045,10 @@ class TestRelayBonjour:
 class TestRelaySessions:
     def test_lists_sessions_newest_first(self, tmp_path, monkeypatch):
         import time as _time
+        import watch_dashboard
         import watch_relay
-        monkeypatch.setattr(watch_relay, "live_sessions",
+        import watch_dashboard
+        monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"aaaa1111": "Terminal",
                                      "bbbb2222": "Terminal"})
         proj = tmp_path / "-Users-x-Developer-MyProject"
@@ -1318,8 +1320,10 @@ class TestSessionNames:
 
     def test_hyphenated_project_keeps_its_full_name(self, tmp_path,
                                                     monkeypatch):
+        import watch_dashboard
         import watch_relay
-        monkeypatch.setattr(watch_relay, "live_sessions",
+        import watch_dashboard
+        monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"abc123": "Terminal"})
         self._write(tmp_path, "-Users-dev-Developer-familia-gateway",
                     "abc123.jsonl",
@@ -1333,8 +1337,10 @@ class TestSessionNames:
 
     def test_falls_back_to_folder_name_without_cwd(self, tmp_path,
                                                    monkeypatch):
+        import watch_dashboard
         import watch_relay
-        monkeypatch.setattr(watch_relay, "live_sessions",
+        import watch_dashboard
+        monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"def456": "Terminal"})
         self._write(tmp_path, "-Users-dev-Developer-solo", "def456.jsonl",
                     [{"message": {"role": "assistant", "content": "hi"}}])
@@ -1342,8 +1348,10 @@ class TestSessionNames:
         assert sessions[0]["project"] == "solo"
 
     def test_skips_system_injected_openers(self, tmp_path, monkeypatch):
+        import watch_dashboard
         import watch_relay
-        monkeypatch.setattr(watch_relay, "live_sessions",
+        import watch_dashboard
+        monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"ghi789": "Terminal"})
         self._write(tmp_path, "-p", "ghi789.jsonl", [
             {"cwd": "/x/proj",
@@ -1358,8 +1366,10 @@ class TestSessionNames:
         """The phone re-titles a session as its topic moves on; the wrist
         does the same, from the newest substantive user ask — while a
         short ack ("ok"/"test") keeps the standing title."""
+        import watch_dashboard
         import watch_relay
-        monkeypatch.setattr(watch_relay, "live_sessions",
+        import watch_dashboard
+        monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"jkl012": "VS Code"})
         self._write(tmp_path, "-p", "jkl012.jsonl", [
             {"cwd": "/x/proj",
@@ -1996,6 +2006,29 @@ class TestParityCheckIsHonestAboutItsScope:
     ])
     def test_everything_else_is_not(self, tool):
         assert not crc.phone_would_auto_allow(tool, {"file_path": "/tmp/x"})
+
+
+class TestAuditLogRotates:
+    """The audit log is the user's own record of what was decided for them,
+    so it is rotated rather than trimmed — the README promises they can read
+    it, and cutting the middle out of a record is not reading."""
+
+    def test_an_oversized_log_is_moved_aside_not_cut(self, tmp_path):
+        path = tmp_path / "audit.jsonl"
+        path.write_text("old entry\n" * 500, encoding="utf-8")
+        before = path.read_text(encoding="utf-8")
+        policy = dict(crc.DEFAULT_POLICY, audit_log=str(path))
+        assert crc._roll_audit(str(path), limit=100) is True
+        crc.write_audit({"tier": "HIGH"}, policy)
+        # Nothing lost: the old entries are one file over.
+        assert (tmp_path / "audit.jsonl.1").read_text(encoding="utf-8") == before
+        assert "HIGH" in path.read_text(encoding="utf-8")
+
+    def test_a_normal_log_is_untouched(self, tmp_path):
+        path = tmp_path / "audit.jsonl"
+        path.write_text("entry\n", encoding="utf-8")
+        assert crc._roll_audit(str(path)) is False
+        assert not (tmp_path / "audit.jsonl.1").exists()
 
 
 class TestLogsDoNotGrowForever:
@@ -2831,13 +2864,14 @@ class TestOnlyActiveSessionsAreListed:
 
     def test_dead_transcripts_are_not_listed(self, tmp_path, monkeypatch):
         import watch_relay
+        import watch_dashboard
         _write_transcript(tmp_path, "-p", "livesess1.jsonl",
                           [{"cwd": "/x/a",
                             "message": {"role": "user", "content": "go"}}])
         _write_transcript(tmp_path, "-p", "deadsess1.jsonl",
                           [{"cwd": "/x/b",
                             "message": {"role": "user", "content": "old"}}])
-        monkeypatch.setattr(watch_relay, "live_sessions",
+        monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"livesess1": "VS Code"})
         sessions = watch_relay.recent_sessions(projects_dir=str(tmp_path))
         assert [s["session_id"] for s in sessions] == ["livesess1"]
@@ -3109,12 +3143,13 @@ class TestTaskVerdictsCanRecover:
 
     def test_exit_marker_wins_even_when_stale(self, tmp_path, monkeypatch):
         import watch_relay
+        import watch_dashboard
         tasks = tmp_path / "claude-1" / "x" / "sess" / "tasks"
         tasks.mkdir(parents=True)
         out = tasks / "tid1.output"
         out.write_text("...\n[exited with code 0]\n")
         os.utime(out, (1, 1))                       # ancient mtime
-        monkeypatch.setattr(watch_relay, "_task_state",
+        monkeypatch.setattr(watch_dashboard, "_task_state",
                             watch_relay._task_state)  # no-op; direct call
         # Patch the glob pattern root by calling through a wrapper that
         # rewrites the pattern? Simpler: exercise the tail logic directly.
@@ -3285,8 +3320,9 @@ class TestSessionListCarriesTheRing:
 
     def _session(self, tmp_path, monkeypatch, lines):
         import watch_relay
+        import watch_dashboard
         _write_transcript(tmp_path, "-p", "ringsess01.jsonl", lines)
-        monkeypatch.setattr(watch_relay, "live_sessions",
+        monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"ringsess01": "VS Code"})
         return watch_relay.recent_sessions(projects_dir=str(tmp_path))[0]
 

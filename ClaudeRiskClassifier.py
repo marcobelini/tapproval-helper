@@ -962,9 +962,31 @@ def _audit_path(policy):
     return os.path.expanduser(str(policy.get("audit_log") or DEFAULT_POLICY["audit_log"]))
 
 
+AUDIT_MAX_BYTES = 20 * 1024 * 1024      # about a year of ordinary use
+
+
+def _roll_audit(path, limit=AUDIT_MAX_BYTES):
+    """Move an oversized audit log aside rather than trimming it.
+
+    The relay's own log gets truncated because it is diagnostics. This one
+    is the user's record of what was decided on their behalf, and the README
+    promises they can read it — so it is rotated, never cut. One previous
+    generation is kept; anything older than that is theirs to archive if
+    they want it.
+    """
+    try:
+        if os.path.getsize(path) < limit:
+            return False
+        os.replace(path, path + ".1")
+        return True
+    except OSError:
+        return False
+
+
 def write_audit(entry, policy):
     """Append one decision to the audit trail. Never raises."""
     path = _audit_path(policy)
+    _roll_audit(path)
     try:
         directory = os.path.dirname(path)
         if directory:
