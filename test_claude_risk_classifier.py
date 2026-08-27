@@ -1977,6 +1977,33 @@ class TestRelayPairing:
 
 
 
+class TestLogsDoNotGrowForever:
+    """The relay runs for weeks; nothing used to trim what it writes."""
+
+    def test_a_large_log_is_trimmed_to_its_tail(self, tmp_path):
+        import watch_relay
+        path = tmp_path / "relay.log"
+        path.write_text("x" * 40 + "\n" + ("line\n" * 5000), encoding="utf-8")
+        before = path.stat().st_size
+        assert watch_relay._rotate_log(str(path), limit=2000) is True
+        after = path.read_text(encoding="utf-8")
+        assert path.stat().st_size < before
+        assert after.startswith("[earlier entries trimmed]")
+        # Never start mid-line: a truncated first line reads as corruption.
+        assert "\nline\n" in after
+
+    def test_a_small_log_is_left_alone(self, tmp_path):
+        import watch_relay
+        path = tmp_path / "relay.log"
+        path.write_text("still short\n", encoding="utf-8")
+        assert watch_relay._rotate_log(str(path), limit=2000) is False
+        assert path.read_text(encoding="utf-8") == "still short\n"
+
+    def test_a_missing_log_is_not_an_error(self, tmp_path):
+        import watch_relay
+        assert watch_relay._rotate_log(str(tmp_path / "nope.log")) is False
+
+
 class TestSecretsDoNotRideAlong:
     """A card carries command text to the wrist and through iCloud, and the
     audit log keeps it on disk. A token pasted into a command should not be

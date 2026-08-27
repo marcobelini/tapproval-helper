@@ -256,6 +256,32 @@ def run_admin(args):
     return 0
 
 
+RELAY_LOG = os.path.expanduser("~/.tapproval-relay.log")
+RELAY_LOG_MAX = 2 * 1024 * 1024      # keep the tail worth reading
+
+
+def _rotate_log(path=None, limit=RELAY_LOG_MAX):
+    """Keep the last ``limit`` bytes and drop the rest.
+
+    A relay that runs for weeks appends to this file forever. Rotating at
+    start rather than on a timer keeps it to one moment when nothing else is
+    happening, and keeps the recent history a support question needs.
+    """
+    path = path or RELAY_LOG
+    try:
+        if os.path.getsize(path) <= limit:
+            return False
+        with open(path, "rb") as handle:
+            handle.seek(-limit, os.SEEK_END)
+            handle.readline()            # never start mid-line
+            tail = handle.read()
+        with open(path, "wb") as handle:
+            handle.write(b"[earlier entries trimmed]\n" + tail)
+        return True
+    except OSError:
+        return False
+
+
 def ensure_running():
     """Start the relay in the background unless one is already up.
 
@@ -280,7 +306,8 @@ def ensure_running():
         print("relay: replacing an older relay (v%s -> v%d)"
               % (version or "?", RELAY_VERSION), file=sys.stderr)
         _stop_relay()
-    log_path = os.path.expanduser("~/.tapproval-relay.log")
+    log_path = RELAY_LOG
+    _rotate_log(log_path)
     error = _spawn_detached(
         [sys.executable, os.path.abspath(__file__),
          "--host", "0.0.0.0", "--tunnel"], log_path)
@@ -861,7 +888,8 @@ def _audit_log_path():
 # Running per-day totals per audit log, so each request reads only the
 # bytes appended since the last one — the audit log grows for the
 # product's whole lifetime and must never be rescanned from byte zero.
-_ACTIVITY_STATE = {}   # path -> {"day", "offset", ...running stats}
+_ACTIVITY_STATE = {}    # path -> {"day", "offset", ...running stats}
+_ACTIVITY_LOCK = threading.Lock()
 
 
 def activity_summary(audit_log=None, now=None):
@@ -874,6 +902,17 @@ def activity_summary(audit_log=None, now=None):
     from datetime import datetime, timezone
     today = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
     path = audit_log or _audit_log_path()
+    # Requests run on their own threads, and this reads a file offset,
+    # advances it, and adds to counters. Two overlapping calls — the watch
+    # and the bridge poll independently — would each fold the same appended
+    # lines into the same totals, and the day's numbers would be wrong for
+    # the rest of the day with nothing to show why.
+    with _ACTIVITY_LOCK:
+        return _activity_summary_locked(path, today, now)
+
+
+def _activity_summary_locked(path, today, now):
+    """The body of :func:`activity_summary`, holding ``_ACTIVITY_LOCK``."""
 
     def fresh_state():
         return {"day": today, "offset": 0, "total": 0, "silenced": 0,
@@ -1197,12 +1236,27 @@ def _parse_thread_locked(path, limit):
     state = _THREAD_STATE.get(path)
     if state is None:
         state = _fresh_thread_state()
-        _THREAD_STATE[path] = state
-        for stale in list(_THREAD_STATE):
-            if len(_THREAD_STATE) <= 32:
-                break
-            if stale != path:
-                _THREAD_STATE.pop(stale, None)
+        # Evicting under the map guard, and dropping each transcript's lock
+        # with its state. A thread mid-parse holds its OWN path lock, not
+        # this one, so evicting its dict left it accumulating into an
+        # orphan — and the next poll cold-parsed from byte zero, which is
+        # the "Loading…" the prewarmer exists to prevent. The lock map also
+        # grew one entry per transcript, forever, in a process that runs
+        # for weeks.
+        with _THREAD_LOCKS_GUARD:
+            _THREAD_STATE[path] = state
+            if len(_THREAD_STATE) > 32:
+                for stale in list(_THREAD_STATE):
+                    if len(_THREAD_STATE) <= 32:
+                        break
+                    if stale == path:
+                        continue
+                    lock = _THREAD_LOCKS.get(stale)
+                    # Only retire a transcript nobody is reading right now.
+                    if lock is not None and lock.locked():
+                        continue
+                    _THREAD_STATE.pop(stale, None)
+                    _THREAD_LOCKS.pop(stale, None)
     lines, state["offset"], shrunk = _read_appended(path, state["offset"])
     if shrunk:
         # Rewritten transcript: the returned lines are the whole new file;
