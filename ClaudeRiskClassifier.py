@@ -1483,6 +1483,15 @@ def run_uninstall():
 
     if not hooks:
         data.pop("hooks", None)
+    # The env block we injected goes too — leaving CLAUDE_RISK_* behind
+    # is harmless but untidy, and an uninstall should be a clean exit.
+    env = data.get("env")
+    if isinstance(env, dict):
+        for key in list(env):
+            if key.startswith("CLAUDE_RISK_"):
+                env.pop(key)
+        if not env:
+            data.pop("env", None)
     _write_settings(path, data)
 
     print("Removed. Your other settings were left untouched.")

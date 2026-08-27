@@ -18,7 +18,7 @@ the product name is Tapproval Base.)*
 You already have an agent on that computer. Tell Claude Code, in its
 own chat (from your phone works too):
 
-> Install Tapproval Base from github.com/marcobelini/tapproval-helper
+> Install github.com/marcobelini/tapproval-helper
 
 Approve what it asks, start a new session, done.
 
@@ -83,12 +83,16 @@ supported path and are safe to repeat (the installer is idempotent).
   watch received on first local contact, and the travel tunnel hides
   behind its own secret path — which is handed over only on a direct
   local fetch, never broadcast. The hook itself talks over loopback
-  only. One honest caveat: on a network you don't control (café
+  only. Two honest caveats: on a network you don't control (café
   Wi-Fi), anyone on it is inside the boundary — run Base on networks
-  you trust.
+  you trust. And a program already running as YOU on your own computer
+  could talk to the local bridge; Base does not try to defend against a
+  machine that is itself compromised.
 - **Everything is on the record.** Every decision lands in a local
-  audit log (`~/.claude/risk-audit.jsonl`) you can read — only the
-  project folder's name is recorded, never paths above it.
+  audit log (`~/.claude/risk-audit.jsonl`) you can read. It records
+  what the card showed — the command or file path in question — plus
+  the project folder's NAME (never the directory structure above it).
+  It stays on your computer.
 - **Leaving is one command.**
   `python3 ~/.tapproval/ClaudeRiskClassifier.py --uninstall` restores
   your settings; delete `~/.tapproval` and it is as if Base was never
