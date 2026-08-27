@@ -2031,6 +2031,108 @@ class TestAuditLogRotates:
         assert not (tmp_path / "audit.jsonl.1").exists()
 
 
+class TestTheWristSaysWhatThePhoneSays:
+    """The watch is a second view of the same conversation, so its wording
+    is not a design choice — it is a fact about the phone."""
+
+    def _thread(self, tmp_path, lines, limit=14):
+        import watch_dashboard
+        folder = tmp_path / "-p"
+        folder.mkdir(exist_ok=True)
+        path = folder / "sess.jsonl"
+        with open(path, "w", encoding="utf-8") as handle:
+            for line in lines:
+                handle.write(json.dumps(line) + "\n")
+        watch_dashboard._THREAD_STATE.pop(str(path), None)
+        return watch_dashboard._parse_thread(str(path), limit)
+
+    def _tool(self, name, description=None):
+        use = {"type": "tool_use", "name": name, "input": {}}
+        if description:
+            use["input"]["description"] = description
+        return {"message": {"role": "assistant", "content": [use]}}
+
+    def _said(self, text):
+        return {"message": {"role": "assistant", "content": text}}
+
+    def test_several_commands_are_counted_not_listed(self, tmp_path):
+        """The phone writes "Ran 4 commands". The wrist used to write
+        "Ran a command, ran a command…" and push the actual words off the
+        top of a very small screen."""
+        turns, _, _ = self._thread(tmp_path, [
+            self._said("starting"),
+            self._tool("Bash"), self._tool("Bash"),
+            self._tool("Bash"), self._tool("Bash"),
+            self._said("done"),
+        ])
+        tools = [t["text"] for t in turns if t["kind"] == "tool"]
+        assert tools == ["Ran 4 commands"]
+
+    def test_a_single_command_is_named_by_what_it_was_for(self, tmp_path):
+        turns, _, _ = self._thread(tmp_path, [
+            self._said("before"),
+            self._tool("Bash", "Read the distribution logs"),
+            self._said("after"),
+        ])
+        tools = [t["text"] for t in turns if t["kind"] == "tool"]
+        assert tools == ["Ran Read the distribution logs"]
+
+    def test_a_mixed_run_counts_each_kind(self, tmp_path):
+        turns, _, _ = self._thread(tmp_path, [
+            self._said("x"),
+            self._tool("Bash"), self._tool("Bash"), self._tool("Edit"),
+            self._said("y"),
+        ])
+        tools = [t["text"] for t in turns if t["kind"] == "tool"]
+        assert tools == ["Ran 2 commands, edited a file"]
+
+
+class TestAPhantomTaskCannotBeBorn:
+    """A running-task count is a claim about the world, so it needs evidence
+    from the world. Text that merely LOOKS like a launch is not evidence.
+
+    This is not hypothetical: a test fixture containing the words
+    "agentId: deadbeef99" travelled through a real conversation, was read as
+    a launch, and — never having existed — could never produce the receipt
+    that would retire it. The wrist reported a running task for the rest of
+    the day while the phone showed none.
+    """
+
+    def test_a_quoted_id_with_nothing_on_disk_is_not_running(self, tmp_path):
+        import watch_dashboard
+        folder = tmp_path / "-p"
+        folder.mkdir()
+        path = folder / "sess.jsonl"
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": {
+                "role": "user",
+                "content": 'the test fixture says agentId: deadbeef99 (internal)'
+            }}) + "\n")
+        watch_dashboard._THREAD_STATE.pop(str(path), None)
+        _turns, running, _tool = watch_dashboard._parse_thread(str(path), 14)
+        assert running == 0
+
+    def test_a_task_with_a_live_output_file_does_count(self, tmp_path, monkeypatch):
+        """The guard must not silence real tasks — only invented ones."""
+        import watch_dashboard
+        session = "sess"
+        tasks = tmp_path / "tmp" / "claude-1" / "proj" / session / "tasks"
+        tasks.mkdir(parents=True)
+        (tasks / "realtask1.output").write_text("still working\n", encoding="utf-8")
+        monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+        assert watch_dashboard._task_state(session, "realtask1") == "running"
+
+    def test_a_finished_task_is_terminal(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        session = "sess"
+        tasks = tmp_path / "tmp" / "claude-1" / "proj" / session / "tasks"
+        tasks.mkdir(parents=True)
+        (tasks / "done1.output").write_text("output\n[exited with code 0]\n",
+                                            encoding="utf-8")
+        monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+        assert watch_dashboard._task_state(session, "done1") == "done"
+
+
 class TestLogsDoNotGrowForever:
     """The relay runs for weeks; nothing used to trim what it writes."""
 
@@ -2098,6 +2200,42 @@ class TestSecretsDoNotRideAlong:
         crc.write_audit({"tier": "HIGH", "detail": "rm -rf /"}, policy)
         assert path.exists()
         assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+
+
+class TestTheKeyCarriedThroughICloudWorks:
+    """A watch reads its key from the owner's private iCloud and presents it
+    directly. That key therefore has to BE a key, not only a ticket to ask
+    for one — an older build has no idea how to make the exchange, and a
+    watch that cannot use what it was given falls back to iCloud forever and
+    quietly loses the session list."""
+
+    def _auth(self, tmp_path, monkeypatch):
+        import watch_relay
+        monkeypatch.setattr(watch_relay, "TOKEN_FILE", str(tmp_path / "none"))
+        return watch_relay.Auth(path=str(tmp_path / "auth.json"))
+
+    def test_the_mirrored_key_opens_the_data_endpoints(self, tmp_path, monkeypatch):
+        auth = self._auth(tmp_path, monkeypatch)
+        assert auth.matches(auth.bootstrap)
+
+    def test_it_survives_a_reload(self, tmp_path, monkeypatch):
+        import watch_relay
+        auth = self._auth(tmp_path, monkeypatch)
+        again = watch_relay.Auth(path=auth.path)
+        assert again.matches(again.bootstrap)
+
+    def test_rotation_keeps_it_usable(self, tmp_path, monkeypatch):
+        auth = self._auth(tmp_path, monkeypatch)
+        before = auth.bootstrap
+        auth.rotate()
+        assert auth.bootstrap != before
+        assert not auth.matches(before)      # the old key really is dead
+        assert auth.matches(auth.bootstrap)  # the new one works at once
+
+    def test_it_is_still_not_the_tunnel_secret(self, tmp_path, monkeypatch):
+        """Two secrets, two jobs — that separation is the whole point."""
+        auth = self._auth(tmp_path, monkeypatch)
+        assert auth.bootstrap != auth.tunnel_secret
 
 
 class TestLanSourceIsNotTrusted:
@@ -2529,24 +2667,41 @@ class TestPhoneVocabulary:
         tool_turns = [t for t in turns if t["kind"] == "tool"]
         assert len(tool_turns) == 1
         assert tool_turns[0]["text"] == (
-            "Ran a command, edited a file, searched the code")
+            "Ran 2 commands, edited a file, searched the code")
 
-    def test_running_tasks_are_launches_minus_receipts(self, tmp_path):
+    def test_a_receipted_task_stops_counting(self, tmp_path, monkeypatch):
+        """Launches minus receipts is the candidate set — and every
+        candidate still has to be found on disk before it counts.
+
+        This test used to assert the opposite, and its own fixture proved
+        why that was wrong: the fake id it invented travelled through a real
+        conversation, was read as a launch there, and reported a running
+        task on the wrist for the rest of the day while the phone showed
+        none. A task nobody can find is not a task.
+        """
+        import watch_dashboard
         import watch_relay
         lines = [
             {"cwd": "/x", "message": {"role": "user", "content": "go"}},
             {"message": {"role": "user", "content":
              "Command running in background with ID: abc123."}},
             {"message": {"role": "user", "content":
-             "agentId: deadbeef99 (internal)"}},
+             "Command running in background with ID: stillgoing1."}},
             {"message": {"role": "user", "content":
              "<task-notification><task-id>abc123</task-id>done"}},
         ]
         _write_transcript(tmp_path, "-p", "tasks01.jsonl", lines)
         path = watch_relay._find_transcript("tasks01",
                                             projects_dir=str(tmp_path))
+        # Give the unreceipted one an output file, the way a real task has.
+        session = os.path.splitext(os.path.basename(path))[0]
+        tasks = tmp_path / "tmp" / "claude-1" / "proj" / session / "tasks"
+        tasks.mkdir(parents=True)
+        (tasks / "stillgoing1.output").write_text("working\n", encoding="utf-8")
+        monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+        watch_dashboard._THREAD_STATE.pop(path, None)
         _, running, _ = watch_relay._parse_thread(path, 14)
-        assert running == 1     # deadbeef99 still runs; abc123 receipted
+        assert running == 1     # abc123 receipted; stillgoing1 found on disk
 
 
 class TestEveryPress:

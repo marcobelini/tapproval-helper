@@ -1258,6 +1258,7 @@ class Auth:
                                 if isinstance(d, dict) and d.get("token")]
         if not self.tunnel_secret or not self.bootstrap:
             self._seed()
+        self._ensure_icloud_device()
 
     def _seed(self):
         """First run — or a file we cannot read, which fails closed to a
@@ -1278,6 +1279,25 @@ class Auth:
                              "label": "Existing watch", "issued": int(time.time()),
                              "last_seen": 0, "source": "migrated"}]
             self.paired_ever = True
+        self.save()
+
+    def _ensure_icloud_device(self):
+        """The key the bridge mirrors into iCloud must BE a key.
+
+        A watch reads it from the owner's private database and presents it
+        directly. Treating it only as a ticket to exchange for a key meant
+        older builds — which have no idea how to make that exchange — were
+        refused, fell back to iCloud permanently, and silently lost the
+        session list. It is no weaker than it looks: only the owner's Apple
+        ID can read that record, and a stranger on the Wi-Fi still has no
+        way to ask for it.
+        """
+        if any(device.get("id") == "icloud" for device in self.devices):
+            return
+        self.devices.append({
+            "id": "icloud", "token": self.bootstrap,
+            "label": "Watch via iCloud", "issued": int(time.time()),
+            "last_seen": 0, "source": "icloud-mirror"})
         self.save()
 
     def save(self):
@@ -1351,7 +1371,13 @@ class Auth:
         with self._lock:
             self.tunnel_secret = uuid.uuid4().hex
             self.bootstrap = uuid.uuid4().hex
-            self.devices = []
+            # The iCloud-mirrored key rotates with everything else, and stays
+            # a usable key: the bridge re-mirrors it within the minute and a
+            # watch picks it up without anyone touching anything.
+            self.devices = [{
+                "id": "icloud", "token": self.bootstrap,
+                "label": "Watch via iCloud", "issued": int(time.time()),
+                "last_seen": 0, "source": "icloud-mirror"}]
             self.save()
             return self.tunnel_secret
 

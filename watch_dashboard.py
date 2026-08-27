@@ -585,22 +585,26 @@ def session_thread(session_id, limit=THREAD_TURN_LIMIT, projects_dir=None):
     return _parse_thread(path, limit)[0]
 
 
+# The phone's wording, in both the shapes it uses: one run named on its own,
+# and several of a kind counted. It writes "Ran 4 commands", never
+# "Ran a command, ran a command, ran a command".
 _TOOL_PHRASES = (
-    (("Bash", "BashOutput"), "ran a command"),
-    (("Edit", "Write", "NotebookEdit", "MultiEdit"), "edited a file"),
-    (("Read",), "read a file"),
-    (("Grep", "Glob"), "searched the code"),
-    (("WebFetch", "WebSearch"), "searched the web"),
-    (("Task", "Agent"), "launched a task"),
+    (("Bash", "BashOutput"), "ran a command", "ran %d commands"),
+    (("Edit", "Write", "NotebookEdit", "MultiEdit"), "edited a file",
+     "edited %d files"),
+    (("Read",), "read a file", "read %d files"),
+    (("Grep", "Glob"), "searched the code", "ran %d searches"),
+    (("WebFetch", "WebSearch"), "searched the web", "ran %d web searches"),
+    (("Task", "Agent"), "launched a task", "launched %d tasks"),
 )
 
 
-def _tool_phrase(name):
-    """The phone app's wording for a tool run."""
-    for names, phrase in _TOOL_PHRASES:
+def _tool_phrase(name, count=1):
+    """The phone app's wording for one tool run, or for several of a kind."""
+    for names, one, many in _TOOL_PHRASES:
         if name in names:
-            return phrase
-    return "used a tool"
+            return one if count < 2 else many % count
+    return "used a tool" if count < 2 else "used tools %d times" % count
 
 
 # Background tasks announce themselves when launched and are receipted by
@@ -624,10 +628,25 @@ def _task_state(session_id, task_id):
     back — only an exit marker is forever.
     """
     import glob as _glob
-    pattern = "/private/tmp/claude-*/*/%s/tasks/%s.output" % (
-        session_id, task_id)
-    verdict = "running"          # no file: only the transcript's word
-    for path in _glob.glob(pattern):
+    patterns = ["/private/tmp/claude-*/*/%s/tasks/%s.output" % (session_id, task_id)]
+    tmpdir = os.environ.get("TMPDIR")
+    if tmpdir:
+        patterns.append(os.path.join(
+            tmpdir, "claude-*", "*", session_id, "tasks", "%s.output" % task_id))
+    found = []
+    for pattern in patterns:
+        found.extend(_glob.glob(pattern))
+    # No file at all is no evidence, and no evidence is not "running".
+    #
+    # This used to let the transcript's word stand, which sounds humble and
+    # is actually how a phantom becomes immortal: a test fixture containing
+    # the words "agentId: deadbeef99" travelled through the conversation,
+    # got read as a launch, and — having never existed — could never produce
+    # the file that would retire it. The wrist reported a running task for
+    # the rest of the day while the phone, which tracks real tasks, showed
+    # none.
+    verdict = "unknown"
+    for path in found:
         verdict = "unknown"
         try:
             with open(path, "rb") as handle:
@@ -763,17 +782,33 @@ def _parse_thread_locked(path, limit):
         # one phrase — "Ran a command, edited a file" — deduped, order
         # kept. Cheap: runs over at most limit*4 kept turns.
         merged = []
+        runs = []                 # tool names in the current consecutive run
+
+        def flush():
+            """Word the run of tool calls that just ended, the way the phone
+            words it: one call named by what it was for, several counted."""
+            if not runs:
+                return
+            if len(runs) == 1 and runs[0][1]:
+                phrase = "ran %s" % runs[0][1]
+            else:
+                counts = OrderedDict()
+                for name, _desc, _at in runs:
+                    counts[name] = counts.get(name, 0) + 1
+                phrase = ", ".join(_tool_phrase(name, n)
+                                   for name, n in counts.items())
+            merged.append({"role": "assistant", "kind": "tool", "at": runs[-1][2],
+                           "text": phrase[:1].upper() + phrase[1:]})
+            del runs[:]
+
         for turn in state["turns"]:
             if turn["kind"] == "tool":
-                phrase = _tool_phrase(turn["text"])
-                if merged and merged[-1]["kind"] == "tool":
-                    have = merged[-1]["text"]
-                    if phrase not in have.lower():
-                        merged[-1] = dict(merged[-1],
-                                          text=have + ", " + phrase)
-                    continue
-                turn = dict(turn, text=phrase[:1].upper() + phrase[1:])
+                runs.append((turn["text"], turn.get("desc") or "",
+                             turn.get("at", "")))
+                continue
+            flush()
             merged.append(dict(turn))
+        flush()
         session_id = os.path.splitext(os.path.basename(path))[0]
         running = 0
         for tid in list(state["launched"] - state["finished"]):
@@ -813,7 +848,7 @@ def _thread_line(state, line, limit):
     if role not in ("user", "assistant"):
         return
     content = message.get("content")
-    text, tool = "", ""
+    text, tool, tool_description = "", "", ""
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
@@ -825,6 +860,7 @@ def _thread_line(state, line, limit):
             elif part.get("type") == "tool_use" and not tool:
                 tool = part.get("name", "")
                 inp = part.get("input") or {}
+                tool_description = inp.get("description")
                 state["running_tool"] = (
                     " ".join(str(inp.get("description")
                                  or "").split())
@@ -832,8 +868,10 @@ def _thread_line(state, line, limit):
                     + _tool_phrase(tool)[1:])
     kind = "text"
     lead = str(text).lstrip()
+    description = ""
     if not lead and tool:
         lead, kind = tool, "tool"
+        description = " ".join(str(tool_description or "").split())[:60]
     if not lead or lead.startswith(("<", "Caveat:", "[Request")):
         return
     # The watch shows the FULL text of a message, like the phone — a 2KB
@@ -861,6 +899,7 @@ def _thread_line(state, line, limit):
         "role": role,
         "kind": kind,
         "text": text,
+        "desc": description,
         "at": entry.get("timestamp", ""),
     })
     if len(state["turns"]) > limit * 4:
