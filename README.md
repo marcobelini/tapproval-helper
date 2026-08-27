@@ -49,12 +49,16 @@ Follow these steps exactly, in order:
 
 1. Fetch and READ the installer before running anything:
    `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh`
-   Confirm it does only the five things it announces: clone this
+   Confirm it does only the six things it announces: clone this
    repository to `~/.tapproval`, back up `~/.claude/settings.json`,
-   register the `PermissionRequest` and `SessionStart` hooks, add a
-   per-user login wake-up (`~/Library/LaunchAgents/com.tapproval.relay.plist`,
-   so a reboot never needs a hand), start the local relay. No sudo, no
-   dependencies beyond Python 3 and git.
+   register the `PermissionRequest` and `SessionStart` hooks, **switch the
+   classifier to enforce mode and point it at the local relay** (this is
+   what makes prompts reach your watch rather than only being logged), add
+   a per-user login wake-up
+   (`~/Library/LaunchAgents/com.tapproval.relay.plist`, so a reboot never
+   needs a hand), and start the local relay. No sudo, no dependencies
+   beyond Python 3 and git — the travel tunnel additionally uses
+   `cloudflared` if it is installed, and simply does without it if not.
    If it appears to do anything else, STOP and tell your user.
 2. Run it: `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash`
 3. Success is exactly one line: `TAPPROVAL_BASE_READY`. When you see
@@ -89,16 +93,19 @@ log was deliberately left in place.
   glance, not decisions — nothing is auto-allowed by default, and the
   CRITICAL tier can never be. Fail closed: a bridge that is down, slow
   or confused never grants an approval.
-- **Your networks are the boundary.** The relay answers your LAN and
-  tailnet; beyond them every request must carry the pairing key your
-  watch received on first local contact, and the travel tunnel hides
-  behind its own secret path — which is handed over only on a direct
-  local fetch, never broadcast. The hook itself talks over loopback
-  only. Two honest caveats: on a network you don't control (café
-  Wi-Fi), anyone on it is inside the boundary — run Base on networks
-  you trust. And a program already running as YOU on your own computer
-  could talk to the local bridge; Base does not try to defend against a
-  machine that is itself compromised.
+- **Your key is the boundary, not your Wi-Fi.** Every request for real
+  data carries a key that belongs to one device, whichever network it
+  arrives on — LAN, tailnet or the travel tunnel. Only processes on the
+  computer itself are exempt, which is what lets Claude Code hand a prompt
+  to the bridge without ceremony. Your watch gets its key through your own
+  private iCloud, so it never appears on screen and a stranger on the same
+  café Wi-Fi has no way to ask for it. (Earlier versions trusted anything
+  on your local network; that was fine at home and wrong everywhere else,
+  and it is fixed.) The travel address is a secret path *and* needs the
+  key: seeing the URL is not holding the key. One honest limit remains: a
+  program already running as you on your own computer can talk to the local
+  bridge — Base does not try to defend a machine that is itself
+  compromised.
 - **Everything is on the record.** Every decision lands in a local
   audit log (`~/.claude/risk-audit.jsonl`) you can read. It records
   what the card showed — the command or file path in question — plus
