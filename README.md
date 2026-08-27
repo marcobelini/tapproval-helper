@@ -54,9 +54,12 @@ Follow these steps exactly, in order:
    local relay. No sudo, no dependencies beyond Python 3 and git.
    If it appears to do anything else, STOP and tell your user.
 2. Run it: `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash`
-3. When it prints "Done", tell your user to **start a new Claude Code
-   session** so the hooks take effect, and to open Tapproval on their
-   watch on the same Wi-Fi.
+3. Success is exactly one line: `TAPPROVAL_BASE_READY`. When you see
+   it, tell your user to **start a new Claude Code session** so the
+   hooks take effect, and to open Tapproval on their watch on the same
+   Wi-Fi — the watch confirms the connection on its own screen. If that
+   line never appears, the install did NOT succeed; report the output
+   to your user instead of retrying blindly.
 
 Do not improvise alternative install methods; these steps are the
 supported path and are safe to repeat (the installer is idempotent).
