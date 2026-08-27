@@ -1283,6 +1283,31 @@ class TestSessionNames:
         sessions = watch_relay.recent_sessions(projects_dir=str(tmp_path))
         assert sessions[0]["opening"] == "the real ask"
 
+    def test_title_follows_the_latest_topic_like_the_phone(self, tmp_path,
+                                                           monkeypatch):
+        """The phone re-titles a session as its topic moves on; the wrist
+        does the same, from the newest substantive user ask — while a
+        short ack ("ok"/"test") keeps the standing title."""
+        import watch_relay
+        monkeypatch.setattr(watch_relay, "live_sessions",
+                            lambda: {"jkl012": "VS Code"})
+        self._write(tmp_path, "-p", "jkl012.jsonl", [
+            {"cwd": "/x/proj",
+             "message": {"role": "user",
+                         "content": "fix the pwa startup crash please"}},
+            {"message": {"role": "assistant", "content": "done"}},
+            {"message": {"role": "user",
+                         "content": "compare the glyphs per subject now"}},
+            {"message": {"role": "user", "content": "ok"}},
+            {"message": {"role": "user",
+                         "content": "/simplify → 4 cleanup agents in parallel"}},
+            {"message": {"role": "user",
+                         "content": "This session is being continued from a "
+                                    "previous conversation that ran out"}}])
+        sessions = watch_relay.recent_sessions(projects_dir=str(tmp_path))
+        assert sessions[0]["title"] == "Compare the glyphs per subject now"
+        assert sessions[0]["opening"].startswith("fix the pwa")
+
 
 class TestSessionsLikeTheApp:
     """The watch shows what the Claude app shows: a title, the repository,
@@ -1302,6 +1327,19 @@ class TestSessionsLikeTheApp:
     def test_live_sessions_survives_a_missing_directory(self, tmp_path):
         import watch_relay
         assert watch_relay.live_sessions(sessions_dir=str(tmp_path / "no")) == {}
+
+    def test_unattended_sdk_runs_stay_off_the_wrist(self, tmp_path):
+        """The phone app never lists headless SDK runs; the wrist mirrors
+        the phone, so a live sdk-cli process must not appear either."""
+        import watch_relay
+        (tmp_path / "1.json").write_text(json.dumps(
+            {"pid": os.getpid(), "sessionId": "robot-1",
+             "entrypoint": "sdk-cli"}), encoding="utf-8")
+        (tmp_path / "2.json").write_text(json.dumps(
+            {"pid": os.getpid(), "sessionId": "human-1",
+             "entrypoint": "claude-vscode"}), encoding="utf-8")
+        live = watch_relay.live_sessions(sessions_dir=str(tmp_path))
+        assert live == {"human-1": "VS Code"}
 
     @pytest.mark.parametrize("url,expected", [
         ("git@github.com:Thoughtful-Steward/pantri.git", "Thoughtful-Steward/pantri"),

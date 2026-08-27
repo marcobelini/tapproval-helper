@@ -649,6 +649,11 @@ def live_sessions(sessions_dir=None):
         session_id, pid = data.get("sessionId"), data.get("pid")
         if not session_id or not pid:
             continue
+        # Unattended SDK runs (claude agents, headless drivers) never
+        # appear in the phone app's session list — and the wrist mirrors
+        # the phone, so they don't belong on the watch either.
+        if data.get("entrypoint") == "sdk-cli":
+            continue
         try:
             os.kill(int(pid), 0)          # signal 0: "are you there?"
         except (OSError, ValueError, TypeError):
@@ -1079,6 +1084,7 @@ def prewarm_threads(session_ids):
 def _fresh_thread_state():
     return {"offset": 0, "turns": [], "launched": set(),
             "finished": set(), "running_tool": None, "github": None,
+            "latest_ask": None,
             "result": None, "result_at": 0.0, "limit": None}
 
 
@@ -1208,6 +1214,15 @@ def _thread_line(state, line, limit):
         fact = _last_github_fact(text)
         if fact:
             state["github"] = fact
+    # The phone re-titles a session as its topic moves on; mirror that by
+    # remembering the latest user ask with enough substance to BE a topic.
+    # Not topics: short acks ("ok"/"det virker"), slash-command/skill
+    # invocations, and the harness's own compaction hand-off message.
+    lead_ask = text.strip()
+    if (role == "user" and kind == "text" and len(lead_ask) >= 24
+            and not lead_ask.startswith("/")
+            and not lead_ask.startswith("This session is being continued")):
+        state["latest_ask"] = lead_ask[:200]
     state["turns"].append({
         "role": role,
         "kind": kind,
@@ -1242,11 +1257,11 @@ def _last_github_fact(text):
 
 def _thread_activity(path):
     """The list row's share of the thread state: (running_tasks,
-    running_tool, github). Same limit as /thread, so the list and the
-    detail screen share one incremental parse per transcript."""
+    running_tool, github, latest_ask). Same limit as /thread, so the list
+    and the detail screen share one incremental parse per transcript."""
     _, running, running_tool = _parse_thread(path, 14)
     state = _THREAD_STATE.get(path) or {}
-    return running, running_tool, state.get("github")
+    return running, running_tool, state.get("github"), state.get("latest_ask")
 
 
 def resolve_session(prefix, projects_dir=None):
@@ -1324,9 +1339,11 @@ def recent_sessions(limit=12, projects_dir=None):
         name = os.path.basename(str(cwd).rstrip("/")) if cwd else ""
         if not name:
             name = project.rstrip("-").rsplit("-", 1)[-1] or project
-        running_tasks, running_tool, github = _thread_activity(path)
+        running_tasks, running_tool, github, latest_ask = _thread_activity(path)
         sessions.append({
-            "title": derive_title(opening) or name,
+            # Titled by the newest substantive ask, the way the phone
+            # re-titles a session as its topic moves on.
+            "title": derive_title(latest_ask or opening) or name,
             "project": name,
             "repo": repo_slug(cwd),
             "status": live.get(session_id, ""),
