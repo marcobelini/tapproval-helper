@@ -1337,6 +1337,89 @@ def _relay_command():
                                _quote_path(_relay_path()))
 
 
+# A reboot must not need a hand: a login item wakes the relay the moment
+# the user logs back in, instead of leaving the watch searching until the
+# first Claude Code session happens to start.
+def _launch_agent_path():
+    """Overridable like CLAUDE_SETTINGS_PATH, so tests never touch the
+    real LaunchAgents directory."""
+    return os.environ.get("CLAUDE_LAUNCH_AGENT_PATH") or os.path.join(
+        os.path.expanduser("~"), "Library", "LaunchAgents",
+        "com.tapproval.relay.plist")
+
+_LAUNCH_AGENT_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.tapproval.relay</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>%s</string>
+    <string>%s</string>
+    <string>--ensure</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+"""
+
+
+def _launchctl(*args):
+    """Run launchctl quietly; never raises, never blocks an install."""
+    import subprocess
+    try:
+        subprocess.run(["launchctl"] + list(args),
+                       capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+def _xml_escape(text):
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+
+def install_launch_agent():
+    """Wake the relay at every login, so a reboot never needs a hand.
+
+    The agent runs ``watch_relay.py --ensure`` once at load — idempotent
+    and exits immediately — so it can never fight the SessionStart hook
+    over the port. Crash recovery between logins stays with that hook.
+    Returns True when the agent is in place. macOS only; never raises.
+    """
+    if sys.platform != "darwin":
+        return False
+    relay = _relay_path()
+    if not os.path.exists(relay):
+        return False
+    plist = _LAUNCH_AGENT_XML % (_xml_escape(sys.executable),
+                                 _xml_escape(relay))
+    target = _launch_agent_path()
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(plist)
+    except OSError:
+        return False
+    uid = os.getuid()
+    _launchctl("bootout", "gui/%d/com.tapproval.relay" % uid)
+    _launchctl("bootstrap", "gui/%d" % uid, target)
+    return True
+
+
+def remove_launch_agent():
+    """Take the login wake-up out again — part of a clean exit."""
+    if sys.platform != "darwin":
+        return False
+    _launchctl("bootout", "gui/%d/com.tapproval.relay" % os.getuid())
+    try:
+        os.remove(_launch_agent_path())
+        return True
+    except OSError:
+        return False
+
+
 def _is_our_hook(handler):
     command = str(handler.get("command", ""))
     return (os.path.basename(__file__) in command
@@ -1420,10 +1503,16 @@ def run_install():
     if not starters:
         hooks.pop("SessionStart", None)
 
+    # Even a no-op re-run repairs a missing login wake-up: installs from
+    # before it existed get it the next time anything runs --install.
+    agent = bool(relay_command) and install_launch_agent()
+
     if not changed:
         print("Already installed, and the paths are correct.")
         print("  Settings : %s" % path)
         print("  Command  : %s" % command)
+        if agent:
+            print("  Reboot   : the relay wakes again at login")
         print("  Nothing to do.")
         return 0
 
@@ -1435,6 +1524,8 @@ def run_install():
     print("  Command  : %s" % command)
     if relay_command:
         print("  Relay    : starts itself with every Claude Code session")
+    if agent:
+        print("  Reboot   : the relay wakes again at login")
     if backup:
         print("  Backup   : %s" % backup)
     print("")
@@ -1493,6 +1584,7 @@ def run_uninstall():
         if not env:
             data.pop("env", None)
     _write_settings(path, data)
+    remove_launch_agent()
 
     print("Removed. Your other settings were left untouched.")
     print("  Settings : %s" % path)
@@ -1699,6 +1791,11 @@ def run_status():
         print("Relay hook    : starts itself with every Claude Code session")
     else:
         print("Relay hook    : not wired \u2014 re-run --install to add it")
+    if os.path.exists(_launch_agent_path()):
+        print("Reboot        : the relay wakes again at login")
+    else:
+        print("Reboot        : no login wake-up \u2014 the relay waits for"
+              " the first session; re-run --install to add it")
     try:
         import urllib.request
         with urllib.request.urlopen("http://127.0.0.1:8977/health",

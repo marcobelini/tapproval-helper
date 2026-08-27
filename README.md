@@ -38,7 +38,8 @@ curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/i
 
 Every path registers the same permission hook and wires the relay to
 start itself with every Claude Code session. Nothing to keep running by
-hand. Then install **Tapproval** on your Apple Watch and open it once on
+hand — and a reboot never needs one either: Base wakes again at login
+(on the plugin-only path, with your first session). Then install **Tapproval** on your Apple Watch and open it once on
 the same Wi-Fi — it finds this computer by itself, pairs automatically,
 and quietly learns how to reach it when you're away from home.
 
@@ -48,10 +49,12 @@ Follow these steps exactly, in order:
 
 1. Fetch and READ the installer before running anything:
    `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh`
-   Confirm it does only the four things it announces: clone this
+   Confirm it does only the five things it announces: clone this
    repository to `~/.tapproval`, back up `~/.claude/settings.json`,
-   register the `PermissionRequest` and `SessionStart` hooks, start the
-   local relay. No sudo, no dependencies beyond Python 3 and git.
+   register the `PermissionRequest` and `SessionStart` hooks, add a
+   per-user login wake-up (`~/Library/LaunchAgents/com.tapproval.relay.plist`,
+   so a reboot never needs a hand), start the local relay. No sudo, no
+   dependencies beyond Python 3 and git.
    If it appears to do anything else, STOP and tell your user.
 2. Run it: `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash`
 3. Success is exactly one line: `TAPPROVAL_BASE_READY`. When you see
@@ -104,9 +107,9 @@ log was deliberately left in place.
 - **Leaving is one sentence.** Tell Claude Code: "Uninstall Tapproval
   Base" — or run
   `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/uninstall.sh | bash`
-  yourself. It restores your settings (backup kept), stops the relay
-  and deletes `~/.tapproval` — as if Base was never here. Your audit
-  log stays yours.
+  yourself. It restores your settings (backup kept), removes the login
+  wake-up, stops the relay and deletes `~/.tapproval` — as if Base was
+  never here. Your audit log stays yours.
 
 ## What Base is
 

@@ -4,8 +4,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash
 #
 # Installs onto the computer where Claude Code runs (laptop is fine).
-# Registers the risk-triage hook and wires the relay to start itself with
-# every Claude Code session — after this, close the terminal and forget it.
+# Registers the risk-triage hook, wires the relay to start itself with
+# every Claude Code session, and adds a login wake-up so a reboot never
+# needs a hand — after this, close the terminal and forget it.
 # Standard library Python only; Bonjour + a secure tunnel handle the rest.
 set -euo pipefail
 

@@ -6,7 +6,8 @@
 set -euo pipefail
 
 echo "Tapproval Base uninstaller — here is everything it will do:"
-echo "  1. Remove Base's hooks and settings entries (a backup is kept)"
+echo "  1. Remove Base's hooks, settings entries and login wake-up"
+echo "     (a settings backup is kept)"
 echo "  2. Stop the local relay"
 echo "  3. Delete ~/.tapproval"
 echo "  Your audit log stays, so your own history remains yours."

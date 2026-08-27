@@ -26,6 +26,15 @@ import ClaudeRiskClassifier as crc
 from ClaudeRiskClassifier import Risk
 
 
+@pytest.fixture(autouse=True)
+def _no_real_launch_agent(tmp_path, monkeypatch):
+    """No test may ever touch the real LaunchAgents dir or launchctl —
+    same isolation rule as CLAUDE_SETTINGS_PATH."""
+    monkeypatch.setenv("CLAUDE_LAUNCH_AGENT_PATH",
+                       str(tmp_path / "com.tapproval.relay.plist"))
+    monkeypatch.setattr(crc, "_launchctl", lambda *args: None)
+
+
 class TestClassifyBashReadOnly:
     @pytest.mark.parametrize("command", [
         "ls -la",
@@ -525,6 +534,26 @@ class TestInstaller:
         commands = [h["command"] for h in self._handlers(settings)]
         assert len(commands) == 1
         assert "ClaudeRiskClassifier.py" in commands[0]
+
+    def test_reboot_survival_installs_and_uninstalls_with_us(
+            self, settings, capsys, monkeypatch):
+        """A reboot must not orphan the watch: install writes a login
+        wake-up for the relay, uninstall takes it out again."""
+        agent = crc._launch_agent_path()
+        monkeypatch.setattr(crc.sys, "platform", "darwin")
+        assert crc.run_install() == 0
+        assert os.path.exists(agent)
+        xml = open(agent, encoding="utf-8").read()
+        assert "com.tapproval.relay" in xml
+        assert "--ensure" in xml
+        assert "RunAtLoad" in xml
+        # A re-run repairs a deleted agent even when settings are current.
+        os.remove(agent)
+        assert crc.run_install() == 0
+        assert os.path.exists(agent)
+        assert crc.run_uninstall() == 0
+        capsys.readouterr()
+        assert not os.path.exists(agent)
 
     def test_install_uses_the_running_interpreter(self, settings, capsys):
         crc.run_install()
