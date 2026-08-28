@@ -13,35 +13,37 @@ line of it is in this repository.
 *(Technical id: `tapproval-helper` — the repo and plugin keep that name;
 the product name is Tapproval Base.)*
 
-## Install — no manual setup
+## Install — no terminal, no downloads
 
-You already have an agent on that computer. Tell Claude Code, in its
-own chat (from your phone works too):
-
-> Install github.com/marcobelini/tapproval-helper
-
-Approve what it asks, start a new session, done.
-
-**As a Claude Code plugin** (two slash commands, hooks registered
-automatically):
+Two lines, typed into Claude Code itself:
 
 ```
 /plugin marketplace add marcobelini/tapproval-helper
-/plugin install tapproval-helper@marcobelini/tapproval-helper
+/plugin install tapproval-helper@tapproval
 ```
 
-**Or by hand** (one command, then forget it):
+Start a new session, and that is the whole setup. The plugin registers
+the permission hook and wires the relay to start itself with every
+session; there is nothing to keep running and nothing to maintain.
+
+**Prefer to let the agent do it?** Tell Claude Code, in its own chat
+(from your phone works too):
+
+> Install github.com/marcobelini/tapproval-helper
+
+**Prefer a terminal?** One command, then forget it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash
 ```
 
-Every path registers the same permission hook and wires the relay to
-start itself with every Claude Code session. Nothing to keep running by
-hand — and a reboot never needs one either: Base wakes again at login
-(on the plugin-only path, with your first session). Then install **Tapproval** on your Apple Watch and open it once on
-the same Wi-Fi — it finds this computer by itself, pairs automatically,
-and quietly learns how to reach it when you're away from home.
+Every path registers the same permission hook. A reboot never needs a
+hand either: the installer adds a login wake-up, and on the plugin path
+your first Claude Code session brings Base back by itself.
+
+Then install **Tapproval** on your Apple Watch and open it once on the
+same Wi-Fi — it finds this computer by itself, pairs automatically, and
+quietly learns how to reach it when you're away from home.
 
 ## If you are an AI agent installing this
 

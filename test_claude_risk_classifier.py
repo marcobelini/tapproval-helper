@@ -3520,3 +3520,161 @@ class TestSessionListCarriesTheRing:
                                       "content": "was PR #9 merged?"}},
         ])
         assert session["github"] is None
+
+
+# ---------------------------------------------------------------------------
+# The plugin path
+#
+# `/plugin install` registers the hooks from the plugin's own manifest and
+# writes nothing to settings.json. Nothing here had ever opened a file under
+# helper/, which is how the manifest once shipped a 3600-second wait while the
+# installer wrote 86400 — the card really did expire after an hour, and the
+# tests stayed green.
+
+HELPER_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(crc.__file__)), "helper")
+
+
+def _helper_manifest(*parts):
+    with open(os.path.join(HELPER_DIR, *parts), encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+class TestPluginManifest:
+    """Shipped configuration, held to the module's own constants."""
+
+    def test_hook_carries_the_env_the_installer_would_write(self):
+        env, _timeout = crc._manifest_hook(_helper_manifest("hooks", "hooks.json"))
+        assert env == crc.WATCH_ENV
+
+    def test_hook_timeout_outlives_the_wrist_wait(self):
+        _env, timeout = crc._manifest_hook(_helper_manifest("hooks", "hooks.json"))
+        assert timeout == crc.WATCH_HOOK_TIMEOUT
+
+    def test_session_start_starts_the_relay(self):
+        wiring = _helper_manifest("hooks", "hooks.json")
+        commands = [handler.get("command", "")
+                    for entry in wiring["hooks"]["SessionStart"]
+                    for handler in entry["hooks"]]
+        assert any("watch_relay.py" in c and "--ensure" in c for c in commands)
+
+    def test_plugin_version_matches_the_module(self):
+        assert _helper_manifest(
+            ".claude-plugin", "plugin.json")["version"] == crc.__version__
+
+    def test_marketplace_lists_the_plugin_it_ships(self):
+        market = _helper_manifest(".claude-plugin", "marketplace.json")
+        plugin = _helper_manifest(".claude-plugin", "plugin.json")
+        assert len(market["plugins"]) == 1
+        entry = market["plugins"][0]
+        assert entry["name"] == plugin["name"] == crc.PLUGIN_NAME
+        # plugin.json wins at install time and a mismatched entry version is
+        # silently ignored, so the two must not be allowed to drift.
+        assert entry["version"] == plugin["version"]
+
+
+class TestPluginInstall:
+    """A plugin user has no hook in settings.json.
+
+    Every command that read only settings.json told them they were not
+    installed while the hook ran happily underneath — the confident wrong
+    answer this tool exists to prevent.
+    """
+
+    @pytest.fixture
+    def plugin(self, tmp_path, monkeypatch):
+        root = tmp_path / "cache" / "tapproval" / "tapproval-helper" / "1.1.0"
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / "hooks").mkdir()
+        for parts in ((".claude-plugin", "plugin.json"), ("hooks", "hooks.json")):
+            (root.joinpath(*parts)).write_text(
+                json.dumps(_helper_manifest(*parts)), encoding="utf-8")
+        # The registry Claude Code actually keeps; installPath is authoritative.
+        (tmp_path / "installed_plugins.json").write_text(json.dumps({
+            "version": 2,
+            "plugins": {"tapproval-helper@tapproval": [
+                {"scope": "user", "installPath": str(root), "version": "1.1.0"},
+            ]},
+        }), encoding="utf-8")
+        monkeypatch.setenv("CLAUDE_PLUGINS_DIR", str(tmp_path))
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
+        monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
+        for key in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY",
+                    "CLAUDE_RISK_RELAY_WAIT", "CLAUDE_RISK_CONFIG"):
+            monkeypatch.delenv(key, raising=False)
+        return root
+
+    def test_found_through_the_registry(self, plugin):
+        found = crc._plugin_install()
+        assert found is not None
+        assert found["root"] == str(plugin)
+        assert found["env"]["CLAUDE_RISK_MODE"] == "enforce"
+        assert found["relay"] is True
+
+    def test_status_reports_the_plugin_and_its_real_mode(self, plugin, capsys):
+        assert crc.run_status() == 0
+        out = capsys.readouterr().out
+        assert "Installed     : yes — as a Claude Code plugin" in out
+        assert "Mode          : enforce" in out
+        assert "Relay hook    : starts itself" in out
+        assert "the plugin adds no login item" in out
+
+    def test_status_says_no_when_nothing_is_installed(self, tmp_path, monkeypatch,
+                                                      capsys):
+        monkeypatch.setenv("CLAUDE_PLUGINS_DIR", str(tmp_path / "empty"))
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
+        monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
+        assert crc.run_status() == 0
+        assert "Installed     : no" in capsys.readouterr().out
+
+    def test_no_watch_refuses_rather_than_claiming_success(self, plugin, capsys):
+        settings = os.environ["CLAUDE_SETTINGS_PATH"]
+        assert crc.run_watch(False) == 1
+        out = capsys.readouterr().out
+        assert "/plugin disable" in out
+        assert "OFF" not in out
+        assert not os.path.exists(settings)
+
+    def test_watch_says_it_is_already_on(self, plugin, capsys):
+        assert crc.run_watch(True) == 0
+        assert "already on" in capsys.readouterr().out
+
+    def test_uninstall_refuses_rather_than_removing_nothing(self, plugin, capsys):
+        assert crc.run_uninstall() == 1
+        out = capsys.readouterr().out
+        assert "/plugin uninstall" in out
+        assert "nothing to remove" not in out
+
+    def test_quiet_still_works_because_the_manifest_leaves_it_alone(
+            self, plugin, capsys):
+        """The inline assignments override only what they name; anything
+        else still reaches the hook from settings.json."""
+        assert "CLAUDE_RISK_AUTO_ALLOW" not in crc.WATCH_ENV
+        assert crc.run_quiet(True) == 0
+        capsys.readouterr()
+        data = json.loads(
+            open(os.environ["CLAUDE_SETTINGS_PATH"], encoding="utf-8").read())
+        assert data["env"]["CLAUDE_RISK_AUTO_ALLOW"] == "LOW"
+
+
+class TestHookCommandAssignments:
+    """check_command() shlex-split the command and took the first word for
+    the interpreter, so a plugin-shaped command reported
+    'CLAUDE_RISK_MODE=enforce is not on PATH'."""
+
+    def test_reads_past_inline_assignments(self):
+        command = "CLAUDE_RISK_MODE=enforce %s %s" % (
+            crc._quote_path(sys.executable),
+            crc._quote_path(os.path.abspath(crc.__file__)))
+        assert crc.check_command(command) == []
+
+    def test_assignments_with_nothing_to_run_are_a_problem(self):
+        assert crc.check_command("CLAUDE_RISK_MODE=enforce") == [
+            "that command sets variables but never runs anything"]
+
+    def test_splitter_stops_at_the_first_real_word(self):
+        env, rest = crc._split_assignments(["A=1", "B=2", "python3", "C=3"])
+        assert env == {"A": "1", "B": "2"}
+        assert rest == ["python3", "C=3"]

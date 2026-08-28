@@ -1524,6 +1524,142 @@ def _is_our_hook(handler):
             or "watch_relay.py" in command)
 
 
+# --------------------------------------------------------------------------
+# Recognising a plugin install
+#
+# `/plugin install` registers our hooks from the plugin's own manifest and
+# writes nothing to settings.json. Anything that reads only settings.json
+# therefore tells a plugin user they are not installed, while the hook runs
+# happily underneath — a confident wrong answer, which is the one failure
+# mode this tool exists to prevent.
+
+PLUGIN_NAME = "tapproval-helper"
+
+_ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+
+
+def _plugins_dir():
+    """Where Claude Code keeps installed plugins. Overridable for tests."""
+    return os.path.expanduser(
+        os.environ.get("CLAUDE_PLUGINS_DIR", "~/.claude/plugins"))
+
+
+def _split_assignments(parts):
+    """Peel leading VAR=value words off a split shell command.
+
+    The plugin manifest carries its configuration inline that way, so a
+    naive reader takes CLAUDE_RISK_MODE=enforce for the interpreter and
+    reports it as missing from PATH.
+    """
+    env = {}
+    for index, word in enumerate(parts):
+        match = _ASSIGNMENT_RE.match(word)
+        if not match:
+            return env, parts[index:]
+        env[match.group(1)] = match.group(2)
+    return env, []
+
+
+def _manifest_hook(wiring):
+    """Our PermissionRequest handler in a hooks manifest: (env, timeout)."""
+    for entry in wiring.get("hooks", {}).get("PermissionRequest", []):
+        for handler in entry.get("hooks", []):
+            if not _is_our_hook(handler):
+                continue
+            try:
+                parts = shlex.split(str(handler.get("command", "")),
+                                    posix=(os.name != "nt"))
+            except ValueError:
+                parts = []
+            env, _rest = _split_assignments(parts)
+            return env, handler.get("timeout")
+    return {}, None
+
+
+def _plugin_roots():
+    """Every directory that could hold our installed plugin.
+
+    Claude Code keeps an authoritative registry — ``installed_plugins.json``
+    maps ``<plugin>@<marketplace>`` to the exact ``installPath`` it unpacked
+    to — so read that rather than guessing at directory layout. (It unpacks
+    under ``plugins/cache/``, not ``plugins/marketplaces/``, which is the
+    sort of detail a guess gets wrong.)
+    """
+    roots = []
+    env_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if env_root:
+        roots.append(env_root)
+    registry = os.path.join(_plugins_dir(), "installed_plugins.json")
+    try:
+        with open(registry) as handle:
+            installed = json.load(handle).get("plugins", {})
+    except (OSError, ValueError, AttributeError):
+        return roots
+    if not isinstance(installed, dict):
+        return roots
+    for key, entries in installed.items():
+        if str(key).split("@")[0] != PLUGIN_NAME:
+            continue
+        for entry in entries if isinstance(entries, list) else []:
+            path = isinstance(entry, dict) and entry.get("installPath")
+            if path:
+                roots.append(path)
+    return roots
+
+
+def _plugin_install():
+    """Our plugin on disk, or None.
+
+    Returns the root it was found in, the environment its hook command
+    carries inline, that hook's timeout, and whether it also starts the
+    relay — everything --status needs to describe a plugin install without
+    looking at settings.json at all.
+    """
+    for root in _plugin_roots():
+        try:
+            with open(os.path.join(root, ".claude-plugin",
+                                   "plugin.json")) as handle:
+                if json.load(handle).get("name") != PLUGIN_NAME:
+                    continue
+            with open(os.path.join(root, "hooks", "hooks.json")) as handle:
+                wiring = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        env, timeout = _manifest_hook(wiring)
+        relay = any(
+            "watch_relay.py" in str(handler.get("command", ""))
+            for entry in wiring.get("hooks", {}).get("SessionStart", [])
+            for handler in entry.get("hooks", []))
+        return {"root": root, "env": env, "timeout": timeout, "relay": relay}
+    return None
+
+
+def _settings_handlers(data):
+    """Our PermissionRequest handlers in a parsed settings file."""
+    return [handler
+            for entry in data.get("hooks", {}).get("PermissionRequest", [])
+            for handler in entry.get("hooks", [])
+            if _is_our_hook(handler)]
+
+
+def _plugin_only_install():
+    """The plugin install, when settings.json holds no hook of ours.
+
+    That is the case where the settings-file toggles are inert: the plugin
+    puts CLAUDE_RISK_MODE on the hook's own command line, and an inline
+    assignment beats anything the session environment carries. Variables
+    the manifest does *not* set — CLAUDE_RISK_AUTO_ALLOW, say — still come
+    through from settings, so --quiet keeps working and is not guarded.
+    """
+    try:
+        data = _read_settings(_settings_path())
+    except ValueError:
+        return None
+    if _settings_handlers(data):
+        return None
+    return _plugin_install()
+
+
 def _read_settings(path):
     """Return the parsed settings. Raises ValueError on malformed JSON."""
     if not os.path.exists(path):
@@ -1659,6 +1795,16 @@ def run_uninstall():
         print("Could not read %s (%s). Nothing was changed." % (path, error))
         return 1
 
+    # Nothing of ours in settings, but the plugin has us wired: removing
+    # nothing and reporting success would leave the hook running.
+    plugin = _plugin_only_install()
+    if plugin:
+        print("Installed as a Claude Code plugin, so there is nothing in")
+        print("%s to remove." % path)
+        print("Remove it with:")
+        print("  /plugin uninstall %s" % PLUGIN_NAME)
+        return 1
+
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
         print("Not installed — nothing to remove.")
@@ -1763,7 +1909,24 @@ def run_watch(enable=True):
     real session only sees what settings.json puts there — which is why
     exporting the variables in one shell silently did nothing for the
     sessions that matter. This writes them where every session reads them.
+
+    A plugin install is the one case this cannot reach: the manifest puts
+    CLAUDE_RISK_MODE on the hook's own command line, and an inline
+    assignment beats anything settings.json exports. Saying "wrist
+    approvals are OFF" there would be a lie, so say what is true instead.
     """
+    plugin = _plugin_only_install()
+    if plugin and plugin["env"].get("CLAUDE_RISK_MODE") == "enforce":
+        if enable:
+            print("Wrist approvals are already on — the Claude Code plugin")
+            print("turns them on for every session.")
+            return 0
+        print("Wrist approvals come from the Claude Code plugin, not from")
+        print("%s — so this flag cannot turn them off." % _settings_path())
+        print("Turn them off with:")
+        print("  /plugin disable %s" % PLUGIN_NAME)
+        return 1
+
     def mutate(data):
         env = data["env"]
         if enable:
@@ -1841,6 +2004,11 @@ def check_command(command):
         return ["the command in settings.json cannot be parsed"]
     if not parts:
         return ["the command in settings.json is empty"]
+    # A hook command may set variables before naming the interpreter —
+    # the plugin manifest does exactly that.
+    _assignments, parts = _split_assignments(parts)
+    if not parts:
+        return ["that command sets variables but never runs anything"]
 
     interpreter = parts[0].strip('"')
     if os.sep in interpreter or (os.altsep and os.altsep in interpreter):
@@ -1864,19 +2032,26 @@ def run_status():
     except ValueError:
         data, readable = {}, False
 
-    handlers = [h
-                for entry in data.get("hooks", {}).get("PermissionRequest", [])
-                for h in entry.get("hooks", [])
-                if _is_our_hook(h)]
+    handlers = _settings_handlers(data)
+    plugin = _plugin_install()
+    plugin_only = bool(plugin) and not handlers
     policy = load_policy()
     entries = read_audit(policy)
     mode = str(policy.get("mode", "shadow")).lower()
+    if plugin_only:
+        # The hook's own command line is the truth for a plugin install;
+        # this shell's environment says nothing about it.
+        mode = str(plugin["env"].get("CLAUDE_RISK_MODE", mode)).lower()
 
     print("Settings file : %s" % path)
     if not readable:
         print("Installed     : unknown \u2014 that file is not valid JSON")
+    elif plugin_only:
+        print("Installed     : yes \u2014 as a Claude Code plugin")
+        print("Plugin        : %s" % plugin["root"])
     elif not handlers:
-        print("Installed     : no \u2014 run with --install")
+        print("Installed     : no \u2014 run with --install, or install the")
+        print("                Claude Code plugin")
     else:
         print("Installed     : yes")
         for handler in handlers:
@@ -1898,7 +2073,7 @@ def run_status():
     relay_wired = any(
         "watch_relay.py" in str(h.get("command", ""))
         for entry in data.get("hooks", {}).get("SessionStart", [])
-        for h in entry.get("hooks", []))
+        for h in entry.get("hooks", [])) or bool(plugin and plugin["relay"])
     if relay_wired:
         print("Relay hook    : starts itself with every Claude Code session")
     else:
@@ -1906,6 +2081,9 @@ def run_status():
     print("Version       : %s" % __version__)
     if os.path.exists(_launch_agent_path()):
         print("Reboot        : the relay wakes again at login")
+    elif plugin_only:
+        print("Reboot        : the first Claude Code session brings the relay")
+        print("                back \u2014 the plugin adds no login item")
     else:
         print("Reboot        : no login wake-up \u2014 the relay waits for"
               " the first session; re-run --install to add it")
@@ -1930,7 +2108,7 @@ def run_status():
             print("Collecting    : since %s" % first)
         print("")
         print("Ready to summarise \u2014 run this script again with --report.")
-    elif handlers:
+    elif handlers or plugin:
         print("Decisions     : none yet")
         print("")
         print("If you have used Claude Code since installing and this is still")
