@@ -540,6 +540,11 @@ def say_to_session(prefix, text, projects_dir=None):
     return "could not start: %s" % error if error else "sent"
 
 
+# How often the resolver looks for subagent transcripts that did not exist
+# when the card was posted. A seam so tests need not sleep through it.
+RESOLVER_RESCAN_SECONDS = 5.0
+
+
 def _prompt_resolver(card, projects_dir=None):
     """A callable answering: was this card's prompt resolved elsewhere?
 
@@ -560,7 +565,28 @@ def _prompt_resolver(card, projects_dir=None):
         from ClaudeRiskClassifier import _card_fingerprint
     except Exception:
         return None
-    state = {"path": None, "offset": None, "use_ids": set()}
+    # One entry per transcript we watch: the session's own, plus every
+    # subagent's. A card raised inside a subagent has its tool_use written
+    # to `<session>/subagents/agent-*.jsonl`, NOT to the session file — so
+    # watching only the session file meant such a card could never be
+    # retracted, and hung on the wrist until the wait expired.
+    state = {"path": None, "files": {}, "use_ids": set(), "scan_at": 0.0}
+
+    def _watch_list():
+        """Every transcript this card's answer could appear in.
+
+        Subagents start after the card does, so this is rescanned — cheaply,
+        on the same 5s clock — rather than fixed at the first look.
+        """
+        paths = [state["path"]]
+        directory, name = os.path.split(state["path"])
+        sub = os.path.join(directory, name[:-len(".jsonl")], "subagents")
+        try:
+            paths.extend(os.path.join(sub, f) for f in sorted(os.listdir(sub))
+                         if f.endswith(".jsonl"))
+        except OSError:
+            pass
+        return paths
 
     def check():
         try:
@@ -573,10 +599,32 @@ def _prompt_resolver(card, projects_dir=None):
                 if state["path"] is None:
                     state["retry_at"] = time.monotonic() + 30.0
                     return False
-                state["offset"] = max(
-                    0, os.path.getsize(state["path"]) - 262144)
-            lines, state["offset"], shrunk = _read_appended(
-                state["path"], state["offset"])
+            now = time.monotonic()
+            if now >= state["scan_at"]:
+                state["scan_at"] = now + RESOLVER_RESCAN_SECONDS
+                for path in _watch_list():
+                    if path not in state["files"]:
+                        # A file we have only just noticed gets a bounded
+                        # tail, the same as the session file did: enough to
+                        # find the originating tool_use, not the whole
+                        # history of an earlier run.
+                        try:
+                            state["files"][path] = max(
+                                0, os.path.getsize(path) - 262144)
+                        except OSError:
+                            pass
+            resolved = False
+            for path in list(state["files"]):
+                lines, state["files"][path], shrunk = _read_appended(
+                    path, state["files"][path])
+                if _scan(lines, shrunk, path):
+                    resolved = True
+            return resolved
+        except (OSError, ValueError):
+            return False
+
+    def _scan(lines, shrunk, path):
+        try:
             if shrunk:
                 # The transcript was rewritten (compaction). Its history
                 # now contains earlier runs of possibly the SAME command
@@ -585,7 +633,7 @@ def _prompt_resolver(card, projects_dir=None):
                 # only appends from here on can resolve this card.
                 state["use_ids"].clear()
                 try:
-                    state["offset"] = os.path.getsize(state["path"])
+                    state["files"][path] = os.path.getsize(path)
                 except OSError:
                     pass
                 return False

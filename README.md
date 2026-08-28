@@ -91,6 +91,15 @@ log was deliberately left in place.
   from home they ride either your own iCloud (private to your Apple
   ID) or an encrypted tunnel (Cloudflare) hidden behind a secret path —
   in transit only, stored nowhere.
+- **`127.0.0.1` is not a computer of ours.** You will see that address in
+  the code and in the hook it installs. It is called *loopback*, and it is
+  the one address every computer reserves for itself: it means "this
+  machine", whoever is running it. On your computer it is your computer.
+  Nothing anywhere in Base names a particular machine, and nothing routes
+  through the author's. Your watch finds your computer by looking for it on
+  your own network (Bonjour), not by being told where to go — which is why
+  installing Base makes your computer, and only yours, the thing your watch
+  talks to.
 - **Nothing is decided for you.** The risk tiers are labels for your
   glance, not decisions — nothing is auto-allowed by default, and the
   CRITICAL tier can never be. Fail closed: a bridge that is down, slow

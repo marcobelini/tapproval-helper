@@ -3773,3 +3773,77 @@ class TestPermissionDecisionShape:
         assert decision["behavior"] == verdict
         if expected:
             assert decision == expected
+
+
+class TestSubagentCardsRetract:
+    """A card raised inside a subagent must leave the wrist when answered.
+
+    Claude Code writes a subagent's tool calls to its own transcript —
+    `<project>/<session-id>/subagents/agent-*.jsonl` — not to the session
+    file. The resolver used to watch only the session file, so it never
+    saw the originating tool_use, no result could ever match it, and the
+    card sat on the wrist until the 24-hour wait expired. Found live with
+    six such cards stacked up from one session.
+    """
+
+    TOOL, TOOL_INPUT = "Bash", {"command": "rm -rf /tmp/subagent-target"}
+
+    def _setup(self, tmp_path, monkeypatch):
+        import watch_relay
+        monkeypatch.setattr(watch_relay, "RESOLVER_RESCAN_SECONDS", 0.0)
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        project = tmp_path / "-Users-someone-Developer-Demo"
+        project.mkdir()
+        (project / (sid + ".jsonl")).write_text(
+            json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n",
+            encoding="utf-8")
+        card = {"session_id": sid, "tool": self.TOOL,
+                "fingerprint": crc._card_fingerprint(self.TOOL, self.TOOL_INPUT)}
+        check = watch_relay._prompt_resolver(card, projects_dir=str(tmp_path))
+        return check, project / sid / "subagents"
+
+    def _write(self, path, *blocks):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            for block in blocks:
+                handle.write(json.dumps(
+                    {"type": "assistant", "isSidechain": True,
+                     "message": {"content": [block]}}) + "\n")
+
+    def test_a_subagent_card_is_retracted_when_answered_elsewhere(
+            self, tmp_path, monkeypatch):
+        check, subagents = self._setup(tmp_path, monkeypatch)
+        assert check() is False
+        agent = subagents / "agent-deadbeef.jsonl"
+        self._write(agent, {"type": "tool_use", "id": "toolu_SUB",
+                            "name": self.TOOL, "input": self.TOOL_INPUT})
+        assert check() is False, "asked but unanswered must not retract"
+        self._write(agent, {"type": "tool_result",
+                            "tool_use_id": "toolu_SUB", "content": "ok"})
+        assert check() is True
+
+    def test_a_subagent_starting_after_the_card_is_still_watched(
+            self, tmp_path, monkeypatch):
+        """The subagent that raises the card does not exist when the card
+        is posted, which is why the directory is rescanned."""
+        check, subagents = self._setup(tmp_path, monkeypatch)
+        assert not subagents.exists()
+        check()
+        agent = subagents / "agent-later.jsonl"
+        self._write(agent, {"type": "tool_use", "id": "toolu_LATE",
+                            "name": self.TOOL, "input": self.TOOL_INPUT},
+                    {"type": "tool_result", "tool_use_id": "toolu_LATE",
+                     "content": "done"})
+        assert check() is True
+
+    def test_another_subagents_answer_does_not_retract_this_card(
+            self, tmp_path, monkeypatch):
+        """Several subagents run at once; only a matching call counts."""
+        check, subagents = self._setup(tmp_path, monkeypatch)
+        other = subagents / "agent-other.jsonl"
+        self._write(other, {"type": "tool_use", "id": "toolu_OTHER",
+                            "name": self.TOOL,
+                            "input": {"command": "echo something else"}},
+                    {"type": "tool_result", "tool_use_id": "toolu_OTHER",
+                     "content": "ok"})
+        assert check() is False
