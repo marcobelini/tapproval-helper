@@ -49,6 +49,28 @@ def _decision_message(payload):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_self_update(tmp_path, monkeypatch):
+    """No test may run `git pull` on the working tree.
+
+    The SessionStart hook fast-forwards a git install on its way past, and
+    this repository is one — so without this the suite pulled the very
+    checkout it was testing. It also made an unrelated test order-dependent:
+    the first test to run wrote the daily stamp, and every test after it
+    silently skipped the update. Point the stamp somewhere disposable and
+    mark it fresh, so the "asked recently" branch short-circuits before any
+    subprocess is reached. Tests that mean to exercise the update override
+    this themselves.
+    """
+    stamp = tmp_path / "last-update"
+    stamp.write_text("now", encoding="utf-8")
+    # The env var reaches subprocesses; the attribute covers in-process calls
+    # made before a subprocess re-imports the module.
+    monkeypatch.setenv("TAPPROVAL_UPDATE_STAMP", str(stamp))
+    import watch_relay
+    monkeypatch.setattr(watch_relay, "_UPDATE_STAMP", str(stamp))
+
+
+@pytest.fixture(autouse=True)
 def _no_real_launch_agent(tmp_path, monkeypatch):
     """No test may ever touch the real LaunchAgents dir or launchctl —
     same isolation rule as CLAUDE_SETTINGS_PATH."""
@@ -3884,3 +3906,69 @@ class TestTunnelBinaryLookup:
         monkeypatch.setattr(watch_relay, "_TUNNEL_PATHS",
                             ("/nonexistent/cloudflared",))
         assert watch_relay._cloudflared() is None
+
+
+class TestHelperKeepsItselfCurrent:
+    """A stale helper is not a cosmetic problem.
+
+    The version before 1.1.1 discarded every wrist approval in silence, so
+    an update that never arrives is the failure this guards against. The
+    SessionStart hook already runs on every session; it now fast-forwards
+    a git install on the way past, at most once a day, and never in the
+    way of a session.
+    """
+
+    def _relay(self):
+        import watch_relay
+        return watch_relay
+
+    def test_a_plugin_install_is_never_rewritten(self, tmp_path, monkeypatch):
+        """Claude Code owns a plugin's files and manages its own updates."""
+        wr = self._relay()
+        monkeypatch.setattr(wr, "__file__", str(tmp_path / "watch_relay.py"))
+        monkeypatch.setattr(wr, "_UPDATE_STAMP", str(tmp_path / "stamp"))
+        assert wr._self_update() is False      # no .git beside it
+
+    def test_it_asks_at_most_once_a_day(self, tmp_path, monkeypatch):
+        wr = self._relay()
+        (tmp_path / ".git").mkdir()
+        stamp = tmp_path / "stamp"
+        stamp.write_text("recent", encoding="utf-8")
+        monkeypatch.setattr(wr, "__file__", str(tmp_path / "watch_relay.py"))
+        monkeypatch.setattr(wr, "_UPDATE_STAMP", str(stamp))
+        called = []
+        monkeypatch.setattr(wr.subprocess, "run",
+                            lambda *a, **k: called.append(a) or None)
+        assert wr._self_update() is False
+        assert called == [], "a fresh stamp must skip the network entirely"
+
+    def test_a_failure_never_blocks_the_session(self, tmp_path, monkeypatch):
+        """No git, no network, a dirty clone — start what is already there."""
+        wr = self._relay()
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr(wr, "__file__", str(tmp_path / "watch_relay.py"))
+        monkeypatch.setattr(wr, "_UPDATE_STAMP", str(tmp_path / "stamp"))
+
+        def boom(*_a, **_k):
+            raise OSError("git is not installed")
+        monkeypatch.setattr(wr.subprocess, "run", boom)
+        assert wr._self_update() is False
+
+
+    def test_it_never_raises_whatever_git_does(self, tmp_path, monkeypatch):
+        """This runs on the blocking path of a SessionStart hook. An
+        exception here takes down the session — a far worse outcome than
+        a missed update — so the guard catches everything, not a chosen
+        list. A narrow except is how this promise was first broken: a
+        test that stubbed subprocess.Popen made subprocess.run raise
+        TypeError, which sailed straight through."""
+        import watch_relay as wr
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr(wr, "__file__", str(tmp_path / "watch_relay.py"))
+        monkeypatch.setattr(wr, "_UPDATE_STAMP", str(tmp_path / "stamp"))
+        for blow_up in (TypeError("no __enter__"), AttributeError("nope"),
+                        ValueError("odd"), RuntimeError("worse")):
+            def raiser(*_a, _e=blow_up, **_k):
+                raise _e
+            monkeypatch.setattr(wr.subprocess, "run", raiser)
+            assert wr._self_update() is False

@@ -37,6 +37,13 @@ session; there is nothing to keep running and nothing to maintain.
 curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash
 ```
 
+**Staying current** takes no commands either. The helper checks once a day,
+on a session you were starting anyway, and fast-forwards itself. That matters
+more than it sounds: a version of this shipped that discarded every wrist
+approval in silence, and an update that never arrives is not an update. A
+plugin install is left alone — Claude Code manages those itself, and asking
+it to update Tapproval in plain words is enough.
+
 Every path registers the same permission hook. A reboot never needs a
 hand either: the installer adds a login wake-up, and on the plugin path
 your first Claude Code session brings Base back by itself.

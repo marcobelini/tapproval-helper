@@ -285,6 +285,64 @@ def _rotate_log(path=None, limit=RELAY_LOG_MAX):
         return False
 
 
+# At most once a day, and never in the way. A stale helper is not a
+# cosmetic problem: the version before 1.1.1 discarded every wrist
+# approval in silence, so "an update that never arrives" is the failure
+# mode this guards against.
+# Overridable like CLAUDE_SETTINGS_PATH and CLAUDE_LAUNCH_AGENT_PATH, so a
+# test — including one that runs the hook in a subprocess, where a
+# monkeypatch cannot reach — never pulls the working tree it is testing.
+_UPDATE_STAMP = os.environ.get("TAPPROVAL_UPDATE_STAMP") or os.path.expanduser(
+    "~/.tapproval-last-update")
+_UPDATE_EVERY = 86400.0
+
+
+def _self_update():
+    """Fast-forward a git-installed helper. Returns True if it moved.
+
+    Only ever touches an install that is a git checkout — the one made by
+    install.sh. A plugin install belongs to Claude Code, which manages its
+    own updates, and must not be rewritten underneath it. Every failure is
+    silent and harmless: a machine that cannot reach GitHub, a clone with
+    local edits, no git at all — the relay simply starts what is already
+    there. Never raises, never blocks a session.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    if not os.path.isdir(os.path.join(here, ".git")):
+        return False
+    try:
+        age = time.time() - os.path.getmtime(_UPDATE_STAMP)
+        if age < _UPDATE_EVERY:
+            return False
+    except OSError:
+        pass
+    try:
+        with open(_UPDATE_STAMP, "w") as handle:
+            handle.write(str(int(time.time())))
+    except OSError:
+        pass
+    # Everything, including reading the results, sits inside one guard and
+    # catches everything. The promise above is "never raises", and this runs
+    # on the blocking path of a SessionStart hook: an exception here would
+    # take down the session, which is a far worse outcome than a missed
+    # update. Narrow excepts made that promise false.
+    try:
+        before = subprocess.run(["git", "-C", here, "rev-parse", "HEAD"],
+                                capture_output=True, text=True, timeout=10)
+        subprocess.run(["git", "-C", here, "pull", "--ff-only", "--quiet"],
+                       capture_output=True, text=True, timeout=60)
+        after = subprocess.run(["git", "-C", here, "rev-parse", "HEAD"],
+                               capture_output=True, text=True, timeout=10)
+        moved = (before.returncode == 0 and after.returncode == 0
+                 and before.stdout.strip() != after.stdout.strip())
+    except Exception:
+        return False
+    if moved:
+        print("relay: helper updated to the latest published version",
+              file=sys.stderr)
+    return moved
+
+
 def ensure_running():
     """Start the relay in the background unless one is already up.
 
@@ -293,10 +351,14 @@ def ensure_running():
     line to stderr and exits immediately either way. Never raises.
     """
     import urllib.request
+    updated = _self_update()
     running = _probe_relay()
     if running is not None:
         version = running.get("version") or 0
-        if version >= RELAY_VERSION:
+        # A relay started before an update is running the old code even
+        # when its protocol version matches, so a fresh pull must replace
+        # it — subject to the same "not while a card is waiting" rule.
+        if version >= RELAY_VERSION and not updated:
             print("relay: already running", file=sys.stderr)
             return 0
         # An older relay is serving. Without this the machine keeps running
