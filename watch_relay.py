@@ -1500,6 +1500,28 @@ def _reap_stale_tunnels(port):
         pass
 
 
+# launchd hands a process a bare PATH — no /opt/homebrew/bin, no
+# /usr/local/bin. The relay is started by a login item after every reboot,
+# so looking only on PATH found nothing, printed "cloudflared not
+# installed" (which was false), and silently left the travel route off
+# until someone restarted the relay from a shell. Look where Homebrew
+# actually puts it as well.
+_TUNNEL_PATHS = ("/opt/homebrew/bin/cloudflared",      # Apple silicon
+                 "/usr/local/bin/cloudflared",         # Intel
+                 "/opt/local/bin/cloudflared")         # MacPorts
+
+
+def _cloudflared():
+    """The cloudflared binary, or None when it genuinely is not installed."""
+    found = shutil.which("cloudflared")
+    if found:
+        return found
+    for candidate in _TUNNEL_PATHS:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def start_tunnel(port, token):
     """Expose the token-only listener through a Cloudflare quick tunnel.
 
@@ -1508,14 +1530,15 @@ def start_tunnel(port, token):
     The process is registered for cleanup at exit so a relay restart never
     leaves an orphan tunnel running.
     """
-    if not shutil.which("cloudflared"):
+    binary = _cloudflared()
+    if not binary:
         print("relay: cloudflared not installed — off-Wi-Fi tunnel disabled.\n"
               "       install it with:  brew install cloudflared",
               file=sys.stderr)
         return None
     _reap_stale_tunnels(port)
     proc = subprocess.Popen(
-        ["cloudflared", "tunnel", "--no-autoupdate",
+        [binary, "tunnel", "--no-autoupdate",
          "--url", "http://127.0.0.1:%d" % port],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
 

@@ -3847,3 +3847,40 @@ class TestSubagentCardsRetract:
                     {"type": "tool_result", "tool_use_id": "toolu_OTHER",
                      "content": "ok"})
         assert check() is False
+
+
+class TestTunnelBinaryLookup:
+    """The travel tunnel must survive being started by launchd.
+
+    A login item gets a bare PATH — no /opt/homebrew/bin, no
+    /usr/local/bin. The relay is started that way after every reboot, so
+    looking only on PATH found nothing, printed "cloudflared not
+    installed" (which was false), and left the away-from-home route off
+    until somebody restarted the relay from a shell. Nobody would notice
+    until they were away from home with a watch that could not connect.
+    """
+
+    def test_found_on_path(self, monkeypatch, tmp_path):
+        import watch_relay
+        fake = tmp_path / "cloudflared"
+        fake.write_text("#!/bin/sh\n", encoding="utf-8")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        assert watch_relay._cloudflared() == str(fake)
+
+    def test_found_where_homebrew_puts_it_when_path_is_bare(
+            self, monkeypatch, tmp_path):
+        import watch_relay
+        fake = tmp_path / "cloudflared"
+        fake.write_text("#!/bin/sh\n", encoding="utf-8")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", "/nonexistent")
+        monkeypatch.setattr(watch_relay, "_TUNNEL_PATHS", (str(fake),))
+        assert watch_relay._cloudflared() == str(fake)
+
+    def test_none_when_genuinely_absent(self, monkeypatch):
+        import watch_relay
+        monkeypatch.setenv("PATH", "/nonexistent")
+        monkeypatch.setattr(watch_relay, "_TUNNEL_PATHS",
+                            ("/nonexistent/cloudflared",))
+        assert watch_relay._cloudflared() is None

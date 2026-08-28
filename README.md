@@ -131,6 +131,28 @@ log was deliberately left in place.
 
 ## What Base is
 
+### The journey of one approval, in plain words
+
+1. Claude Code wants to run something that needs permission, so it pauses
+   and runs Base.
+2. Base reads the command, works out how risky it is, and gives it a colour.
+   By default the colour is a label for your glance — nothing is decided
+   for you.
+3. Base checks whether you would even have been asked. If your own settings
+   already permit this command, no card is sent: the wrist only ever shows
+   what the terminal would have shown.
+4. The card goes to the relay, a small always-listening part of Base on the
+   same computer.
+5. Your watch finds that computer on your own network by itself — it is not
+   told where to look — and asks every couple of seconds whether anything
+   is waiting.
+6. You tap. The answer travels back, and Base hands it to Claude Code.
+7. If your answer never arrives, Base says nothing, and Claude Code asks you
+   in the terminal exactly as it would without any of this.
+
+Step 7 is the rule the whole design bends around: **an unanswered question
+is never a granted one.**
+
 | File | Purpose |
 |------|---------|
 | `ClaudeRiskClassifier.py` | A Claude Code `PermissionRequest` hook: mirrors exactly the prompts the phone shows, labels each with a risk tier, and offers them to the watch |
