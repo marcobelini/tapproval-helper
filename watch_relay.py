@@ -53,6 +53,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8977          # also referenced by the classifier's --watch/--status
 TUNNEL_PORT = 8978
+# Read once, to migrate a pre-per-device install into the auth file; never
+# written any more. The function that used to create it went with the
+# single-token design, and was the last write-then-chmod left in the tree.
 TOKEN_FILE = os.path.expanduser("~/.tapproval-token")
 AUTH_FILE = os.path.expanduser("~/.tapproval-auth.json")
 # Bumped whenever the wire contract or the auth rules change, so a running
@@ -1426,25 +1429,6 @@ def _token_matches(given, expected):
                                    str(expected).encode("utf-8"))
     except (UnicodeError, TypeError):
         return False
-
-
-def load_or_create_token():
-    """A stable per-machine secret for the tunnel URL. Never raises."""
-    try:
-        with open(TOKEN_FILE) as handle:
-            token = handle.read().strip()
-        if token:
-            return token
-    except OSError:
-        pass
-    token = uuid.uuid4().hex
-    try:
-        with open(TOKEN_FILE, "w") as handle:
-            handle.write(token)
-        os.chmod(TOKEN_FILE, 0o600)
-    except OSError:
-        pass
-    return token
 
 
 # The tunnel's public watch URL, once cloudflared reports it. The LAN
