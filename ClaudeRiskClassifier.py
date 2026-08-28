@@ -105,7 +105,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 RELAY_WAIT_SECONDS = 86400
 
@@ -1099,13 +1099,8 @@ def build_response(event, policy):
         "detail": card["detail"],
     }
 
-    response = {
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": effective,
-            "decisionReason": "[%s] %s" % (risk.name, reason),
-        }
-    }
+    response = {"hookSpecificOutput": _permission_output(
+        effective, "[%s] %s" % (risk.name, reason))}
     return response, audit, card
 
 
@@ -1152,12 +1147,33 @@ def ask_watch(card, policy, project=None):
     return (decision if decision in ("allow", "deny") else "none"), None
 
 
+def _permission_output(behavior, message=""):
+    """The hookSpecificOutput block Claude Code will actually accept.
+
+    The shape is checked, and the CLI's own validator spells it out:
+    the decision must be ``{"behavior": "allow"}`` or
+    ``{"behavior": "deny", "message": "..."}``. A bare string — which
+    this hook emitted until 1.1.1 — fails that check, and a failed hook
+    is NON-BLOCKING: the permission flow proceeds exactly as if nothing
+    had answered it. That is how a wrist approval could disappear while
+    the audit log recorded a perfectly good "allow", for every card, on
+    every machine, silently.
+
+    Escalation carries no decision at all. Saying nothing is what leaves
+    the question with the human, and it is also what this degrades to if
+    the shape is ever tightened again — fail closed by construction, not
+    by a branch that has to be remembered.
+    """
+    output = {"hookEventName": "PermissionRequest"}
+    if behavior == "allow":
+        output["decision"] = {"behavior": "allow"}
+    elif behavior == "deny":
+        output["decision"] = {"behavior": "deny", "message": message}
+    return output
+
+
 ESCALATE_FALLBACK = {
-    "hookSpecificOutput": {
-        "hookEventName": "PermissionRequest",
-        "decision": "escalate",
-        "decisionReason": "Risk classifier failed — deferring to human",
-    }
+    "hookSpecificOutput": {"hookEventName": "PermissionRequest"}
 }
 
 
@@ -1282,15 +1298,12 @@ def run_hook(stdin=None, stdout=None):
                 # to Claude, which then proceeds on the chosen option.
                 audit["effective"] = "deny"
                 audit["answer"] = chosen
-                response["hookSpecificOutput"]["decision"] = "deny"
-                response["hookSpecificOutput"]["decisionReason"] = (
-                    "The user answered from their watch: %s" % chosen)
+                response["hookSpecificOutput"] = _permission_output(
+                    "deny", "The user answered from their watch: %s" % chosen)
             elif verdict in ("allow", "deny"):
                 audit["effective"] = verdict
-                response["hookSpecificOutput"]["decision"] = verdict
-                response["hookSpecificOutput"]["decisionReason"] += (
-                    " — %s from watch"
-                    % ("approved" if verdict == "allow" else "denied"))
+                response["hookSpecificOutput"] = _permission_output(
+                    verdict, "Denied from the watch.")
         write_audit(audit, policy)
     except Exception as error:  # fail closed to the human, never crash the session
         print("ClaudeRiskClassifier: %s" % error, file=sys.stderr)

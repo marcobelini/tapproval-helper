@@ -26,6 +26,28 @@ import ClaudeRiskClassifier as crc
 from ClaudeRiskClassifier import Risk
 
 
+def _behavior(payload):
+    """What Claude Code will actually do with a hook response.
+
+    Accepts the whole response or just its hookSpecificOutput block.
+    Returns "allow", "deny", or "escalate" — escalate being the *absence*
+    of a decision, which is how the question is left with the human.
+    The CLI validates the shape: a bare string is rejected outright, and
+    a rejected hook is non-blocking, so the old string form silently did
+    nothing at all.
+    """
+    out = payload.get("hookSpecificOutput", payload)
+    decision = out.get("decision")
+    return decision.get("behavior") if isinstance(decision, dict) else "escalate"
+
+
+def _decision_message(payload):
+    out = payload.get("hookSpecificOutput", payload)
+    decision = out.get("decision")
+    return decision.get("message", "") if isinstance(decision, dict) else ""
+
+
+
 @pytest.fixture(autouse=True)
 def _no_real_launch_agent(tmp_path, monkeypatch):
     """No test may ever touch the real LaunchAgents dir or launchctl —
@@ -448,7 +470,7 @@ class TestBuildResponse:
                       audit_log=str(tmp_path / "a.jsonl"))
         event = {"tool_name": "Bash", "tool_input": {"command": "ls -la"}}
         response, audit, _ = crc.build_response(event, policy)
-        assert response["hookSpecificOutput"]["decision"] == "escalate"
+        assert _behavior(response) == "escalate"
         # ...but the classification is still recorded, which is the point.
         assert audit["decision"] == "allow"
         assert audit["tier"] == "SAFE"
@@ -459,7 +481,7 @@ class TestBuildResponse:
                       audit_log=str(tmp_path / "a.jsonl"))
         event = {"tool_name": "Bash", "tool_input": {"command": "ls -la"}}
         response, audit, _ = crc.build_response(event, policy)
-        assert response["hookSpecificOutput"]["decision"] == "allow"
+        assert _behavior(response) == "allow"
         assert audit["effective"] == "allow"
 
     def test_response_names_the_hook_event(self, tmp_path):
@@ -518,7 +540,7 @@ class TestHookContract:
             "CLAUDE_RISK_AUTO_ALLOW": "LOW",
             "CLAUDE_RISK_AUDIT_LOG": str(tmp_path / "a.jsonl"),
         })
-        assert json.loads(result.stdout)["hookSpecificOutput"]["decision"] == "allow"
+        assert _behavior(json.loads(result.stdout)) == "allow"
 
     def test_enforce_mode_escalates_a_dangerous_command(self, tmp_path):
         event = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}}
@@ -526,13 +548,13 @@ class TestHookContract:
             "CLAUDE_RISK_MODE": "enforce",
             "CLAUDE_RISK_AUDIT_LOG": str(tmp_path / "a.jsonl"),
         })
-        assert json.loads(result.stdout)["hookSpecificOutput"]["decision"] == "escalate"
+        assert _behavior(json.loads(result.stdout)) == "escalate"
 
     @pytest.mark.parametrize("payload", ["", "   ", "not json", "[]", "null", '{"tool_name":'])
     def test_malformed_input_fails_closed_to_the_human(self, payload, tmp_path):
         result = self._run(payload, {"CLAUDE_RISK_AUDIT_LOG": str(tmp_path / "a.jsonl")})
         assert result.returncode == 0
-        decision = json.loads(result.stdout)["hookSpecificOutput"]["decision"]
+        decision = _behavior(json.loads(result.stdout))
         assert decision == "escalate"
 
     def test_unwritable_audit_log_still_returns_a_decision(self, tmp_path):
@@ -543,7 +565,7 @@ class TestHookContract:
         result = self._run(json.dumps(event),
                            {"CLAUDE_RISK_AUDIT_LOG": str(blocker / "audit.jsonl")})
         assert result.returncode == 0
-        assert json.loads(result.stdout)["hookSpecificOutput"]["decision"]
+        assert _behavior(json.loads(result.stdout))
 
 
 class TestInstaller:
@@ -747,7 +769,7 @@ class TestInstallerCLI:
         result = subprocess.run(shlex.split(command), input=event,
                                 capture_output=True, text=True, env=env, timeout=30)
         assert result.returncode == 0
-        decision = json.loads(result.stdout)["hookSpecificOutput"]["decision"]
+        decision = _behavior(json.loads(result.stdout))
         assert decision == "escalate"
 
 
@@ -999,8 +1021,10 @@ class TestWatchRelayBridge:
         crc.run_hook(stdin=io.StringIO(json.dumps(event)), stdout=stdout)
 
         response = json.loads(stdout.getvalue())
-        assert response["hookSpecificOutput"]["decision"] == "allow"
-        assert "from watch" in response["hookSpecificOutput"]["decisionReason"]
+        assert _behavior(response) == "allow"
+        # An allow carries no message: the checked shape is {"behavior":
+        # "allow"} and nothing else. The reason lives in the audit log.
+        assert response["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
         entries = crc.read_audit({"audit_log": str(tmp_path / "a.jsonl")})
         assert entries[-1]["watch"] == "allow"
         assert entries[-1]["effective"] == "allow"
@@ -1022,7 +1046,7 @@ class TestWatchRelayBridge:
         crc.run_hook(stdin=io.StringIO(json.dumps(event)), stdout=stdout)
 
         assert called == []
-        decision = json.loads(stdout.getvalue())["hookSpecificOutput"]["decision"]
+        decision = _behavior(json.loads(stdout.getvalue()))
         assert decision == "escalate"
 
 
@@ -2644,9 +2668,9 @@ class TestQuestionCards:
             {"tool_name": "AskUserQuestion",
              "tool_input": self.EVENT_INPUT})), stdout=out)
         result = json.loads(out.getvalue())["hookSpecificOutput"]
-        assert result["decision"] == "deny"
-        assert "Del hele ugen i to" in result["decisionReason"]
-        assert "answered from their watch" in result["decisionReason"]
+        assert _behavior(result) == "deny"
+        assert "Del hele ugen i to" in _decision_message(result)
+        assert "answered from their watch" in _decision_message(result)
 
 
 class TestPhoneVocabulary:
@@ -2760,34 +2784,34 @@ class TestEveryPress:
         port, queue = live_relay
         self._press(queue, "allow")
         result = self._hook(port, tmp_path)
-        assert result["decision"] == "allow"
-        assert "approved" in result["decisionReason"]
+        assert _behavior(result) == "allow"
+        assert result["decision"] == {"behavior": "allow"}
 
     def test_deny_press(self, live_relay, tmp_path):
         port, queue = live_relay
         self._press(queue, "deny")
         result = self._hook(port, tmp_path)
-        assert result["decision"] == "deny"
-        assert "denied" in result["decisionReason"]
+        assert _behavior(result) == "deny"
+        assert "watch" in _decision_message(result).lower()
 
     def test_always_press_then_silence(self, live_relay, tmp_path):
         port, queue = live_relay
         self._press(queue, "always")
         first = self._hook(port, tmp_path)
-        assert first["decision"] == "allow"
+        assert _behavior(first) == "allow"
         # The identical ask again: NO press this time — the relay must
         # answer instantly from the session grant, no card queued.
         second = self._hook(port, tmp_path)
-        assert second["decision"] == "allow"
+        assert _behavior(second) == "allow"
         assert queue.pending() == []
 
     def test_always_does_not_leak_across_commands(self, live_relay, tmp_path):
         port, queue = live_relay
         self._press(queue, "always")
-        assert self._hook(port, tmp_path)["decision"] == "allow"
+        assert _behavior(self._hook(port, tmp_path)) == "allow"
         # A DIFFERENT command from the same session must still ask.
         result = self._hook(port, tmp_path, command="git push --force origin main")
-        assert result["decision"] == "escalate"
+        assert _behavior(result) == "escalate"
 
     def test_always_keys_on_the_command_not_the_headline(self, live_relay,
                                                          tmp_path):
@@ -2797,12 +2821,12 @@ class TestEveryPress:
         self._press(queue, "always")
         first = self._hook(port, tmp_path, command="rm -r build",
                            description="Clean build artifacts")
-        assert first["decision"] == "allow"
+        assert _behavior(first) == "allow"
         # Same headline, different command: a human must see it.
         self._press(queue, "deny")
         second = self._hook(port, tmp_path, command="rm -r src",
                             description="Clean build artifacts")
-        assert second["decision"] == "deny"
+        assert _behavior(second) == "deny"
 
     def test_critical_is_never_replayed(self, live_relay, tmp_path):
         """The human tap may land on any tier — its echo may not.
@@ -2811,11 +2835,11 @@ class TestEveryPress:
         command = "git push --force origin main && rm -rf / --no-preserve-root"
         self._press(queue, "always")
         first = self._hook(port, tmp_path, command=command)
-        assert first["decision"] == "allow"      # the tap itself is human
+        assert _behavior(first) == "allow"      # the tap itself is human
         # The identical CRITICAL ask again: no silent replay allowed.
         self._press(queue, "deny")
         second = self._hook(port, tmp_path, command=command)
-        assert second["decision"] == "deny"
+        assert _behavior(second) == "deny"
 
 
 class TestRunningToolChip:
@@ -2887,7 +2911,7 @@ class TestPromptParity:
         port, queue = live_relay
         started = _time.monotonic()
         result = self._hook(port, tmp_path, "gh pr view 12")
-        assert result["decision"] == "escalate"
+        assert _behavior(result) == "escalate"
         assert _time.monotonic() - started < 2, "must not wait on the relay"
         assert queue.pending() == []
 
@@ -2901,7 +2925,7 @@ class TestPromptParity:
         started = _time.monotonic()
         result = self._hook(port, tmp_path, "npm run build --prod",
                             cwd=str(tmp_path / "proj"))
-        assert result["decision"] == "escalate"
+        assert _behavior(result) == "escalate"
         assert _time.monotonic() - started < 2
         assert queue.pending() == []
 
@@ -2921,7 +2945,7 @@ class TestPromptParity:
 
         threading.Thread(target=watcher, daemon=True).start()
         result = self._hook(port, tmp_path, "rm -rf build")
-        assert result["decision"] == "allow"
+        assert _behavior(result) == "allow"
         assert "card" in seen
 
     @pytest.mark.parametrize("pattern,command,hit", [
@@ -3125,7 +3149,9 @@ class TestPhoneSilenceMirror:
             {"tool_name": "Bash", "tool_input": {"command": "pytest"}})),
             stdout=out)
         result = json.loads(out.getvalue())["hookSpecificOutput"]
-        assert "approved from watch" in result["decisionReason"]
+        # An allow is the bare checked shape; the reason is audited,
+        # not sent — anything extra risks failing validation again.
+        assert result["decision"] == {"behavior": "allow"}
 
 
 class TestQuestionCardTier:
@@ -3678,3 +3704,72 @@ class TestHookCommandAssignments:
         env, rest = crc._split_assignments(["A=1", "B=2", "python3", "C=3"])
         assert env == {"A": "1", "B": "2"}
         assert rest == ["python3", "C=3"]
+
+
+class TestPermissionDecisionShape:
+    """The exact JSON Claude Code accepts — the whole product rides on it.
+
+    The CLI validates the decision and says so in its own words:
+
+        PermissionRequest decision must be {"behavior": "allow"} or
+        {"behavior": "deny", "message": "..."}
+
+    Until 1.1.1 this hook emitted a bare string. That fails validation,
+    and a failed hook is NON-BLOCKING — the permission flow proceeds as
+    if nothing had answered. So every wrist approval was discarded while
+    the audit log recorded a perfectly good "allow", on every machine,
+    for every card, in silence. Nothing else in this suite catches that:
+    the tests all asked what we *meant*, never what we *emit*.
+    """
+
+    def test_allow_is_the_bare_checked_object(self):
+        assert crc._permission_output("allow") == {
+            "hookEventName": "PermissionRequest",
+            "decision": {"behavior": "allow"},
+        }
+
+    def test_deny_carries_its_message(self):
+        out = crc._permission_output("deny", "because")
+        assert out["decision"] == {"behavior": "deny", "message": "because"}
+
+    def test_escalation_sends_no_decision_at_all(self):
+        """Saying nothing is what leaves the question with the human."""
+        assert crc._permission_output("escalate") == {
+            "hookEventName": "PermissionRequest"}
+        assert "decision" not in crc._permission_output("escalate")
+
+    def test_the_fallback_escalates_by_saying_nothing(self):
+        assert crc.ESCALATE_FALLBACK["hookSpecificOutput"] == {
+            "hookEventName": "PermissionRequest"}
+
+    def test_decision_is_never_a_bare_string(self):
+        """The regression itself, stated as a rule."""
+        for behavior in ("allow", "deny", "escalate", "anything-else"):
+            decision = crc._permission_output(behavior, "m").get("decision")
+            assert not isinstance(decision, str)
+
+    @pytest.mark.parametrize("verdict,expected", [
+        ("allow", {"behavior": "allow"}),
+        ("deny", None),          # message differs; shape checked below
+    ])
+    def test_a_watch_answer_reaches_stdout_in_that_shape(
+            self, verdict, expected, tmp_path, monkeypatch):
+        import io
+        monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
+        # A relay address is what makes the hook consult the wrist at all.
+        # Leaving it to the ambient environment passed here and failed on
+        # CI, because this machine exports it and a clean one does not.
+        monkeypatch.setenv("CLAUDE_RISK_RELAY", "http://127.0.0.1:8977")
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "a.jsonl"))
+        monkeypatch.delenv("CLAUDE_RISK_CONFIG", raising=False)
+        monkeypatch.delenv("CLAUDE_RISK_AUTO_ALLOW", raising=False)
+        monkeypatch.setattr(crc, "ask_watch", lambda *a, **k: (verdict, None))
+        out = io.StringIO()
+        crc.run_hook(stdin=io.StringIO(json.dumps(
+            {"tool_name": "Bash", "cwd": str(tmp_path),
+             "tool_input": {"command": "rm -rf %s/x" % tmp_path}})), stdout=out)
+        decision = json.loads(out.getvalue())["hookSpecificOutput"]["decision"]
+        assert isinstance(decision, dict)
+        assert decision["behavior"] == verdict
+        if expected:
+            assert decision == expected

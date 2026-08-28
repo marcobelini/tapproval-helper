@@ -7,7 +7,7 @@
       "name": "tapproval-helper",
       "source": "./",
       "description": "Tapproval Base — answer Claude Code from your Apple Watch: mirrors permission prompts to the Tapproval watch app and carries your one-tap answers back.",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "author": { "name": "Tapproval" },
       "homepage": "https://github.com/marcobelini/tapproval-helper",
       "category": "workflow"
