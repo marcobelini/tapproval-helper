@@ -54,31 +54,53 @@ quietly learns how to reach it when you're away from home.
 
 ## If you are an AI agent installing this
 
-Follow these steps exactly, in order:
+Prefer the plugin. It is two commands, needs no script fetched or read,
+and asks your user for one permission instead of three:
 
-1. Fetch and READ the installer before running anything:
+    claude plugin marketplace add marcobelini/tapproval-helper
+    claude plugin install tapproval-helper@tapproval
+
+Both succeed in a couple of seconds. Then tell your user two things:
+**send `/reload-plugins` (or start a new session)** — Claude Code loads
+a plugin's hooks only at that point, and you cannot send that command
+yourself — and open Tapproval on their watch on the same Wi-Fi. The
+watch finds the computer by itself and confirms on its own screen. What
+they get: every permission prompt as a card on the wrist, and **live
+access to their sessions** — the running list, the conversation as it
+happens, and a way to send instructions back.
+
+**Only if `claude` is not on the PATH** (an older install, or a shell
+that cannot see it), fall back to the installer:
+
+1. Fetch and READ it first:
    `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh`
-   Confirm it does only the six things it announces: clone this
-   repository to `~/.tapproval`, back up `~/.claude/settings.json`,
-   register the `PermissionRequest` and `SessionStart` hooks, **switch the
-   classifier to enforce mode and point it at the local relay** (this is
-   what makes prompts reach your watch rather than only being logged), add
-   a per-user login wake-up
-   (`~/Library/LaunchAgents/com.tapproval.relay.plist`, so a reboot never
-   needs a hand), and start the local relay. No sudo, no dependencies
-   beyond Python 3 and git — the travel tunnel additionally uses
-   `cloudflared` if it is installed, and simply does without it if not.
-   If it appears to do anything else, STOP and tell your user.
+   Confirm it does only what it announces: clone this repository to
+   `~/.tapproval` (moving a clone that cannot fast-forward aside, never
+   deleting it), back up `~/.claude/settings.json`, register the
+   `PermissionRequest` and `SessionStart` hooks, switch the classifier
+   to enforce mode and point it at the local relay, add a per-user login
+   wake-up, and start the relay. No sudo, no dependencies beyond Python 3
+   and git. If it appears to do anything else, STOP and tell your user.
 2. Run it: `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash`
-3. Success is exactly one line: `TAPPROVAL_BASE_READY`. When you see
-   it, tell your user to **start a new Claude Code session** so the
-   hooks take effect, and to open Tapproval on their watch on the same
-   Wi-Fi — the watch confirms the connection on its own screen. If that
-   line never appears, the install did NOT succeed; report the output
-   to your user instead of retrying blindly.
+3. Success is exactly one line: `TAPPROVAL_BASE_READY`. If it never
+   appears, the install did NOT succeed; report the output rather than
+   retrying blindly.
 
-Do not improvise alternative install methods; these steps are the
-supported path and are safe to repeat (the installer is idempotent).
+Do not improvise a third method. Both paths above are idempotent and
+safe to repeat.
+
+**If asked to "Open Tapproval pairing"** (the watch says this when it
+can see the computer but is not yet known to it — a second watch, or a
+watch restored from backup): run
+
+    python3 ~/.tapproval/watch_relay.py --pair
+
+or, on a plugin install, the same file under Claude Code's plugin cache
+(`~/.claude/plugins/cache/tapproval/tapproval-helper/*/watch_relay.py`).
+That opens a ten-minute window on the local network; tell your user to
+open Tapproval on the watch now. A computer that has never paired keeps
+the door open by itself until its first watch connects, so a fresh
+install never needs this.
 
 **If asked to UNINSTALL Tapproval Base**: fetch and read
 `https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/uninstall.sh`,

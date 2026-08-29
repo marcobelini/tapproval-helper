@@ -27,11 +27,10 @@ else
   git clone -q --depth 1 "$REPO" "$DIR"
 fi
 
-python3 "$DIR/ClaudeRiskClassifier.py" --install
-# --watch wires enforce mode and the relay address, so the first card
-# reaches the wrist without a second command — same behaviour as the
-# plugin path.
-python3 "$DIR/ClaudeRiskClassifier.py" --watch
+# One call: --watch wires enforce mode and the relay address so the first
+# card reaches the wrist. As two calls the transcript promised "shadow
+# mode, work a week" and, three lines later, "wrist approvals are ON".
+python3 "$DIR/ClaudeRiskClassifier.py" --install --watch
 python3 "$DIR/watch_relay.py" --ensure
 
 echo ""

@@ -7,7 +7,7 @@ will be taken seriously.
 ## Reporting
 
 Open a [private security advisory](https://github.com/marcobelini/tapproval-helper/security/advisories/new),
-or e-mail **security@thoughtfulsteward.org** if you would rather not use
+or e-mail **tapproval@thoughtfulsteward.org** if you would rather not use
 GitHub. Please include what you did, what happened, and what you expected.
 
 You will get an acknowledgement within a few days. This is a small project

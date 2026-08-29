@@ -1722,8 +1722,14 @@ def _write_settings(path, data):
         raise
 
 
-def run_install():
-    """Register this script as a PermissionRequest hook. Safe to re-run."""
+def run_install(then_watch=False):
+    """Register this script as a PermissionRequest hook. Safe to re-run.
+
+    ``then_watch`` is set when --watch is on the same command line: the
+    closing paragraph below would otherwise promise "shadow mode, work
+    normally for a week" three lines before --watch prints "Wrist
+    approvals are ON" — the installer said both, in that order.
+    """
     path = _settings_path()
     try:
         data = _read_settings(path)
@@ -1789,6 +1795,8 @@ def run_install():
         print("  Reboot   : the relay wakes again at login")
     if backup:
         print("  Backup   : %s" % backup)
+    if then_watch:
+        return 0
     print("")
     print("Nothing about your sessions changes yet: the classifier starts in")
     print("shadow mode, so every permission prompt still reaches you exactly")
@@ -1863,6 +1871,16 @@ def run_uninstall():
         print("  Backup   : %s" % backup)
     print("  The audit log was left in place; delete it yourself if you want it gone.")
     return 0
+
+
+def _human_duration(seconds):
+    """'24 hours', not '1440 minutes' — the number a person would say."""
+    seconds = int(seconds)
+    if seconds % 3600 == 0 and seconds >= 3600:
+        hours = seconds // 3600
+        return "%d hour%s" % (hours, "" if hours == 1 else "s")
+    minutes = max(1, seconds // 60)
+    return "%d minute%s" % (minutes, "" if minutes == 1 else "s")
 
 
 WATCH_ENV = {
@@ -1954,7 +1972,7 @@ def run_watch(enable=True):
                 "  Relay    : " + WATCH_ENV["CLAUDE_RISK_RELAY"] + "\n"
                 "  Wait     : a card stays on the watch until answered —\n"
                 "             here or anywhere else (up to "
-                + str(RELAY_WAIT_SECONDS // 60) + " minutes).\n"
+                + _human_duration(RELAY_WAIT_SECONDS) + ").\n"
                 "             Lowering your wrist never retracts it. With no\n"
                 "             watch around at all, prompts go straight to the\n"
                 "             terminal as usual.\n"
@@ -2171,7 +2189,11 @@ def main(argv=None):
 
 def _dispatch(args):
     if args.install:
-        return run_install()
+        code = run_install(then_watch=args.watch)
+        if code or not args.watch:
+            return code
+        print("")
+        return run_watch(True)
     if args.uninstall:
         return run_uninstall()
     if args.quiet:

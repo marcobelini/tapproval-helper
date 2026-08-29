@@ -2311,6 +2311,7 @@ class TestLanSourceIsNotTrusted:
         auth._window_until = 0.0
         auth._window_claims = 0
         auth._window_ips = set()
+        auth._slammed = False
         auth.save = lambda: None
         server, queue = watch_relay.serve(port=0, auth=auth)
         # Rewrite the peer address on the server instance: a LAN client with
@@ -2424,6 +2425,64 @@ class TestLanSourceIsNotTrusted:
         for _ in range(8):
             self._call(base + "/pair")
         assert not auth.window_open()
+
+    # -- a machine that has never paired ----------------------------------
+    #
+    # The door used to be a 10-minute fuse lit when the relay started — and
+    # install.sh starts the relay. Install the helper, go and get the watch
+    # app from TestFlight, read the tour: the fuse had burnt out, and the
+    # first thing a new user saw was "Not paired yet" plus a phrase no
+    # README explains. There is nothing behind that door yet to protect.
+
+    def _never_paired(self, auth):
+        auth.paired_ever = False
+        auth.devices = []
+        auth._window_until = 0.0        # no timer at all
+
+    def test_a_never_paired_machine_keeps_the_door_open(self, lan):
+        base, _, auth = lan
+        self._never_paired(auth)
+        assert auth.window_open()
+        status, body = self._call(base + "/pair")
+        assert status == 200 and body["token"] == "bootstraptoken"
+
+    def test_the_door_does_not_expire_before_the_first_watch(self, lan):
+        """The fuse: an hour later, still open."""
+        import watch_relay
+        base, _, auth = lan
+        self._never_paired(auth)
+        real = watch_relay.time.time
+        try:
+            watch_relay.time.time = lambda: real() + 3600.0
+            assert auth.window_open()
+            assert self._call(base + "/pair")[0] == 200
+        finally:
+            watch_relay.time.time = real
+
+    def test_enrolment_shuts_the_open_door_for_good(self, lan):
+        """The moment a device is on the other side, it is a door again."""
+        base, _, auth = lan
+        self._never_paired(auth)
+        self._call(base + "/enroll", token="bootstraptoken", method="POST",
+                   body={"device_id": "w1", "label": "Watch"})
+        assert auth.paired_ever
+        assert not auth.window_open()
+        status, body = self._call(base + "/pair")
+        assert status == 403 and body.get("error") == "already paired"
+
+    def test_a_burst_still_slams_a_never_paired_door(self, lan):
+        """No timer to expire, so an attack needs something explicit to
+        shut — and the next --ensure reopens it, which is the right trade."""
+        base, _, auth = lan
+        self._never_paired(auth)
+        for _ in range(8):
+            self._call(base + "/pair")
+        assert not auth.window_open()
+        # Refused either way: the rate limiter answers first (429), and
+        # the shut door would answer 403 behind it. Both are "no".
+        assert self._call(base + "/pair")[0] in (403, 429)
+        auth.open_window()                 # what --ensure does at start
+        assert auth.window_open()
 
     def test_enrolment_trades_the_bootstrap_for_a_device_key(self, lan):
         base, _, auth = lan
@@ -3972,3 +4031,52 @@ class TestHelperKeepsItselfCurrent:
                 raise _e
             monkeypatch.setattr(wr.subprocess, "run", raiser)
             assert wr._self_update() is False
+
+
+class TestInstallTranscript:
+    """What the installer says must be what it did.
+
+    As two calls, install.sh's transcript promised "shadow mode — work
+    normally for a week" and, three lines later, "Wrist approvals are ON".
+    A first-time user reading that has no way to know which one is true.
+    """
+
+    @pytest.fixture
+    def settings(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
+        for key in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY",
+                    "CLAUDE_RISK_RELAY_WAIT", "CLAUDE_RISK_CONFIG"):
+            monkeypatch.delenv(key, raising=False)
+        return tmp_path / "settings.json"
+
+    def test_install_with_watch_does_not_promise_shadow_mode(
+            self, settings, capsys):
+        assert crc.main(["--install", "--watch"]) == 0
+        out = capsys.readouterr().out
+        assert "Wrist approvals are ON" in out
+        assert "shadow mode" not in out
+        assert "work normally for a week" not in out
+
+    def test_install_alone_still_explains_shadow_mode(self, settings, capsys):
+        """The plain --install path is unchanged: it IS shadow mode."""
+        assert crc.main(["--install"]) == 0
+        assert "shadow mode" in capsys.readouterr().out
+
+    def test_install_with_watch_actually_enables_it(self, settings):
+        crc.main(["--install", "--watch"])
+        data = json.loads(settings.read_text(encoding="utf-8"))
+        assert data["env"]["CLAUDE_RISK_MODE"] == "enforce"
+
+    def test_the_wait_is_a_duration_a_person_would_say(self, settings, capsys):
+        crc.main(["--install", "--watch"])
+        out = capsys.readouterr().out
+        assert "24 hours" in out
+        assert "1440" not in out
+
+    @pytest.mark.parametrize("seconds,expected", [
+        (60, "1 minute"), (300, "5 minutes"), (3600, "1 hour"),
+        (86400, "24 hours"), (5400, "90 minutes"), (0, "1 minute"),
+    ])
+    def test_human_duration(self, seconds, expected):
+        assert crc._human_duration(seconds) == expected

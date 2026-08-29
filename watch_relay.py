@@ -1350,6 +1350,7 @@ class Auth:
         self._window_until = 0.0
         self._window_claims = 0
         self._window_ips = set()
+        self._slammed = False
         self._load()
 
     # ---- persistence -------------------------------------------------
@@ -1501,14 +1502,31 @@ class Auth:
             self._window_until = time.time() + float(seconds)
             self._window_claims = 0
             self._window_ips = set()
+            self._slammed = False
             return self._window_until
 
     def close_window(self):
         with self._lock:
             self._window_until = 0.0
+            # A never-paired door has no timer to expire, so a burst needs
+            # something explicit to shut. Cleared by open_window().
+            self._slammed = True
 
     def window_open(self):
+        """Is /pair handing out the bootstrap right now?
+
+        Two doors, one question. A machine that has NEVER paired keeps the
+        door open until its first device enrols: there is nothing behind
+        it to protect yet, and a 10-minute fuse lit at install time was
+        burning out while the user was still installing the watch app —
+        they arrived to "Not paired yet" and a phrase no README explains.
+        Once anything has paired, the door is the deliberate, short window
+        that --pair opens, exactly as before. A burst still shuts either
+        one (close_window); the next --ensure reopens the first kind.
+        """
         with self._lock:
+            if not self.paired_ever and not self._slammed:
+                return True
             return time.time() < self._window_until
 
     def claim_window(self, client_ip):
@@ -1519,7 +1537,8 @@ class Auth:
         rejection rather than letting it be ground down.
         """
         with self._lock:
-            if time.time() >= self._window_until:
+            never_paired = not self.paired_ever and not self._slammed
+            if not never_paired and time.time() >= self._window_until:
                 return None
             if self._window_claims >= PAIR_WINDOW_CLAIMS:
                 return None
@@ -1704,13 +1723,13 @@ def main(argv=None):
     # listener they arrive on. First contact from the user's own network
     # fetches it via /pair — pairing is automatic and never broadcast.
     auth = Auth()
-    if not auth.devices:
-        # Nothing has ever paired: leave the door open for ten minutes so a
-        # first watch can connect even where iCloud is unavailable. Once a
-        # device is enrolled this never happens again.
+    if not auth.paired_ever:
+        # Nothing has ever paired: the door stays open until the first
+        # watch enrols (see Auth.window_open). open_window() here only
+        # resets the claim budget and clears a slam from an earlier run.
         auth.open_window()
-        print("relay: pairing open for %d minutes (no device paired yet)"
-              % (PAIR_WINDOW_SECONDS // 60), file=sys.stderr)
+        print("relay: pairing open until the first watch connects",
+              file=sys.stderr)
 
     server, queue = serve(args.host, args.port, auth=auth)
     print("relay: listening on http://%s:%d" % (args.host, args.port),
