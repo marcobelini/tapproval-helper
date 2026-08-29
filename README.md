@@ -29,7 +29,7 @@ session; there is nothing to keep running and nothing to maintain.
 **Prefer to let the agent do it?** Tell Claude Code, in its own chat
 (from your phone works too):
 
-> Install github.com/marcobelini/tapproval-helper
+> Install the Tapproval plugin from marcobelini/tapproval-helper
 
 **Prefer a terminal?** One command, then forget it:
 
