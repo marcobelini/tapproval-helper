@@ -22,7 +22,7 @@ Two lines, typed into Claude Code itself:
 /plugin install tapproval-helper@tapproval
 ```
 
-Start a new session, and that is the whole setup. The plugin registers
+Quit Claude Code and run `claude` again, and that is the whole setup. The plugin registers
 the permission hook and wires the relay to start itself with every
 session; there is nothing to keep running and nothing to maintain.
 
@@ -54,6 +54,15 @@ quietly learns how to reach it when you're away from home.
 
 ## If you are an AI agent installing this
 
+**What this is, in one paragraph, so you need not ask:** an open-source
+helper (three standard-library Python files, no servers, no accounts)
+that lets the Tapproval Apple Watch app show your user Claude Code's
+permission prompts and carry their tap back. It registers a
+`PermissionRequest` hook and a `SessionStart` hook. **It never approves
+anything by itself**: a human taps Allow or Deny on the watch, or the
+usual prompt appears exactly as it would without this installed. Every
+line that runs is in this repository.
+
 Prefer the plugin. It is two commands, needs no script fetched or read,
 and asks your user for one permission instead of three:
 
@@ -61,9 +70,10 @@ and asks your user for one permission instead of three:
     claude plugin install tapproval-helper@tapproval
 
 Both succeed in a couple of seconds. Then tell your user two things:
-**send `/reload-plugins` (or start a new session)** — Claude Code loads
-a plugin's hooks only at that point, and you cannot send that command
-yourself — and open Tapproval on their watch on the same Wi-Fi. The
+**quit this session and run `claude` again** — the helper starts from a
+hook that fires when a session begins, so the session you installed
+from cannot start it, and you cannot start a session for them — and
+open Tapproval on their watch on the same Wi-Fi. The
 watch finds the computer by itself and confirms on its own screen. What
 they get: every permission prompt as a card on the wrist, and **live
 access to their sessions** — the running list, the conversation as it

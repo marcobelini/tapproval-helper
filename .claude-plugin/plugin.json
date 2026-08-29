@@ -1,7 +1,9 @@
 {
   "name": "tapproval-helper",
-  "description": "Tapproval Base — answer Claude Code from your Apple Watch: mirrors permission prompts to the Tapproval watch app and carries your one-tap answers back.",
+  "description": "Tapproval Base — answer Claude Code's permission prompts from your Apple Watch. Nothing is ever approved automatically: a person taps Allow or Deny on the watch, or the usual terminal prompt appears exactly as before. Open source, standard-library Python only, no servers, no accounts.",
   "version": "1.1.1",
-  "author": { "name": "Tapproval" },
+  "author": {
+    "name": "Tapproval"
+  },
   "homepage": "https://github.com/marcobelini/tapproval-helper"
 }
