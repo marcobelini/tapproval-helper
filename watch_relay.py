@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import json
+import shlex
 import functools
 import os
 import re
@@ -602,6 +603,66 @@ def say_to_session(prefix, text, projects_dir=None):
     return "could not start: %s" % error if error else "sent"
 
 
+def known_projects(projects_dir=None, limit=50):
+    """The projects a new session may be started in: one row per directory
+    Claude Code has recently worked in, most recent first. Derived from the
+    same transcripts the session list reads, so the watch never has to
+    type a path and the relay never opens a terminal somewhere it has not
+    already seen Claude Code run."""
+    seen, rows = set(), []
+    for session in recent_sessions(limit=limit, projects_dir=projects_dir,
+                                   include_idle=True):
+        path = session.get("path") or ""
+        if not path or path in seen or not os.path.isdir(path):
+            continue
+        seen.add(path)
+        rows.append({"name": session.get("project") or os.path.basename(path),
+                     "path": path,
+                     "minutes_ago": session.get("minutes_ago", 0)})
+    return rows
+
+
+def start_session(path, text, projects_dir=None, platform=None):
+    """Open a REAL Claude Code session on this Mac, in ``path``, with ``text``
+    as its first message. Returns a short status; "started" on success.
+
+    Not ``claude -p``: that is headless, and a headless session never fires
+    the PermissionRequest hook — it would be the one session that could not
+    ask the watch anything, and would stop at its first risky command. So
+    this opens a Terminal window running an ordinary interactive ``claude``,
+    whose cards reach the wrist like any other's.
+
+    Every failure comes back as words the watch can show: no Mac, no
+    ``claude`` on the PATH, a directory Claude Code has never worked in, or
+    a Terminal that will not open (no one logged in at the screen — the
+    usual reason). Never raises, never blocks longer than a few seconds.
+    """
+    text = " ".join(str(text or "").split())[:500]
+    if not text:
+        return "empty"
+    if (platform or sys.platform) != "darwin":
+        return "new sessions need a Mac"
+    path = os.path.expanduser(str(path or ""))
+    if path not in {row["path"] for row in known_projects(projects_dir)}:
+        return "unknown project"
+    if not shutil.which("claude"):
+        return "claude not on PATH"
+    script = 'cd %s && claude %s' % (shlex.quote(path), shlex.quote(text))
+    apple = ('tell application "Terminal"\n'
+             '  activate\n'
+             '  do script %s\n'
+             'end tell' % json.dumps(script))
+    try:
+        done = subprocess.run(["osascript", "-e", apple], capture_output=True,
+                              text=True, timeout=8)
+    except (OSError, subprocess.SubprocessError) as error:
+        return "could not open Terminal: %s" % error
+    if done.returncode != 0:
+        why = (done.stderr or done.stdout or "").strip().splitlines()
+        return "could not open Terminal: %s" % (why[-1] if why else "no reason given")
+    return "started"
+
+
 # How often the resolver looks for subagent transcripts that did not exist
 # when the card was posted. A seam so tests need not sleep through it.
 RESOLVER_RESCAN_SECONDS = 5.0
@@ -1095,6 +1156,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                                  "helper": HELPER_VERSION})
             else:
                 self._send_json({"ok": True})
+        elif path == "/projects":
+            self._send_json({"projects": known_projects()})
         elif path == "/sessions":
             rows = recent_sessions()
             prewarm_threads([row["session_id"] for row in rows])
@@ -1183,6 +1246,26 @@ class RelayHandler(BaseHTTPRequestHandler):
             if answer:
                 payload["answer"] = answer
             self._send_json(payload)
+        elif path == "/new":
+            # Opens a Terminal on this Mac: the same budget and the same
+            # one-at-a-time gate as /say, for the same reasons.
+            who = self.headers.get("X-Tapproval-Token", "") or self.client_address[0]
+            allowed, retry = LIMITS.allow("say", who, 6, 60)
+            if not allowed:
+                self._send_json({"error": "too many messages"}, 429,
+                                headers={"Retry-After": str(int(retry))})
+                return
+            gate = LIMITS.gate("say", 1)
+            if not gate.acquire(blocking=False):
+                self._send_json({"error": "a message is already being sent"}, 429)
+                return
+            try:
+                body = self._read_json() or {}
+                status = start_session(str(body.get("path", ""))[:512],
+                                       body.get("text", ""))
+            finally:
+                gate.release()
+            self._send_json({"ok": status == "started", "status": status})
         elif path == "/say":
             # Each call spawns `claude --resume`: serialising them is
             # correctness, not politeness.

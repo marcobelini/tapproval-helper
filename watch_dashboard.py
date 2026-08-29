@@ -950,8 +950,13 @@ def resolve_session(prefix, projects_dir=None):
     return os.path.basename(path)[:-6], cwd
 
 
-def recent_sessions(limit=12, projects_dir=None):
+def recent_sessions(limit=12, projects_dir=None, include_idle=False):
     """The user's ACTIVE Claude Code sessions, straight from local storage.
+
+    ``include_idle`` lifts the liveness filter. The session LIST never wants
+    that — it mirrors the phone, which shows active sessions — but the
+    "start a new session where?" list does: a project you worked in
+    yesterday is exactly where you might start one today.
 
     Claude Code keeps transcripts at ~/.claude/projects/<munged-path>/<id>.jsonl
     — the only sanctioned way to enumerate sessions today (no remote API).
@@ -981,7 +986,9 @@ def recent_sessions(limit=12, projects_dir=None):
 
     found.sort(reverse=True)
     live = live_sessions()
-    found = [f for f in found if f[3] in live][:limit]
+    if not include_idle:
+        found = [f for f in found if f[3] in live]
+    found = found[:limit]
     sessions = []
     for mtime, path, project, session_id in found:
         # Only the ones we actually return are worth opening.

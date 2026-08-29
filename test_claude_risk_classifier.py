@@ -70,6 +70,26 @@ def _no_real_self_update(tmp_path, monkeypatch):
     monkeypatch.setattr(watch_relay, "_UPDATE_STAMP", str(stamp))
 
 
+@pytest.fixture
+def settings(tmp_path, monkeypatch):
+    """A throwaway settings.json, and no ambient wrist-approval settings.
+
+    Four test classes carried their own copy of this fixture, three of them
+    without the env-clearing — which is why the same test could pass on a
+    machine with CLAUDE_RISK_MODE exported and fail on a fresh checkout.
+    The installer must never touch a real config, so the path is the one
+    thing every installer test needs; the env is cleared because the
+    default behaviour is usually the subject.
+    """
+    path = tmp_path / "settings.json"
+    monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(path))
+    monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
+    for key in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY",
+                "CLAUDE_RISK_RELAY_WAIT", "CLAUDE_RISK_CONFIG"):
+        monkeypatch.delenv(key, raising=False)
+    return path
+
+
 @pytest.fixture(autouse=True)
 def _no_real_launch_agent(tmp_path, monkeypatch):
     """No test may ever touch the real LaunchAgents dir or launchctl —
@@ -593,13 +613,6 @@ class TestHookContract:
 class TestInstaller:
     """The installer writes to the user's real Claude Code config, so the
     safety properties matter more than the happy path."""
-
-    @pytest.fixture
-    def settings(self, tmp_path, monkeypatch):
-        path = tmp_path / "settings.json"
-        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(path))
-        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
-        return path
 
     def _handlers(self, path):
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -1214,13 +1227,6 @@ class TestSelfStartingRelay:
     automatic: it exists whenever Claude Code does. No extra hardware, no
     always-on machine, nothing for the user to run."""
 
-    @pytest.fixture
-    def settings(self, tmp_path, monkeypatch):
-        path = tmp_path / "settings.json"
-        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(path))
-        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "a.jsonl"))
-        return path
-
     def test_install_registers_session_start_relay(self, settings, capsys):
         crc.run_install()
         data = json.loads(settings.read_text())
@@ -1560,13 +1566,6 @@ class TestUsageSummary:
 class TestWatchToggle:
     """Exporting env vars in one shell did nothing for the sessions that
     matter — real sessions read settings.json. --watch writes it there."""
-
-    @pytest.fixture
-    def settings(self, tmp_path, monkeypatch):
-        path = tmp_path / "settings.json"
-        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(path))
-        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "a.jsonl"))
-        return path
 
     def test_watch_writes_env_for_every_session(self, settings, capsys):
         crc.run_install(); capsys.readouterr()
@@ -4041,15 +4040,6 @@ class TestInstallTranscript:
     A first-time user reading that has no way to know which one is true.
     """
 
-    @pytest.fixture
-    def settings(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
-        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
-        for key in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY",
-                    "CLAUDE_RISK_RELAY_WAIT", "CLAUDE_RISK_CONFIG"):
-            monkeypatch.delenv(key, raising=False)
-        return tmp_path / "settings.json"
-
     def test_install_with_watch_does_not_promise_shadow_mode(
             self, settings, capsys):
         assert crc.main(["--install", "--watch"]) == 0
@@ -4080,3 +4070,124 @@ class TestInstallTranscript:
     ])
     def test_human_duration(self, seconds, expected):
         assert crc._human_duration(seconds) == expected
+
+
+class TestNewSessionFromTheWatch:
+    """Starting a real Claude Code session from the wrist.
+
+    Not `claude -p`: a headless session never fires the PermissionRequest
+    hook, so it would be the one session that could not ask the watch
+    anything. The relay opens a Terminal window instead. Every failure
+    must come back as words the watch can show.
+    """
+
+    def _projects(self, tmp_path):
+        """A fake ~/.claude/projects with two sessions in two directories."""
+        import watch_relay
+        root = tmp_path / "projects"
+        for slug, cwd, age in (("-Users-x-Developer-acme", tmp_path / "acme", 60),
+                               ("-Users-x-Developer-pantri", tmp_path / "pantri", 3600)):
+            (root / slug).mkdir(parents=True); cwd.mkdir()
+            f = root / slug / ("s-%s.jsonl" % slug[-5:])
+            f.write_text(json.dumps({"type": "user", "cwd": str(cwd),
+                                     "message": {"role": "user", "content": "hi"}}) + "\n",
+                         encoding="utf-8")
+            os.utime(f, (time.time() - age, time.time() - age))
+        return str(root)
+
+    def test_known_projects_are_recent_directories_newest_first(self, tmp_path, monkeypatch):
+        import watch_relay
+        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})   # nothing live
+        rows = watch_relay.known_projects(projects_dir=self._projects(tmp_path))
+        assert [r["name"] for r in rows] == ["acme", "pantri"]
+        assert all(os.path.isdir(r["path"]) for r in rows)
+
+    def test_known_projects_drop_directories_that_no_longer_exist(self, tmp_path, monkeypatch):
+        import watch_relay, shutil
+        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        root = self._projects(tmp_path)
+        shutil.rmtree(tmp_path / "pantri")
+        assert [r["name"] for r in watch_relay.known_projects(projects_dir=root)] == ["acme"]
+
+    def test_refuses_anything_but_a_mac(self, tmp_path):
+        import watch_relay
+        assert watch_relay.start_session("/x", "go", platform="linux") == "new sessions need a Mac"
+
+    def test_refuses_an_empty_message(self):
+        import watch_relay
+        assert watch_relay.start_session("/x", "   ", platform="darwin") == "empty"
+
+    def test_refuses_a_directory_claude_code_has_never_worked_in(self, tmp_path, monkeypatch):
+        """The watch never types a path, and the relay never opens a
+        terminal somewhere it has not already seen Claude Code run."""
+        import watch_relay
+        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        root = self._projects(tmp_path)
+        assert watch_relay.start_session(str(tmp_path / "elsewhere"), "go",
+                                         projects_dir=root, platform="darwin") == "unknown project"
+
+    def test_says_when_claude_is_missing(self, tmp_path, monkeypatch):
+        import watch_relay
+        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: None)
+        root = self._projects(tmp_path)
+        assert watch_relay.start_session(str(tmp_path / "acme"), "go",
+                                         projects_dir=root, platform="darwin") == "claude not on PATH"
+
+    def test_a_terminal_that_will_not_open_is_reported_in_words(self, tmp_path, monkeypatch):
+        """No one logged in at the screen is the usual reason; the watch
+        must be able to say so rather than spin."""
+        import watch_relay, subprocess as sp
+        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
+        monkeypatch.setattr(watch_relay.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
+            a[0], 1, "", "execution error: Not authorized to send Apple events to Terminal. (-1743)"))
+        root = self._projects(tmp_path)
+        status = watch_relay.start_session(str(tmp_path / "acme"), "go",
+                                           projects_dir=root, platform="darwin")
+        assert status.startswith("could not open Terminal: ")
+        assert "Not authorized" in status
+
+    def test_success_opens_terminal_in_that_directory_with_that_message(self, tmp_path, monkeypatch):
+        import watch_relay, subprocess as sp
+        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
+        seen = {}
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd; return sp.CompletedProcess(cmd, 0, "", "")
+        monkeypatch.setattr(watch_relay.subprocess, "run", fake_run)
+        root = self._projects(tmp_path)
+        status = watch_relay.start_session(str(tmp_path / "acme"), "Fix CI; it's red",
+                                           projects_dir=root, platform="darwin")
+        assert status == "started"
+        assert seen["cmd"][0] == "osascript"
+        script = seen["cmd"][-1]
+        assert 'tell application "Terminal"' in script and "do script" in script
+        # The shell line is a JSON string literal inside the AppleScript;
+        # decode it and check both cwd and message are shell-quoted, so a
+        # message with quotes or semicolons cannot escape into the shell.
+        import shlex
+        shell_line = json.loads(script.split("do script ", 1)[1].split("\n")[0])
+        assert shell_line == "cd %s && claude %s" % (
+            shlex.quote(str(tmp_path / "acme")), shlex.quote("Fix CI; it's red"))
+
+    def test_projects_and_new_are_ordinary_data_routes(self, tmp_path, monkeypatch):
+        """/projects needs the same key as every other data route, and /new
+        answers a refusal as JSON the watch can show — never a 500."""
+        import threading, urllib.request, urllib.error, watch_relay
+        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        watch_relay.LIMITS.reset()
+        server, _ = watch_relay.serve(port=0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        try:
+            with urllib.request.urlopen(base + "/projects", timeout=3) as r:
+                assert "projects" in json.loads(r.read())
+            req = urllib.request.Request(base + "/new", method="POST",
+                                         data=json.dumps({"path": "/nowhere", "text": "go"}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=3) as r:
+                body = json.loads(r.read())
+            assert body["ok"] is False and body["status"] in ("unknown project", "new sessions need a Mac")
+        finally:
+            server.shutdown(); server.server_close()
