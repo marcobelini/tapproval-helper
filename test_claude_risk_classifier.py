@@ -3661,13 +3661,26 @@ class TestSessionListCarriesTheRing:
 # The plugin path
 #
 # `/plugin install` registers the hooks from the plugin's own manifest and
-# writes nothing to settings.json. Nothing here had ever opened a file under
-# helper/, which is how the manifest once shipped a 3600-second wait while the
+# writes nothing to settings.json. Nothing here had ever opened the shipped
+# manifests, which is how one once carried a 3600-second wait while the
 # installer wrote 86400 — the card really did expire after an hour, and the
 # tests stayed green.
+#
+# The manifests live wherever the plugin root is: hooks.json runs
+# `${CLAUDE_PLUGIN_ROOT}/ClaudeRiskClassifier.py`, so that is the module's own
+# directory. In this repo that is the checkout root; the product repo keeps
+# the same files one level down in helper/, so fall back to that layout.
 
-HELPER_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(crc.__file__)), "helper")
+
+def _find_helper_dir():
+    here = os.path.dirname(os.path.abspath(crc.__file__))
+    for candidate in (here, os.path.join(here, "helper")):
+        if os.path.isfile(os.path.join(candidate, ".claude-plugin", "plugin.json")):
+            return candidate
+    return here
+
+
+HELPER_DIR = _find_helper_dir()
 
 
 def _helper_manifest(*parts):
