@@ -905,7 +905,8 @@ class TestCommandHealthCheck:
         assert crc.check_command(crc._hook_command()) == []
 
     def test_missing_interpreter_is_reported(self, tmp_path):
-        script = tmp_path / "s.py"; script.write_text("", encoding="utf-8")
+        script = tmp_path / "s.py"
+        script.write_text("", encoding="utf-8")
         problems = crc.check_command("/Applications/Gone.app/bin/python3 %s" % script)
         assert any("interpreter no longer exists" in p for p in problems)
 
@@ -914,13 +915,16 @@ class TestCommandHealthCheck:
         assert any("script no longer exists" in p for p in problems)
 
     def test_bare_interpreter_not_on_path_is_reported(self, tmp_path):
-        script = tmp_path / "s.py"; script.write_text("", encoding="utf-8")
+        script = tmp_path / "s.py"
+        script.write_text("", encoding="utf-8")
         problems = crc.check_command("python9nonexistent %s" % script)
         assert any("not on PATH" in p for p in problems)
 
     def test_quoted_paths_with_spaces_are_handled(self, tmp_path):
-        folder = tmp_path / "My Developer"; folder.mkdir()
-        script = folder / "s.py"; script.write_text("", encoding="utf-8")
+        folder = tmp_path / "My Developer"
+        folder.mkdir()
+        script = folder / "s.py"
+        script.write_text("", encoding="utf-8")
         assert crc.check_command("%s '%s'" % (sys.executable, script)) == []
 
     def test_unparseable_command_is_reported(self):
@@ -944,7 +948,8 @@ class TestCommandHealthCheck:
     def test_status_stays_quiet_when_healthy(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
         monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "a.jsonl"))
-        crc.run_install(); capsys.readouterr()
+        crc.run_install()
+        capsys.readouterr()
         crc.run_status()
         assert "BROKEN" not in capsys.readouterr().out
 
@@ -1106,7 +1111,6 @@ class TestRelaySessions:
         import time as _time
         import watch_dashboard
         import watch_relay
-        import watch_dashboard
         monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"aaaa1111": "Terminal",
                                      "bbbb2222": "Terminal"})
@@ -1201,7 +1205,8 @@ class TestRelayTunnelDiscovery:
             base = "http://127.0.0.1:%d" % server.server_address[1]
             with urllib.request.urlopen(base + "/tunnel", timeout=5) as reply:
                 assert json.loads(reply.read())["url"].endswith("/t/tok")
-            server.shutdown(); server.server_close()
+            server.shutdown()
+            server.server_close()
         finally:
             watch_relay.TUNNEL_URL = None
 
@@ -1219,7 +1224,8 @@ class TestRelayTunnelDiscovery:
         except urllib.error.HTTPError as error:
             status = error.code
         assert status == 404
-        server.shutdown(); server.server_close()
+        server.shutdown()
+        server.server_close()
 
 
 class TestSelfStartingRelay:
@@ -1261,13 +1267,15 @@ class TestSelfStartingRelay:
                             lambda *a, **k: spawned.append(a))
         assert watch_relay.ensure_running() == 0
         assert spawned == []
-        server.shutdown(); server.server_close()
+        server.shutdown()
+        server.server_close()
 
     def test_ensure_spawns_when_down(self, monkeypatch):
         import watch_relay
         monkeypatch.setattr(watch_relay, "DEFAULT_PORT", 1)  # nothing there
         spawned = []
-        class FakeProc: pass
+        class FakeProc:
+            pass
         monkeypatch.setattr(watch_relay.subprocess, "Popen",
                             lambda cmd, **k: spawned.append(cmd) or FakeProc())
         assert watch_relay.ensure_running() == 0
@@ -1279,7 +1287,8 @@ class TestStatusRelayAwareness:
     def test_status_reports_wired_relay(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "s.json"))
         monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "a.jsonl"))
-        crc.run_install(); capsys.readouterr()
+        crc.run_install()
+        capsys.readouterr()
         crc.run_status()
         out = capsys.readouterr().out
         assert "starts itself with every Claude Code session" in out
@@ -1315,7 +1324,8 @@ class TestWatchSeenAttribution:
         urllib.request.urlopen(base + "/pending", timeout=5).read()
         assert queue.watch_seen_seconds_ago() is not None
 
-        server.shutdown(); server.server_close()
+        server.shutdown()
+        server.server_close()
 
 
 class TestBonjourTXTAddresses:
@@ -1356,8 +1366,8 @@ def _write_transcript(tmp_path, folder, name, lines):
     pdir.mkdir(parents=True, exist_ok=True)
     path = pdir / name
     path.write_text(
-        "\n".join(l if isinstance(l, str) else json.dumps(l)
-                   for l in lines) + "\n",
+        "\n".join(line if isinstance(line, str) else json.dumps(line)
+                   for line in lines) + "\n",
         encoding="utf-8")
     return path
 
@@ -1374,7 +1384,6 @@ class TestSessionNames:
                                                     monkeypatch):
         import watch_dashboard
         import watch_relay
-        import watch_dashboard
         monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"abc123": "Terminal"})
         self._write(tmp_path, "-Users-dev-Developer-familia-gateway",
@@ -1391,7 +1400,6 @@ class TestSessionNames:
                                                    monkeypatch):
         import watch_dashboard
         import watch_relay
-        import watch_dashboard
         monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"def456": "Terminal"})
         self._write(tmp_path, "-Users-dev-Developer-solo", "def456.jsonl",
@@ -1402,7 +1410,6 @@ class TestSessionNames:
     def test_skips_system_injected_openers(self, tmp_path, monkeypatch):
         import watch_dashboard
         import watch_relay
-        import watch_dashboard
         monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"ghi789": "Terminal"})
         self._write(tmp_path, "-p", "ghi789.jsonl", [
@@ -1420,7 +1427,6 @@ class TestSessionNames:
         short ack ("ok"/"test") keeps the standing title."""
         import watch_dashboard
         import watch_relay
-        import watch_dashboard
         monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"jkl012": "VS Code"})
         self._write(tmp_path, "-p", "jkl012.jsonl", [
@@ -1568,7 +1574,8 @@ class TestWatchToggle:
     matter — real sessions read settings.json. --watch writes it there."""
 
     def test_watch_writes_env_for_every_session(self, settings, capsys):
-        crc.run_install(); capsys.readouterr()
+        crc.run_install()
+        capsys.readouterr()
         crc.run_watch(True)
         data = json.loads(settings.read_text())
         assert data["env"]["CLAUDE_RISK_MODE"] == "enforce"
@@ -1578,7 +1585,9 @@ class TestWatchToggle:
     def test_watch_outlives_its_own_wait(self, settings, capsys):
         """The hook's timeout must exceed the wrist wait, or Claude Code
         kills the hook mid-glance and the card vanishes."""
-        crc.run_install(); crc.run_watch(True); capsys.readouterr()
+        crc.run_install()
+        crc.run_watch(True)
+        capsys.readouterr()
         data = json.loads(settings.read_text())
         timeouts = [h.get("timeout")
                     for entry in data["hooks"]["PermissionRequest"]
@@ -1587,14 +1596,18 @@ class TestWatchToggle:
         assert timeouts and all(t > wait for t in timeouts)
 
     def test_no_watch_reverts_cleanly(self, settings, capsys):
-        crc.run_install(); crc.run_watch(True); crc.run_watch(False)
+        crc.run_install()
+        crc.run_watch(True)
+        crc.run_watch(False)
         capsys.readouterr()
         data = json.loads(settings.read_text())
         assert "CLAUDE_RISK_MODE" not in data.get("env", {})
         assert data["hooks"]["PermissionRequest"]  # hook itself survives
 
     def test_watch_is_idempotent(self, settings, capsys):
-        crc.run_install(); crc.run_watch(True); capsys.readouterr()
+        crc.run_install()
+        crc.run_watch(True)
+        capsys.readouterr()
         before = settings.read_text()
         crc.run_watch(True)
         assert settings.read_text() == before
@@ -1687,7 +1700,6 @@ class TestWatchPresence:
         """`_inject`'s worker unpacks submit()'s return; a 2/3-tuple
         mismatch killed the --demo/--card path silently (worker thread
         died after the wait, outcome never printed)."""
-        import threading
         import time as _time
         import watch_relay
         queue = watch_relay.CardQueue()
@@ -1835,7 +1847,8 @@ class TestSessionReplies:
         import watch_relay
         self._session(tmp_path)
         seen = {}
-        class FakeProc: pass
+        class FakeProc:
+            pass
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _: "/usr/bin/claude")
         monkeypatch.setattr(watch_relay.subprocess, "Popen",
                             lambda cmd, **kw: seen.update(cmd=cmd, cwd=kw.get("cwd")) or FakeProc())
@@ -1967,7 +1980,8 @@ class TestLabellerByDefault:
     def test_quiet_writes_the_opt_in_for_every_session(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "s.json"))
         monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "a.jsonl"))
-        crc.run_install(); capsys.readouterr()
+        crc.run_install()
+        capsys.readouterr()
         crc.run_quiet(True)
         data = json.loads((tmp_path / "s.json").read_text())
         assert data["env"]["CLAUDE_RISK_AUTO_ALLOW"] == "LOW"
@@ -2751,7 +2765,9 @@ class TestQuestionCards:
 
     def test_answer_travels_back_as_the_deny_reason(self, live_relay,
                                                     tmp_path, monkeypatch):
-        import io, threading, time as _time
+        import io
+        import threading
+        import time as _time
         port, queue = live_relay
 
         def answer_first_card():
@@ -2992,7 +3008,8 @@ class TestPromptParity:
     prompts on — never the classes Claude Code answers silently."""
 
     def _hook(self, port, tmp_path, command, cwd=None):
-        import io, os as _os
+        import io
+        import os as _os
         backup = dict(_os.environ)
         _os.environ.update({
             "CLAUDE_RISK_MODE": "enforce",
@@ -3039,7 +3056,8 @@ class TestPromptParity:
         assert queue.pending() == []
 
     def test_a_real_prompt_still_cards(self, live_relay, tmp_path):
-        import threading, time as _time
+        import threading
+        import time as _time
         port, queue = live_relay
         seen = {}
 
@@ -3233,7 +3251,9 @@ class TestPhoneSilenceMirror:
                                                   tmp_path, monkeypatch):
         """pytest is SAFE in our tables but prompts on the phone — the
         wrist must card it, not skip it as parity."""
-        import io, threading, time as _time
+        import io
+        import threading
+        import time as _time
         port, queue = live_relay
 
         def press():
@@ -3286,7 +3306,8 @@ class TestFingerprintPerTool:
 
 class TestEmptyAnswerRefused:
     def test_answer_with_no_words_is_refused(self):
-        import threading, time as _time
+        import threading
+        import time as _time
         import watch_relay
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
@@ -3344,7 +3365,8 @@ class TestResolvedElsewhere:
         return card, path
 
     def test_a_phone_answer_retracts_the_card(self, tmp_path):
-        import threading, time as _time
+        import threading
+        import time as _time
         import watch_relay
         card, path = self._card_and_transcript(tmp_path)
         queue = watch_relay.CardQueue()
@@ -3374,7 +3396,7 @@ class TestResolvedElsewhere:
         assert queue.pending() == []
 
     def test_unrelated_results_do_not_retract(self, tmp_path):
-        import threading, time as _time
+        import time as _time
         import watch_relay
         card, path = self._card_and_transcript(tmp_path)
         with open(path, "a", encoding="utf-8") as handle:
@@ -3444,7 +3466,6 @@ class TestTaskVerdictsCanRecover:
         # Patch the glob pattern root by calling through a wrapper that
         # rewrites the pattern? Simpler: exercise the tail logic directly.
         import glob as _glob
-        real_glob = _glob.glob
         monkeypatch.setattr(_glob, "glob",
                             lambda pattern: [str(out)])
         assert watch_relay._task_state("sess", "tid1") == "done"
@@ -3482,7 +3503,8 @@ class TestAlwaysMirrorsThePhone:
         assert card["can_always"] is False
 
     def test_relay_never_records_a_grant_the_phone_would_not_offer(self):
-        import threading, time as _time
+        import threading
+        import time as _time
         import watch_relay
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
@@ -3528,7 +3550,8 @@ class TestHostRebindingDefense:
             assert not watch_relay.host_allowed(host), host
 
     def test_main_listener_refuses_a_foreign_host_end_to_end(self):
-        import threading, http.client
+        import threading
+        import http.client
         import watch_relay
         queue = watch_relay.CardQueue()
         server, _ = watch_relay.serve("127.0.0.1", 0, queue=queue)
@@ -3661,26 +3684,13 @@ class TestSessionListCarriesTheRing:
 # The plugin path
 #
 # `/plugin install` registers the hooks from the plugin's own manifest and
-# writes nothing to settings.json. Nothing here had ever opened the shipped
-# manifests, which is how one once carried a 3600-second wait while the
+# writes nothing to settings.json. Nothing here had ever opened a file under
+# helper/, which is how the manifest once shipped a 3600-second wait while the
 # installer wrote 86400 — the card really did expire after an hour, and the
 # tests stayed green.
-#
-# The manifests live wherever the plugin root is: hooks.json runs
-# `${CLAUDE_PLUGIN_ROOT}/ClaudeRiskClassifier.py`, so that is the module's own
-# directory. In this repo that is the checkout root; the product repo keeps
-# the same files one level down in helper/, so fall back to that layout.
 
-
-def _find_helper_dir():
-    here = os.path.dirname(os.path.abspath(crc.__file__))
-    for candidate in (here, os.path.join(here, "helper")):
-        if os.path.isfile(os.path.join(candidate, ".claude-plugin", "plugin.json")):
-            return candidate
-    return here
-
-
-HELPER_DIR = _find_helper_dir()
+HELPER_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(crc.__file__)), "helper")
 
 
 def _helper_manifest(*parts):
@@ -4125,11 +4135,11 @@ class TestNewSessionFromTheWatch:
 
     def _projects(self, tmp_path):
         """A fake ~/.claude/projects with two sessions in two directories."""
-        import watch_relay
         root = tmp_path / "projects"
         for slug, cwd, age in (("-Users-x-Developer-acme", tmp_path / "acme", 60),
                                ("-Users-x-Developer-pantri", tmp_path / "pantri", 3600)):
-            (root / slug).mkdir(parents=True); cwd.mkdir()
+            (root / slug).mkdir(parents=True)
+            cwd.mkdir()
             f = root / slug / ("s-%s.jsonl" % slug[-5:])
             f.write_text(json.dumps({"type": "user", "cwd": str(cwd),
                                      "message": {"role": "user", "content": "hi"}}) + "\n",
@@ -4145,7 +4155,8 @@ class TestNewSessionFromTheWatch:
         assert all(os.path.isdir(r["path"]) for r in rows)
 
     def test_known_projects_drop_directories_that_no_longer_exist(self, tmp_path, monkeypatch):
-        import watch_relay, shutil
+        import watch_relay
+        import shutil
         monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
         root = self._projects(tmp_path)
         shutil.rmtree(tmp_path / "pantri")
@@ -4179,7 +4190,8 @@ class TestNewSessionFromTheWatch:
     def test_a_terminal_that_will_not_open_is_reported_in_words(self, tmp_path, monkeypatch):
         """No one logged in at the screen is the usual reason; the watch
         must be able to say so rather than spin."""
-        import watch_relay, subprocess as sp
+        import watch_relay
+        import subprocess as sp
         monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
         monkeypatch.setattr(watch_relay.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
@@ -4191,12 +4203,14 @@ class TestNewSessionFromTheWatch:
         assert "Not authorized" in status
 
     def test_success_opens_terminal_in_that_directory_with_that_message(self, tmp_path, monkeypatch):
-        import watch_relay, subprocess as sp
+        import watch_relay
+        import subprocess as sp
         monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
         seen = {}
         def fake_run(cmd, **kw):
-            seen["cmd"] = cmd; return sp.CompletedProcess(cmd, 0, "", "")
+            seen["cmd"] = cmd
+            return sp.CompletedProcess(cmd, 0, "", "")
         monkeypatch.setattr(watch_relay.subprocess, "run", fake_run)
         root = self._projects(tmp_path)
         status = watch_relay.start_session(str(tmp_path / "acme"), "Fix CI; it's red",
@@ -4216,7 +4230,10 @@ class TestNewSessionFromTheWatch:
     def test_projects_and_new_are_ordinary_data_routes(self, tmp_path, monkeypatch):
         """/projects needs the same key as every other data route, and /new
         answers a refusal as JSON the watch can show — never a 500."""
-        import threading, urllib.request, urllib.error, watch_relay
+        import threading
+        import urllib.request
+        import urllib.error
+        import watch_relay
         monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
         watch_relay.LIMITS.reset()
         server, _ = watch_relay.serve(port=0)
@@ -4232,4 +4249,5 @@ class TestNewSessionFromTheWatch:
                 body = json.loads(r.read())
             assert body["ok"] is False and body["status"] in ("unknown project", "new sessions need a Mac")
         finally:
-            server.shutdown(); server.server_close()
+            server.shutdown()
+            server.server_close()

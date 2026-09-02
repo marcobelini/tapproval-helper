@@ -3,6 +3,8 @@
 **The computer half of Tapproval — answer Claude Code from your Apple
 Watch.**
 
+Website: https://tapproval.thoughtfulsteward.org · Privacy policy: https://tapproval.thoughtfulsteward.org/privacy.html · Support: tapproval@thoughtfulsteward.org
+
 When Claude Code works on your computer, it stops and asks before doing
 anything that needs permission. The Tapproval watch app puts those
 questions on your wrist; **Base** is the small bridge on the computer

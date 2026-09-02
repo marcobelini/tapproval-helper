@@ -351,7 +351,6 @@ def ensure_running():
     lifecycle is automatic: it exists whenever Claude Code does. Prints a
     line to stderr and exits immediately either way. Never raises.
     """
-    import urllib.request
     updated = _self_update()
     running = _probe_relay()
     if running is not None:
@@ -561,7 +560,8 @@ class CardQueue:
 # is the relay, and the relay's job is small and dangerous, while reading
 # transcripts is large and harmless. Re-exported here so `watch_relay.X`
 # keeps working for everything that already calls it.
-from watch_dashboard import (CLAUDE_PROJECTS, CLAUDE_SESSIONS, ENTRYPOINTS,
+from watch_dashboard import (  # noqa: E402,F401  (re-exports, see above)
+    CLAUDE_PROJECTS, CLAUDE_SESSIONS, ENTRYPOINTS,
     PREWARM_SESSIONS, THREAD_TURN_LIMIT, USAGE_WINDOW_HOURS,
     _ACTIVITY_LOCK, _ACTIVITY_STATE, _GH_FACT, _GH_VERB, _MD_BULLET,
     _MD_CODE, _MD_EM, _MD_ESCAPE, _MD_FENCE, _MD_HEADING, _MD_HR, _MD_HTML,
@@ -1726,7 +1726,6 @@ def start_tunnel(port, token):
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
 
     def announce():
-        import re
         global TUNNEL_URL
         for line in proc.stderr:
             match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
