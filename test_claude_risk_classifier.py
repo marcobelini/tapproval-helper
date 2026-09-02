@@ -1843,8 +1843,37 @@ class TestSessionReplies:
             "abc123", "run the tests", projects_dir=str(tmp_path)) == "sent"
         assert seen["cmd"][:2] == ["claude", "--resume"]
         assert seen["cmd"][2] == "abc12345"
-        assert seen["cmd"][-1] == "run the tests"
+        assert seen["cmd"][-2:] == ["-p", "run the tests"]
         assert seen["cwd"] == "/x/proj"
+
+    def _spawned(self, tmp_path, monkeypatch, **kwargs):
+        import watch_relay
+        self._session(tmp_path)
+        seen = {}
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _: "/usr/bin/claude")
+        monkeypatch.setattr(watch_relay.subprocess, "Popen",
+                            lambda cmd, **kw: seen.update(cmd=cmd) or object())
+        assert watch_relay.say_to_session(
+            "abc123", "run the tests", projects_dir=str(tmp_path),
+            **kwargs) == "sent"
+        return seen["cmd"]
+
+    def test_a_wrist_reply_is_asked_for_briefly_by_default(self, tmp_path, monkeypatch):
+        """Each message is its own `claude` process, so the Concise style
+        rides along for that one reply and never touches the desktop
+        session it lands in."""
+        import json
+        cmd = self._spawned(tmp_path, monkeypatch)
+        assert "--settings" in cmd
+        settings = json.loads(cmd[cmd.index("--settings") + 1])
+        assert settings == {"outputStyle": "Concise"}
+        # The message itself is still the last thing on the line.
+        assert cmd[-2:] == ["-p", "run the tests"]
+
+    def test_the_watch_can_ask_for_full_replies(self, tmp_path, monkeypatch):
+        cmd = self._spawned(tmp_path, monkeypatch, brief=False)
+        assert "--settings" not in cmd
+        assert cmd == ["claude", "--resume", "abc12345", "-p", "run the tests"]
 
 
 class TestRecognisedTooling:

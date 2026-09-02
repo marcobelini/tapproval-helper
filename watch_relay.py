@@ -580,13 +580,24 @@ from watch_dashboard import (CLAUDE_PROJECTS, CLAUDE_SESSIONS, ENTRYPOINTS,
     session_meta, session_thread, usage_summary)
 
 
-def say_to_session(prefix, text, projects_dir=None):
+# What a wrist-sent message asks Claude to sound like. Each message spawns
+# a fresh `claude` process, and a process reads its settings once, at
+# start — so this flag shapes exactly one reply and nothing else. The
+# desktop session it lands in never restarts, so its own style is
+# untouched. Trying to change the user's settings file instead would
+# quietly follow them back to the keyboard.
+BRIEF_REPLY_SETTINGS = json.dumps({"outputStyle": "Concise"})
+
+
+def say_to_session(prefix, text, projects_dir=None, brief=True):
     """Send an instruction to a session, the way the terminal would.
 
     Runs ``claude --resume <id> -p <text>`` in that session's directory so
     the reply lands in the same transcript the watch is reading — which is
-    why the answer simply appears in the thread view. Returns a short
-    status string; never raises and never blocks the caller.
+    why the answer simply appears in the thread view. With ``brief`` (the
+    default) the reply is asked for in Claude Code's Concise style, which
+    is what a 14 pt thread on a wrist wants. Returns a short status
+    string; never raises and never blocks the caller.
     """
     text = " ".join(str(text or "").split())[:500]
     if not text:
@@ -596,8 +607,12 @@ def say_to_session(prefix, text, projects_dir=None):
         return "unknown session"
     if not shutil.which("claude"):
         return "claude not on PATH"
+    command = ["claude", "--resume", session_id]
+    if brief:
+        command += ["--settings", BRIEF_REPLY_SETTINGS]
+    command += ["-p", text]
     error = _spawn_detached(
-        ["claude", "--resume", session_id, "-p", text],
+        command,
         os.path.expanduser("~/.tapproval-say.log"),
         cwd=cwd or os.path.expanduser("~"))
     return "could not start: %s" % error if error else "sent"
@@ -1281,8 +1296,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                 return
             try:
                 body = self._read_json() or {}
+                # Only an explicit false turns brevity off: a watch that
+                # predates the switch, or a missing key, still gets the
+                # short reply the screen was built for.
                 status = say_to_session(str(body.get("session_id", ""))[:64],
-                                        body.get("text", ""))
+                                        body.get("text", ""),
+                                        brief=body.get("brief") is not False)
             finally:
                 gate.release()
             self._send_json({"ok": status == "sent", "status": status})
