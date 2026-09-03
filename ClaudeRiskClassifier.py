@@ -1333,6 +1333,29 @@ def run_explain(target, tool):
     return 0
 
 
+def report_facts(entries):
+    """What the audit log says, as numbers: the totals, the tier split,
+    how many prompts the policy would have raised, the per-project and
+    per-tool splits, the latest escalations. Pure, so a test can hold it."""
+    total = len(entries)
+    tiers = Counter(e.get("tier", "?") for e in entries)
+    decisions = Counter(e.get("decision", "?") for e in entries)
+    escalated = decisions.get("escalate", 0) + decisions.get("deny", 0)
+    projects = sorted({e.get("project") for e in entries if e.get("project")})
+    by_project = []
+    for name in projects:
+        rows = [e for e in entries if e.get("project") == name]
+        asked = len([e for e in rows if e.get("decision") in ("escalate", "deny")])
+        share = 100.0 * (len(rows) - asked) / len(rows) if rows else 0.0
+        by_project.append((name, len(rows), asked, share))
+    by_tool = Counter(e.get("tool", "?") for e in entries
+                      if e.get("decision") == "allow")
+    escalations = [e for e in entries if e.get("decision") in ("escalate", "deny")]
+    return {"total": total, "tiers": tiers, "escalated": escalated,
+            "saved": total - escalated, "by_project": by_project,
+            "by_tool": by_tool.most_common(5), "escalations": escalations[-5:]}
+
+
 def run_report():
     """Summarise the audit log: how many prompts would the watch have raised?"""
     policy = load_policy()
@@ -1341,19 +1364,15 @@ def run_report():
         print("No audit entries at %s" % _audit_path(policy))
         print("Run some Claude Code sessions with the hook installed first.")
         return 0
-
-    total = len(entries)
-    tiers = Counter(e.get("tier", "?") for e in entries)
-    decisions = Counter(e.get("decision", "?") for e in entries)
-    escalated = decisions.get("escalate", 0) + decisions.get("deny", 0)
-    saved = total - escalated
+    f = report_facts(entries)
+    total, escalated, saved = f["total"], f["escalated"], f["saved"]
 
     print("Audit log : %s" % _audit_path(policy))
     print("Events    : %d" % total)
     print("")
     print("Risk tiers")
     for tier in ("SAFE", "LOW", "MEDIUM", "HIGH", "CRITICAL"):
-        count = tiers.get(tier, 0)
+        count = f["tiers"].get(tier, 0)
         if not count:
             continue
         bar = "#" * int(round(30.0 * count / total))
@@ -1367,29 +1386,22 @@ def run_report():
               % (100.0 * saved / total, saved))
     print("")
 
-    projects = sorted({e.get("project") for e in entries if e.get("project")})
-    if len(projects) > 1:
+    if len(f["by_project"]) > 1:
         print("By project")
-        for name in projects:
-            rows = [e for e in entries if e.get("project") == name]
-            asked = len([e for e in rows
-                         if e.get("decision") in ("escalate", "deny")])
-            share = 100.0 * (len(rows) - asked) / len(rows) if rows else 0.0
+        for name, count, asked, share in f["by_project"]:
             print("  %-24s %5d asked %4d  (%.0f%% silenced)"
-                  % (name[:24], len(rows), asked, share))
+                  % (name[:24], count, asked, share))
         print("")
 
-    by_tool = Counter(e.get("tool", "?") for e in entries if e.get("decision") == "allow")
-    if by_tool:
+    if f["by_tool"]:
         print("Top auto-allowed tools")
-        for tool, count in by_tool.most_common(5):
+        for tool, count in f["by_tool"]:
             print("  %-24s %d" % (tool, count))
         print("")
 
-    escalations = [e for e in entries if e.get("decision") in ("escalate", "deny")]
-    if escalations:
+    if f["escalations"]:
         print("Most recent escalations")
-        for entry in escalations[-5:]:
+        for entry in f["escalations"]:
             print("  [%-8s] %s" % (entry.get("tier", "?"), entry.get("headline", "")))
         print("")
 
@@ -1722,6 +1734,63 @@ def _write_settings(path, data):
         raise
 
 
+def _sync_hook(entry_list, wanted, matcher, marker):
+    """Idempotently point our hook entry in ``entry_list`` at ``wanted``.
+
+    Ours is any handler whose command mentions ``marker`` (the script's
+    file name): repointed in place when it differs, added — with the
+    matcher — when absent, left alone when already right. True if the
+    list changed, which is what decides whether settings are rewritten.
+    """
+    ours = [h for entry in entry_list for h in entry.get("hooks", [])
+            if marker in str(h.get("command", ""))]
+    if ours:
+        if all(h.get("command") == wanted for h in ours):
+            return False
+        for handler in ours:
+            handler["command"] = wanted
+            handler.setdefault("timeout", 10)
+        return True
+    entry = {"hooks": [{"type": "command", "command": wanted,
+                        "timeout": 10}]}
+    if matcher:
+        entry["matcher"] = matcher
+    entry_list.append(entry)
+    return True
+
+
+def _remove_our_hooks(hooks):
+    """Drop our handlers from both events, keeping everyone else's. Empty
+    events disappear. Returns how many handlers went."""
+    removed = 0
+    for event in ("PermissionRequest", "SessionStart"):
+        kept = []
+        for entry in hooks.get(event, []):
+            handlers = [h for h in entry.get("hooks", [])
+                        if not _is_our_hook(h)]
+            removed += len(entry.get("hooks", [])) - len(handlers)
+            if handlers:
+                entry["hooks"] = handlers
+                kept.append(entry)
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event, None)
+    return removed
+
+
+def _strip_our_env(data):
+    """The env block we injected goes too — leaving CLAUDE_RISK_* behind
+    is harmless but untidy, and an uninstall should be a clean exit."""
+    env = data.get("env")
+    if isinstance(env, dict):
+        for key in list(env):
+            if key.startswith("CLAUDE_RISK_"):
+                env.pop(key)
+        if not env:
+            data.pop("env", None)
+
+
 def run_install(then_watch=False):
     """Register this script as a PermissionRequest hook. Safe to re-run.
 
@@ -1745,28 +1814,10 @@ def run_install(then_watch=False):
     entries = hooks.setdefault("PermissionRequest", [])
     starters = hooks.setdefault("SessionStart", [])
 
-    def _sync(entry_list, wanted, matcher, marker):
-        """Idempotently point our hook entry at ``wanted``. True if changed."""
-        ours = [h for entry in entry_list for h in entry.get("hooks", [])
-                if marker in str(h.get("command", ""))]
-        if ours:
-            if all(h.get("command") == wanted for h in ours):
-                return False
-            for handler in ours:
-                handler["command"] = wanted
-                handler.setdefault("timeout", 10)
-            return True
-        entry = {"hooks": [{"type": "command", "command": wanted,
-                            "timeout": 10}]}
-        if matcher:
-            entry["matcher"] = matcher
-        entry_list.append(entry)
-        return True
-
-    changed = _sync(entries, command, "*", os.path.basename(__file__))
+    changed = _sync_hook(entries, command, "*", os.path.basename(__file__))
     if relay_command:
-        changed = _sync(starters, relay_command, None,
-                        "watch_relay.py") or changed
+        changed = _sync_hook(starters, relay_command, None,
+                             "watch_relay.py") or changed
     if not starters:
         hooks.pop("SessionStart", None)
 
@@ -1832,36 +1883,14 @@ def run_uninstall():
         return 0
 
     backup = _backup(path)
-    removed = 0
-    for event in ("PermissionRequest", "SessionStart"):
-        kept = []
-        for entry in hooks.get(event, []):
-            handlers = [h for h in entry.get("hooks", [])
-                        if not _is_our_hook(h)]
-            removed += len(entry.get("hooks", [])) - len(handlers)
-            if handlers:
-                entry["hooks"] = handlers
-                kept.append(entry)
-        if kept:
-            hooks[event] = kept
-        else:
-            hooks.pop(event, None)
-
+    removed = _remove_our_hooks(hooks)
     if not removed:
         print("Not installed — nothing to remove.")
         return 0
 
     if not hooks:
         data.pop("hooks", None)
-    # The env block we injected goes too — leaving CLAUDE_RISK_* behind
-    # is harmless but untidy, and an uninstall should be a clean exit.
-    env = data.get("env")
-    if isinstance(env, dict):
-        for key in list(env):
-            if key.startswith("CLAUDE_RISK_"):
-                env.pop(key)
-        if not env:
-            data.pop("env", None)
+    _strip_our_env(data)
     _write_settings(path, data)
     remove_launch_agent()
 
@@ -2054,15 +2083,15 @@ def check_command(command):
     return problems
 
 
-def run_status():
-    """Plain-English answer to 'is this thing on?'"""
+def status_facts():
+    """Everything --status reports, as facts rather than lines, so a test
+    can hold one of them without parsing a printout."""
     path = _settings_path()
     try:
         data = _read_settings(path)
         readable = True
     except ValueError:
         data, readable = {}, False
-
     handlers = _settings_handlers(data)
     plugin = _plugin_install()
     plugin_only = bool(plugin) and not handlers
@@ -2073,11 +2102,38 @@ def run_status():
         # The hook's own command line is the truth for a plugin install;
         # this shell's environment says nothing about it.
         mode = str(plugin["env"].get("CLAUDE_RISK_MODE", mode)).lower()
+    relay_wired = any(
+        "watch_relay.py" in str(h.get("command", ""))
+        for entry in data.get("hooks", {}).get("SessionStart", [])
+        for h in entry.get("hooks", [])) or bool(plugin and plugin["relay"])
+    return {
+        "settings_path": path, "readable": readable, "handlers": handlers,
+        "plugin": plugin, "plugin_only": plugin_only, "mode": mode,
+        "relay_wired": relay_wired, "login_item": os.path.exists(_launch_agent_path()),
+        "relay_health": _relay_health(), "audit_path": _audit_path(policy),
+        "entries": entries,
+    }
 
-    print("Settings file : %s" % path)
-    if not readable:
+
+def _relay_health():
+    """The running relay's /health, or None when nothing answers."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:8977/health",
+                                    timeout=1) as reply:
+            return json.loads(reply.read())
+    except Exception:
+        return None
+
+
+def run_status():
+    """Plain-English answer to 'is this thing on?'"""
+    f = status_facts()
+    plugin, handlers = f["plugin"], f["handlers"]
+    print("Settings file : %s" % f["settings_path"])
+    if not f["readable"]:
         print("Installed     : unknown \u2014 that file is not valid JSON")
-    elif plugin_only:
+    elif f["plugin_only"]:
         print("Installed     : yes \u2014 as a Claude Code plugin")
         print("Plugin        : %s" % plugin["root"])
     elif not handlers:
@@ -2095,43 +2151,37 @@ def run_status():
                 print("                Nothing is being recorded. Re-run --install")
                 print("                from the folder you want to use.")
 
-    if mode == "enforce":
+    if f["mode"] == "enforce":
         print("Mode          : enforce \u2014 decisions are being acted on")
     else:
         print("Mode          : shadow \u2014 watching only, nothing is being")
         print("                blocked or auto-approved")
 
-    relay_wired = any(
-        "watch_relay.py" in str(h.get("command", ""))
-        for entry in data.get("hooks", {}).get("SessionStart", [])
-        for h in entry.get("hooks", [])) or bool(plugin and plugin["relay"])
-    if relay_wired:
+    if f["relay_wired"]:
         print("Relay hook    : starts itself with every Claude Code session")
     else:
         print("Relay hook    : not wired \u2014 re-run --install to add it")
     print("Version       : %s" % __version__)
-    if os.path.exists(_launch_agent_path()):
+    if f["login_item"]:
         print("Reboot        : the relay wakes again at login")
-    elif plugin_only:
+    elif f["plugin_only"]:
         print("Reboot        : the first Claude Code session brings the relay")
         print("                back \u2014 the plugin adds no login item")
     else:
         print("Reboot        : no login wake-up \u2014 the relay waits for"
               " the first session; re-run --install to add it")
-    try:
-        import urllib.request
-        with urllib.request.urlopen("http://127.0.0.1:8977/health",
-                                    timeout=1) as reply:
-            health = json.loads(reply.read())
+    health = f["relay_health"]
+    if health is not None:
         seen = health.get("watch_seen_seconds_ago")
         watch = ("watch seen %ds ago" % seen) if seen is not None \
             else "no watch yet"
         print("Relay         : running (%s)" % watch)
-    except Exception:
+    else:
         print("Relay         : not running right now (starts with the next")
         print("                Claude Code session)")
 
-    print("Audit log     : %s" % _audit_path(policy))
+    entries = f["entries"]
+    print("Audit log     : %s" % f["audit_path"])
     if entries:
         print("Decisions     : %d recorded" % len(entries))
         first = str(entries[0].get("ts", ""))[:10]

@@ -4251,3 +4251,290 @@ class TestNewSessionFromTheWatch:
         finally:
             server.shutdown()
             server.server_close()
+
+
+class TestRelayRoutes:
+    """Every route through the dispatcher, from loopback — which the relay
+    trusts, so these hold what each route DOES rather than who may call it
+    (TestLanSourceIsNotTrusted holds that). The rules that used to sit inline in
+    two long handlers now live in one table; a route added without a rule
+    is the failure this class is here to catch."""
+
+    @pytest.fixture
+    def relay(self):
+        import threading
+        import watch_relay
+        watch_relay.LIMITS.reset()
+        auth = watch_relay.Auth.__new__(watch_relay.Auth)
+        auth.path = "/dev/null"
+        auth._lock = threading.RLock()
+        auth.tunnel_secret = "tunnelsecret"
+        auth.bootstrap = "bootstraptoken"
+        auth.devices = []
+        auth.paired_ever = True
+        auth._window_until = 0.0
+        auth._window_claims = 0
+        auth._window_ips = set()
+        auth._slammed = False
+        auth.save = lambda: None
+        server, queue = watch_relay.serve(port=0, auth=auth)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        yield "http://127.0.0.1:%d" % server.server_address[1], queue, auth
+        server.shutdown()
+        server.server_close()
+
+    _call = TestLanSourceIsNotTrusted._call
+
+    def test_every_route_in_the_table_has_a_handler(self):
+        import watch_relay
+        handler = watch_relay.RelayHandler
+        for method, routes in handler.ROUTES.items():
+            for path, (name, rules) in routes.items():
+                assert callable(getattr(handler, name)), (method, path)
+                assert set(rules) <= {"auth", "lan_only", "local", "admin"}, path
+
+    def test_the_two_pairing_routes_are_the_only_ones_without_auth(self):
+        import watch_relay
+        open_routes = {(m, p) for m, routes in watch_relay.RelayHandler.ROUTES.items()
+                       for p, (_, rules) in routes.items() if not rules.get("auth", True)}
+        assert open_routes == {("GET", "/pair"), ("POST", "/enroll")}
+
+    def test_what_reaches_the_machine_is_local_only(self):
+        import watch_relay
+        post = watch_relay.RelayHandler.ROUTES["POST"]
+        for path in ("/card", "/heartbeat", "/admin/pair-open", "/admin/rotate", "/admin/pair-reset"):
+            assert post[path][1].get("local"), path
+
+    @pytest.mark.parametrize("method,path", [("GET", "/nope"), ("POST", "/nope"),
+                                             ("GET", "/say"), ("POST", "/pending")])
+    def test_an_unknown_route_or_the_wrong_method_is_not_found(self, relay, method, path):
+        base, _, _ = relay
+        assert self._call(base + path, method=method)[0] == 404
+
+    def test_health_says_more_to_a_credentialed_caller(self, relay):
+        base, _, _ = relay
+        status, body = self._call(base + "/health")
+        assert status == 200 and body["ok"] is True
+        # loopback is credentialed: the details come with it
+        assert "version" in body and "pending" in body
+
+    def test_the_read_routes_answer_with_their_shapes(self, relay, monkeypatch):
+        import watch_relay
+        monkeypatch.setattr(watch_relay, "known_projects", lambda: [{"name": "x"}])
+        monkeypatch.setattr(watch_relay, "recent_sessions", lambda: [])
+        monkeypatch.setattr(watch_relay, "activity_summary", lambda: {"total": 0})
+        monkeypatch.setattr(watch_relay, "usage_summary", lambda: {"input": 0})
+        base, _, _ = relay
+        assert self._call(base + "/projects")[1] == {"projects": [{"name": "x"}]}
+        assert self._call(base + "/sessions")[1] == {"sessions": []}
+        assert self._call(base + "/activity")[1] == {"total": 0}
+        assert self._call(base + "/usage")[1] == {"input": 0}
+
+    def test_an_unknown_thread_is_empty_not_an_error(self, relay):
+        base, _, _ = relay
+        status, body = self._call(base + "/thread?id=nope")
+        assert status == 200
+        assert body == {"turns": [], "running_tasks": 0, "running_tool": None,
+                        "modified_seconds_ago": None}
+
+    def test_the_tunnel_route_hands_over_the_away_addresses(self, relay, monkeypatch):
+        import watch_relay
+        monkeypatch.setattr(watch_relay, "TUNNEL_URL", "https://t.example")
+        base, _, _ = relay
+        status, body = self._call(base + "/tunnel")
+        assert status == 200 and body["url"] == "https://t.example"
+
+    def test_a_malformed_card_is_refused_before_anything_waits(self, relay):
+        base, _, _ = relay
+        status, body = self._call(base + "/card", method="POST", body={"nope": 1})
+        assert status == 400 and "card" in body["error"]
+
+    def test_a_malformed_decision_is_refused(self, relay):
+        base, _, _ = relay
+        assert self._call(base + "/decision", method="POST", body={"id": 5})[0] == 400
+        assert self._call(base + "/decision", method="POST",
+                          body={"id": "x", "decision": "maybe"})[0] == 400
+
+    def test_a_decision_for_a_card_nobody_asked_is_not_accepted(self, relay):
+        base, _, _ = relay
+        status, body = self._call(base + "/decision", method="POST",
+                                  body={"id": "ghost", "decision": "allow"})
+        assert status == 200 and body == {"ok": False}
+
+    def test_the_heartbeat_records_the_watchs_presence(self, relay):
+        base, queue, _ = relay
+        status, body = self._call(base + "/heartbeat", method="POST",
+                                  body={"watch_seen_seconds_ago": 3})
+        assert status == 200 and body == {"ok": True}
+        assert queue.watch_seen_seconds_ago() is not None
+
+    def test_a_new_session_with_no_words_is_refused_in_words(self, relay):
+        base, _, _ = relay
+        status, body = self._call(base + "/new", method="POST", body={"path": "/x", "text": " "})
+        assert status == 200 and body == {"ok": False, "status": "empty"}
+
+    def test_the_second_send_in_the_same_moment_waits_its_turn(self, relay):
+        import watch_relay
+        base, _, _ = relay
+        gate = watch_relay.LIMITS.gate("say", 1)
+        assert gate.acquire(blocking=False)
+        try:
+            status, body = self._call(base + "/say", method="POST",
+                                      body={"session_id": "x", "text": "hi"})
+        finally:
+            gate.release()
+        assert status == 429 and "already" in body["error"]
+
+    def test_administration_from_this_machine_opens_the_pairing_window(self, relay):
+        base, _, auth = relay
+        status, body = self._call(base + "/admin/pair-open", method="POST")
+        assert status == 200 and body["ok"] is True and body["seconds"] > 0
+        assert auth._window_until > 0
+
+    def test_a_rotation_answers_in_one_word(self, relay, monkeypatch):
+        import watch_relay
+        monkeypatch.setattr(watch_relay, "_rotate_tunnel_prefix", lambda secret: None)
+        base, _, _ = relay
+        status, body = self._call(base + "/admin/rotate", method="POST")
+        assert status == 200 and body == {"ok": True, "rotated": True}
+
+
+class TestStatusFacts:
+    """--status as facts, not lines: the same truths the printout tells,
+    reachable without parsing it."""
+
+    def test_a_fresh_machine_reports_nothing_installed(self, tmp_path, monkeypatch):
+        import ClaudeRiskClassifier as crc
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+        monkeypatch.setattr(crc, "_plugin_install", lambda: None)
+        monkeypatch.setattr(crc, "_relay_health", lambda: None)
+        monkeypatch.setattr(crc, "read_audit", lambda policy: [])
+        facts = crc.status_facts()
+        assert facts["handlers"] == [] and facts["plugin_only"] is False
+        assert facts["relay_wired"] is False and facts["relay_health"] is None
+        assert facts["entries"] == []
+
+    def test_a_plugin_install_reports_its_own_mode(self, tmp_path, monkeypatch):
+        import ClaudeRiskClassifier as crc
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+        monkeypatch.setattr(crc, "_plugin_install", lambda: {
+            "root": "/plugins/tapproval", "env": {"CLAUDE_RISK_MODE": "enforce"}, "relay": True})
+        monkeypatch.setattr(crc, "_relay_health", lambda: {"watch_seen_seconds_ago": 4})
+        monkeypatch.setattr(crc, "read_audit", lambda policy: [])
+        facts = crc.status_facts()
+        assert facts["plugin_only"] is True
+        assert facts["mode"] == "enforce"
+        assert facts["relay_wired"] is True
+        assert facts["relay_health"]["watch_seen_seconds_ago"] == 4
+
+
+class TestInstallerHelpers:
+    """The installer's three moves, each on its own: point our hook at a
+    command (idempotently), take our hooks out and nobody else's, and
+    strip the env we injected."""
+
+    def test_sync_adds_our_hook_with_the_matcher_when_absent(self):
+        import ClaudeRiskClassifier as crc
+        entries = []
+        assert crc._sync_hook(entries, "/x/ClaudeRiskClassifier.py", "*", "ClaudeRiskClassifier.py")
+        assert entries == [{"matcher": "*", "hooks": [
+            {"type": "command", "command": "/x/ClaudeRiskClassifier.py", "timeout": 10}]}]
+
+    def test_sync_is_a_no_op_when_already_right(self):
+        import ClaudeRiskClassifier as crc
+        entries = [{"hooks": [{"type": "command", "command": "/x/ClaudeRiskClassifier.py"}]}]
+        assert not crc._sync_hook(entries, "/x/ClaudeRiskClassifier.py", "*", "ClaudeRiskClassifier.py")
+        assert len(entries) == 1
+
+    def test_sync_repoints_a_stale_copy_in_place(self):
+        import ClaudeRiskClassifier as crc
+        entries = [{"hooks": [{"type": "command", "command": "/old/ClaudeRiskClassifier.py"},
+                              {"type": "command", "command": "/theirs/other.py"}]}]
+        assert crc._sync_hook(entries, "/new/ClaudeRiskClassifier.py", "*", "ClaudeRiskClassifier.py")
+        assert entries[0]["hooks"][0]["command"] == "/new/ClaudeRiskClassifier.py"
+        assert entries[0]["hooks"][1]["command"] == "/theirs/other.py"
+        assert len(entries) == 1
+
+    def test_removal_keeps_everyone_elses_hooks_and_counts_ours(self):
+        import ClaudeRiskClassifier as crc
+        hooks = {"PermissionRequest": [{"matcher": "*", "hooks": [
+                     {"type": "command", "command": "python3 /x/ClaudeRiskClassifier.py"},
+                     {"type": "command", "command": "/theirs/lint.sh"}]}],
+                 "SessionStart": [{"hooks": [
+                     {"type": "command", "command": "python3 /x/watch_relay.py --ensure"}]}]}
+        removed = crc._remove_our_hooks(hooks)
+        assert removed == 2
+        assert hooks == {"PermissionRequest": [{"matcher": "*", "hooks": [
+            {"type": "command", "command": "/theirs/lint.sh"}]}]}
+
+    def test_only_our_env_keys_are_stripped(self):
+        import ClaudeRiskClassifier as crc
+        data = {"env": {"CLAUDE_RISK_MODE": "enforce", "CLAUDE_RISK_RELAY": "x", "EDITOR": "vim"}}
+        crc._strip_our_env(data)
+        assert data == {"env": {"EDITOR": "vim"}}
+        data = {"env": {"CLAUDE_RISK_MODE": "enforce"}}
+        crc._strip_our_env(data)
+        assert data == {}
+
+
+class TestReportFacts:
+    """The report's numbers without the report's prose."""
+
+    def _entries(self):
+        return [
+            {"tier": "SAFE", "decision": "allow", "tool": "Bash", "project": "a"},
+            {"tier": "SAFE", "decision": "allow", "tool": "Bash", "project": "a"},
+            {"tier": "HIGH", "decision": "escalate", "tool": "Bash", "project": "b", "headline": "rm -rf build"},
+            {"tier": "CRITICAL", "decision": "deny", "tool": "Bash", "project": "b", "headline": "git push --force"},
+        ]
+
+    def test_escalations_and_denies_both_count_as_interruptions(self):
+        import ClaudeRiskClassifier as crc
+        f = crc.report_facts(self._entries())
+        assert (f["total"], f["escalated"], f["saved"]) == (4, 2, 2)
+        assert f["tiers"]["SAFE"] == 2 and f["tiers"]["CRITICAL"] == 1
+
+    def test_projects_are_split_with_their_silenced_share(self):
+        import ClaudeRiskClassifier as crc
+        f = crc.report_facts(self._entries())
+        assert f["by_project"] == [("a", 2, 0, 100.0), ("b", 2, 2, 0.0)]
+
+    def test_only_auto_allowed_tools_make_the_top_list(self):
+        import ClaudeRiskClassifier as crc
+        f = crc.report_facts(self._entries())
+        assert f["by_tool"] == [("Bash", 2)]
+        assert [e["headline"] for e in f["escalations"]] == ["rm -rf build", "git push --force"]
+
+    def test_an_empty_log_is_all_zeros(self):
+        import ClaudeRiskClassifier as crc
+        f = crc.report_facts([])
+        assert f["total"] == 0 and f["escalated"] == 0 and f["by_project"] == []
+
+
+class TestMergeToolRuns:
+    """Consecutive tool turns read as one phrase, the way the phone words
+    them; a spoken turn ends the run."""
+
+    def test_one_described_call_is_named_by_its_purpose(self):
+        import watch_dashboard as wd
+        turns = [{"kind": "tool", "text": "Bash", "desc": "the tests", "at": "t1"}]
+        merged = wd._merge_tool_runs(turns)
+        assert merged == [{"role": "assistant", "kind": "tool", "at": "t1", "text": "Ran the tests"}]
+
+    def test_several_calls_collapse_into_counts_and_keep_order(self):
+        import watch_dashboard as wd
+        turns = [{"kind": "tool", "text": "Bash", "desc": "", "at": "1"},
+                 {"kind": "tool", "text": "Bash", "desc": "", "at": "2"},
+                 {"kind": "tool", "text": "Edit", "desc": "", "at": "3"},
+                 {"kind": "text", "role": "assistant", "text": "Done.", "at": "4"},
+                 {"kind": "tool", "text": "Read", "desc": "", "at": "5"}]
+        merged = wd._merge_tool_runs(turns)
+        assert [m["kind"] for m in merged] == ["tool", "text", "tool"]
+        assert merged[0]["at"] == "3" and "Bash" not in merged[0]["text"]
+        assert merged[1]["text"] == "Done."
+
+    def test_no_tools_means_the_turns_come_back_as_they_were(self):
+        import watch_dashboard as wd
+        turns = [{"kind": "text", "role": "user", "text": "hi", "at": "1"}]
+        assert wd._merge_tool_runs(turns) == turns

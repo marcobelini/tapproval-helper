@@ -734,31 +734,87 @@ def _parse_thread(path, limit):
         return _parse_thread_locked(path, limit)
 
 
-def _parse_thread_locked(path, limit):
+def _thread_state_for(path):
+    """This transcript's accumulated state, created on first sight.
+
+    Evicting under the map guard, and dropping each transcript's lock
+    with its state. A thread mid-parse holds its OWN path lock, not this
+    one, so evicting its dict left it accumulating into an orphan — and
+    the next poll cold-parsed from byte zero, which is the "Loading…" the
+    prewarmer exists to prevent. The lock map also grew one entry per
+    transcript, forever, in a process that runs for weeks.
+    """
     state = _THREAD_STATE.get(path)
-    if state is None:
-        state = _fresh_thread_state()
-        # Evicting under the map guard, and dropping each transcript's lock
-        # with its state. A thread mid-parse holds its OWN path lock, not
-        # this one, so evicting its dict left it accumulating into an
-        # orphan — and the next poll cold-parsed from byte zero, which is
-        # the "Loading…" the prewarmer exists to prevent. The lock map also
-        # grew one entry per transcript, forever, in a process that runs
-        # for weeks.
-        with _THREAD_LOCKS_GUARD:
-            _THREAD_STATE[path] = state
-            if len(_THREAD_STATE) > 32:
-                for stale in list(_THREAD_STATE):
-                    if len(_THREAD_STATE) <= 32:
-                        break
-                    if stale == path:
-                        continue
-                    lock = _THREAD_LOCKS.get(stale)
-                    # Only retire a transcript nobody is reading right now.
-                    if lock is not None and lock.locked():
-                        continue
-                    _THREAD_STATE.pop(stale, None)
-                    _THREAD_LOCKS.pop(stale, None)
+    if state is not None:
+        return state
+    state = _fresh_thread_state()
+    with _THREAD_LOCKS_GUARD:
+        _THREAD_STATE[path] = state
+        if len(_THREAD_STATE) > 32:
+            for stale in list(_THREAD_STATE):
+                if len(_THREAD_STATE) <= 32:
+                    break
+                if stale == path:
+                    continue
+                lock = _THREAD_LOCKS.get(stale)
+                # Only retire a transcript nobody is reading right now.
+                if lock is not None and lock.locked():
+                    continue
+                _THREAD_STATE.pop(stale, None)
+                _THREAD_LOCKS.pop(stale, None)
+    return state
+
+
+def _merge_tool_runs(turns):
+    """Phone-style aggregation: consecutive tool turns collapse into one
+    phrase — "Ran a command, edited a file" — deduped, order kept. One
+    call is named by what it was for, several are counted. Pure."""
+    merged = []
+    runs = []                 # (name, desc, at) of the current consecutive run
+
+    def flush():
+        if not runs:
+            return
+        if len(runs) == 1 and runs[0][1]:
+            phrase = "ran %s" % runs[0][1]
+        else:
+            counts = OrderedDict()
+            for name, _desc, _at in runs:
+                counts[name] = counts.get(name, 0) + 1
+            phrase = ", ".join(_tool_phrase(name, n)
+                               for name, n in counts.items())
+        merged.append({"role": "assistant", "kind": "tool", "at": runs[-1][2],
+                       "text": phrase[:1].upper() + phrase[1:]})
+        del runs[:]
+
+    for turn in turns:
+        if turn["kind"] == "tool":
+            runs.append((turn["text"], turn.get("desc") or "",
+                         turn.get("at", "")))
+            continue
+        flush()
+        merged.append(dict(turn))
+    flush()
+    return merged
+
+
+def _running_task_count(state, session_id):
+    """How many launched tasks are still running, judged from files
+    OUTSIDE this transcript. "done" is terminal and never re-judged;
+    "unknown" counts as not running now but is asked again next time —
+    quiet tasks may wake, read errors pass."""
+    running = 0
+    for tid in list(state["launched"] - state["finished"]):
+        verdict = _task_state(session_id, tid)
+        if verdict == "done":
+            state["finished"].add(tid)
+        elif verdict == "running":
+            running += 1
+    return running
+
+
+def _parse_thread_locked(path, limit):
+    state = _thread_state_for(path)
     lines, state["offset"], shrunk = _read_appended(path, state["offset"])
     if shrunk:
         # Rewritten transcript: the returned lines are the whole new file;
@@ -772,53 +828,14 @@ def _parse_thread_locked(path, limit):
             _thread_line(state, line, limit)
         state["result"] = None
     # Recompute on new lines, a new limit, or a 30s clock: the task
-    # verdicts below depend on files OUTSIDE this transcript, so a cached
+    # verdicts depend on files OUTSIDE this transcript, so a cached
     # result must not outlive their truth just because the session went
     # quiet.
     if (state["result"] is None or state["limit"] != limit
             or time.monotonic() - state["result_at"] > 30.0):
-        # Phone-style aggregation: consecutive tool turns collapse into
-        # one phrase — "Ran a command, edited a file" — deduped, order
-        # kept. Cheap: runs over at most limit*4 kept turns.
-        merged = []
-        runs = []                 # tool names in the current consecutive run
-
-        def flush():
-            """Word the run of tool calls that just ended, the way the phone
-            words it: one call named by what it was for, several counted."""
-            if not runs:
-                return
-            if len(runs) == 1 and runs[0][1]:
-                phrase = "ran %s" % runs[0][1]
-            else:
-                counts = OrderedDict()
-                for name, _desc, _at in runs:
-                    counts[name] = counts.get(name, 0) + 1
-                phrase = ", ".join(_tool_phrase(name, n)
-                                   for name, n in counts.items())
-            merged.append({"role": "assistant", "kind": "tool", "at": runs[-1][2],
-                           "text": phrase[:1].upper() + phrase[1:]})
-            del runs[:]
-
-        for turn in state["turns"]:
-            if turn["kind"] == "tool":
-                runs.append((turn["text"], turn.get("desc") or "",
-                             turn.get("at", "")))
-                continue
-            flush()
-            merged.append(dict(turn))
-        flush()
+        merged = _merge_tool_runs(state["turns"])
         session_id = os.path.splitext(os.path.basename(path))[0]
-        running = 0
-        for tid in list(state["launched"] - state["finished"]):
-            verdict = _task_state(session_id, tid)
-            if verdict == "done":
-                # Terminal on disk — never globbed or read again.
-                state["finished"].add(tid)
-            elif verdict == "running":
-                running += 1
-            # "unknown" counts as not running NOW but is re-judged on the
-            # next recompute — quiet tasks may wake, read errors pass.
+        running = _running_task_count(state, session_id)
         state["result"] = (merged[-limit:], running, state["running_tool"])
         state["result_at"] = time.monotonic()
         state["limit"] = limit

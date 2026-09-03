@@ -683,8 +683,8 @@ def start_session(path, text, projects_dir=None, platform=None):
 RESOLVER_RESCAN_SECONDS = 5.0
 
 
-def _prompt_resolver(card, projects_dir=None):
-    """A callable answering: was this card's prompt resolved elsewhere?
+class _PromptResolver:
+    """Answers, on each call: was this card's prompt resolved elsewhere?
 
     The transcript already carries the truth — the assistant's tool_use
     for the very call the card asks about was written before the prompt,
@@ -693,31 +693,65 @@ def _prompt_resolver(card, projects_dir=None):
     hash the hook stamped), remember its id, and watch for the result.
     Each check reads only bytes appended since the last one; the first
     reads a bounded tail to find the originating tool_use. Never raises.
-    """
-    session_id = str(card.get("session_id") or "")
-    fingerprint = card.get("fingerprint")
-    tool = card.get("tool")
-    if not session_id or not fingerprint or not tool:
-        return None
-    try:
-        from ClaudeRiskClassifier import _card_fingerprint
-    except Exception:
-        return None
-    # One entry per transcript we watch: the session's own, plus every
-    # subagent's. A card raised inside a subagent has its tool_use written
-    # to `<session>/subagents/agent-*.jsonl`, NOT to the session file — so
-    # watching only the session file meant such a card could never be
-    # retracted, and hung on the wrist until the wait expired.
-    state = {"path": None, "files": {}, "use_ids": set(), "scan_at": 0.0}
 
-    def _watch_list():
+    One entry per transcript we watch: the session's own, plus every
+    subagent's. A card raised inside a subagent has its tool_use written
+    to `<session>/subagents/agent-*.jsonl`, NOT to the session file — so
+    watching only the session file meant such a card could never be
+    retracted, and hung on the wrist until the wait expired.
+    """
+    TAIL_BYTES = 262144
+    RETRY_SECONDS = 30.0
+
+    def __init__(self, session_id, tool, fingerprint, fingerprint_of,
+                 projects_dir=None):
+        self.session_id = session_id
+        self.tool = tool
+        self.fingerprint = fingerprint
+        self.fingerprint_of = fingerprint_of
+        self.projects_dir = projects_dir
+        self.path = None            # the session transcript, once found
+        self.files = {}             # transcript path -> bytes already read
+        self.use_ids = set()        # tool_use ids that match the card
+        self.scan_at = 0.0          # next time to look for new subagents
+        self.retry_at = 0.0         # next time to look for a missing transcript
+
+    def __call__(self):
+        try:
+            if not self._located():
+                return False
+            self._notice_new_transcripts()
+            resolved = False
+            for path in list(self.files):
+                lines, self.files[path], shrunk = _read_appended(
+                    path, self.files[path])
+                if self._scan(lines, shrunk, path):
+                    resolved = True
+            return resolved
+        except (OSError, ValueError):
+            return False
+
+    def _located(self):
+        """Find the session transcript — once, and not on every 5s wake
+        when it is missing, since that walks every project directory."""
+        if self.path is not None:
+            return True
+        if time.monotonic() < self.retry_at:
+            return False
+        self.path = _find_transcript(self.session_id, self.projects_dir)
+        if self.path is None:
+            self.retry_at = time.monotonic() + self.RETRY_SECONDS
+            return False
+        return True
+
+    def _watch_list(self):
         """Every transcript this card's answer could appear in.
 
         Subagents start after the card does, so this is rescanned — cheaply,
         on the same 5s clock — rather than fixed at the first look.
         """
-        paths = [state["path"]]
-        directory, name = os.path.split(state["path"])
+        paths = [self.path]
+        directory, name = os.path.split(self.path)
         sub = os.path.join(directory, name[:-len(".jsonl")], "subagents")
         try:
             paths.extend(os.path.join(sub, f) for f in sorted(os.listdir(sub))
@@ -726,42 +760,24 @@ def _prompt_resolver(card, projects_dir=None):
             pass
         return paths
 
-    def check():
-        try:
-            if state["path"] is None:
-                # A missing transcript means walking every project dir;
-                # don't repeat that walk on each 5s wake.
-                if time.monotonic() < state.get("retry_at", 0.0):
-                    return False
-                state["path"] = _find_transcript(session_id, projects_dir)
-                if state["path"] is None:
-                    state["retry_at"] = time.monotonic() + 30.0
-                    return False
-            now = time.monotonic()
-            if now >= state["scan_at"]:
-                state["scan_at"] = now + RESOLVER_RESCAN_SECONDS
-                for path in _watch_list():
-                    if path not in state["files"]:
-                        # A file we have only just noticed gets a bounded
-                        # tail, the same as the session file did: enough to
-                        # find the originating tool_use, not the whole
-                        # history of an earlier run.
-                        try:
-                            state["files"][path] = max(
-                                0, os.path.getsize(path) - 262144)
-                        except OSError:
-                            pass
-            resolved = False
-            for path in list(state["files"]):
-                lines, state["files"][path], shrunk = _read_appended(
-                    path, state["files"][path])
-                if _scan(lines, shrunk, path):
-                    resolved = True
-            return resolved
-        except (OSError, ValueError):
-            return False
+    def _notice_new_transcripts(self):
+        now = time.monotonic()
+        if now < self.scan_at:
+            return
+        self.scan_at = now + RESOLVER_RESCAN_SECONDS
+        for path in self._watch_list():
+            if path not in self.files:
+                # A file we have only just noticed gets a bounded tail,
+                # the same as the session file did: enough to find the
+                # originating tool_use, not the whole history of an
+                # earlier run.
+                try:
+                    self.files[path] = max(
+                        0, os.path.getsize(path) - self.TAIL_BYTES)
+                except OSError:
+                    pass
 
-    def _scan(lines, shrunk, path):
+    def _scan(self, lines, shrunk, path):
         try:
             if shrunk:
                 # The transcript was rewritten (compaction). Its history
@@ -769,9 +785,9 @@ def _prompt_resolver(card, projects_dir=None):
                 # with their old results — matching those would retract a
                 # live card nobody answered. Go dormant past the rewrite:
                 # only appends from here on can resolve this card.
-                state["use_ids"].clear()
+                self.use_ids.clear()
                 try:
-                    state["files"][path] = os.path.getsize(path)
+                    self.files[path] = os.path.getsize(path)
                 except OSError:
                     pass
                 return False
@@ -787,18 +803,33 @@ def _prompt_resolver(card, projects_dir=None):
                     if not isinstance(part, dict):
                         continue
                     if (part.get("type") == "tool_use"
-                            and part.get("name") == tool
-                            and _card_fingerprint(
-                                tool, part.get("input") or {}) == fingerprint):
-                        state["use_ids"].add(part.get("id"))
+                            and part.get("name") == self.tool
+                            and self.fingerprint_of(
+                                self.tool, part.get("input") or {})
+                            == self.fingerprint):
+                        self.use_ids.add(part.get("id"))
                     elif (part.get("type") == "tool_result"
-                          and part.get("tool_use_id") in state["use_ids"]):
+                          and part.get("tool_use_id") in self.use_ids):
                         return True
         except (OSError, ValueError):
             return False
         return False
 
-    return check
+
+def _prompt_resolver(card, projects_dir=None):
+    """A callable answering whether the card's prompt was resolved
+    elsewhere, or None when the card carries too little to tell."""
+    session_id = str(card.get("session_id") or "")
+    fingerprint = card.get("fingerprint")
+    tool = card.get("tool")
+    if not session_id or not fingerprint or not tool:
+        return None
+    try:
+        from ClaudeRiskClassifier import _card_fingerprint
+    except Exception:
+        return None
+    return _PromptResolver(session_id, tool, fingerprint, _card_fingerprint,
+                           projects_dir)
 
 
 
@@ -1134,218 +1165,259 @@ class RelayHandler(BaseHTTPRequestHandler):
                                   source=str(body.get("source") or "icloud"))
         self._send_json({"token": token})
 
-    def do_GET(self):
+    # ---- routing -----------------------------------------------------------
+    #
+    # One table says what each route needs; one dispatcher checks it; one
+    # method per route does the work. The two previous handlers had grown
+    # to 74 and 137 lines of if/elif with the rules spelled out inline,
+    # which is exactly where a rule gets forgotten on the next route added.
+    #
+    #   auth       the caller must hold a device token (loopback is exempt
+    #              inside _authorized); /pair and /enroll are how a token is
+    #              obtained, so they cannot require one.
+    #   lan_only   never served through the tunnel listener; the address a
+    #              stranger could reach is not where the travel secret,
+    #              cards or presence may change hands.
+    #   local      only a process on this machine: the hook, the bridge,
+    #              the --pair / --rotate-token commands. Never the network,
+    #              because a forged card harvests a real tap.
+
+    ROUTES = {
+        "GET": {
+            "/pair": ("_get_pair", dict(auth=False)),
+            "/pending": ("_get_pending", {}),
+            "/health": ("_get_health", {}),
+            "/projects": ("_get_projects", {}),
+            "/sessions": ("_get_sessions", {}),
+            "/activity": ("_get_activity", {}),
+            "/usage": ("_get_usage", {}),
+            "/thread": ("_get_thread", {}),
+            "/tunnel": ("_get_tunnel", dict(lan_only=True)),
+        },
+        "POST": {
+            "/enroll": ("_post_enroll", dict(auth=False)),
+            "/card": ("_post_card", dict(local=True, lan_only=True)),
+            "/heartbeat": ("_post_heartbeat", dict(local=True, lan_only=True)),
+            "/new": ("_post_new", {}),
+            "/say": ("_post_say", {}),
+            "/decision": ("_post_decision", {}),
+            "/admin/pair-open": ("_post_admin", dict(local=True, admin=True)),
+            "/admin/pair-reset": ("_post_admin", dict(local=True, admin=True)),
+            "/admin/rotate": ("_post_admin", dict(local=True, admin=True)),
+        },
+    }
+
+    def _dispatch(self, method):
         if not self._host_ok():
             self._send_json({"error": "bad host"}, 403)
             return
         path, query = self._route()
-        if path is not None and self.required_token is not None and (
+        on_tunnel = self.required_token is not None
+        if path is not None and on_tunnel and (
                 path in TUNNEL_HIDDEN or path.startswith("/admin/")):
+            # Wrong (or absent) secret prefix on the tunnel listener, or a
+            # route that does not exist there: say nothing about what
+            # lives here.
             path = None
-        if path is None:
-            # Wrong (or absent) secret prefix on the tunnel listener: say
-            # nothing about what lives here.
+        route = self.ROUTES[method].get(path) if path else None
+        if route is None:
             self._send_json({"error": "not found"}, 404)
             return
-        if path == "/pair":
-            self._handle_pair()
-            return
-        if not self._authorized(path):
+        handler, rules = route
+        if rules.get("auth", True) and not self._authorized(path):
             self._send_json({"error": "not paired"}, 403)
             return
-        if path == "/pending":
-            # The bridge identifies itself so its polls never masquerade as
-            # a watch in the "watch seen" diagnostics.
-            from_watch = query.get("source", [""])[0] != "bridge"
-            self._send_json({"cards": self.queue.pending(from_watch=from_watch)})
-        elif path == "/health":
-            # Liveness is public; the details are not. A pending count plus
-            # "is a watch on the wrist right now" tells a stranger when
-            # nobody is looking.
-            if self._credentialed():
-                self._send_json({"ok": True,
-                                 "pending": len(self.queue.pending()),
-                                 "watch_seen_seconds_ago":
-                                     self.queue.watch_seen_seconds_ago(),
-                                 "version": RELAY_VERSION,
-                                 "helper": HELPER_VERSION})
-            else:
-                self._send_json({"ok": True})
-        elif path == "/projects":
-            self._send_json({"projects": known_projects()})
-        elif path == "/sessions":
-            rows = recent_sessions()
-            prewarm_threads([row["session_id"] for row in rows])
-            self._send_json({"sessions": rows})
-        elif path == "/activity":
-            self._send_json(activity_summary())
-        elif path == "/usage":
-            self._send_json(usage_summary())
-        elif path == "/thread":
-            session_id = (query.get("id", [""])[0] or "")[:64]
-            turns, active, running, tool_now = [], None, 0, None
-            path_on_disk = _find_transcript(session_id) if session_id else None
-            if path_on_disk:
-                try:
-                    # Freshness first — the watch shows a "working" pulse
-                    # while Claude is actually writing.
-                    active = max(0, int(time.time()
-                                        - os.path.getmtime(path_on_disk)))
-                except OSError:
-                    pass
-                turns, running, tool_now = _parse_thread(
-                    path_on_disk, THREAD_TURN_LIMIT)
-            self._send_json({"turns": turns,
-                             "running_tasks": running,
-                             "running_tool": tool_now,
-                             "modified_seconds_ago": active})
-        elif path == "/tunnel" and self.required_token is None:
-            # LAN only: hand the watch its away-addresses while it's
-            # home. Deliberately NOT in the Bonjour TXT record — this
-            # fetch is the one place the travel secret changes hands.
-            self._send_json({"url": TUNNEL_URL,
-                             "tailscale": tailscale_url(
-                                 self.server.server_address[1])})
-        else:
-            self._send_json({"error": "not found"}, 404)
-
-    def do_POST(self):
-        if not self._host_ok():
-            self._send_json({"error": "bad host"}, 403)
-            return
-        path, _ = self._route()
-        if path is not None and self.required_token is not None and (
-                path in TUNNEL_HIDDEN or path.startswith("/admin/")):
-            path = None
-        if path is None:
-            self._send_json({"error": "not found"}, 404)
-            return
-        if path == "/enroll":
-            self._handle_enroll(self._read_json() or {})
-            return
-        if not self._authorized(path):
-            self._send_json({"error": "not paired"}, 403)
-            return
-        # Cards and heartbeats come from processes on this machine — the
-        # hook and the Mac bridge. Accepting them from the network let a
-        # stranger on the same Wi-Fi forge a wrist card (a fake prompt
-        # harvesting a real tap) or fake the watch's presence.
-        if path in ("/card", "/heartbeat") and not self._is_local_process():
+        if rules.get("local") and (
+                not self._is_local_process()
+                or (rules.get("admin") and not hasattr(self.auth, "rotate"))):
             self._send_json({"error": "local processes only"}, 403)
             return
-        if path == "/card" and self.required_token is None:
-            body = self._read_json()
-            if body is None or not isinstance(body.get("card"), dict):
-                self._send_json({"error": "expected {\"card\": {...}}"}, 400)
-                return
-            try:
-                wait = float(body.get("wait", DEFAULT_WAIT))
-            except (TypeError, ValueError):
-                wait = DEFAULT_WAIT
-            wait = max(0.0, min(wait, MAX_WAIT))
-
-            gate = LIMITS.gate("card", 32)
-            if not gate.acquire(blocking=False):
-                # Fail closed, exactly as a dead relay does: the terminal
-                # asks instead. Better a prompt than a stalled hook.
-                self._send_json({"id": "", "decision": "none"})
-                return
-            try:
-                card_id, decision, answer = self.queue.submit(
-                    body["card"], wait,
-                    caller_alive=functools.partial(_socket_alive, self.connection),
-                    resolved_elsewhere=_prompt_resolver(body["card"]))
-            finally:
-                gate.release()
-            payload = {"id": card_id, "decision": decision}
-            if answer:
-                payload["answer"] = answer
-            self._send_json(payload)
-        elif path == "/new":
-            # Opens a Terminal on this Mac: the same budget and the same
-            # one-at-a-time gate as /say, for the same reasons.
-            who = self.headers.get("X-Tapproval-Token", "") or self.client_address[0]
-            allowed, retry = LIMITS.allow("say", who, 6, 60)
-            if not allowed:
-                self._send_json({"error": "too many messages"}, 429,
-                                headers={"Retry-After": str(int(retry))})
-                return
-            gate = LIMITS.gate("say", 1)
-            if not gate.acquire(blocking=False):
-                self._send_json({"error": "a message is already being sent"}, 429)
-                return
-            try:
-                body = self._read_json() or {}
-                status = start_session(str(body.get("path", ""))[:512],
-                                       body.get("text", ""))
-            finally:
-                gate.release()
-            self._send_json({"ok": status == "started", "status": status})
-        elif path == "/say":
-            # Each call spawns `claude --resume`: serialising them is
-            # correctness, not politeness.
-            who = self.headers.get("X-Tapproval-Token", "") or self.client_address[0]
-            allowed, retry = LIMITS.allow("say", who, 6, 60)
-            if not allowed:
-                self._send_json({"error": "too many messages"}, 429,
-                                headers={"Retry-After": str(int(retry))})
-                return
-            gate = LIMITS.gate("say", 1)
-            if not gate.acquire(blocking=False):
-                self._send_json({"error": "a message is already being sent"}, 429)
-                return
-            try:
-                body = self._read_json() or {}
-                # Only an explicit false turns brevity off: a watch that
-                # predates the switch, or a missing key, still gets the
-                # short reply the screen was built for.
-                status = say_to_session(str(body.get("session_id", ""))[:64],
-                                        body.get("text", ""),
-                                        brief=body.get("brief") is not False)
-            finally:
-                gate.release()
-            self._send_json({"ok": status == "sent", "status": status})
-        elif path == "/decision":
-            body = self._read_json()
-            card_id = (body or {}).get("id")
-            decision = (body or {}).get("decision")
-            if not isinstance(card_id, str) or decision not in VALID_DECISIONS:
-                self._send_json({"error": "expected {\"id\", \"decision\"}"}, 400)
-                return
-            accepted = self.queue.decide(card_id, decision,
-                                         answer=(body or {}).get("answer"))
-            self._send_json({"ok": accepted})
-        elif path in ("/admin/pair-open", "/admin/rotate",
-                      "/admin/pair-reset"):
-            # Administration is for a process on this machine only — the
-            # `--pair` / `--rotate-token` commands, never the network.
-            if not self._is_local_process() or not hasattr(self.auth, "rotate"):
-                self._send_json({"error": "local processes only"}, 403)
-                return
-            if path == "/admin/pair-open":
-                until = self.auth.open_window()
-                self._send_json({"ok": True, "seconds": PAIR_WINDOW_SECONDS,
-                                 "until": int(until)})
-            elif path == "/admin/pair-reset":
-                self.auth.revoke_all()
-                self.auth.open_window()
-                self._send_json({"ok": True, "devices": 0,
-                                 "seconds": PAIR_WINDOW_SECONDS})
-            else:
-                secret = self.auth.rotate()
-                type(self).required_token = None   # main listener unchanged
-                _rotate_tunnel_prefix(secret)
-                self.auth.open_window()
-                self._send_json({"ok": True, "rotated": True})
-        elif path == "/heartbeat" and self.required_token is None:
-            # The bridge relays the watch's CloudKit heartbeat: how many
-            # seconds ago the watch last checked iCloud. Main server only —
-            # never through the public tunnel.
-            body = self._read_json() or {}
-            self.queue.note_watch_indirect(body.get("watch_seen_seconds_ago"))
-            self._send_json({"ok": True})
-        else:
+        if rules.get("lan_only") and on_tunnel:
             self._send_json({"error": "not found"}, 404)
+            return
+        getattr(self, handler)(path, query)
+
+    def do_GET(self):
+        self._dispatch("GET")
+
+    def do_POST(self):
+        self._dispatch("POST")
+
+    # ---- GET ---------------------------------------------------------------
+
+    def _get_pair(self, path, query):
+        self._handle_pair()
+
+    def _get_pending(self, path, query):
+        # The bridge identifies itself so its polls never masquerade as
+        # a watch in the "watch seen" diagnostics.
+        from_watch = query.get("source", [""])[0] != "bridge"
+        self._send_json({"cards": self.queue.pending(from_watch=from_watch)})
+
+    def _get_health(self, path, query):
+        # Liveness is public; the details are not. A pending count plus
+        # "is a watch on the wrist right now" tells a stranger when
+        # nobody is looking.
+        if self._credentialed():
+            self._send_json({"ok": True,
+                             "pending": len(self.queue.pending()),
+                             "watch_seen_seconds_ago":
+                                 self.queue.watch_seen_seconds_ago(),
+                             "version": RELAY_VERSION,
+                             "helper": HELPER_VERSION})
+        else:
+            self._send_json({"ok": True})
+
+    def _get_projects(self, path, query):
+        self._send_json({"projects": known_projects()})
+
+    def _get_sessions(self, path, query):
+        rows = recent_sessions()
+        prewarm_threads([row["session_id"] for row in rows])
+        self._send_json({"sessions": rows})
+
+    def _get_activity(self, path, query):
+        self._send_json(activity_summary())
+
+    def _get_usage(self, path, query):
+        self._send_json(usage_summary())
+
+    def _get_thread(self, path, query):
+        session_id = (query.get("id", [""])[0] or "")[:64]
+        turns, active, running, tool_now = [], None, 0, None
+        path_on_disk = _find_transcript(session_id) if session_id else None
+        if path_on_disk:
+            try:
+                # Freshness first — the watch shows a "working" pulse
+                # while Claude is actually writing.
+                active = max(0, int(time.time()
+                                    - os.path.getmtime(path_on_disk)))
+            except OSError:
+                pass
+            turns, running, tool_now = _parse_thread(
+                path_on_disk, THREAD_TURN_LIMIT)
+        self._send_json({"turns": turns,
+                         "running_tasks": running,
+                         "running_tool": tool_now,
+                         "modified_seconds_ago": active})
+
+    def _get_tunnel(self, path, query):
+        # LAN only: hand the watch its away-addresses while it's home.
+        # Deliberately NOT in the Bonjour TXT record — this fetch is the
+        # one place the travel secret changes hands.
+        self._send_json({"url": TUNNEL_URL,
+                         "tailscale": tailscale_url(
+                             self.server.server_address[1])})
+
+    # ---- POST --------------------------------------------------------------
+
+    def _post_enroll(self, path, query):
+        self._handle_enroll(self._read_json() or {})
+
+    def _post_card(self, path, query):
+        body = self._read_json()
+        if body is None or not isinstance(body.get("card"), dict):
+            self._send_json({"error": "expected {\"card\": {...}}"}, 400)
+            return
+        try:
+            wait = float(body.get("wait", DEFAULT_WAIT))
+        except (TypeError, ValueError):
+            wait = DEFAULT_WAIT
+        wait = max(0.0, min(wait, MAX_WAIT))
+
+        gate = LIMITS.gate("card", 32)
+        if not gate.acquire(blocking=False):
+            # Fail closed, exactly as a dead relay does: the terminal
+            # asks instead. Better a prompt than a stalled hook.
+            self._send_json({"id": "", "decision": "none"})
+            return
+        try:
+            card_id, decision, answer = self.queue.submit(
+                body["card"], wait,
+                caller_alive=functools.partial(_socket_alive, self.connection),
+                resolved_elsewhere=_prompt_resolver(body["card"]))
+        finally:
+            gate.release()
+        payload = {"id": card_id, "decision": decision}
+        if answer:
+            payload["answer"] = answer
+        self._send_json(payload)
+
+    def _serialised_send(self, act):
+        """/new and /say both spawn a `claude` process on this Mac: the
+        same per-caller budget and the same one-at-a-time gate, for the
+        same reasons — serialising them is correctness, not politeness.
+        `act(body)` returns the status word; the reply says whether it
+        was the good one."""
+        who = self.headers.get("X-Tapproval-Token", "") or self.client_address[0]
+        allowed, retry = LIMITS.allow("say", who, 6, 60)
+        if not allowed:
+            self._send_json({"error": "too many messages"}, 429,
+                            headers={"Retry-After": str(int(retry))})
+            return
+        gate = LIMITS.gate("say", 1)
+        if not gate.acquire(blocking=False):
+            self._send_json({"error": "a message is already being sent"}, 429)
+            return
+        try:
+            status, good = act(self._read_json() or {})
+        finally:
+            gate.release()
+        self._send_json({"ok": status == good, "status": status})
+
+    def _post_new(self, path, query):
+        # Opens a Terminal on this Mac.
+        self._serialised_send(lambda body: (
+            start_session(str(body.get("path", ""))[:512], body.get("text", "")),
+            "started"))
+
+    def _post_say(self, path, query):
+        # Only an explicit false turns brevity off: a watch that predates
+        # the switch, or a missing key, still gets the short reply the
+        # screen was built for.
+        self._serialised_send(lambda body: (
+            say_to_session(str(body.get("session_id", ""))[:64],
+                           body.get("text", ""),
+                           brief=body.get("brief") is not False),
+            "sent"))
+
+    def _post_decision(self, path, query):
+        body = self._read_json()
+        card_id = (body or {}).get("id")
+        decision = (body or {}).get("decision")
+        if not isinstance(card_id, str) or decision not in VALID_DECISIONS:
+            self._send_json({"error": "expected {\"id\", \"decision\"}"}, 400)
+            return
+        accepted = self.queue.decide(card_id, decision,
+                                     answer=(body or {}).get("answer"))
+        self._send_json({"ok": accepted})
+
+    def _post_admin(self, path, query):
+        # Administration is for a process on this machine only — the
+        # `--pair` / `--rotate-token` commands, never the network.
+        if path == "/admin/pair-open":
+            until = self.auth.open_window()
+            self._send_json({"ok": True, "seconds": PAIR_WINDOW_SECONDS,
+                             "until": int(until)})
+        elif path == "/admin/pair-reset":
+            self.auth.revoke_all()
+            self.auth.open_window()
+            self._send_json({"ok": True, "devices": 0,
+                             "seconds": PAIR_WINDOW_SECONDS})
+        else:
+            secret = self.auth.rotate()
+            type(self).required_token = None   # main listener unchanged
+            _rotate_tunnel_prefix(secret)
+            self.auth.open_window()
+            self._send_json({"ok": True, "rotated": True})
+
+    def _post_heartbeat(self, path, query):
+        # The bridge relays the watch's CloudKit heartbeat: how many
+        # seconds ago the watch last checked iCloud. Main server only —
+        # never through the public tunnel.
+        body = self._read_json() or {}
+        self.queue.note_watch_indirect(body.get("watch_seen_seconds_ago"))
+        self._send_json({"ok": True})
 
 
 # The tunnel listener's handler class, so a rotation can change the secret
@@ -1784,7 +1856,7 @@ def _inject(queue, card, wait):
     return thread
 
 
-def main(argv=None):
+def _build_parser():
     parser = argparse.ArgumentParser(
         description="Local relay between the risk classifier and a watch app.")
     parser.add_argument("--host", default=DEFAULT_HOST)
@@ -1812,11 +1884,68 @@ def main(argv=None):
     parser.add_argument("--rotate-token", action="store_true",
                         help="replace the travel address and every device "
                              "key; paired watches re-pair by themselves")
-    args = parser.parse_args(argv)
+    return parser
 
+
+def _start_tunnel(queue, auth):
+    """The second listener and the cloudflared process behind it. Two
+    independent secrets on the public path: the unguessable rendezvous
+    prefix says where, the device token says who."""
+    global _TUNNEL_HANDLER
+    tunnel_server, _ = serve("127.0.0.1", TUNNEL_PORT,
+                             queue=queue, token=auth.tunnel_secret, auth=auth)
+    _TUNNEL_HANDLER = tunnel_server.RequestHandlerClass
+    threading.Thread(target=tunnel_server.serve_forever, daemon=True).start()
+    return start_tunnel(TUNNEL_PORT, auth.tunnel_secret)
+
+
+class _Advertiser:
+    """The Bonjour advertisement, re-published once the tunnel URL exists
+    so the TXT record carries every address the watch might need."""
+
+    def __init__(self, port):
+        self.port = port
+        self.process = advertise(port)
+        if self.process is not None:
+            print("relay: advertising as \"Tapproval\" (%s) with %s"
+                  % (BONJOUR_TYPE, advertise_txt(port)), file=sys.stderr)
+
+    def republish_when_tunnel_is_up(self):
+        threading.Thread(target=self._republish, daemon=True).start()
+
+    def _republish(self):
+        for _ in range(60):
+            time.sleep(1)
+            if TUNNEL_URL:
+                break
+        if not TUNNEL_URL or self.process is None:
+            return
+        self.process.terminate()
+        self.process = advertise(self.port)
+        print("relay: re-advertised with the away address included",
+              file=sys.stderr)
+
+    def terminate(self):
+        if self.process is not None:
+            self.process.terminate()
+
+
+def _inject_startup_cards(args, queue):
+    if args.demo:
+        for index, card in enumerate(DEMO_CARDS):
+            threading.Timer(1.0 + index * 2.0, _inject,
+                            args=(queue, card, args.wait)).start()
+        print("relay: demo cards arriving over the next few seconds",
+              file=sys.stderr)
+    if args.card:
+        threading.Timer(1.0, _inject,
+                        args=(queue, _classified_card(args.card), args.wait)).start()
+
+
+def main(argv=None):
+    args = _build_parser().parse_args(argv)
     if args.ensure:
         return ensure_running()
-
     if args.pair or args.pair_reset or args.rotate_token:
         return run_admin(args)
 
@@ -1835,55 +1964,13 @@ def main(argv=None):
     server, queue = serve(args.host, args.port, auth=auth)
     print("relay: listening on http://%s:%d" % (args.host, args.port),
           file=sys.stderr)
-
-    tunnel_proc = None
-    if args.tunnel:
-        # Two independent secrets on the public path: the unguessable
-        # rendezvous prefix says where, the device token says who.
-        global _TUNNEL_HANDLER
-        tunnel_server, _ = serve("127.0.0.1", TUNNEL_PORT,
-                                 queue=queue, token=auth.tunnel_secret,
-                                 auth=auth)
-        _TUNNEL_HANDLER = tunnel_server.RequestHandlerClass
-        threading.Thread(target=tunnel_server.serve_forever,
-                         daemon=True).start()
-        tunnel_proc = start_tunnel(TUNNEL_PORT, auth.tunnel_secret)
-
+    tunnel_proc = _start_tunnel(queue, auth) if args.tunnel else None
     advertiser = None
     if not args.no_bonjour:
-        advertiser = advertise(args.port)
-        if advertiser is not None:
-            print("relay: advertising as \"Tapproval\" (%s) with %s"
-                  % (BONJOUR_TYPE, advertise_txt(args.port)), file=sys.stderr)
-
-        def republish_with_tunnel():
-            """Re-advertise once the tunnel URL exists, so the TXT record
-            carries every address the watch might need."""
-            nonlocal advertiser
-            for _ in range(60):
-                time.sleep(1)
-                if TUNNEL_URL:
-                    break
-            if not TUNNEL_URL or advertiser is None:
-                return
-            advertiser.terminate()
-            advertiser = advertise(args.port)
-            print("relay: re-advertised with the away address included",
-                  file=sys.stderr)
-
+        advertiser = _Advertiser(args.port)
         if args.tunnel:
-            threading.Thread(target=republish_with_tunnel,
-                             daemon=True).start()
-
-    if args.demo:
-        for index, card in enumerate(DEMO_CARDS):
-            threading.Timer(1.0 + index * 2.0, _inject,
-                            args=(queue, card, args.wait)).start()
-        print("relay: demo cards arriving over the next few seconds",
-              file=sys.stderr)
-    if args.card:
-        threading.Timer(1.0, _inject,
-                        args=(queue, _classified_card(args.card), args.wait)).start()
+            advertiser.republish_when_tunnel_is_up()
+    _inject_startup_cards(args, queue)
 
     # SIGTERM (pkill, launchd, a relay restart from --ensure) must run the
     # same cleanup as Ctrl-C — otherwise the Bonjour advertiser and the
