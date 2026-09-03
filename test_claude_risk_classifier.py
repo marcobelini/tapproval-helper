@@ -2569,7 +2569,10 @@ class TestLanSourceIsNotTrusted:
     def _never_paired(self, auth):
         auth.paired_ever = False
         auth.devices = []
-        auth._window_until = 0.0        # no timer at all
+        auth._window_until = 0.0        # no --pair window at all
+        # The first-run window a relay start would have lit.
+        import watch_relay
+        auth._first_window_until = time.time() + watch_relay.PAIR_FIRST_WINDOW_SECONDS
 
     def test_a_never_paired_machine_keeps_the_door_open(self, lan):
         base, _, auth = lan
@@ -2578,16 +2581,22 @@ class TestLanSourceIsNotTrusted:
         status, body = self._call(base + "/pair")
         assert status == 200 and body["token"] == "bootstraptoken"
 
-    def test_the_door_does_not_expire_before_the_first_watch(self, lan):
-        """The fuse: an hour later, still open."""
+    def test_the_door_stays_open_long_enough_to_install_and_no_longer(self, lan):
+        """The fuse: twenty minutes later still open, an hour later shut —
+        until the next session start lights it again."""
         import watch_relay
         base, _, auth = lan
         self._never_paired(auth)
         real = watch_relay.time.time
         try:
-            watch_relay.time.time = lambda: real() + 3600.0
+            watch_relay.time.time = lambda: real() + 1200.0
             assert auth.window_open()
             assert self._call(base + "/pair")[0] == 200
+            watch_relay.time.time = lambda: real() + 3600.0
+            assert not auth.window_open()
+            assert self._call(base + "/pair")[0] == 403
+            auth.relight_first_window()
+            assert auth.window_open()
         finally:
             watch_relay.time.time = real
 
@@ -2603,8 +2612,8 @@ class TestLanSourceIsNotTrusted:
         assert status == 403 and body.get("error") == "already paired"
 
     def test_a_burst_still_slams_a_never_paired_door(self, lan):
-        """No timer to expire, so an attack needs something explicit to
-        shut — and the next --ensure reopens it, which is the right trade."""
+        """A burst shuts the door before the fuse would — and the next
+        --ensure reopens it, which is the right trade."""
         base, _, auth = lan
         self._never_paired(auth)
         for _ in range(8):
@@ -3779,8 +3788,11 @@ class TestSessionListCarriesTheRing:
 # installer wrote 86400 — the card really did expire after an hour, and the
 # tests stayed green.
 
-HELPER_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(crc.__file__)), "helper")
+_ROOT = os.path.dirname(os.path.abspath(crc.__file__))
+# helper/ in the product repo; the same files sit at the root of the public
+# repo the sync script produces, and this suite runs there too.
+HELPER_DIR = (os.path.join(_ROOT, "helper")
+              if os.path.isdir(os.path.join(_ROOT, "helper")) else _ROOT)
 
 
 def _helper_manifest(*parts):
@@ -4330,12 +4342,15 @@ class TestNewSessionFromTheWatch:
         threading.Thread(target=server.serve_forever, daemon=True).start()
         base = "http://127.0.0.1:%d" % server.server_address[1]
         try:
-            with urllib.request.urlopen(base + "/projects", timeout=3) as r:
+            # 15 s, not 3: both routes scan ~/.claude/projects, which on a
+            # machine with a few dozen projects takes two or three seconds
+            # by itself, and this test is about routing, not speed.
+            with urllib.request.urlopen(base + "/projects", timeout=15) as r:
                 assert "projects" in json.loads(r.read())
             req = urllib.request.Request(base + "/new", method="POST",
                                          data=json.dumps({"path": "/nowhere", "text": "go"}).encode(),
                                          headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=3) as r:
+            with urllib.request.urlopen(req, timeout=15) as r:
                 body = json.loads(r.read())
             assert body["ok"] is False and body["status"] in ("unknown project", "new sessions need a Mac")
         finally:
@@ -4382,7 +4397,7 @@ class TestRelayRoutes:
         for method, routes in handler.ROUTES.items():
             for path, (name, rules) in routes.items():
                 assert callable(getattr(handler, name)), (method, path)
-                assert set(rules) <= {"auth", "lan_only", "local", "admin"}, path
+                assert set(rules) <= {"auth", "lan_only", "local", "admin", "token"}, path
 
     def test_the_two_pairing_routes_are_the_only_ones_without_auth(self):
         import watch_relay
@@ -4441,16 +4456,38 @@ class TestRelayRoutes:
         assert status == 400 and "card" in body["error"]
 
     def test_a_malformed_decision_is_refused(self, relay):
-        base, _, _ = relay
-        assert self._call(base + "/decision", method="POST", body={"id": 5})[0] == 400
-        assert self._call(base + "/decision", method="POST",
+        base, _, auth = relay
+        key = auth.bootstrap
+        assert self._call(base + "/decision", token=key, method="POST", body={"id": 5})[0] == 400
+        assert self._call(base + "/decision", token=key, method="POST",
                           body={"id": "x", "decision": "maybe"})[0] == 400
 
     def test_a_decision_for_a_card_nobody_asked_is_not_accepted(self, relay):
-        base, _, _ = relay
-        status, body = self._call(base + "/decision", method="POST",
+        base, _, auth = relay
+        status, body = self._call(base + "/decision", token=auth.bootstrap, method="POST",
                                   body={"id": "ghost", "decision": "allow"})
         assert status == 200 and body == {"ok": False}
+
+    def test_loopback_alone_cannot_answer_a_card(self, relay):
+        # A command Claude runs is a local process too. Reading and posting
+        # cards stay free on loopback; answering and speaking need a key.
+        base, _, auth = relay
+        assert self._call(base + "/decision", method="POST",
+                          body={"id": "ghost", "decision": "allow"})[0] == 403
+        assert self._call(base + "/say", method="POST",
+                          body={"session_id": "x", "text": "hi"})[0] == 403
+        assert self._call(base + "/decision", token="not-a-key", method="POST",
+                          body={"id": "ghost", "decision": "allow"})[0] == 403
+        # The bootstrap secret (the 0600 file, which the Mac bridge reads)
+        # and a device token both open the door.
+        assert self._call(base + "/decision", token=auth.bootstrap, method="POST",
+                          body={"id": "ghost", "decision": "allow"})[0] == 200
+        device = auth.issue_device("watch-1")
+        assert self._call(base + "/decision", token=device, method="POST",
+                          body={"id": "ghost", "decision": "allow"})[0] == 200
+        # Posting a card from loopback still needs nothing (400: bad body,
+        # which means it got past the door).
+        assert self._call(base + "/card", method="POST", body={"nope": 1})[0] == 400
 
     def test_the_heartbeat_records_the_watchs_presence(self, relay):
         base, queue, _ = relay
@@ -4470,7 +4507,7 @@ class TestRelayRoutes:
         gate = watch_relay.LIMITS.gate("say", 1)
         assert gate.acquire(blocking=False)
         try:
-            status, body = self._call(base + "/say", method="POST",
+            status, body = self._call(base + "/say", token=relay[2].bootstrap, method="POST",
                                       body={"session_id": "x", "text": "hi"})
         finally:
             gate.release()
@@ -4684,3 +4721,118 @@ class TestSessionRegistry:
         _write_transcript(tmp_path, "-p", "r-1.jsonl",
                           [{"cwd": "/x/proj", "message": {"role": "user", "content": "fix the invoice totals"}}])
         assert watch_relay.recent_sessions(projects_dir=str(tmp_path))[0]["title"] == "Billing fix"
+
+
+class TestFirstPairingIsAWindow:
+    """A machine that has never paired opens its door for half an hour at
+    every relay start and session start — not until someone walks in."""
+
+    def _auth(self, tmp_path):
+        import watch_relay
+        return watch_relay.Auth(path=str(tmp_path / "auth.json"))
+
+    def test_open_right_after_start_and_shut_half_an_hour_later(self, tmp_path, monkeypatch):
+        import watch_relay
+        auth = self._auth(tmp_path)
+        assert not auth.paired_ever and auth.window_open()
+        now = time.time()
+        monkeypatch.setattr(watch_relay.time, "time",
+                            lambda: now + watch_relay.PAIR_FIRST_WINDOW_SECONDS + 1)
+        assert not auth.window_open()
+        assert auth.claim_window("192.168.1.9") is None
+
+    def test_a_session_start_relights_it(self, tmp_path, monkeypatch):
+        import watch_relay
+        auth = self._auth(tmp_path)
+        now = time.time()
+        monkeypatch.setattr(watch_relay.time, "time",
+                            lambda: now + watch_relay.PAIR_FIRST_WINDOW_SECONDS + 1)
+        assert not auth.window_open()
+        auth.relight_first_window()
+        assert auth.window_open()
+        assert auth.claim_window("192.168.1.9") == auth.bootstrap
+
+    def test_ensure_relights_only_a_never_paired_relay(self, monkeypatch):
+        import watch_relay
+        calls = []
+        monkeypatch.setattr(watch_relay, "_self_update", lambda: False)
+        monkeypatch.setattr(watch_relay, "_reopen_pairing", lambda: calls.append("lit"))
+        health = {"version": watch_relay.RELAY_VERSION, "pending": 0, "paired_ever": False}
+        monkeypatch.setattr(watch_relay, "_probe_relay", lambda: health)
+        assert watch_relay.ensure_running() == 0
+        assert calls == ["lit"]
+        health["paired_ever"] = True
+        assert watch_relay.ensure_running() == 0
+        assert calls == ["lit"]
+
+
+class TestTheUpdateLeavesTheBlockingPath:
+    """The SessionStart hook never waits on git: when an update is due it
+    spawns the pull and returns; the pull replaces the relay itself."""
+
+    def test_a_due_update_is_spawned_not_run(self, tmp_path, monkeypatch):
+        import watch_relay
+        stamp = tmp_path / "stamp"
+        stamp.write_text("0", encoding="utf-8")
+        os.utime(stamp, (0, 0))
+        monkeypatch.setattr(watch_relay, "_UPDATE_STAMP", str(stamp))
+        monkeypatch.setattr(os.path, "isdir", lambda p: True)
+        spawned = []
+        monkeypatch.setattr(watch_relay, "_spawn_detached",
+                            lambda argv, log: spawned.append(argv) or None)
+        def no_git(*a, **k):
+            raise AssertionError("git ran on the blocking path")
+        monkeypatch.setattr(watch_relay.subprocess, "run", no_git)
+        assert watch_relay._self_update() is False
+        assert spawned and spawned[0][-1] == "--update"
+
+    def test_the_detached_half_replaces_the_relay_only_if_the_code_moved(self, monkeypatch):
+        import watch_relay
+        ensured = []
+        monkeypatch.setattr(watch_relay, "ensure_running",
+                            lambda updated=None: ensured.append(updated) or 0)
+        monkeypatch.setattr(watch_relay, "_pull_update", lambda: False)
+        assert watch_relay.main(["--update"]) == 0
+        assert ensured == []
+        monkeypatch.setattr(watch_relay, "_pull_update", lambda: True)
+        assert watch_relay.main(["--update"]) == 0
+        assert ensured == [True]
+
+
+class TestNoPersonalIdentityInTrackedFiles:
+    """CLAUDE.md rules 5 and 6 are a promise, and this is the check.
+
+    The forbidden strings are themselves personal, so they cannot live in
+    a tracked file: the list is read from .private/forbidden-strings.txt
+    (gitignored) or the TAPPROVAL_FORBIDDEN_FILE environment variable, one
+    string per line, and the test skips where neither exists — a public
+    checkout has no personal data to protect and no list to protect it
+    with."""
+
+    def _forbidden(self):
+        root = os.path.dirname(os.path.abspath(crc.__file__))
+        path = os.environ.get("TAPPROVAL_FORBIDDEN_FILE") or os.path.join(
+            root, ".private", "forbidden-strings.txt")
+        if not os.path.isfile(path):
+            pytest.skip("no forbidden-strings list on this machine")
+        with open(path, encoding="utf-8") as handle:
+            words = [w.strip() for w in handle if w.strip() and not w.startswith("#")]
+        return root, words
+
+    def test_tracked_files_carry_none_of_them(self):
+        root, words = self._forbidden()
+        listed = subprocess.run(["git", "-C", root, "ls-files", "-z"],
+                                capture_output=True, check=True).stdout
+        offenders = []
+        for rel in listed.decode("utf-8", "replace").split("\0"):
+            if not rel or rel.startswith("design/"):
+                continue
+            try:
+                with open(os.path.join(root, rel), "rb") as handle:
+                    text = handle.read().decode("utf-8", "ignore").lower()
+            except OSError:
+                continue
+            for word in words:
+                if word.lower() in text:
+                    offenders.append("%s: %s" % (rel, word))
+        assert not offenders, "\n".join(offenders)

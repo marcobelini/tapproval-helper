@@ -113,7 +113,10 @@ watch restored from backup): run
 
 or, on a plugin install, the same file under Claude Code's plugin cache
 (`~/.claude/plugins/cache/tapproval/tapproval-helper/*/watch_relay.py`).
-That opens a ten-minute window on the local network; tell your user to
+That opens a ten-minute window on the local network. (A computer that
+has never paired opens the window by itself for half an hour after every
+Claude Code session starts, so a first install needs no command at all.)
+Tell your user to
 open Tapproval on the watch now. A computer that has never paired keeps
 the door open by itself until its first watch connects, so a fresh
 install never needs this.
@@ -218,7 +221,7 @@ pytest
 
 One Claude Code behavior can look wrong from the outside and isn't — it
 is explained in the watch app the moment it first appears (Settings →
-Known quirks), and tracked upstream as
+How it works), and tracked upstream as
 [anthropics/claude-code#32493](https://github.com/anthropics/claude-code/issues/32493)
 and [#89761](https://github.com/anthropics/claude-code/issues/89761).
 

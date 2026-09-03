@@ -65,6 +65,7 @@ AUTH_FILE = os.path.expanduser("~/.tapproval-auth.json")
 RELAY_VERSION = 2
 PAIR_WINDOW_SECONDS = 600   # a deliberately opened window, not a standing door
 PAIR_WINDOW_CLAIMS = 2      # one watch, plus one retry
+PAIR_FIRST_WINDOW_SECONDS = 1800   # never paired: half an hour, re-lit by every session start
 DEFAULT_WAIT = 6.0     # how long POST /card blocks by default
 try:
     # One number, one owner: the hook's wait, its timeout and this clamp
@@ -299,7 +300,13 @@ _UPDATE_EVERY = 86400.0
 
 
 def _self_update():
-    """Fast-forward a git-installed helper. Returns True if it moved.
+    """Kick off a fast-forward of a git-installed helper, once a day.
+
+    Runs on the blocking path of the SessionStart hook, so it never pulls
+    here: it spawns ``--update`` detached and returns False at once. The
+    background process pulls, and if the checkout moved it replaces the
+    running relay itself, under the same "not while a card is waiting"
+    rule. Returns False: the caller never has to wait for the network.
 
     Only ever touches an install that is a git checkout — the one made by
     install.sh. A plugin install belongs to Claude Code, which manages its
@@ -322,11 +329,17 @@ def _self_update():
             handle.write(str(int(time.time())))
     except OSError:
         pass
-    # Everything, including reading the results, sits inside one guard and
-    # catches everything. The promise above is "never raises", and this runs
-    # on the blocking path of a SessionStart hook: an exception here would
-    # take down the session, which is a far worse outcome than a missed
-    # update. Narrow excepts made that promise false.
+    _spawn_detached([sys.executable, os.path.abspath(__file__), "--update"],
+                    RELAY_LOG)
+    return False
+
+
+def _pull_update():
+    """The pull itself, synchronous, for the detached ``--update`` process.
+    Returns True if the checkout moved. Never raises."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    # One guard around everything, including reading the results: the
+    # promise is "never raises", and narrow excepts made it false once.
     try:
         before = subprocess.run(["git", "-C", here, "rev-parse", "HEAD"],
                                 capture_output=True, text=True, timeout=10)
@@ -344,14 +357,34 @@ def _self_update():
     return moved
 
 
-def ensure_running():
+def _reopen_pairing():
+    """Tell the running relay that a session started: on a machine that
+    has never paired, that re-lights the first-run pairing window."""
+    import urllib.request
+    try:
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/admin/pair-open" % DEFAULT_PORT,
+            data=b"{}", method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=2):
+            pass
+    except Exception:
+        pass
+
+
+def ensure_running(updated=None):
     """Start the relay in the background unless one is already up.
 
     Registered as a Claude Code SessionStart hook, so the relay's whole
     lifecycle is automatic: it exists whenever Claude Code does. Prints a
     line to stderr and exits immediately either way. Never raises.
+
+    ``updated`` is True when called by the background updater after a
+    pull moved the checkout; None means "kick the updater off if it is
+    due", which is what the hook does.
     """
-    updated = _self_update()
+    if updated is None:
+        updated = _self_update()
     running = _probe_relay()
     if running is not None:
         version = running.get("version") or 0
@@ -359,6 +392,8 @@ def ensure_running():
         # when its protocol version matches, so a fresh pull must replace
         # it — subject to the same "not while a card is waiting" rule.
         if version >= RELAY_VERSION and not updated:
+            if running.get("paired_ever") is False:
+                _reopen_pairing()
             print("relay: already running", file=sys.stderr)
             return 0
         # An older relay is serving. Without this the machine keeps running
@@ -1047,6 +1082,25 @@ class RelayHandler(BaseHTTPRequestHandler):
             return auth.matches(token)
         return _token_matches(token, auth)
 
+    def _proves_key(self):
+        """A device token from anywhere; or, from a local process on the
+        main listener only, the bootstrap secret — which lives in the 0600
+        auth file, so holding it is proof of being this user on this
+        machine. The Mac bridge sends it. Loopback by itself proves
+        nothing here: authorize_request's local-process pass is for
+        reading and for posting cards, never for answering them."""
+        auth = self.auth
+        token = self.headers.get("X-Tapproval-Token", "")
+        if auth is None:
+            # No credential store at all (a bare test server): nothing to
+            # prove against, so the listener's own rule stands.
+            return self._authorized("/decision")
+        if hasattr(auth, "matches") and auth.matches(token):
+            return True
+        return (self.required_token is None
+                and _is_loopback(self.client_address[0])
+                and hasattr(auth, "is_bootstrap") and auth.is_bootstrap(token))
+
     def _is_local_process(self):
         """Loopback on the LAN listener — the hook and the bridge. False on
         the tunnel listener, where loopback is only cloudflared."""
@@ -1199,8 +1253,11 @@ class RelayHandler(BaseHTTPRequestHandler):
             "/card": ("_post_card", dict(local=True, lan_only=True)),
             "/heartbeat": ("_post_heartbeat", dict(local=True, lan_only=True)),
             "/new": ("_post_new", {}),
-            "/say": ("_post_say", {}),
-            "/decision": ("_post_decision", {}),
+            # token: a key from EVERY source. Loopback is a local process,
+            # and a command Claude runs is a local process too — it must
+            # not be able to answer its own card or speak into a session.
+            "/say": ("_post_say", dict(token=True)),
+            "/decision": ("_post_decision", dict(token=True)),
             "/admin/pair-open": ("_post_admin", dict(local=True, admin=True)),
             "/admin/pair-reset": ("_post_admin", dict(local=True, admin=True)),
             "/admin/rotate": ("_post_admin", dict(local=True, admin=True)),
@@ -1231,6 +1288,10 @@ class RelayHandler(BaseHTTPRequestHandler):
                 not self._is_local_process()
                 or (rules.get("admin") and not hasattr(self.auth, "rotate"))):
             self._send_json({"error": "local processes only"}, 403)
+            return
+        if rules.get("token") and not self._proves_key():
+            self._send_json({"error": "a device key is required, even from "
+                                      "this machine"}, 403)
             return
         if rules.get("lan_only") and on_tunnel:
             self._send_json({"error": "not found"}, 404)
@@ -1264,7 +1325,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                              "watch_seen_seconds_ago":
                                  self.queue.watch_seen_seconds_ago(),
                              "version": RELAY_VERSION,
-                             "helper": HELPER_VERSION})
+                             "helper": HELPER_VERSION,
+                             "paired_ever": getattr(self.auth, "paired_ever", True)})
         else:
             self._send_json({"ok": True})
 
@@ -1396,6 +1458,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         # Administration is for a process on this machine only — the
         # `--pair` / `--rotate-token` commands, never the network.
         if path == "/admin/pair-open":
+            if hasattr(self.auth, "relight_first_window"):
+                self.auth.relight_first_window()
             until = self.auth.open_window()
             self._send_json({"ok": True, "seconds": PAIR_WINDOW_SECONDS,
                              "until": int(until)})
@@ -1525,6 +1589,11 @@ class Auth:
         self._window_claims = 0
         self._window_ips = set()
         self._slammed = False
+        # A machine that has never paired opens its door for a while at
+        # every relay start and every --ensure, not forever: long enough
+        # to install the watch app, short enough that a laptop left on
+        # café Wi-Fi is not handing out keys all afternoon.
+        self._first_window_until = time.time() + PAIR_FIRST_WINDOW_SECONDS
         self._load()
 
     # ---- persistence -------------------------------------------------
@@ -1689,19 +1758,35 @@ class Auth:
     def window_open(self):
         """Is /pair handing out the bootstrap right now?
 
-        Two doors, one question. A machine that has NEVER paired keeps the
-        door open until its first device enrols: there is nothing behind
-        it to protect yet, and a 10-minute fuse lit at install time was
-        burning out while the user was still installing the watch app —
-        they arrived to "Not paired yet" and a phrase no README explains.
-        Once anything has paired, the door is the deliberate, short window
-        that --pair opens, exactly as before. A burst still shuts either
-        one (close_window); the next --ensure reopens the first kind.
+        Two doors, one question. A machine that has NEVER paired opens
+        the door for PAIR_FIRST_WINDOW_SECONDS at every relay start and
+        every --ensure: a 10-minute fuse lit once at install time burnt
+        out while the user was still installing the watch app, and a door
+        that never shut handed the key to whoever found the Bonjour advert
+        first on a café network. Half an hour, re-lit by every Claude Code
+        session, is long enough to install and short enough to be a
+        window. Once anything has paired, the door is the deliberate,
+        short window that --pair opens. A burst shuts either one
+        (close_window) until the next --ensure.
         """
         with self._lock:
-            if not self.paired_ever and not self._slammed:
-                return True
-            return time.time() < self._window_until
+            return time.time() < self._open_until()
+
+    def _open_until(self):
+        # getattr: an Auth assembled without __init__ (tests do) has no
+        # first window, and must read as "door shut", never as a crash
+        # inside a handler thread.
+        if not self.paired_ever and not self._slammed:
+            return max(getattr(self, "_first_window_until", 0.0), self._window_until)
+        return self._window_until
+
+    def relight_first_window(self):
+        """--ensure on a never-paired machine: another half hour."""
+        with self._lock:
+            if not self.paired_ever:
+                self._slammed = False
+                self._first_window_until = time.time() + PAIR_FIRST_WINDOW_SECONDS
+            return getattr(self, "_first_window_until", 0.0)
 
     def claim_window(self, client_ip):
         """Hand out the bootstrap, once per address and twice at most.
@@ -1711,8 +1796,7 @@ class Auth:
         rejection rather than letting it be ground down.
         """
         with self._lock:
-            never_paired = not self.paired_ever and not self._slammed
-            if not never_paired and time.time() >= self._window_until:
+            if time.time() >= self._open_until():
                 return None
             if self._window_claims >= PAIR_WINDOW_CLAIMS:
                 return None
@@ -1875,6 +1959,7 @@ def _build_parser():
     parser.add_argument("--ensure", action="store_true",
                         help="start the relay in the background if it is "
                              "not already running, then exit")
+    parser.add_argument("--update", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--pair", action="store_true",
                         help="open a short pairing window so a new watch can "
                              "connect, then exit")
@@ -1946,6 +2031,12 @@ def main(argv=None):
     args = _build_parser().parse_args(argv)
     if args.ensure:
         return ensure_running()
+    if args.update:
+        # The detached half of --ensure: pull, then replace the relay if
+        # the code moved and nothing is waiting.
+        if _pull_update():
+            ensure_running(updated=True)
+        return 0
     if args.pair or args.pair_reset or args.rotate_token:
         return run_admin(args)
 
