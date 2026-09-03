@@ -441,6 +441,93 @@ class TestWristCard:
         assert len(card["detail"]) <= 20
 
 
+class TestCardFacts:
+    """A card for a tool the builder does not know answers one sentence —
+    Claude wants to DO WHAT to WHAT THING — in words, never in JSON."""
+
+    DESIGN = {"method": "finalize_plan",
+              "projectId": "80b7c22c-6e00-401b-a786-e261a2fed502",
+              "localDir": "./ds-bundle",
+              "writes": ["components/**", "tokens/**", "fonts/**",
+                         "_vendor/**", "styles.css"],
+              "deletes": []}
+
+    def test_headline_is_the_verb_phrase_not_the_tool(self):
+        card = crc.wrist_card("DesignSync", self.DESIGN, Risk.MEDIUM)
+        assert card["headline"] == "DesignSync · finalize plan"
+
+    def test_facts_name_the_target_without_json(self):
+        card = crc.wrist_card("DesignSync", self.DESIGN, Risk.MEDIUM)
+        labels = [label for label, _ in card["facts"]]
+        assert labels == ["project", "local dir", "writes"]
+        assert card["facts"][0][1].startswith("80b7c22c")
+        assert card["facts"][2][1] == "5 items"
+        for char in "{}\"":
+            assert char not in card["detail"]
+        assert "project 80b7c22c" in card["detail"]
+
+    def test_the_action_key_is_not_repeated_as_a_fact(self):
+        card = crc.wrist_card("DesignSync", self.DESIGN, Risk.MEDIUM)
+        assert "method" not in [label for label, _ in card["facts"]]
+
+    def test_mcp_call_reads_as_server_and_action(self):
+        card = crc.wrist_card("mcp__github__merge_pull_request",
+                              {"owner": "acme", "repo": "platform",
+                               "pull_number": 142, "merge_method": "squash"},
+                              Risk.HIGH)
+        assert card["headline"] == "github · merge pull request"
+        assert card["facts"][:3] == [["owner", "acme"], ["repo", "platform"],
+                                     ["pull number", "142"]]
+
+    def test_an_action_argument_joins_the_headline(self):
+        card = crc.wrist_card("mcp__wordpress__content_authoring",
+                              {"action": "posts.create", "site_id": 7,
+                               "title": "Launch"}, Risk.HIGH)
+        assert card["headline"] == "wordpress · content authoring · posts.create"
+        assert ["title", "Launch"] in card["facts"]
+
+    def test_nested_input_collapses_to_counts(self):
+        card = crc.wrist_card("SomeFutureTool",
+                              {"payload": {"a": 1, "b": 2}, "rows": [1, 2, 3, 4],
+                               "flag": True, "empty": None}, Risk.MEDIUM)
+        assert card["facts"] == [["payload", "2 fields"], ["rows", "4 items"],
+                                 ["flag", "yes"]]
+
+    def test_a_path_keeps_its_tail(self):
+        long_path = "/Users/someone/Developer/very/deep/tree/src/api/handlers.py"
+        value = crc._fact_value(long_path, 24)
+        assert value.startswith("…") and value.endswith("handlers.py")
+        assert len(value) <= 24
+
+    def test_short_string_lists_are_spelled_out(self):
+        assert crc._fact_value(["a", "b"], 32) == "a, b"
+        assert crc._fact_value([], 32) == "none"
+
+    def test_labels_are_words(self):
+        assert crc._humanise_key("projectId") == "project"
+        assert crc._humanise_key("file_path") == "file"
+        assert crc._humanise_key("pull_number") == "pull number"
+        assert crc._humanise_key("id") == "id"
+
+    def test_facts_are_never_a_single_hidden_field(self):
+        card = crc.wrist_card("mcp__db__run", {"host": "db-prod-01",
+                                               "table": "users",
+                                               "query": "DELETE FROM users"},
+                              Risk.CRITICAL)
+        assert ["host", "db-prod-01"] in card["facts"]
+        assert ["table", "users"] in card["facts"]
+
+    def test_known_tools_carry_no_facts(self):
+        card = crc.wrist_card("Bash", {"command": "ls"}, Risk.SAFE)
+        assert "facts" not in card
+
+    def test_facts_pass_through_the_credential_filter(self):
+        card = crc.wrist_card("Deploy", {"token": "ghp_" + "a" * 40,
+                                         "target": "prod"}, Risk.HIGH)
+        assert "ghp_" + "a" * 40 not in card["detail"]
+        assert all("ghp_" + "a" * 40 not in v for _, v in card["facts"])
+
+
 class TestDecide:
     DEFAULT = dict(crc.DEFAULT_POLICY)
 
@@ -1420,15 +1507,18 @@ class TestSessionNames:
         sessions = watch_relay.recent_sessions(projects_dir=str(tmp_path))
         assert sessions[0]["opening"] == "the real ask"
 
-    def test_title_follows_the_latest_topic_like_the_phone(self, tmp_path,
-                                                           monkeypatch):
-        """The phone re-titles a session as its topic moves on; the wrist
-        does the same, from the newest substantive user ask — while a
-        short ack ("ok"/"test") keeps the standing title."""
+    def test_title_is_how_the_session_began_not_its_newest_message(self, tmp_path,
+                                                                    monkeypatch):
+        """The phone titles a session once, from its opening ask. Titling
+        by the newest message (as this test once demanded) showed the
+        wrist a different name for the same session than the phone — seen
+        on the wrist 2026-09-03 — so the opening ask is the title, and a
+        /rename beats it."""
         import watch_dashboard
         import watch_relay
         monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"jkl012": "VS Code"})
+        monkeypatch.setattr(watch_dashboard, "session_registry", lambda: {})
         self._write(tmp_path, "-p", "jkl012.jsonl", [
             {"cwd": "/x/proj",
              "message": {"role": "user",
@@ -1443,7 +1533,7 @@ class TestSessionNames:
                          "content": "This session is being continued from a "
                                     "previous conversation that ran out"}}])
         sessions = watch_relay.recent_sessions(projects_dir=str(tmp_path))
-        assert sessions[0]["title"] == "Compare the glyphs per subject now"
+        assert sessions[0]["title"] == "Fix the pwa startup crash please"
         assert sessions[0]["opening"].startswith("fix the pwa")
 
 
@@ -4538,3 +4628,59 @@ class TestMergeToolRuns:
         import watch_dashboard as wd
         turns = [{"kind": "text", "role": "user", "text": "hi", "at": "1"}]
         assert wd._merge_tool_runs(turns) == turns
+
+
+class TestSessionRegistry:
+    """What the wrist shows must be what the phone shows: the sessions
+    Remote Control lists, under the names the person gave them."""
+
+    def _registry(self, tmp_path, entries):
+        for n, entry in enumerate(entries):
+            (tmp_path / ("%d.json" % n)).write_text(json.dumps(
+                dict({"pid": os.getpid(), "entrypoint": "cli"}, **entry)), encoding="utf-8")
+
+    def test_bridge_and_rename_are_read_from_the_registry(self, tmp_path):
+        import watch_relay
+        self._registry(tmp_path, [
+            {"sessionId": "phone-1", "bridgeSessionId": "session_x", "name": "acme-3f", "nameSource": "derived"},
+            {"sessionId": "local-1", "name": "Billing fix", "nameSource": "user"}])
+        reg = watch_relay.session_registry(sessions_dir=str(tmp_path))
+        assert reg["phone-1"]["bridged"] is True and reg["phone-1"]["name"] == ""
+        assert reg["local-1"]["bridged"] is False and reg["local-1"]["name"] == "Billing fix"
+
+    def test_the_list_mirrors_the_phone_when_the_phone_has_sessions(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        import watch_relay
+        monkeypatch.setattr(watch_dashboard, "live_sessions",
+                            lambda: {"phone-1": "Terminal", "local-1": "Terminal"})
+        monkeypatch.setattr(watch_dashboard, "session_registry", lambda: {
+            "phone-1": {"status": "Terminal", "bridged": True, "name": ""},
+            "local-1": {"status": "Terminal", "bridged": False, "name": ""}})
+        for sid in ("phone-1", "local-1"):
+            _write_transcript(tmp_path, "-p", sid + ".jsonl",
+                              [{"cwd": "/x/proj", "message": {"role": "user", "content": "start " + sid}}])
+        ids = [s["session_id"] for s in watch_relay.recent_sessions(projects_dir=str(tmp_path))]
+        assert ids == ["phone-1"]
+
+    def test_without_remote_control_every_live_session_shows(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        import watch_relay
+        monkeypatch.setattr(watch_dashboard, "live_sessions",
+                            lambda: {"a-1": "Terminal", "b-1": "Terminal"})
+        monkeypatch.setattr(watch_dashboard, "session_registry", lambda: {
+            "a-1": {"status": "Terminal", "bridged": False, "name": ""},
+            "b-1": {"status": "Terminal", "bridged": False, "name": ""}})
+        for sid in ("a-1", "b-1"):
+            _write_transcript(tmp_path, "-p", sid + ".jsonl",
+                              [{"cwd": "/x/proj", "message": {"role": "user", "content": "start " + sid}}])
+        assert len(watch_relay.recent_sessions(projects_dir=str(tmp_path))) == 2
+
+    def test_a_renamed_session_carries_its_name(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        import watch_relay
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {"r-1": "Terminal"})
+        monkeypatch.setattr(watch_dashboard, "session_registry", lambda: {
+            "r-1": {"status": "Terminal", "bridged": False, "name": "Billing fix"}})
+        _write_transcript(tmp_path, "-p", "r-1.jsonl",
+                          [{"cwd": "/x/proj", "message": {"role": "user", "content": "fix the invoice totals"}}])
+        assert watch_relay.recent_sessions(projects_dir=str(tmp_path))[0]["title"] == "Billing fix"

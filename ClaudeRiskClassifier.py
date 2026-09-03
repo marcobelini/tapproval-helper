@@ -827,6 +827,93 @@ def redact_secrets(text):
         return str(text or "")
 
 
+# The one sentence every card must answer: Claude wants to DO WHAT to
+# WHAT THING. For a tool the card builder does not know, the arguments
+# hold both halves — these keys say what the call does, in the order a
+# reader would ask...
+ACTION_KEYS = ("method", "action", "operation", "op", "command", "query")
+# ...and these say where it lands: the fields a blind tap would need to
+# have seen. Order is reading order on the wrist.
+TARGET_KEYS = ("projectId", "project_id", "project", "owner", "repo",
+               "url", "path", "file_path", "id", "name", "title", "to",
+               "recipient", "table", "host", "branch", "collection",
+               "doc_id", "pull_number", "issue_number")
+CARD_FACTS = 3
+FACT_CHARS = 32
+
+
+def _humanise_key(key):
+    """``projectId`` → ``project``, ``file_path`` → ``file``, ``pull_number``
+    → ``pull number``: the label a person would use, never the wire name."""
+    words = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(key))
+    words = re.sub(r"[_\-.]+", " ", words).strip().lower()
+    words = re.sub(r"\s+(id|path)$", "", words) or words
+    return words or str(key)
+
+
+def _fact_value(value, limit):
+    """One argument as a person would say it: no quotes, no braces, a
+    count for anything nested, and a path keeps its tail."""
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        return "%d field%s" % (len(value), "" if len(value) == 1 else "s")
+    if isinstance(value, list):
+        if not value:
+            return "none"
+        if len(value) <= 3 and all(isinstance(v, str) for v in value):
+            joined = ", ".join(" ".join(v.split()) for v in value)
+            if len(joined) <= limit:
+                return joined
+        return "%d item%s" % (len(value), "" if len(value) == 1 else "s")
+    text = " ".join(str(value).split())
+    if len(text) > limit and "/" in text.rstrip("/"):
+        # A path's identifying part is its tail: "…/api/handlers.py".
+        return _fit("…" + text[-(limit - 1):], limit)
+    return _fit(text, limit)
+
+
+def card_facts(tool_input, count=CARD_FACTS, limit=FACT_CHARS,
+               skip=()):
+    """The few argument facts that name the target — action keys first,
+    then the fields that say where the call lands, then whatever else the
+    call carries, in its own order. Never a single field: an approval
+    surface that hides which repo, table or host is targeted invites a
+    blind tap. Returns ``[[label, value], ...]``."""
+    if not isinstance(tool_input, dict):
+        return []
+    facts, seen = [], set(skip)
+    ordered = [k for k in ACTION_KEYS + TARGET_KEYS if k in tool_input]
+    ordered += [k for k in tool_input if k not in ordered]
+    for key in ordered:
+        if key in seen:
+            continue
+        seen.add(key)
+        facts.append([_humanise_key(key), _fact_value(tool_input[key], limit)])
+        if len(facts) == count:
+            break
+    return facts
+
+
+def _action_from_input(tool_input):
+    """The action an argument names, in words: ``finalize_plan`` →
+    ``finalize plan``. Returns ``(key, words)`` or ``(None, "")``."""
+    for key in ACTION_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip() and len(value) <= 40:
+            return key, " ".join(value.replace("_", " ").split())
+    return None, ""
+
+
+def _facts_detail(facts, limit):
+    return _fit(" · ".join("%s %s" % (label, value) for label, value in facts),
+                limit)
+
+
 def wrist_card(tool, tool_input, risk,
                headline_chars=HEADLINE_CHARS, detail_chars=DETAIL_CHARS):
     """Build the compact card a watch face can render in one glance."""
@@ -873,19 +960,26 @@ def wrist_card(tool, tool_input, risk,
             headline_chars,
         )
         detail = _fit("%s %s" % (verb, path), detail_chars)
-    elif tool.startswith("mcp__"):
-        parts = tool.split("__")
-        server = parts[1] if len(parts) > 1 else "mcp"
-        action = parts[2] if len(parts) > 2 else ""
-        headline = _fit("%s: %s" % (server, action.replace("_", " ")), headline_chars)
-        detail = _fit(json.dumps(tool_input, ensure_ascii=False), detail_chars)
     else:
-        headline = _fit(tool or "Unknown tool", headline_chars)
-        # The full arguments, truncated — never a single field: an approval
-        # surface that hides which repo/table/host is targeted invites a
-        # blind tap.
-        detail = _fit(json.dumps(tool_input, ensure_ascii=False),
-                      detail_chars)
+        # A tool the builder does not know, or an MCP call: say what it
+        # does and where it lands, in words. The tool name gives the
+        # "who"; an action argument ("method": "finalize_plan") gives
+        # the verb; the target fields become two or three facts. The
+        # detail is those same facts as one line, for the audit log and
+        # a wrist app older than this field.
+        if tool.startswith("mcp__"):
+            parts = tool.split("__")
+            who = parts[1] if len(parts) > 1 else "mcp"
+            named = parts[2].replace("_", " ") if len(parts) > 2 else ""
+        else:
+            who, named = (tool or "Unknown tool"), ""
+        action_key, action = _action_from_input(tool_input)
+        pieces = [who] + [p for p in (named, action) if p]
+        headline = _fit(" · ".join(pieces), headline_chars)
+        facts = card_facts(tool_input, skip=(action_key,) if action_key else ())
+        detail = _facts_detail(facts, detail_chars)
+        return {"tier": risk.name, "headline": headline, "detail": detail,
+                "facts": facts}
 
     return {"tier": risk.name, "headline": headline, "detail": detail}
 

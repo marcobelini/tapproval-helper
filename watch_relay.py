@@ -575,7 +575,7 @@ from watch_dashboard import (  # noqa: E402,F401  (re-exports, see above)
     _remember_repo_slug, _session_meta, _stat_cached, _task_state,
     _thread_activity, _thread_line, _thread_lock, _tool_phrase,
     _usage_entries, _usage_entries_uncached, activity_summary,
-    derive_title, live_sessions, plain_text, prewarm_threads,
+    derive_title, live_sessions, session_registry, plain_text, prewarm_threads,
     recent_sessions, repo_slug, resolve_session,
     session_meta, session_thread, usage_summary)
 

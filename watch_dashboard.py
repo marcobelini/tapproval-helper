@@ -207,19 +207,17 @@ ENTRYPOINTS = {
 }
 
 
-def live_sessions(sessions_dir=None):
-    """Sessions running right now: id -> where it is being driven from.
-
-    Claude Code drops a JSON file per live process into ~/.claude/sessions
-    with the session id, the entrypoint and its pid. A stale file whose pid
-    is gone means the session ended. Never raises.
-    """
-    live = {}
+def session_registry(sessions_dir=None):
+    """What Claude Code records about each live session, by id: where it
+    runs, whether the phone can see it (Remote Control gave it a bridge
+    id), and the name a person gave it with /rename, if any. Dead pids and
+    unattended SDK runs are left out. Never raises."""
+    registry = {}
     root = sessions_dir or CLAUDE_SESSIONS
     try:
         names = os.listdir(root)
     except OSError:
-        return live
+        return registry
     for name in names:
         if not name.endswith(".json"):
             continue
@@ -240,9 +238,21 @@ def live_sessions(sessions_dir=None):
             os.kill(int(pid), 0)          # signal 0: "are you there?"
         except (OSError, ValueError, TypeError):
             continue
-        live[session_id] = ENTRYPOINTS.get(
-            data.get("entrypoint", ""), "Connected")
-    return live
+        registry[session_id] = {
+            "status": ENTRYPOINTS.get(data.get("entrypoint", ""), "Connected"),
+            "bridged": bool(data.get("bridgeSessionId")),
+            "name": (str(data.get("name") or "").strip()
+                     if data.get("nameSource") == "user" else ""),
+        }
+    return registry
+
+
+def live_sessions(sessions_dir=None):
+    """Sessions running right now: id -> where it is being driven from.
+    The status-only view of :func:`session_registry`. Never raises.
+    """
+    return {sid: entry["status"]
+            for sid, entry in session_registry(sessions_dir).items()}
 
 
 _REPO_SLUG_CACHE = OrderedDict()
@@ -1002,8 +1012,15 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False):
 
     found.sort(reverse=True)
     live = live_sessions()
+    registry = session_registry()
     if not include_idle:
         found = [f for f in found if f[3] in live]
+        # Mirror the phone: when Remote Control has any session, the phone
+        # lists exactly those, so the wrist does too. A watch whose owner
+        # never turned Remote Control on still sees every live session.
+        if any(entry["bridged"] for entry in registry.values()):
+            found = [f for f in found
+                     if f[3] not in registry or registry[f[3]]["bridged"]]
     found = found[:limit]
     sessions = []
     for mtime, path, project, session_id in found:
@@ -1013,10 +1030,13 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False):
         if not name:
             name = project.rstrip("-").rsplit("-", 1)[-1] or project
         running_tasks, running_tool, github, latest_ask = _thread_activity(path)
+        # A name given with /rename wins outright. Otherwise the opening
+        # ask: the phone titles a session once, from how it began, and a
+        # wrist that re-titled by the newest message showed a different
+        # name for the same session — which read as a different session.
+        named = registry.get(session_id, {}).get("name", "")
         sessions.append({
-            # Titled by the newest substantive ask, the way the phone
-            # re-titles a session as its topic moves on.
-            "title": derive_title(latest_ask or opening) or name,
+            "title": named or derive_title(opening) or name,
             "project": name,
             "repo": repo_slug(cwd),
             "status": live.get(session_id, ""),
