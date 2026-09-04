@@ -108,6 +108,10 @@ class Risk(IntEnum):
 __version__ = "1.1.1"
 
 RELAY_WAIT_SECONDS = 86400
+# The relay listens here; watch_relay.DEFAULT_PORT says the same, but this
+# file must stand alone, so the number is written once more, once.
+RELAY_PORT = 8977
+RELAY_URL = "http://127.0.0.1:%d" % RELAY_PORT
 
 DEFAULT_POLICY = {
     # "shadow" = classify and log but never change behaviour (safe default).
@@ -431,6 +435,9 @@ SEGMENT_RULES = [
 ]
 
 RM_RE = re.compile(r"\brm\b((?:\s+-{1,2}[A-Za-z-]+)*)\s*(.*)")
+# Any -r/-R among the flags. The tier and the wrist headline both ask,
+# and they must agree on the answer.
+RM_RECURSIVE = re.compile(r"-[A-Za-z]*[rR]")
 # Skip git's global options before the subcommand — including the ones
 # that take a value as a SEPARATE word (`git -C <dir> push …`, `git -c
 # <name>=<val> push …`). The old `(?:-\S+\s+)*` swallowed only the flag,
@@ -481,7 +488,7 @@ def _rm_risk(segment):
     if not match:
         return None
     flags, targets = match.group(1) or "", match.group(2) or ""
-    recursive = bool(re.search(r"-[A-Za-z]*[rR]", flags))
+    recursive = bool(RM_RECURSIVE.search(flags))
     for target in targets.split():
         if target.startswith("-"):
             continue
@@ -774,7 +781,7 @@ def _bash_headline(command, limit):
 
     rm_match = RM_RE.search(head) if token == "rm" else None
     if rm_match:
-        recursive = bool(re.search(r"-[A-Za-z]*[rR]", rm_match.group(1) or ""))
+        recursive = bool(RM_RECURSIVE.search(rm_match.group(1) or ""))
         suffix = " -r" if recursive else ""
         targets = _short_targets(rm_match.group(2) or "", budget - 8 - len(suffix))
         return _fit("Delete %s%s" % (targets, suffix), budget) + extra
@@ -1695,6 +1702,17 @@ def _manifest_hook(wiring):
     return {}, None
 
 
+def _load_json(path, default=None):
+    """The parsed file, or ``default`` when it is missing or not JSON.
+    For lookups where absence is an ordinary answer; the policy loader
+    reports its failure instead and does not use this."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+
 def _plugin_roots():
     """Every directory that could hold our installed plugin.
 
@@ -1708,12 +1726,8 @@ def _plugin_roots():
     env_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
     if env_root:
         roots.append(env_root)
-    registry = os.path.join(_plugins_dir(), "installed_plugins.json")
-    try:
-        with open(registry) as handle:
-            installed = json.load(handle).get("plugins", {})
-    except (OSError, ValueError, AttributeError):
-        return roots
+    registry = _load_json(os.path.join(_plugins_dir(), "installed_plugins.json"), {})
+    installed = registry.get("plugins", {}) if isinstance(registry, dict) else None
     if not isinstance(installed, dict):
         return roots
     for key, entries in installed.items():
@@ -1735,14 +1749,11 @@ def _plugin_install():
     looking at settings.json at all.
     """
     for root in _plugin_roots():
-        try:
-            with open(os.path.join(root, ".claude-plugin",
-                                   "plugin.json")) as handle:
-                if json.load(handle).get("name") != PLUGIN_NAME:
-                    continue
-            with open(os.path.join(root, "hooks", "hooks.json")) as handle:
-                wiring = json.load(handle)
-        except (OSError, ValueError):
+        manifest = _load_json(os.path.join(root, ".claude-plugin", "plugin.json"), {})
+        if not isinstance(manifest, dict) or manifest.get("name") != PLUGIN_NAME:
+            continue
+        wiring = _load_json(os.path.join(root, "hooks", "hooks.json"))
+        if not isinstance(wiring, dict):
             continue
         env, timeout = _manifest_hook(wiring)
         relay = any(
@@ -2008,7 +2019,7 @@ def _human_duration(seconds):
 
 WATCH_ENV = {
     "CLAUDE_RISK_MODE": "enforce",
-    "CLAUDE_RISK_RELAY": "http://127.0.0.1:%d" % 8977,
+    "CLAUDE_RISK_RELAY": RELAY_URL,
     "CLAUDE_RISK_RELAY_WAIT": str(RELAY_WAIT_SECONDS),
 }
 
@@ -2213,7 +2224,7 @@ def _relay_health():
     """The running relay's /health, or None when nothing answers."""
     try:
         import urllib.request
-        with urllib.request.urlopen("http://127.0.0.1:8977/health",
+        with urllib.request.urlopen(RELAY_URL + "/health",
                                     timeout=1) as reply:
             return json.loads(reply.read())
     except Exception:

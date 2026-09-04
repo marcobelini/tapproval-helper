@@ -22,6 +22,13 @@ import time
 
 import pytest
 
+import json as _json
+import threading
+import urllib.error
+import urllib.request
+
+import watch_relay
+
 import ClaudeRiskClassifier as crc
 from ClaudeRiskClassifier import Risk
 
@@ -66,7 +73,6 @@ def _no_real_self_update(tmp_path, monkeypatch):
     # The env var reaches subprocesses; the attribute covers in-process calls
     # made before a subprocess re-imports the module.
     monkeypatch.setenv("TAPPROVAL_UPDATE_STAMP", str(stamp))
-    import watch_relay
     monkeypatch.setattr(watch_relay, "_UPDATE_STAMP", str(stamp))
 
 
@@ -88,6 +94,51 @@ def settings(tmp_path, monkeypatch):
                 "CLAUDE_RISK_RELAY_WAIT", "CLAUDE_RISK_CONFIG"):
         monkeypatch.delenv(key, raising=False)
     return path
+
+
+@pytest.fixture
+def fresh_auth(tmp_path, monkeypatch):
+    """A real Auth on a throwaway path, with the legacy-token migration
+    pointed at nothing. Two suites used to assemble one with Auth.__new__
+    and ten hand-set private fields — every new field on Auth then had to
+    be added in both places, and a handler thread crashed when it was
+    not. The real initialiser cannot get out of step with itself."""
+    monkeypatch.setattr(watch_relay, "TOKEN_FILE", str(tmp_path / "no-token"))
+    auth = watch_relay.Auth(path=str(tmp_path / "auth.json"))
+    auth.save = lambda: None
+    return auth
+
+
+def _known_watch(auth):
+    """The fixture's one paired watch: fixed secrets the tests can type."""
+    auth.tunnel_secret = "tunnelsecret"
+    auth.bootstrap = "bootstraptoken"
+    auth.devices = [{"id": "w1", "token": "devicetoken",
+                     "label": "Watch", "issued": 0, "last_seen": 0,
+                     "source": "test"}]
+    auth.paired_ever = True
+    auth.close_window()
+    return auth
+
+
+def relay_call(url, token=None, method="GET", body=None):
+    """One HTTP call to a test relay: (status, parsed body). An HTTP
+    error is an answer here, not an exception."""
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Tapproval-Token"] = token
+    data = _json.dumps(body or {}).encode() if method == "POST" else None
+    request = urllib.request.Request(url, data=data, headers=headers,
+                                     method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=5) as reply:
+            return reply.status, _json.loads(reply.read().decode())
+    except urllib.error.HTTPError as error:
+        try:
+            return error.code, _json.loads(error.read().decode())
+        except Exception:
+            return error.code, {}
+
 
 
 @pytest.fixture(autouse=True)
@@ -1052,8 +1103,6 @@ class TestWatchRelayBridge:
 
     @pytest.fixture
     def relay(self):
-        import threading
-        import watch_relay
 
         server, queue = watch_relay.serve(port=0)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1069,7 +1118,6 @@ class TestWatchRelayBridge:
 
     def _answer_first_card(self, queue, decision):
         """Background 'human': decide the first card that appears."""
-        import threading
         import time
 
         def worker():
@@ -1120,7 +1168,6 @@ class TestWatchRelayBridge:
         self._watch_is_present(queue)
         assert queue.decide("nope", "allow") is False          # unknown card
         card_ids = []
-        import threading
         threading.Thread(
             target=lambda: card_ids.append(queue.submit(self.CARD, 1.0)),
             daemon=True).start()
@@ -1180,12 +1227,10 @@ class TestWatchRelayBridge:
 class TestRelayBonjour:
     def test_advertise_returns_none_without_dnssd(self, monkeypatch):
         """Non-macOS hosts have no dns-sd; the relay must degrade quietly."""
-        import watch_relay
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _: None)
         assert watch_relay.advertise(8977) is None
 
     def test_advertise_survives_spawn_failure(self, monkeypatch):
-        import watch_relay
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _: "/usr/bin/dns-sd")
         def boom(*a, **k):
             raise OSError("nope")
@@ -1197,7 +1242,6 @@ class TestRelaySessions:
     def test_lists_sessions_newest_first(self, tmp_path, monkeypatch):
         import time as _time
         import watch_dashboard
-        import watch_relay
         monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"aaaa1111": "Terminal",
                                      "bbbb2222": "Terminal"})
@@ -1216,7 +1260,6 @@ class TestRelaySessions:
         assert sessions[1]["minutes_ago"] >= 59
 
     def test_missing_projects_dir_is_empty(self, tmp_path):
-        import watch_relay
         assert watch_relay.recent_sessions(projects_dir=str(tmp_path / "no")) == []
 
 
@@ -1226,8 +1269,6 @@ class TestRelayTunnelToken:
 
     @pytest.fixture
     def tokened(self):
-        import threading
-        import watch_relay
         server, queue = watch_relay.serve(port=0, token="s3cret")
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1236,8 +1277,6 @@ class TestRelayTunnelToken:
         server.server_close()
 
     def _get(self, url):
-        import urllib.error
-        import urllib.request
         try:
             with urllib.request.urlopen(url, timeout=5) as reply:
                 return reply.status
@@ -1262,15 +1301,12 @@ class TestRelayTunnelToken:
         assert self._get(base + "/t/s3cret/health") == 403
 
     def test_card_injection_refused_through_tunnel(self, tokened):
-        import json as _json
-        import urllib.request
         base, queue = tokened
         request = urllib.request.Request(
             base + "/t/s3cret/card",
             data=_json.dumps({"card": {"tier": "HIGH", "headline": "x",
                                        "detail": "x"}}).encode(),
             headers={"Content-Type": "application/json"})
-        import urllib.error
         try:
             with urllib.request.urlopen(request, timeout=5) as reply:
                 status = reply.status
@@ -1282,9 +1318,6 @@ class TestRelayTunnelToken:
 
 class TestRelayTunnelDiscovery:
     def test_lan_listener_serves_tunnel_url(self):
-        import threading
-        import urllib.request
-        import watch_relay
         watch_relay.TUNNEL_URL = "https://example.trycloudflare.com/t/tok"
         try:
             server, _ = watch_relay.serve(port=0)
@@ -1298,10 +1331,6 @@ class TestRelayTunnelDiscovery:
             watch_relay.TUNNEL_URL = None
 
     def test_tunnel_url_not_exposed_through_tunnel_listener(self):
-        import threading
-        import urllib.error
-        import urllib.request
-        import watch_relay
         server, _ = watch_relay.serve(port=0, token="tok")
         threading.Thread(target=server.serve_forever, daemon=True).start()
         base = "http://127.0.0.1:%d" % server.server_address[1]
@@ -1343,8 +1372,6 @@ class TestSelfStartingRelay:
         assert "SessionStart" not in hooks
 
     def test_ensure_detects_running_relay(self, monkeypatch, capsys):
-        import threading
-        import watch_relay
         server, _ = watch_relay.serve(port=0)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         monkeypatch.setattr(watch_relay, "DEFAULT_PORT",
@@ -1358,7 +1385,6 @@ class TestSelfStartingRelay:
         server.server_close()
 
     def test_ensure_spawns_when_down(self, monkeypatch):
-        import watch_relay
         monkeypatch.setattr(watch_relay, "DEFAULT_PORT", 1)  # nothing there
         spawned = []
         class FakeProc:
@@ -1398,9 +1424,6 @@ class TestWatchSeenAttribution:
     bridge identifies itself and stays out of the diagnostics."""
 
     def test_bridge_polls_do_not_count_as_watch(self):
-        import threading
-        import urllib.request
-        import watch_relay
         server, queue = watch_relay.serve(port=0)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         base = "http://127.0.0.1:%d" % server.server_address[1]
@@ -1421,14 +1444,12 @@ class TestBonjourTXTAddresses:
     that silently fails on real hardware."""
 
     def test_txt_carries_port_always(self):
-        import watch_relay
         txt = watch_relay.advertise_txt(8977)
         assert txt["port"] == "8977"
 
     def test_txt_never_carries_the_tunnel(self, monkeypatch):
         """The tunnel URL embeds the travel secret; a TXT record would
         hand it to every device on the network. Never broadcast."""
-        import watch_relay
         monkeypatch.setattr(watch_relay, "TUNNEL_URL",
                             "https://x.trycloudflare.com/t/tok")
         txt = watch_relay.advertise_txt(8977)
@@ -1436,7 +1457,6 @@ class TestBonjourTXTAddresses:
         assert "tok" not in json.dumps(txt)
 
     def test_lan_ips_never_returns_tailnet_addresses(self, monkeypatch):
-        import watch_relay
         class FakeRun:
             stdout = "100.69.31.42\n"
         monkeypatch.setattr(watch_relay.subprocess, "run",
@@ -1470,7 +1490,6 @@ class TestSessionNames:
     def test_hyphenated_project_keeps_its_full_name(self, tmp_path,
                                                     monkeypatch):
         import watch_dashboard
-        import watch_relay
         monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"abc123": "Terminal"})
         self._write(tmp_path, "-Users-dev-Developer-familia-gateway",
@@ -1486,7 +1505,6 @@ class TestSessionNames:
     def test_falls_back_to_folder_name_without_cwd(self, tmp_path,
                                                    monkeypatch):
         import watch_dashboard
-        import watch_relay
         monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"def456": "Terminal"})
         self._write(tmp_path, "-Users-dev-Developer-solo", "def456.jsonl",
@@ -1496,7 +1514,6 @@ class TestSessionNames:
 
     def test_skips_system_injected_openers(self, tmp_path, monkeypatch):
         import watch_dashboard
-        import watch_relay
         monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"ghi789": "Terminal"})
         self._write(tmp_path, "-p", "ghi789.jsonl", [
@@ -1515,7 +1532,6 @@ class TestSessionNames:
         on the wrist 2026-09-03 — so the opening ask is the title, and a
         /rename beats it."""
         import watch_dashboard
-        import watch_relay
         monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"jkl012": "VS Code"})
         monkeypatch.setattr(watch_dashboard, "session_registry", lambda: {})
@@ -1542,7 +1558,6 @@ class TestSessionsLikeTheApp:
     and whether the session is live."""
 
     def test_live_sessions_ignores_dead_processes(self, tmp_path):
-        import watch_relay
         (tmp_path / "1.json").write_text(json.dumps(
             {"pid": os.getpid(), "sessionId": "alive-1",
              "entrypoint": "claude-vscode"}), encoding="utf-8")
@@ -1553,13 +1568,11 @@ class TestSessionsLikeTheApp:
         assert live == {"alive-1": "VS Code"}
 
     def test_live_sessions_survives_a_missing_directory(self, tmp_path):
-        import watch_relay
         assert watch_relay.live_sessions(sessions_dir=str(tmp_path / "no")) == {}
 
     def test_unattended_sdk_runs_stay_off_the_wrist(self, tmp_path):
         """The phone app never lists headless SDK runs; the wrist mirrors
         the phone, so a live sdk-cli process must not appear either."""
-        import watch_relay
         (tmp_path / "1.json").write_text(json.dumps(
             {"pid": os.getpid(), "sessionId": "robot-1",
              "entrypoint": "sdk-cli"}), encoding="utf-8")
@@ -1576,7 +1589,6 @@ class TestSessionsLikeTheApp:
         ("", ""),
     ])
     def test_repo_slug_parses_remotes(self, url, expected, monkeypatch):
-        import watch_relay
         class Out:
             stdout = url
         monkeypatch.setattr(watch_relay.subprocess, "run", lambda *a, **k: Out())
@@ -1593,7 +1605,6 @@ class TestSessionsLikeTheApp:
         ("x" * 80, "X" + "x" * 42 + "…"),
     ])
     def test_derive_title(self, text, expected):
-        import watch_relay
         assert watch_relay.derive_title(text) == expected
 
 
@@ -1620,7 +1631,6 @@ class TestUsageSummary:
                                       "cache_read_input_tokens": 100}}}
 
     def test_counts_only_the_rolling_window(self, tmp_path):
-        import watch_relay
         self._transcript(tmp_path, "a.jsonl", [
             self._entry(10, 500),      # inside 5h
             self._entry(60, 300),      # inside 5h
@@ -1633,7 +1643,6 @@ class TestUsageSummary:
         assert usage["day_messages"] == 3
 
     def test_breaks_down_by_model(self, tmp_path):
-        import watch_relay
         self._transcript(tmp_path, "b.jsonl", [
             self._entry(5, 100, "claude-opus-5"),
             self._entry(5, 400, "claude-fable-5"),
@@ -1644,12 +1653,10 @@ class TestUsageSummary:
         assert usage["models"]["claude-opus-5"] == 150
 
     def test_empty_directory_reports_zeroes(self, tmp_path):
-        import watch_relay
         usage = watch_relay.usage_summary(projects_dir=str(tmp_path))
         assert usage["window_output"] == 0 and usage["day_messages"] == 0
 
     def test_unparseable_lines_are_skipped(self, tmp_path):
-        import watch_relay
         pdir = tmp_path / "-p"
         pdir.mkdir()
         (pdir / "c.jsonl").write_text(
@@ -1764,9 +1771,7 @@ class TestWatchPresence:
     never a gate."""
 
     def test_a_card_queues_even_with_no_watch_yet(self):
-        import threading
         import time as _time
-        import watch_relay
         queue = watch_relay.CardQueue()          # nobody has ever polled
         result = {}
 
@@ -1791,7 +1796,6 @@ class TestWatchPresence:
         mismatch killed the --demo/--card path silently (worker thread
         died after the wait, outcome never printed)."""
         import time as _time
-        import watch_relay
         queue = watch_relay.CardQueue()
         thread = watch_relay._inject(
             queue, {"tier": "HIGH", "headline": "x", "detail": "x"}, wait=10)
@@ -1806,7 +1810,6 @@ class TestWatchPresence:
         assert not thread.is_alive()      # would still be alive if it raised
 
     def test_a_recent_poll_counts_as_present(self):
-        import watch_relay
         queue = watch_relay.CardQueue()
         assert not queue.watch_present()
         queue.pending(from_watch=True)
@@ -1814,7 +1817,6 @@ class TestWatchPresence:
 
     def test_a_stale_poll_does_not(self, monkeypatch):
         import time as _time
-        import watch_relay
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
         queue.last_poll = _time.monotonic() - (queue.WATCH_PRESENT_SECONDS + 5)
@@ -1826,7 +1828,6 @@ class TestLateDecisions:
     silently does nothing is indistinguishable from a broken button."""
 
     def test_relay_refuses_an_answer_for_a_card_it_no_longer_holds(self):
-        import watch_relay
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
         card_id, decision, _ = queue.submit(
@@ -1836,8 +1837,6 @@ class TestLateDecisions:
         assert queue.pending() == []
 
     def test_an_answer_in_time_is_accepted(self):
-        import threading
-        import watch_relay
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
         result = {}
@@ -1865,8 +1864,6 @@ class TestWaitsOnlyWhileWatched:
     def test_a_lowered_wrist_does_not_cost_the_question(self):
         """Once asked, the card stands until answered — a wrist that stops
         polling for a while must never retract it. (The owner's rule, twice.)"""
-        import threading
-        import watch_relay
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
         done = threading.Event()
@@ -1886,8 +1883,6 @@ class TestWaitsOnlyWhileWatched:
         assert queue.pending(), "and still visible for the returning wrist"
 
     def test_keeps_waiting_while_the_watch_keeps_polling(self):
-        import threading
-        import watch_relay
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
         done = threading.Event()
@@ -1915,7 +1910,6 @@ class TestSessionReplies:
                             "message": {"role": "user", "content": "hi"}}])
 
     def test_resolves_a_short_id_to_the_full_one(self, tmp_path):
-        import watch_relay
         self._session(tmp_path)
         session_id, cwd = watch_relay.resolve_session(
             "abc123", projects_dir=str(tmp_path))
@@ -1923,18 +1917,15 @@ class TestSessionReplies:
         assert cwd == "/x/proj"
 
     def test_unknown_session_is_reported_not_guessed(self, tmp_path):
-        import watch_relay
         assert watch_relay.say_to_session(
             "nope", "hello", projects_dir=str(tmp_path)) == "unknown session"
 
     def test_empty_text_is_refused(self, tmp_path):
-        import watch_relay
         self._session(tmp_path)
         assert watch_relay.say_to_session(
             "abc123", "   ", projects_dir=str(tmp_path)) == "empty"
 
     def test_sends_in_the_sessions_own_directory(self, tmp_path, monkeypatch):
-        import watch_relay
         self._session(tmp_path)
         seen = {}
         class FakeProc:
@@ -1950,7 +1941,6 @@ class TestSessionReplies:
         assert seen["cwd"] == "/x/proj"
 
     def _spawned(self, tmp_path, monkeypatch, **kwargs):
-        import watch_relay
         self._session(tmp_path)
         seen = {}
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _: "/usr/bin/claude")
@@ -2091,12 +2081,10 @@ class TestRelayPairing:
     café network that is a room full of strangers."""
 
     def test_loopback_needs_nothing(self):
-        import watch_relay
         assert watch_relay.authorize_request(
             "127.0.0.1", "/say", "", False, "secret")
 
     def test_strangers_are_refused_everywhere_but_health(self):
-        import watch_relay
         assert not watch_relay.authorize_request(
             "203.0.113.9", "/pending", "", False, "secret")
         assert not watch_relay.authorize_request(
@@ -2116,11 +2104,9 @@ class TestRelayPairing:
         """The café-Wi-Fi hole, closed. Every one of these once answered a
         stranger on the same subnet: transcripts, the session list, and the
         power to answer a prompt or speak into a live session."""
-        import watch_relay
         assert not watch_relay.authorize_request(ip, path, "", False, "secret")
 
     def test_the_paired_key_opens_everything(self):
-        import watch_relay
         assert watch_relay.authorize_request(
             "192.168.1.50", "/thread", "secret", False, "secret")
         assert watch_relay.authorize_request(
@@ -2130,7 +2116,6 @@ class TestRelayPairing:
         """The travel URL is printed to stderr and written to the relay log,
         so it is not a secret worth betting a session on. It says where to
         knock; the device key still says who is knocking."""
-        import watch_relay
         assert not watch_relay.authorize_request(
             "203.0.113.9", "/pending", "", True, "secret", via_tunnel=True)
         assert watch_relay.authorize_request(
@@ -2139,12 +2124,10 @@ class TestRelayPairing:
     def test_loopback_is_not_a_pass_on_the_tunnel_listener(self):
         """cloudflared connects from 127.0.0.1, so on that listener loopback
         means "the internet", not "a local process"."""
-        import watch_relay
         assert not watch_relay.authorize_request(
             "127.0.0.1", "/pending", "", True, "secret", via_tunnel=True)
 
     def test_no_configured_key_never_admits_strangers(self):
-        import watch_relay
         assert not watch_relay.authorize_request(
             "203.0.113.9", "/pending", "wrong", False, None)
 
@@ -2157,13 +2140,11 @@ class TestRelayPairing:
     def test_private_address_detection(self, ip, local):
         """Still needed — but only for the Host-header rebinding check, never
         as an authorization decision."""
-        import watch_relay
         assert watch_relay._is_private_address(ip) is local
 
     def test_the_old_boundary_helper_is_gone(self):
         """Guard against a merge resurrecting the function whose docstring
         called itself "the pairing boundary"."""
-        import watch_relay
         assert not hasattr(watch_relay, "_is_local_source")
 
 
@@ -2315,7 +2296,6 @@ class TestLogsDoNotGrowForever:
     """The relay runs for weeks; nothing used to trim what it writes."""
 
     def test_a_large_log_is_trimmed_to_its_tail(self, tmp_path):
-        import watch_relay
         path = tmp_path / "relay.log"
         path.write_text("x" * 40 + "\n" + ("line\n" * 5000), encoding="utf-8")
         before = path.stat().st_size
@@ -2327,14 +2307,12 @@ class TestLogsDoNotGrowForever:
         assert "\nline\n" in after
 
     def test_a_small_log_is_left_alone(self, tmp_path):
-        import watch_relay
         path = tmp_path / "relay.log"
         path.write_text("still short\n", encoding="utf-8")
         assert watch_relay._rotate_log(str(path), limit=2000) is False
         assert path.read_text(encoding="utf-8") == "still short\n"
 
     def test_a_missing_log_is_not_an_error(self, tmp_path):
-        import watch_relay
         assert watch_relay._rotate_log(str(tmp_path / "nope.log")) is False
 
 
@@ -2388,7 +2366,6 @@ class TestTheKeyCarriedThroughICloudWorks:
     quietly loses the session list."""
 
     def _auth(self, tmp_path, monkeypatch):
-        import watch_relay
         monkeypatch.setattr(watch_relay, "TOKEN_FILE", str(tmp_path / "none"))
         return watch_relay.Auth(path=str(tmp_path / "auth.json"))
 
@@ -2397,7 +2374,6 @@ class TestTheKeyCarriedThroughICloudWorks:
         assert auth.matches(auth.bootstrap)
 
     def test_it_survives_a_reload(self, tmp_path, monkeypatch):
-        import watch_relay
         auth = self._auth(tmp_path, monkeypatch)
         again = watch_relay.Auth(path=auth.path)
         assert again.matches(again.bootstrap)
@@ -2425,26 +2401,11 @@ class TestLanSourceIsNotTrusted:
     """
 
     @pytest.fixture
-    def lan(self):
-        import threading
-        import watch_relay
+    def lan(self, fresh_auth):
         # Rate-limit counters are module-wide, like site rules: reset them or
         # one test's burst becomes the next test's mysterious 429.
         watch_relay.LIMITS.reset()
-        auth = watch_relay.Auth.__new__(watch_relay.Auth)
-        auth.path = "/dev/null"
-        auth._lock = threading.RLock()
-        auth.tunnel_secret = "tunnelsecret"
-        auth.bootstrap = "bootstraptoken"
-        auth.devices = [{"id": "w1", "token": "devicetoken",
-                         "label": "Watch", "issued": 0, "last_seen": 0,
-                         "source": "test"}]
-        auth.paired_ever = True
-        auth._window_until = 0.0
-        auth._window_claims = 0
-        auth._window_ips = set()
-        auth._slammed = False
-        auth.save = lambda: None
+        auth = _known_watch(fresh_auth)
         server, queue = watch_relay.serve(port=0, auth=auth)
         # Rewrite the peer address on the server instance: a LAN client with
         # no production test seam, and the Host header still names loopback
@@ -2462,24 +2423,7 @@ class TestLanSourceIsNotTrusted:
         server.shutdown()
         server.server_close()
 
-    def _call(self, url, token=None, method="GET", body=None):
-        import json as _json
-        import urllib.error
-        import urllib.request
-        headers = {"Content-Type": "application/json"}
-        if token:
-            headers["X-Tapproval-Token"] = token
-        data = _json.dumps(body or {}).encode() if method == "POST" else None
-        request = urllib.request.Request(url, data=data, headers=headers,
-                                         method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=5) as reply:
-                return reply.status, _json.loads(reply.read().decode())
-        except urllib.error.HTTPError as error:
-            try:
-                return error.code, _json.loads(error.read().decode())
-            except Exception:
-                return error.code, {}
+    _call = staticmethod(relay_call)
 
     @pytest.mark.parametrize("path", [
         "/pending", "/sessions", "/activity", "/usage", "/thread?id=x",
@@ -2569,10 +2513,7 @@ class TestLanSourceIsNotTrusted:
     def _never_paired(self, auth):
         auth.paired_ever = False
         auth.devices = []
-        auth._window_until = 0.0        # no --pair window at all
-        # The first-run window a relay start would have lit.
-        import watch_relay
-        auth._first_window_until = time.time() + watch_relay.PAIR_FIRST_WINDOW_SECONDS
+        auth.relight()          # the door a relay start would have lit
 
     def test_a_never_paired_machine_keeps_the_door_open(self, lan):
         base, _, auth = lan
@@ -2584,7 +2525,6 @@ class TestLanSourceIsNotTrusted:
     def test_the_door_stays_open_long_enough_to_install_and_no_longer(self, lan):
         """The fuse: twenty minutes later still open, an hour later shut —
         until the next session start lights it again."""
-        import watch_relay
         base, _, auth = lan
         self._never_paired(auth)
         real = watch_relay.time.time
@@ -2595,7 +2535,7 @@ class TestLanSourceIsNotTrusted:
             watch_relay.time.time = lambda: real() + 3600.0
             assert not auth.window_open()
             assert self._call(base + "/pair")[0] == 403
-            auth.relight_first_window()
+            auth.relight()
             assert auth.window_open()
         finally:
             watch_relay.time.time = real
@@ -2649,8 +2589,6 @@ class TestGhostCards:
     leave the wrist immediately, not haunt it for the rest of the wait."""
 
     def test_dead_caller_retracts_the_card_promptly(self):
-        import threading
-        import watch_relay
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
         alive = {"value": True}
@@ -2674,8 +2612,6 @@ class TestGhostCards:
         assert queue.pending() == []              # retracted, not haunting
 
     def test_a_live_caller_keeps_waiting(self):
-        import threading
-        import watch_relay
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
         done = threading.Event()
@@ -2708,7 +2644,6 @@ class TestThreadForTheWatch:
         ])
 
     def test_tool_turns_are_typed_and_text_is_cleaned(self, tmp_path):
-        import watch_relay
         self._transcript(tmp_path)
         turns = watch_relay.session_thread("livethread1",
                                            projects_dir=str(tmp_path))
@@ -2739,39 +2674,32 @@ class TestPlainTextForTheWatch:
         ("~~gone~~ kept", "gone kept"),
     ])
     def test_markers_go_structure_stays(self, md, expected):
-        import watch_relay
         assert watch_relay.plain_text(md) == expected
 
     def test_markdown_fence_is_prose_in_disguise(self):
-        import watch_relay
         md = "```markdown\n# Title\n- item\n```"
         assert watch_relay.plain_text(md) == "Title\n• item"
 
     def test_four_backtick_markdown_fence_is_prose_too(self):
         """Claude uses ````markdown when the content itself holds ```."""
-        import watch_relay
         md = "````markdown\n# PKT-003 — bygget\n## Runde 2\n````"
         assert watch_relay.plain_text(md) == "PKT-003 — bygget\nRunde 2"
 
     def test_code_fence_becomes_one_marker(self):
         """Code renders as a box on the phone; the wrist shows one [code]
         marker per block instead of verbatim lines."""
-        import watch_relay
         md = "```python\n# a comment\nx = 1\n```"
         assert watch_relay.plain_text(md) == "[code]"
 
     def test_identifiers_with_double_underscores_survive(self):
-        import watch_relay
         assert watch_relay.plain_text("ran mcp__github__merge_pull_request") == \
             "ran mcp__github__merge_pull_request"
 
     def test_empty_and_none(self):
-        import watch_relay
         assert watch_relay.plain_text("") == ""
         assert watch_relay.plain_text(None) == ""
 
     def test_thread_turns_and_titles_are_flattened(self, tmp_path):
-        import watch_relay
         _write_transcript(tmp_path, "-p", "mdthread1.jsonl", [
             {"cwd": "/x", "message": {"role": "user",
                                        "content": "## Fix the **checkout**"}},
@@ -2792,7 +2720,6 @@ class TestFenceNesting:
     must not flip the state (the motivating case for the {3,} widening)."""
 
     def test_inner_fence_stays_inside_the_outer(self):
-        import watch_relay
         text = "before\n````markdown\ninner prose\n```\nstill inside\n````\nafter"
         flat = watch_relay.plain_text(text)
         # prose fences still flatten their content; the inner ``` does not
@@ -2804,7 +2731,6 @@ class TestFenceNesting:
         """A code block is a box on the phone; on the wrist it is one
         [code] marker — never verbatim soup, never more than one marker
         per block."""
-        import watch_relay
         text = "before\n````\ncode line\n```\nmore code\n````\ntail"
         flat = watch_relay.plain_text(text)
         assert "more code" not in flat
@@ -2818,8 +2744,6 @@ def live_relay():
 
     Shared by every hook-through-relay test so the env handling and the
     server teardown cannot drift apart between copies."""
-    import threading
-    import watch_relay
     queue = watch_relay.CardQueue()
     server, _ = watch_relay.serve("127.0.0.1", 0, queue=queue)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -2865,7 +2789,6 @@ class TestQuestionCards:
     def test_answer_travels_back_as_the_deny_reason(self, live_relay,
                                                     tmp_path, monkeypatch):
         import io
-        import threading
         import time as _time
         port, queue = live_relay
 
@@ -2902,7 +2825,6 @@ class TestPhoneVocabulary:
     become one phrase, and running background tasks are counted."""
 
     def test_consecutive_tools_become_one_phrase(self, tmp_path):
-        import watch_relay
         lines = [{"cwd": "/x", "message": {"role": "user", "content": "go"}}]
         for name in ("Bash", "Bash", "Edit", "Grep"):
             lines.append({"message": {"role": "assistant",
@@ -2928,7 +2850,6 @@ class TestPhoneVocabulary:
         none. A task nobody can find is not a task.
         """
         import watch_dashboard
-        import watch_relay
         lines = [
             {"cwd": "/x", "message": {"role": "user", "content": "go"}},
             {"message": {"role": "user", "content":
@@ -2991,7 +2912,6 @@ class TestEveryPress:
             _os.environ.update(env_backup)
 
     def _press(self, queue, decision, answer=None):
-        import threading
         import time as _time
 
         def worker():
@@ -3071,7 +2991,6 @@ class TestRunningToolChip:
     no tool_result after it is the command running right now."""
 
     def test_unfinished_tool_is_running(self, tmp_path):
-        import watch_relay
         lines = [
             {"cwd": "/x", "message": {"role": "user", "content": "go"}},
             {"message": {"role": "assistant", "content": [
@@ -3086,7 +3005,6 @@ class TestRunningToolChip:
         assert running_tool == "Long build step"
 
     def test_finished_tool_is_not(self, tmp_path):
-        import watch_relay
         lines = [
             {"cwd": "/x", "message": {"role": "user", "content": "go"}},
             {"message": {"role": "assistant", "content": [
@@ -3155,7 +3073,6 @@ class TestPromptParity:
         assert queue.pending() == []
 
     def test_a_real_prompt_still_cards(self, live_relay, tmp_path):
-        import threading
         import time as _time
         port, queue = live_relay
         seen = {}
@@ -3228,8 +3145,6 @@ class TestCloudHeartbeat:
     cards the bridge exists to mirror."""
 
     def test_fresh_heartbeat_counts_as_presence(self, live_relay):
-        import json as _json
-        import urllib.request
         port, queue = live_relay
         queue.last_poll = None      # no direct watch poll ever
         assert not queue.watch_present()
@@ -3242,20 +3157,17 @@ class TestCloudHeartbeat:
         assert queue.watch_present()
 
     def test_stale_heartbeat_is_ignored(self):
-        import watch_relay
         queue = watch_relay.CardQueue()
         queue.note_watch_indirect(watch_relay.CardQueue.WATCH_PRESENT_SECONDS + 5)
         assert not queue.watch_present()
 
     def test_garbage_never_crashes_or_counts(self):
-        import watch_relay
         queue = watch_relay.CardQueue()
         for junk in (None, "soon", -3, {"a": 1}):
             queue.note_watch_indirect(junk)
         assert not queue.watch_present()
 
     def test_indirect_never_rewinds_a_direct_poll(self):
-        import watch_relay
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)          # direct poll: now
         direct = queue.last_poll
@@ -3268,7 +3180,6 @@ class TestOnlyActiveSessionsAreListed:
     Claude process — never a graveyard of every transcript on disk."""
 
     def test_dead_transcripts_are_not_listed(self, tmp_path, monkeypatch):
-        import watch_relay
         import watch_dashboard
         _write_transcript(tmp_path, "-p", "livesess1.jsonl",
                           [{"cwd": "/x/a",
@@ -3351,7 +3262,6 @@ class TestPhoneSilenceMirror:
         """pytest is SAFE in our tables but prompts on the phone — the
         wrist must card it, not skip it as parity."""
         import io
-        import threading
         import time as _time
         port, queue = live_relay
 
@@ -3405,9 +3315,7 @@ class TestFingerprintPerTool:
 
 class TestEmptyAnswerRefused:
     def test_answer_with_no_words_is_refused(self):
-        import threading
         import time as _time
-        import watch_relay
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
         result = {}
@@ -3428,7 +3336,6 @@ class TestEmptyAnswerRefused:
 
 class TestAnsweredQuestionsCount:
     def test_watch_answer_counts_in_activity(self, tmp_path):
-        import watch_relay
         log = tmp_path / "audit.jsonl"
         log.write_text(json.dumps({
             "ts": "2099-01-01T10:00:00+00:00", "tier": "MEDIUM",
@@ -3464,9 +3371,7 @@ class TestResolvedElsewhere:
         return card, path
 
     def test_a_phone_answer_retracts_the_card(self, tmp_path):
-        import threading
         import time as _time
-        import watch_relay
         card, path = self._card_and_transcript(tmp_path)
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
@@ -3496,7 +3401,6 @@ class TestResolvedElsewhere:
 
     def test_unrelated_results_do_not_retract(self, tmp_path):
         import time as _time
-        import watch_relay
         card, path = self._card_and_transcript(tmp_path)
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps({"message": {"role": "assistant",
@@ -3520,7 +3424,6 @@ class TestResolvedElsewhere:
         """Compaction rewrites the file smaller. The resolver must go
         dormant past the rewrite — matching an EARLIER identical command's
         old result would retract a live card nobody answered."""
-        import watch_relay
         card, path = self._card_and_transcript(tmp_path)
         resolver = watch_relay._prompt_resolver(
             card, projects_dir=str(tmp_path))
@@ -3553,7 +3456,6 @@ class TestTaskVerdictsCanRecover:
     again — and an exit marker beats a stale mtime."""
 
     def test_exit_marker_wins_even_when_stale(self, tmp_path, monkeypatch):
-        import watch_relay
         import watch_dashboard
         tasks = tmp_path / "claude-1" / "x" / "sess" / "tasks"
         tasks.mkdir(parents=True)
@@ -3570,7 +3472,6 @@ class TestTaskVerdictsCanRecover:
         assert watch_relay._task_state("sess", "tid1") == "done"
 
     def test_stale_but_alive_is_unknown_not_done(self, tmp_path, monkeypatch):
-        import watch_relay
         import glob as _glob
         out = tmp_path / "tid2.output"
         out.write_text("still working\n")
@@ -3602,9 +3503,7 @@ class TestAlwaysMirrorsThePhone:
         assert card["can_always"] is False
 
     def test_relay_never_records_a_grant_the_phone_would_not_offer(self):
-        import threading
         import time as _time
-        import watch_relay
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
         card = {"tier": "HIGH", "headline": "x", "detail": "x",
@@ -3635,23 +3534,19 @@ class TestHostRebindingDefense:
     in Host, which is neither a loopback name nor a bare local IP."""
 
     def test_loopback_and_local_ip_hosts_pass(self):
-        import watch_relay
         for host in ("127.0.0.1:8977", "localhost:8977", "localhost",
                      "192.168.1.25:8977", "10.0.0.3:8977", "100.100.5.5:8977",
                      "[::1]:8977", "::1"):
             assert watch_relay.host_allowed(host), host
 
     def test_rebinding_and_foreign_hosts_are_rejected(self):
-        import watch_relay
         for host in ("evil.com:8977", "evil.com", "",
                      "10.evil.com:8977", "127.0.0.1.evil.com",
                      "8.8.8.8:8977", "attacker.local:8977"):
             assert not watch_relay.host_allowed(host), host
 
     def test_main_listener_refuses_a_foreign_host_end_to_end(self):
-        import threading
         import http.client
-        import watch_relay
         queue = watch_relay.CardQueue()
         server, _ = watch_relay.serve("127.0.0.1", 0, queue=queue)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -3681,7 +3576,6 @@ class TestHostRebindingDefense:
             server.server_close()
 
     def test_tunnel_listener_is_exempt(self):
-        import watch_relay
         handler = type("H", (watch_relay.RelayHandler,),
                        {"required_token": "sekret"})
         inst = handler.__new__(handler)
@@ -3695,7 +3589,6 @@ class TestFullTextReachesTheWrist:
     wrist shows the full text, like the phone."""
 
     def test_a_long_reply_survives_intact(self, tmp_path):
-        import watch_relay
         tail = "Hæver jeg den til fem minutter, sparer jeg trafikken. SLUT"
         long_text = ("A" * 2500) + " " + tail
         _write_transcript(tmp_path, "-p", "longmsg01.jsonl", [
@@ -3709,7 +3602,6 @@ class TestFullTextReachesTheWrist:
         assert turns[-1]["text"].endswith("SLUT")
 
     def test_the_truly_enormous_is_cut_at_a_word_and_says_so(self, tmp_path):
-        import watch_relay
         enormous = ("ord " * 5000).strip()          # ~20000 chars
         _write_transcript(tmp_path, "-p", "longmsg02.jsonl", [
             {"cwd": "/x", "message": {"role": "user", "content": "go"}},
@@ -3731,7 +3623,6 @@ class TestSessionListCarriesTheRing:
     the sessions payload too, plus the last GitHub fact Claude mentioned."""
 
     def _session(self, tmp_path, monkeypatch, lines):
-        import watch_relay
         import watch_dashboard
         _write_transcript(tmp_path, "-p", "ringsess01.jsonl", lines)
         monkeypatch.setattr(watch_dashboard, "live_sessions",
@@ -4023,7 +3914,6 @@ class TestSubagentCardsRetract:
     TOOL, TOOL_INPUT = "Bash", {"command": "rm -rf /tmp/subagent-target"}
 
     def _setup(self, tmp_path, monkeypatch):
-        import watch_relay
         monkeypatch.setattr(watch_relay, "RESOLVER_RESCAN_SECONDS", 0.0)
         sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         project = tmp_path / "-Users-someone-Developer-Demo"
@@ -4095,7 +3985,6 @@ class TestTunnelBinaryLookup:
     """
 
     def test_found_on_path(self, monkeypatch, tmp_path):
-        import watch_relay
         fake = tmp_path / "cloudflared"
         fake.write_text("#!/bin/sh\n", encoding="utf-8")
         fake.chmod(0o755)
@@ -4104,7 +3993,6 @@ class TestTunnelBinaryLookup:
 
     def test_found_where_homebrew_puts_it_when_path_is_bare(
             self, monkeypatch, tmp_path):
-        import watch_relay
         fake = tmp_path / "cloudflared"
         fake.write_text("#!/bin/sh\n", encoding="utf-8")
         fake.chmod(0o755)
@@ -4113,7 +4001,6 @@ class TestTunnelBinaryLookup:
         assert watch_relay._cloudflared() == str(fake)
 
     def test_none_when_genuinely_absent(self, monkeypatch):
-        import watch_relay
         monkeypatch.setenv("PATH", "/nonexistent")
         monkeypatch.setattr(watch_relay, "_TUNNEL_PATHS",
                             ("/nonexistent/cloudflared",))
@@ -4125,46 +4012,46 @@ class TestHelperKeepsItselfCurrent:
 
     The version before 1.1.1 discarded every wrist approval in silence, so
     an update that never arrives is the failure this guards against. The
-    SessionStart hook already runs on every session; it now fast-forwards
-    a git install on the way past, at most once a day, and never in the
-    way of a session.
+    SessionStart hook already runs on every session; it now kicks off a
+    fast-forward of a git install at most once a day, in a detached
+    process, so it is never in the way of a session.
     """
 
-    def _relay(self):
-        import watch_relay
-        return watch_relay
+    def _spawns(self, monkeypatch):
+        spawned = []
+        monkeypatch.setattr(watch_relay, "_spawn_detached",
+                            lambda argv, log: spawned.append(argv) or None)
+        return spawned
 
     def test_a_plugin_install_is_never_rewritten(self, tmp_path, monkeypatch):
         """Claude Code owns a plugin's files and manages its own updates."""
-        wr = self._relay()
+        wr = watch_relay
+        spawned = self._spawns(monkeypatch)
         monkeypatch.setattr(wr, "__file__", str(tmp_path / "watch_relay.py"))
         monkeypatch.setattr(wr, "_UPDATE_STAMP", str(tmp_path / "stamp"))
-        assert wr._self_update() is False      # no .git beside it
+        wr._self_update()                      # no .git beside it
+        assert spawned == []
 
     def test_it_asks_at_most_once_a_day(self, tmp_path, monkeypatch):
-        wr = self._relay()
+        wr = watch_relay
+        spawned = self._spawns(monkeypatch)
         (tmp_path / ".git").mkdir()
         stamp = tmp_path / "stamp"
         stamp.write_text("recent", encoding="utf-8")
         monkeypatch.setattr(wr, "__file__", str(tmp_path / "watch_relay.py"))
         monkeypatch.setattr(wr, "_UPDATE_STAMP", str(stamp))
-        called = []
-        monkeypatch.setattr(wr.subprocess, "run",
-                            lambda *a, **k: called.append(a) or None)
-        assert wr._self_update() is False
-        assert called == [], "a fresh stamp must skip the network entirely"
+        wr._self_update()
+        assert spawned == [], "a fresh stamp must skip the update entirely"
 
     def test_a_failure_never_blocks_the_session(self, tmp_path, monkeypatch):
         """No git, no network, a dirty clone — start what is already there."""
-        wr = self._relay()
-        (tmp_path / ".git").mkdir()
+        wr = watch_relay
         monkeypatch.setattr(wr, "__file__", str(tmp_path / "watch_relay.py"))
-        monkeypatch.setattr(wr, "_UPDATE_STAMP", str(tmp_path / "stamp"))
 
         def boom(*_a, **_k):
             raise OSError("git is not installed")
         monkeypatch.setattr(wr.subprocess, "run", boom)
-        assert wr._self_update() is False
+        assert wr._pull_update() is False
 
 
     def test_it_never_raises_whatever_git_does(self, tmp_path, monkeypatch):
@@ -4174,16 +4061,14 @@ class TestHelperKeepsItselfCurrent:
         list. A narrow except is how this promise was first broken: a
         test that stubbed subprocess.Popen made subprocess.run raise
         TypeError, which sailed straight through."""
-        import watch_relay as wr
-        (tmp_path / ".git").mkdir()
+        wr = watch_relay
         monkeypatch.setattr(wr, "__file__", str(tmp_path / "watch_relay.py"))
-        monkeypatch.setattr(wr, "_UPDATE_STAMP", str(tmp_path / "stamp"))
         for blow_up in (TypeError("no __enter__"), AttributeError("nope"),
                         ValueError("odd"), RuntimeError("worse")):
             def raiser(*_a, _e=blow_up, **_k):
                 raise _e
             monkeypatch.setattr(wr.subprocess, "run", raiser)
-            assert wr._self_update() is False
+            assert wr._pull_update() is False
 
 
 class TestInstallTranscript:
@@ -4250,14 +4135,12 @@ class TestNewSessionFromTheWatch:
         return str(root)
 
     def test_known_projects_are_recent_directories_newest_first(self, tmp_path, monkeypatch):
-        import watch_relay
         monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})   # nothing live
         rows = watch_relay.known_projects(projects_dir=self._projects(tmp_path))
         assert [r["name"] for r in rows] == ["acme", "pantri"]
         assert all(os.path.isdir(r["path"]) for r in rows)
 
     def test_known_projects_drop_directories_that_no_longer_exist(self, tmp_path, monkeypatch):
-        import watch_relay
         import shutil
         monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
         root = self._projects(tmp_path)
@@ -4265,24 +4148,20 @@ class TestNewSessionFromTheWatch:
         assert [r["name"] for r in watch_relay.known_projects(projects_dir=root)] == ["acme"]
 
     def test_refuses_anything_but_a_mac(self, tmp_path):
-        import watch_relay
         assert watch_relay.start_session("/x", "go", platform="linux") == "new sessions need a Mac"
 
     def test_refuses_an_empty_message(self):
-        import watch_relay
         assert watch_relay.start_session("/x", "   ", platform="darwin") == "empty"
 
     def test_refuses_a_directory_claude_code_has_never_worked_in(self, tmp_path, monkeypatch):
         """The watch never types a path, and the relay never opens a
         terminal somewhere it has not already seen Claude Code run."""
-        import watch_relay
         monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
         root = self._projects(tmp_path)
         assert watch_relay.start_session(str(tmp_path / "elsewhere"), "go",
                                          projects_dir=root, platform="darwin") == "unknown project"
 
     def test_says_when_claude_is_missing(self, tmp_path, monkeypatch):
-        import watch_relay
         monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: None)
         root = self._projects(tmp_path)
@@ -4292,7 +4171,6 @@ class TestNewSessionFromTheWatch:
     def test_a_terminal_that_will_not_open_is_reported_in_words(self, tmp_path, monkeypatch):
         """No one logged in at the screen is the usual reason; the watch
         must be able to say so rather than spin."""
-        import watch_relay
         import subprocess as sp
         monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
@@ -4305,7 +4183,6 @@ class TestNewSessionFromTheWatch:
         assert "Not authorized" in status
 
     def test_success_opens_terminal_in_that_directory_with_that_message(self, tmp_path, monkeypatch):
-        import watch_relay
         import subprocess as sp
         monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
@@ -4332,10 +4209,6 @@ class TestNewSessionFromTheWatch:
     def test_projects_and_new_are_ordinary_data_routes(self, tmp_path, monkeypatch):
         """/projects needs the same key as every other data route, and /new
         answers a refusal as JSON the watch can show — never a 500."""
-        import threading
-        import urllib.request
-        import urllib.error
-        import watch_relay
         monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
         watch_relay.LIMITS.reset()
         server, _ = watch_relay.serve(port=0)
@@ -4366,22 +4239,10 @@ class TestRelayRoutes:
     is the failure this class is here to catch."""
 
     @pytest.fixture
-    def relay(self):
-        import threading
-        import watch_relay
+    def relay(self, fresh_auth):
         watch_relay.LIMITS.reset()
-        auth = watch_relay.Auth.__new__(watch_relay.Auth)
-        auth.path = "/dev/null"
-        auth._lock = threading.RLock()
-        auth.tunnel_secret = "tunnelsecret"
-        auth.bootstrap = "bootstraptoken"
+        auth = _known_watch(fresh_auth)
         auth.devices = []
-        auth.paired_ever = True
-        auth._window_until = 0.0
-        auth._window_claims = 0
-        auth._window_ips = set()
-        auth._slammed = False
-        auth.save = lambda: None
         server, queue = watch_relay.serve(port=0, auth=auth)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -4389,10 +4250,9 @@ class TestRelayRoutes:
         server.shutdown()
         server.server_close()
 
-    _call = TestLanSourceIsNotTrusted._call
+    _call = staticmethod(relay_call)
 
     def test_every_route_in_the_table_has_a_handler(self):
-        import watch_relay
         handler = watch_relay.RelayHandler
         for method, routes in handler.ROUTES.items():
             for path, (name, rules) in routes.items():
@@ -4400,13 +4260,11 @@ class TestRelayRoutes:
                 assert set(rules) <= {"auth", "lan_only", "local", "admin", "token"}, path
 
     def test_the_two_pairing_routes_are_the_only_ones_without_auth(self):
-        import watch_relay
         open_routes = {(m, p) for m, routes in watch_relay.RelayHandler.ROUTES.items()
                        for p, (_, rules) in routes.items() if not rules.get("auth", True)}
         assert open_routes == {("GET", "/pair"), ("POST", "/enroll")}
 
     def test_what_reaches_the_machine_is_local_only(self):
-        import watch_relay
         post = watch_relay.RelayHandler.ROUTES["POST"]
         for path in ("/card", "/heartbeat", "/admin/pair-open", "/admin/rotate", "/admin/pair-reset"):
             assert post[path][1].get("local"), path
@@ -4425,7 +4283,6 @@ class TestRelayRoutes:
         assert "version" in body and "pending" in body
 
     def test_the_read_routes_answer_with_their_shapes(self, relay, monkeypatch):
-        import watch_relay
         monkeypatch.setattr(watch_relay, "known_projects", lambda: [{"name": "x"}])
         monkeypatch.setattr(watch_relay, "recent_sessions", lambda: [])
         monkeypatch.setattr(watch_relay, "activity_summary", lambda: {"total": 0})
@@ -4444,7 +4301,6 @@ class TestRelayRoutes:
                         "modified_seconds_ago": None}
 
     def test_the_tunnel_route_hands_over_the_away_addresses(self, relay, monkeypatch):
-        import watch_relay
         monkeypatch.setattr(watch_relay, "TUNNEL_URL", "https://t.example")
         base, _, _ = relay
         status, body = self._call(base + "/tunnel")
@@ -4502,7 +4358,6 @@ class TestRelayRoutes:
         assert status == 200 and body == {"ok": False, "status": "empty"}
 
     def test_the_second_send_in_the_same_moment_waits_its_turn(self, relay):
-        import watch_relay
         base, _, _ = relay
         gate = watch_relay.LIMITS.gate("say", 1)
         assert gate.acquire(blocking=False)
@@ -4520,7 +4375,6 @@ class TestRelayRoutes:
         assert auth._window_until > 0
 
     def test_a_rotation_answers_in_one_word(self, relay, monkeypatch):
-        import watch_relay
         monkeypatch.setattr(watch_relay, "_rotate_tunnel_prefix", lambda secret: None)
         base, _, _ = relay
         status, body = self._call(base + "/admin/rotate", method="POST")
@@ -4677,7 +4531,6 @@ class TestSessionRegistry:
                 dict({"pid": os.getpid(), "entrypoint": "cli"}, **entry)), encoding="utf-8")
 
     def test_bridge_and_rename_are_read_from_the_registry(self, tmp_path):
-        import watch_relay
         self._registry(tmp_path, [
             {"sessionId": "phone-1", "bridgeSessionId": "session_x", "name": "acme-3f", "nameSource": "derived"},
             {"sessionId": "local-1", "name": "Billing fix", "nameSource": "user"}])
@@ -4687,7 +4540,6 @@ class TestSessionRegistry:
 
     def test_the_list_mirrors_the_phone_when_the_phone_has_sessions(self, tmp_path, monkeypatch):
         import watch_dashboard
-        import watch_relay
         monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"phone-1": "Terminal", "local-1": "Terminal"})
         monkeypatch.setattr(watch_dashboard, "session_registry", lambda: {
@@ -4701,7 +4553,6 @@ class TestSessionRegistry:
 
     def test_without_remote_control_every_live_session_shows(self, tmp_path, monkeypatch):
         import watch_dashboard
-        import watch_relay
         monkeypatch.setattr(watch_dashboard, "live_sessions",
                             lambda: {"a-1": "Terminal", "b-1": "Terminal"})
         monkeypatch.setattr(watch_dashboard, "session_registry", lambda: {
@@ -4714,7 +4565,6 @@ class TestSessionRegistry:
 
     def test_a_renamed_session_carries_its_name(self, tmp_path, monkeypatch):
         import watch_dashboard
-        import watch_relay
         monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {"r-1": "Terminal"})
         monkeypatch.setattr(watch_dashboard, "session_registry", lambda: {
             "r-1": {"status": "Terminal", "bridged": False, "name": "Billing fix"}})
@@ -4727,13 +4577,8 @@ class TestFirstPairingIsAWindow:
     """A machine that has never paired opens its door for half an hour at
     every relay start and session start — not until someone walks in."""
 
-    def _auth(self, tmp_path):
-        import watch_relay
-        return watch_relay.Auth(path=str(tmp_path / "auth.json"))
-
-    def test_open_right_after_start_and_shut_half_an_hour_later(self, tmp_path, monkeypatch):
-        import watch_relay
-        auth = self._auth(tmp_path)
+    def test_open_right_after_start_and_shut_half_an_hour_later(self, fresh_auth, monkeypatch):
+        auth = fresh_auth
         assert not auth.paired_ever and auth.window_open()
         now = time.time()
         monkeypatch.setattr(watch_relay.time, "time",
@@ -4741,29 +4586,35 @@ class TestFirstPairingIsAWindow:
         assert not auth.window_open()
         assert auth.claim_window("192.168.1.9") is None
 
-    def test_a_session_start_relights_it(self, tmp_path, monkeypatch):
-        import watch_relay
-        auth = self._auth(tmp_path)
+    def test_a_session_start_relights_it(self, fresh_auth, monkeypatch):
+        auth = fresh_auth
         now = time.time()
         monkeypatch.setattr(watch_relay.time, "time",
                             lambda: now + watch_relay.PAIR_FIRST_WINDOW_SECONDS + 1)
         assert not auth.window_open()
-        auth.relight_first_window()
+        auth.relight()
         assert auth.window_open()
         assert auth.claim_window("192.168.1.9") == auth.bootstrap
 
+    def test_the_first_watch_shuts_the_door_and_a_session_start_no_longer_opens_it(self, fresh_auth):
+        auth = fresh_auth
+        assert auth.window_open()
+        auth.issue_device("w1", source="lan")
+        assert auth.paired_ever and not auth.window_open()
+        auth.relight()
+        assert not auth.window_open()
+
     def test_ensure_relights_only_a_never_paired_relay(self, monkeypatch):
-        import watch_relay
         calls = []
-        monkeypatch.setattr(watch_relay, "_self_update", lambda: False)
-        monkeypatch.setattr(watch_relay, "_reopen_pairing", lambda: calls.append("lit"))
+        monkeypatch.setattr(watch_relay, "_self_update", lambda: None)
+        monkeypatch.setattr(watch_relay, "_admin_call", lambda path: calls.append(path))
         health = {"version": watch_relay.RELAY_VERSION, "pending": 0, "paired_ever": False}
         monkeypatch.setattr(watch_relay, "_probe_relay", lambda: health)
         assert watch_relay.ensure_running() == 0
-        assert calls == ["lit"]
+        assert calls == ["/admin/pair-relight"]
         health["paired_ever"] = True
         assert watch_relay.ensure_running() == 0
-        assert calls == ["lit"]
+        assert calls == ["/admin/pair-relight"]
 
 
 class TestTheUpdateLeavesTheBlockingPath:
@@ -4771,7 +4622,6 @@ class TestTheUpdateLeavesTheBlockingPath:
     spawns the pull and returns; the pull replaces the relay itself."""
 
     def test_a_due_update_is_spawned_not_run(self, tmp_path, monkeypatch):
-        import watch_relay
         stamp = tmp_path / "stamp"
         stamp.write_text("0", encoding="utf-8")
         os.utime(stamp, (0, 0))
@@ -4783,11 +4633,10 @@ class TestTheUpdateLeavesTheBlockingPath:
         def no_git(*a, **k):
             raise AssertionError("git ran on the blocking path")
         monkeypatch.setattr(watch_relay.subprocess, "run", no_git)
-        assert watch_relay._self_update() is False
+        watch_relay._self_update()
         assert spawned and spawned[0][-1] == "--update"
 
     def test_the_detached_half_replaces_the_relay_only_if_the_code_moved(self, monkeypatch):
-        import watch_relay
         ensured = []
         monkeypatch.setattr(watch_relay, "ensure_running",
                             lambda updated=None: ensured.append(updated) or 0)
@@ -4810,7 +4659,7 @@ class TestNoPersonalIdentityInTrackedFiles:
     with."""
 
     def _forbidden(self):
-        root = os.path.dirname(os.path.abspath(crc.__file__))
+        root = _ROOT
         path = os.environ.get("TAPPROVAL_FORBIDDEN_FILE") or os.path.join(
             root, ".private", "forbidden-strings.txt")
         if not os.path.isfile(path):
@@ -4836,3 +4685,18 @@ class TestNoPersonalIdentityInTrackedFiles:
                 if word.lower() in text:
                     offenders.append("%s: %s" % (rel, word))
         assert not offenders, "\n".join(offenders)
+
+
+def test_the_two_ci_workflows_share_their_test_steps():
+    """helper/.github/workflows/tests.yml is copied verbatim into the public
+    repo. Its Python steps must be the private workflow's, or the public
+    repo tests something else than what shipped."""
+    private = os.path.join(_ROOT, ".github", "workflows", "tests.yml")
+    public = os.path.join(HELPER_DIR, ".github", "workflows", "tests.yml")
+    if not os.path.isfile(private):
+        pytest.skip("no private workflow in this layout")
+    def python_steps(path):
+        lines = open(path, encoding="utf-8").read().split("\n")
+        end = next(i for i, line in enumerate(lines) if "shellcheck" in line and "run:" in line)
+        return lines[:end]
+    assert python_steps(private) == python_steps(public)

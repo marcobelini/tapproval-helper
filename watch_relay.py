@@ -88,7 +88,6 @@ BONJOUR_TYPE = "_wristtriage._tcp"
 def lan_ips():
     """This machine's LAN addresses (never the tailnet). Never raises."""
     import socket
-    ips = []
     for iface in ("en0", "en1", "en2", "en3"):
         try:
             out = subprocess.run(["ipconfig", "getifaddr", iface],
@@ -98,17 +97,17 @@ def lan_ips():
                 return [ip]
         except (OSError, subprocess.SubprocessError):
             pass
-    if not ips:
-        try:
-            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            probe.connect(("8.8.8.8", 80))
-            ip = probe.getsockname()[0]
-            probe.close()
-            if ip and not ip.startswith("100."):
-                ips.append(ip)
-        except OSError:
-            pass
-    return ips
+    # No named interface answered: the address the default route uses.
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))
+        ip = probe.getsockname()[0]
+        probe.close()
+        if ip and not ip.startswith("100."):
+            return [ip]
+    except OSError:
+        pass
+    return []
 
 
 def advertise_txt(port):
@@ -184,20 +183,29 @@ def _spawn_detached(command, log_path, cwd=None):
     return ""
 
 
+def _loopback_json(path, data=None, timeout=5):
+    """One request to the relay on this machine: the parsed JSON reply, or
+    None for any failure at all — no relay, a slow one, a bad body. GET
+    without ``data``, POST with it."""
+    import urllib.request
+    request = urllib.request.Request(
+        "http://127.0.0.1:%d%s" % (DEFAULT_PORT, path), data=data,
+        method="POST" if data is not None else "GET",
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as reply:
+            return json.loads(reply.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
 def _probe_relay(timeout=2):
     """What the running relay says about itself, or None if none is up.
 
     Asks over loopback, which the relay trusts, so the answer carries the
     version and the pending count rather than the anonymous liveness reply.
     """
-    import urllib.request
-    try:
-        with urllib.request.urlopen(
-                "http://127.0.0.1:%d/health" % DEFAULT_PORT,
-                timeout=timeout) as reply:
-            return json.loads(reply.read().decode("utf-8"))
-    except Exception:
-        return None
+    return _loopback_json("/health", timeout=timeout)
 
 
 def _stop_relay(deadline=8.0):
@@ -218,16 +226,7 @@ def _stop_relay(deadline=8.0):
 def _admin_call(path):
     """Loopback-only administration: the relay owns the state, this just
     asks it. Returns the parsed reply or None."""
-    import urllib.request
-    request = urllib.request.Request(
-        "http://127.0.0.1:%d%s" % (DEFAULT_PORT, path),
-        data=b"{}", method="POST",
-        headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=5) as reply:
-            return json.loads(reply.read().decode("utf-8"))
-    except Exception:
-        return None
+    return _loopback_json(path, data=b"{}")
 
 
 def run_admin(args):
@@ -303,10 +302,10 @@ def _self_update():
     """Kick off a fast-forward of a git-installed helper, once a day.
 
     Runs on the blocking path of the SessionStart hook, so it never pulls
-    here: it spawns ``--update`` detached and returns False at once. The
+    here: it spawns ``--update`` detached and returns at once. The
     background process pulls, and if the checkout moved it replaces the
     running relay itself, under the same "not while a card is waiting"
-    rule. Returns False: the caller never has to wait for the network.
+    rule. Nothing is returned: the caller never waits for the network.
 
     Only ever touches an install that is a git checkout — the one made by
     install.sh. A plugin install belongs to Claude Code, which manages its
@@ -317,11 +316,11 @@ def _self_update():
     """
     here = os.path.dirname(os.path.abspath(__file__))
     if not os.path.isdir(os.path.join(here, ".git")):
-        return False
+        return
     try:
         age = time.time() - os.path.getmtime(_UPDATE_STAMP)
         if age < _UPDATE_EVERY:
-            return False
+            return
     except OSError:
         pass
     try:
@@ -331,7 +330,6 @@ def _self_update():
         pass
     _spawn_detached([sys.executable, os.path.abspath(__file__), "--update"],
                     RELAY_LOG)
-    return False
 
 
 def _pull_update():
@@ -357,34 +355,19 @@ def _pull_update():
     return moved
 
 
-def _reopen_pairing():
-    """Tell the running relay that a session started: on a machine that
-    has never paired, that re-lights the first-run pairing window."""
-    import urllib.request
-    try:
-        request = urllib.request.Request(
-            "http://127.0.0.1:%d/admin/pair-open" % DEFAULT_PORT,
-            data=b"{}", method="POST",
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=2):
-            pass
-    except Exception:
-        pass
-
-
-def ensure_running(updated=None):
+def ensure_running(updated=False):
     """Start the relay in the background unless one is already up.
 
     Registered as a Claude Code SessionStart hook, so the relay's whole
     lifecycle is automatic: it exists whenever Claude Code does. Prints a
     line to stderr and exits immediately either way. Never raises.
 
-    ``updated`` is True when called by the background updater after a
-    pull moved the checkout; None means "kick the updater off if it is
-    due", which is what the hook does.
+    ``updated`` is True only when the background updater calls back after
+    a pull moved the checkout; the hook itself passes nothing and only
+    kicks the updater off when it is due.
     """
-    if updated is None:
-        updated = _self_update()
+    if not updated:
+        _self_update()
     running = _probe_relay()
     if running is not None:
         version = running.get("version") or 0
@@ -393,7 +376,7 @@ def ensure_running(updated=None):
         # it — subject to the same "not while a card is waiting" rule.
         if version >= RELAY_VERSION and not updated:
             if running.get("paired_ever") is False:
-                _reopen_pairing()
+                _admin_call("/admin/pair-relight")   # another half hour
             print("relay: already running", file=sys.stderr)
             return 0
         # An older relay is serving. Without this the machine keeps running
@@ -596,23 +579,11 @@ class CardQueue:
 # transcripts is large and harmless. Re-exported here so `watch_relay.X`
 # keeps working for everything that already calls it.
 from watch_dashboard import (  # noqa: E402,F401  (re-exports, see above)
-    CLAUDE_PROJECTS, CLAUDE_SESSIONS, ENTRYPOINTS,
-    PREWARM_SESSIONS, THREAD_TURN_LIMIT, USAGE_WINDOW_HOURS,
-    _ACTIVITY_LOCK, _ACTIVITY_STATE, _GH_FACT, _GH_VERB, _MD_BULLET,
-    _MD_CODE, _MD_EM, _MD_ESCAPE, _MD_FENCE, _MD_HEADING, _MD_HR, _MD_HTML,
-    _MD_IMAGE, _MD_LINK, _MD_QUOTE, _MD_STRIKE, _MD_STRONG, _MD_TABLE_SEP,
-    _META_CACHE, _REPO_SLUG_CACHE, _REPO_SLUG_MAX, _TASK_DONE,
-    _TASK_LAUNCH, _THREAD_LOCKS, _THREAD_LOCKS_GUARD, _THREAD_STATE,
-    _TOOL_PHRASES, _TRANSCRIPT_PATHS, _USAGE_FILES,
-    _activity_summary_locked, _audit_log_path, _find_transcript,
-    _fresh_thread_state, _last_github_fact, _last_prewarm, _parse_stamp,
-    _parse_thread, _parse_thread_locked, _read_appended,
-    _remember_repo_slug, _session_meta, _stat_cached, _task_state,
-    _thread_activity, _thread_line, _thread_lock, _tool_phrase,
-    _usage_entries, _usage_entries_uncached, activity_summary,
-    derive_title, live_sessions, session_registry, plain_text, prewarm_threads,
-    recent_sessions, repo_slug, resolve_session,
-    session_meta, session_thread, usage_summary)
+    activity_summary, derive_title, _find_transcript, live_sessions,
+    _parse_thread, plain_text, prewarm_threads, _read_appended,
+    recent_sessions, repo_slug, _REPO_SLUG_CACHE, resolve_session,
+    session_meta, session_registry, session_thread, _task_state,
+    THREAD_TURN_LIMIT, usage_summary)
 
 
 # What a wrist-sent message asks Claude to sound like. Each message spawns
@@ -958,20 +929,24 @@ def authorize_request(client_ip, path, header_token,
     so the exemption is deliberately withheld there: the secret path proves
     where the request came from, and the token proves who sent it.
     """
-    def _credential_ok():
-        if auth is None:
-            return False
-        if hasattr(auth, "matches"):
-            return auth.matches(header_token)
-        return _token_matches(header_token, auth)
-
     if via_tunnel:
-        return bool(tunnel_authed) and _credential_ok()
+        return bool(tunnel_authed) and _credential_ok(auth, header_token)
     if _is_loopback(client_ip):
         return True
     if path == "/health":            # liveness only; the body is trimmed
         return True
-    return _credential_ok()
+    return _credential_ok(auth, header_token)
+
+
+def _credential_ok(auth, token):
+    """Does ``token`` match the credential store — an Auth, or the bare
+    token string the older call sites still pass? False when there is no
+    store at all: nothing to prove against is not proof."""
+    if auth is None:
+        return False
+    if hasattr(auth, "matches"):
+        return auth.matches(token)
+    return _token_matches(token, auth)
 
 
 class _Limits:
@@ -1072,34 +1047,22 @@ class RelayHandler(BaseHTTPRequestHandler):
         """Did this caller prove anything at all? Decides how much /health
         is willing to say — a pending count and "is a watch on the wrist
         right now" is a presence oracle, not liveness."""
-        if self.required_token is None and _is_loopback(self.client_address[0]):
+        if self._is_local_process():
             return True
-        auth = self.auth
-        token = self.headers.get("X-Tapproval-Token", "")
-        if auth is None:
-            return False
-        if hasattr(auth, "matches"):
-            return auth.matches(token)
-        return _token_matches(token, auth)
+        return _credential_ok(self.auth, self.headers.get("X-Tapproval-Token", ""))
 
     def _proves_key(self):
         """A device token from anywhere; or, from a local process on the
-        main listener only, the bootstrap secret — which lives in the 0600
-        auth file, so holding it is proof of being this user on this
-        machine. The Mac bridge sends it. Loopback by itself proves
-        nothing here: authorize_request's local-process pass is for
-        reading and for posting cards, never for answering them."""
-        auth = self.auth
+        main listener, the bootstrap secret out of the 0600 auth file —
+        the Mac bridge's credential. Loopback by itself proves nothing on
+        the two routes that act: a command Claude runs is a local process
+        too, and must not answer its own card. No store, no proof."""
         token = self.headers.get("X-Tapproval-Token", "")
-        if auth is None:
-            # No credential store at all (a bare test server): nothing to
-            # prove against, so the listener's own rule stands.
-            return self._authorized("/decision")
-        if hasattr(auth, "matches") and auth.matches(token):
+        if _credential_ok(self.auth, token):
             return True
-        return (self.required_token is None
-                and _is_loopback(self.client_address[0])
-                and hasattr(auth, "is_bootstrap") and auth.is_bootstrap(token))
+        return (self._is_local_process()
+                and hasattr(self.auth, "is_bootstrap")
+                and self.auth.is_bootstrap(token))
 
     def _is_local_process(self):
         """Loopback on the LAN listener — the hook and the bridge. False on
@@ -1259,6 +1222,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             "/say": ("_post_say", dict(token=True)),
             "/decision": ("_post_decision", dict(token=True)),
             "/admin/pair-open": ("_post_admin", dict(local=True, admin=True)),
+            "/admin/pair-relight": ("_post_admin", dict(local=True, admin=True)),
             "/admin/pair-reset": ("_post_admin", dict(local=True, admin=True)),
             "/admin/rotate": ("_post_admin", dict(local=True, admin=True)),
         },
@@ -1457,9 +1421,9 @@ class RelayHandler(BaseHTTPRequestHandler):
     def _post_admin(self, path, query):
         # Administration is for a process on this machine only — the
         # `--pair` / `--rotate-token` commands, never the network.
-        if path == "/admin/pair-open":
-            if hasattr(self.auth, "relight_first_window"):
-                self.auth.relight_first_window()
+        if path == "/admin/pair-relight":
+            self._send_json({"ok": True, "until": int(self.auth.relight())})
+        elif path == "/admin/pair-open":
             until = self.auth.open_window()
             self._send_json({"ok": True, "seconds": PAIR_WINDOW_SECONDS,
                              "until": int(until)})
@@ -1588,13 +1552,13 @@ class Auth:
         self._window_until = 0.0
         self._window_claims = 0
         self._window_ips = set()
-        self._slammed = False
-        # A machine that has never paired opens its door for a while at
-        # every relay start and every --ensure, not forever: long enough
-        # to install the watch app, short enough that a laptop left on
-        # café Wi-Fi is not handing out keys all afternoon.
-        self._first_window_until = time.time() + PAIR_FIRST_WINDOW_SECONDS
         self._load()
+        # A machine that has never paired opens its door for a while at
+        # every relay start (here) and every --ensure (relight), not
+        # forever: long enough to install the watch app, short enough that
+        # a laptop left on café Wi-Fi is not handing out keys all afternoon.
+        if not self.paired_ever:
+            self._window_until = time.time() + PAIR_FIRST_WINDOW_SECONDS
 
     # ---- persistence -------------------------------------------------
 
@@ -1714,6 +1678,10 @@ class Auth:
                                  "label": str(label or "Apple Watch")[:40],
                                  "issued": int(time.time()), "last_seen": 0,
                                  "source": source})
+            if not self.paired_ever:
+                # The first watch is through: the first-run door shuts
+                # behind it. From here only --pair opens one.
+                self._window_until = 0.0
             self.paired_ever = True
             self.save()
         return token
@@ -1741,52 +1709,42 @@ class Auth:
     # ---- the pairing window -----------------------------------------
 
     def open_window(self, seconds=PAIR_WINDOW_SECONDS):
+        """Open the LAN pairing door for ``seconds``; returns when it shuts."""
         with self._lock:
             self._window_until = time.time() + float(seconds)
             self._window_claims = 0
             self._window_ips = set()
-            self._slammed = False
             return self._window_until
 
     def close_window(self):
+        """Shut the door now — a burst on /pair is an attack, not a retry."""
         with self._lock:
             self._window_until = 0.0
-            # A never-paired door has no timer to expire, so a burst needs
-            # something explicit to shut. Cleared by open_window().
-            self._slammed = True
+
+    def relight(self):
+        """--ensure on a machine that has never paired: another
+        PAIR_FIRST_WINDOW_SECONDS. A no-op once anything has paired, so a
+        session start can never reopen a paired machine's door."""
+        with self._lock:
+            if self.paired_ever:
+                return self._window_until
+            return self.open_window(PAIR_FIRST_WINDOW_SECONDS)
 
     def window_open(self):
         """Is /pair handing out the bootstrap right now?
 
-        Two doors, one question. A machine that has NEVER paired opens
-        the door for PAIR_FIRST_WINDOW_SECONDS at every relay start and
-        every --ensure: a 10-minute fuse lit once at install time burnt
-        out while the user was still installing the watch app, and a door
-        that never shut handed the key to whoever found the Bonjour advert
-        first on a café network. Half an hour, re-lit by every Claude Code
-        session, is long enough to install and short enough to be a
-        window. Once anything has paired, the door is the deliberate,
-        short window that --pair opens. A burst shuts either one
-        (close_window) until the next --ensure.
+        One timer. A machine that has NEVER paired lights it for
+        PAIR_FIRST_WINDOW_SECONDS at every relay start and every --ensure:
+        a 10-minute fuse lit once at install time burnt out while the user
+        was still installing the watch app, and a door that never shut
+        handed the key to whoever found the Bonjour advert first on a café
+        network. Half an hour, re-lit by every Claude Code session, is long
+        enough to install and short enough to be a window. The first watch
+        through shuts it; from then on only --pair lights it, for
+        PAIR_WINDOW_SECONDS. A burst on /pair shuts either.
         """
         with self._lock:
-            return time.time() < self._open_until()
-
-    def _open_until(self):
-        # getattr: an Auth assembled without __init__ (tests do) has no
-        # first window, and must read as "door shut", never as a crash
-        # inside a handler thread.
-        if not self.paired_ever and not self._slammed:
-            return max(getattr(self, "_first_window_until", 0.0), self._window_until)
-        return self._window_until
-
-    def relight_first_window(self):
-        """--ensure on a never-paired machine: another half hour."""
-        with self._lock:
-            if not self.paired_ever:
-                self._slammed = False
-                self._first_window_until = time.time() + PAIR_FIRST_WINDOW_SECONDS
-            return getattr(self, "_first_window_until", 0.0)
+            return time.time() < self._window_until
 
     def claim_window(self, client_ip):
         """Hand out the bootstrap, once per address and twice at most.
@@ -1796,7 +1754,7 @@ class Auth:
         rejection rather than letting it be ground down.
         """
         with self._lock:
-            if time.time() >= self._open_until():
+            if time.time() >= self._window_until:
                 return None
             if self._window_claims >= PAIR_WINDOW_CLAIMS:
                 return None
