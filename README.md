@@ -230,3 +230,13 @@ and [#89761](https://github.com/anthropics/claude-code/issues/89761).
 The relay's contract is deliberately tiny and agent-agnostic — cards in,
 decisions out, over local HTTP. A short spec for third-party agent CLIs
 is planned; open an issue if you want to wire another agent to the wrist.
+
+## If it saves you steps
+
+Tapproval Base is one person's side project, no company behind it. There
+is nothing to sign up for and nothing to buy here — the whole computer
+half is in this repository.
+
+If it earns its place in your setup, the useful thing is to tell one
+other person who leaves Claude running unattended:
+https://tapproval.thoughtfulsteward.org

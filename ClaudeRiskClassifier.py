@@ -61,18 +61,19 @@ a non-interactive hook and has to exit immediately with clean stdout.
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
 import re
-import shlex
-import shutil
 import sys
-import tempfile
 from collections import Counter
 from datetime import datetime, timezone
 from enum import IntEnum
+
+# argparse, shlex, shutil and tempfile are imported where they are used.
+# They serve the installer and the CLI only, and this module is a hook
+# that starts once per tool call: the four together cost about a fifth of
+# the process's wall time, on a path that never touches them.
 
 __all__ = [
     "Risk",
@@ -98,19 +99,29 @@ class Risk(IntEnum):
     CRITICAL = 4
 
 
-# How long a card may stay on the wrist. The hook timeout written by
-# --watch is derived from this so it always outlives the wait. A full day:
-# prompts must never expire on the user — a card stands until it is
-# answered somewhere, and answering it elsewhere retracts it at once.
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
 __version__ = "1.1.1"
 
+# The project's own public page. Not a deployment hostname — those belong
+# in site-rules.json — but a constant of the project itself, the same way
+# the support address is, and the only address --report ever prints.
+PROJECT_SITE = "https://tapproval.thoughtfulsteward.org"
+
+# How long a card may stay on the wrist. The hook timeout written by
+# --watch is derived from this so it always outlives the wait. A full day:
+# prompts must never expire on the user — a card stands until it is
+# answered somewhere, and answering it elsewhere retracts it at once.
 RELAY_WAIT_SECONDS = 86400
 # The relay listens here; watch_relay.DEFAULT_PORT says the same, but this
 # file must stand alone, so the number is written once more, once.
 RELAY_PORT = 8977
+
+# The wrist card's two budgets. DEFAULT_POLICY quotes these, and the policy
+# file may override them; wrist_card() falls back to them when it does not.
+HEADLINE_CHARS = 64
+DETAIL_CHARS = 80
 RELAY_URL = "http://127.0.0.1:%d" % RELAY_PORT
 
 DEFAULT_POLICY = {
@@ -130,8 +141,8 @@ DEFAULT_POLICY = {
     # Hostnames, servers or network shares that are production for you.
     # Any mention of one is treated as HIGH risk. Empty by default.
     "sensitive_hosts": [],
-    "headline_chars": 64,
-    "detail_chars": 80,
+    "headline_chars": HEADLINE_CHARS,
+    "detail_chars": DETAIL_CHARS,
     # Optional watch relay (see watch_relay.py). When set, and only in
     # enforce mode, an escalation is first offered to the watch; if nobody
     # answers in relay_wait seconds the normal terminal prompt appears.
@@ -150,7 +161,11 @@ DEFAULT_POLICY = {
 # Reading a secret is exfiltration risk; writing one is worse.
 SECRET_PATH = re.compile(
     r"(\.env(\.|\b)|id_rsa|id_ed25519|\.pem\b|\.p12\b|\.pfx\b|"
-    r"credential|\bsecrets?\.(json|ya?ml|txt)|\.aws[/\\]|\.ssh[/\\]|\.netrc)",
+    r"credential|\bsecrets?\.(json|ya?ml|txt)|\.aws[/\\]|\.ssh[/\\]|\.netrc|"
+    # The credential stores this list did not name, each of which holds a
+    # live token in plain text: `cat ~/.kube/config` read SAFE until now.
+    r"\.kube[/\\]config|\.npmrc|\.pypirc|\.docker[/\\]config\.json|"
+    r"\.config[/\\]gh[/\\]hosts\.ya?ml|\.gitconfig\b|\.terraformrc)",
     re.I,
 )
 
@@ -202,6 +217,219 @@ ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
 
 # Commands that cannot mutate anything on their own. A redirect or command
 # substitution elsewhere in the segment still bumps the tier.
+# --------------------------------------------------------------------------
+# The effect ontology
+# --------------------------------------------------------------------------
+#
+# Fourteen tables in this file answer a version of "what does this verb do",
+# and every one of them is keyed on a binary's NAME. That is how
+# `flyctl apps destroy myapp` came to read SAFE: `apps` is a recognised
+# read verb for flyctl, and nothing looked at the word after it. Six more
+# read SAFE the same way, including `git branch -D main`, `gh auth token`
+# and `find / -delete`, and `--quiet` auto-allows SAFE.
+#
+# This asks the other question. Not "do I recognise this binary" but "what
+# does this command DO, and how far does the consequence travel" — then
+# derives the tier from the answer instead of carrying one per pattern.
+#
+# It only ever RAISES. classify_bash's bump() is a monotone join, so this
+# runs first and a recognition table can no longer talk the tier back down:
+# an unjustified SAFE loses to the effect the words actually name. Nothing
+# below can lower a tier, which is why adding it cannot make the classifier
+# more permissive than it was.
+
+
+class Effect(IntEnum):
+    """What a command does, independent of which binary does it."""
+
+    OBSERVE = 0
+    MUTATE = 1
+    EXECUTE = 2
+    DESTROY = 3
+    GRANT = 4
+    PUBLISH = 5
+
+
+class Reach(IntEnum):
+    """How far the consequence travels. SHARED is where other people see it."""
+
+    SCRATCH = 0
+    PROJECT = 1
+    MACHINE = 2
+    SYSTEM = 3
+    SHARED = 4
+    PUBLIC = 5
+
+
+class Undo(IntEnum):
+    """Can it be brought back? RECOVERABLE means a backup or VCS can."""
+
+    TRIVIAL = 0
+    RECOVERABLE = 1
+    IRREVERSIBLE = 2
+
+
+def derive_risk(effect, reach, undo=Undo.RECOVERABLE, secret=False):
+    """The tier a fact implies — the guardrails, as one function.
+
+    G1  irreversible and reach >= SHARED    -> CRITICAL
+    G2  DESTROY beyond SCRATCH              -> at least HIGH
+    G3  GRANT or PUBLISH                    -> at least HIGH, CRITICAL past the machine
+    G4  the resource is a credential        -> at least HIGH, whatever the effect
+    G5  no fact at all                      -> the caller gets None and escalates
+
+    Every rule holds over the whole table rather than over one example,
+    so two commands that do the same kind of thing cannot disagree about
+    how dangerous it is. ``test_the_ontology_obeys_its_own_guardrails``
+    asserts G1-G4 across every combination.
+    """
+    if secret:
+        # Reading a credential is already exfiltration; writing one is worse.
+        return Risk.CRITICAL if effect >= Effect.MUTATE else Risk.HIGH
+    if effect in (Effect.PUBLISH, Effect.GRANT):
+        return Risk.CRITICAL if reach >= Reach.SYSTEM else Risk.HIGH
+    if effect == Effect.DESTROY:
+        if reach == Reach.SCRATCH:
+            return Risk.LOW
+        if undo == Undo.IRREVERSIBLE and reach >= Reach.MACHINE:
+            return Risk.CRITICAL
+        return Risk.HIGH
+    if effect == Effect.EXECUTE:
+        return Risk.HIGH if reach >= Reach.MACHINE else Risk.MEDIUM
+    if effect == Effect.MUTATE:
+        if reach == Reach.SCRATCH:
+            return Risk.LOW
+        return Risk.HIGH if reach >= Reach.SHARED else Risk.MEDIUM
+    # OBSERVE is never dangerous in itself. Observing a SECRET is, and that
+    # is handled above — looking is what an agent does all day.
+    return Risk.SAFE
+
+
+# How far a tool's ordinary object lives from this machine. Only tools that
+# genuinely act beyond it are listed; everything else defaults to PROJECT,
+# so this can only raise the cases it was written for. `docker` and `npm`
+# stay at PROJECT deliberately: their destructive verbs already carry tiers
+# from SEGMENT_RULES, and the ontology must not quietly re-tier them.
+TOOL_REACH = {
+    "terraform": Reach.SHARED, "tofu": Reach.SHARED, "pulumi": Reach.SHARED,
+    "kubectl": Reach.SHARED, "helm": Reach.SHARED, "k9s": Reach.SHARED,
+    "aws": Reach.SHARED, "gcloud": Reach.SHARED, "gsutil": Reach.SHARED,
+    "az": Reach.SHARED, "doctl": Reach.SHARED, "linode-cli": Reach.SHARED,
+    "flyctl": Reach.SHARED, "fly": Reach.SHARED, "heroku": Reach.SHARED,
+    "railway": Reach.SHARED, "render": Reach.SHARED, "supabase": Reach.SHARED,
+    "wrangler": Reach.SHARED, "netlify": Reach.PUBLIC, "vercel": Reach.PUBLIC,
+    "rclone": Reach.SHARED, "s3cmd": Reach.SHARED, "b2": Reach.SHARED,
+    "psql": Reach.SHARED, "mysql": Reach.SHARED, "mongosh": Reach.SHARED,
+    "redis-cli": Reach.SHARED, "stripe": Reach.SHARED, "twilio": Reach.SHARED,
+    "launchctl": Reach.SYSTEM, "systemctl": Reach.SYSTEM, "security": Reach.SYSTEM,
+}
+
+# One word, one effect. This is the vocabulary the fourteen tables never
+# had: what a word MEANS, rather than which binary is allowed to say it.
+EFFECT_WORDS = {
+    "destroy": Effect.DESTROY, "delete": Effect.DESTROY, "remove": Effect.DESTROY,
+    "rm": Effect.DESTROY, "rmdir": Effect.DESTROY,
+    "purge": Effect.DESTROY, "drop": Effect.DESTROY, "truncate": Effect.DESTROY,
+    "wipe": Effect.DESTROY, "terminate": Effect.DESTROY, "flushall": Effect.DESTROY,
+    "flushdb": Effect.DESTROY, "deprovision": Effect.DESTROY, "teardown": Effect.DESTROY,
+    "publish": Effect.PUBLISH, "deploy": Effect.PUBLISH, "upload": Effect.PUBLISH,
+    "grant": Effect.GRANT, "revoke": Effect.GRANT, "rotate": Effect.GRANT,
+    "set-url": Effect.MUTATE, "set-head": Effect.MUTATE, "set-branches": Effect.MUTATE,
+    "scale": Effect.MUTATE, "apply": Effect.MUTATE,
+    # `rclone sync` and `aws s3 sync --delete` make the destination match
+    # the source, which means deleting whatever the source does not have.
+    "sync": Effect.MUTATE,
+}
+
+# Flags that carry an effect. Deliberately few and unambiguous: a flag like
+# `-d` means "delete" to git and "data" to curl and "dictionary order" to
+# sort, so only spellings that mean one thing everywhere are listed.
+EFFECT_FLAGS = {
+    "-D": Effect.DESTROY, "--delete": Effect.DESTROY, "--purge": Effect.DESTROY,
+    "--prune": Effect.DESTROY,
+}
+
+# Words that name a credential. Their presence makes the RESOURCE sensitive,
+# whatever the effect: `gh auth token` and `kubectl get secret` are reads,
+# and both put a live credential into the transcript.
+SECRET_WORDS = frozenset(
+    "token tokens secret secrets password passwords credential credentials "
+    "keychain privatekey private-key apikey api-key passwd".split()
+)
+# The spellings tools actually use join the word to its neighbours:
+# `--secret-id`, `AWS_SECRET_ACCESS_KEY`, `--api-key=`, `-field=api_key`.
+# Those are a flag, a NAME=value and an environment variable — the three
+# shapes where a joiner separates words. A plain lowercase name is not
+# split: token-bucket.js, test_token_refresh.py, a token-service namespace
+# and a fix-token-expiry branch all carry the word and none is a
+# credential, and a card the user learns to tap through is how a wrist
+# app stops working. That leaves `get-secret-value` alone unrecognised;
+# the command it belongs to carries `--secret-id`, which is not.
+_SECRET_JOINERS = re.compile(r"[-_=:,]")
+
+
+def _words_name_a_secret(parts):
+    """Whether any word, or any two neighbouring words rejoined, is in
+    SECRET_WORDS — `api-key` and `private-key` live there as pairs."""
+    if any(part in SECRET_WORDS for part in parts):
+        return True
+    return any(parts[i] + parts[i + 1] in SECRET_WORDS
+               or parts[i] + "-" + parts[i + 1] in SECRET_WORDS
+               for i in range(len(parts) - 1))
+
+
+def _names_a_secret(word):
+    bare = word.strip("-'\"")
+    if bare.lower() in SECRET_WORDS:
+        return True
+    if not (word.startswith("-") or "=" in word or bare.isupper()):
+        return False
+    return _words_name_a_secret([p for p in _SECRET_JOINERS.split(bare.lower()) if p])
+
+
+def _ontology_risk(segment):
+    """The effect this segment names, or None when it names none.
+
+    Judged by vocabulary and reach, never by whether the binary is
+    recognised — an unknown tool with a known verb is exactly the case the
+    recognition tables cannot reach (`terraform destroy`, `rclone sync`).
+    Returns ``(rule_id, Risk)`` for classify_bash to bump, so it can only
+    push a tier up.
+    """
+    words = _tokens(segment)
+    if not words:
+        return None
+    tool = os.path.basename(words[0]).lower()
+    reach = TOOL_REACH.get(tool, Reach.PROJECT)
+    # An absolute root argument means the blast radius is the machine, not
+    # the project — `find / -delete` is not `find . -delete`.
+    if any(w == "/" or w.startswith(("/System", "/Library", "/usr", "/etc", "/var"))
+           for w in words[1:]):
+        reach = max(reach, Reach.SYSTEM)
+
+    effect = None
+    for word in words[1:]:
+        named = EFFECT_WORDS.get(word.lower()) or EFFECT_FLAGS.get(word)
+        # `-delete` and `-exec rm` are find's own spelling of destruction.
+        if named is None and word in ("-delete", "-exec"):
+            named = Effect.DESTROY
+        if named is not None:
+            effect = named if effect is None else max(effect, named)
+
+    secret = any(_names_a_secret(w) for w in words[1:])
+    if effect is None and not secret:
+        return None
+    if effect is None:
+        effect = Effect.OBSERVE
+    # Destruction is the one effect that is irreversible by default: a
+    # deleted namespace does not come back from a version-control history.
+    undo = Undo.IRREVERSIBLE if effect == Effect.DESTROY else Undo.RECOVERABLE
+    risk = derive_risk(effect, reach, undo, secret=secret)
+    if risk == Risk.SAFE:
+        return None
+    return ("effect:%s@%s" % (effect.name.lower(), reach.name.lower()), risk)
+
+
 READ_ONLY_COMMANDS = frozenset(
     """
     ls ll la cat bat head tail wc grep egrep fgrep rg ag find fd pwd cd which
@@ -469,10 +697,17 @@ def _segments(command):
     return [s.strip() for s in SEGMENT_SPLIT.split(command or "") if s.strip()]
 
 
+# On the unconditional path, so compiled once. The git-only patterns in
+# _git_risk stay inline on purpose: re's own cache covers repeat calls, and
+# hoisting them charged every non-git hook start ~170 µs — three times a
+# whole classify() — for a branch most tool calls never take.
+_LEADING_PAREN = re.compile(r"^\(\s*")
+
+
 def _tokens(segment):
     """Words of a segment, with env assignments and a leading '(' stripped."""
     stripped = ENV_ASSIGN.sub("", segment.strip())
-    stripped = re.sub(r"^\(\s*", "", stripped)
+    stripped = _LEADING_PAREN.sub("", stripped)
     return stripped.split()
 
 
@@ -517,6 +752,17 @@ def _git_risk(segment):
         return ("git-reset-hard", Risk.HIGH)
     if sub == "clean" and re.search(r"-[a-z]*f", rest):
         return ("git-clean-force", Risk.HIGH)
+    if sub == "config":
+        # `config` sat in GIT_READ_ONLY, so `git config --global alias.x
+        # '!rm -rf ~'` read SAFE: it is a read only when it is reading.
+        if "!" in rest:
+            # A `!`-alias stores a shell command that later runs as `git x`.
+            return ("git-config-shell-alias", Risk.CRITICAL)
+        if re.search(r"(^|\s)--(get|get-all|get-regexp|list)\b|(^|\s)-l\b", rest):
+            return ("git-read", Risk.SAFE)
+        if len([w for w in rest.split() if not w.startswith("-")]) >= 2:
+            return ("git-config-write", Risk.MEDIUM)
+        return ("git-read", Risk.SAFE)
     if sub in GIT_READ_ONLY:
         return ("git-read", Risk.SAFE)
     if sub in GIT_MEDIUM:
@@ -558,6 +804,13 @@ def classify_bash(command):
 
     for segment in _segments(command):
         token = os.path.basename(_first_token(segment)).lower()
+
+        # The effect the words name, before any table gets to recognise the
+        # binary. bump() takes the maximum, so a recognition table below can
+        # no longer talk this back down to SAFE.
+        named_effect = _ontology_risk(segment)
+        if named_effect is not None:
+            bump(*named_effect)
 
         special = _rm_risk(segment) if token == "rm" else None
         if special is None and token == "git":
@@ -662,11 +915,71 @@ READ_ONLY_TOOLS = frozenset(
 )
 WRITE_TOOLS = frozenset("Write Edit MultiEdit NotebookEdit".split())
 
-MCP_WRITE = re.compile(
-    r"^mcp__[^_]+__(create|update|delete|merge|push|write|send|add|remove|set|"
-    r"publish|trigger|run|submit|enable|disable|fork|resolve|reply)",
-    re.I,
+# What the verb of an MCP tool name means. EFFECT_WORDS is shell
+# vocabulary and wins; these are the verbs a connector is told that a
+# shell binary is not — "merge", "reply", "submit" — and would be false
+# positives as argv words (`git stash push`, `docker start`, `npm run`).
+MCP_MUTATE_WORDS = frozenset(
+    "create update merge push write send add set trigger submit enable "
+    "disable fork resolve reply post put patch move rename archive trash "
+    "forward respond insert replace save label unlabel restore".split()
 )
+MCP_EXECUTE_WORDS = frozenset("run execute start stop kill cancel".split())
+MCP_EFFECT = dict({w: Effect.EXECUTE for w in MCP_EXECUTE_WORDS},
+                  **{w: Effect.MUTATE for w in MCP_MUTATE_WORDS})
+MCP_EFFECT.update(EFFECT_WORDS)
+# Longest first, so `setup` meets `set` only after nothing longer matched.
+_MCP_VERB_PREFIXES = sorted((v for v in MCP_EFFECT if len(v) >= 3),
+                            key=len, reverse=True)
+_MCP_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_MCP_WORDS = re.compile(r"[_\-]")
+
+
+def _mcp_risk(tool):
+    """Tier for an ``mcp__<server>__<tool>`` name, from its verb.
+
+    A server name may itself contain underscores (``ccd_session_mgmt``,
+    ``scheduled_tasks``), so the split is at the LAST ``__``. The regex
+    this replaces used ``[^_]+`` for the server and never matched those —
+    every delete on an underscored server read as an unknown MCP tool,
+    two tiers below the same delete on ``github``.
+
+    The verb is the FIRST word, as that regex also had it: judging every
+    word made ``get_label`` a write because "label" is a verb elsewhere.
+    Two things the regex did are kept so nothing it caught reads lower
+    now — camelCase splits (``createIssue``), and a verb matches as a
+    prefix (``setup_webhook``, ``runtime``).
+
+    Reach is TOOL_REACH's answer for the server, else SHARED: a connector
+    acts on something that is not this machine. For a server the table
+    does not know the tier is capped at HIGH — the classifier cannot tell
+    a WordPress from a PDF viewer, and G3 would otherwise call every
+    ``upload_image`` CRITICAL and, under critical_action: deny, refuse it
+    outright. A credential write keeps its CRITICAL: that is G4, and G4
+    does not depend on reach.
+    """
+    server, sep, name = tool[len("mcp__"):].rpartition("__")
+    if not sep or not name:
+        return Risk.MEDIUM, ["mcp-unknown"]
+    words = [w for w in _MCP_WORDS.split(_MCP_CAMEL.sub("_", name).lower()) if w]
+    if not words:
+        return Risk.MEDIUM, ["mcp-unknown"]
+    verb = words[0]
+    effect = MCP_EFFECT.get(verb)
+    if effect is None:
+        effect = next((MCP_EFFECT[v] for v in _MCP_VERB_PREFIXES
+                       if verb.startswith(v)), None)
+    secret = _words_name_a_secret(words)
+    if effect is None and not secret:
+        return Risk.MEDIUM, ["mcp-unknown"]
+    effect = effect or Effect.OBSERVE
+    known = server in TOOL_REACH
+    risk = derive_risk(effect, TOOL_REACH.get(server, Reach.SHARED), secret=secret)
+    if not known and not secret:
+        risk = min(risk, Risk.HIGH)
+    # A connector's read is still a network call by an agent; the floor an
+    # unknown MCP tool has always had applies to a recognised read too.
+    return max(risk, Risk.MEDIUM), ["mcp:%s" % effect.name.lower()]
 
 CONTENT_KEYS = ("content", "new_string", "file_text", "new_source")
 
@@ -679,7 +992,7 @@ def classify(event):
     if not isinstance(tool_input, dict):
         tool_input = {}
 
-    if tool == "Bash" or tool == "BashOutput":
+    if tool in ("Bash", "BashOutput"):
         risk, rules = classify_bash(tool_input.get("command", ""))
     elif tool in WRITE_TOOLS:
         risk, rules = classify_path(
@@ -708,10 +1021,7 @@ def classify(event):
     elif tool in ("Task", "Agent", "Workflow"):
         risk, rules = Risk.MEDIUM, ["spawns-agents"]
     elif tool.startswith("mcp__"):
-        if MCP_WRITE.match(tool):
-            risk, rules = Risk.HIGH, ["mcp-write"]
-        else:
-            risk, rules = Risk.MEDIUM, ["mcp-unknown"]
+        risk, rules = _mcp_risk(tool)
     elif not tool:
         risk, rules = Risk.MEDIUM, ["missing-tool-name"]
     else:
@@ -801,8 +1111,6 @@ def _bash_headline(command, limit):
 # One budget for every card the module ever builds — the audit log, the
 # relay and --explain must describe the same truncation or they lie to
 # each other. Policy keys headline_chars/detail_chars override both.
-HEADLINE_CHARS = 64
-DETAIL_CHARS = 80
 
 
 def _card_budgets(policy):
@@ -1273,9 +1581,9 @@ def _permission_output(behavior, message=""):
     return output
 
 
-ESCALATE_FALLBACK = {
-    "hookSpecificOutput": {"hookEventName": "PermissionRequest"}
-}
+# Built by the one function allowed to build it, so the shape whose
+# breakage was invisible for months has exactly one constructor.
+ESCALATE_FALLBACK = {"hookSpecificOutput": _permission_output("escalate")}
 
 
 def _user_permission_rules(cwd=None):
@@ -1447,7 +1755,7 @@ def report_facts(entries):
     for name in projects:
         rows = [e for e in entries if e.get("project") == name]
         asked = len([e for e in rows if e.get("decision") in ("escalate", "deny")])
-        share = 100.0 * (len(rows) - asked) / len(rows) if rows else 0.0
+        share = 100.0 * (len(rows) - asked) / len(rows)
         by_project.append((name, len(rows), asked, share))
     by_tool = Counter(e.get("tool", "?") for e in entries
                       if e.get("decision") == "allow")
@@ -1455,6 +1763,35 @@ def report_facts(entries):
     return {"total": total, "tiers": tiers, "escalated": escalated,
             "saved": total - escalated, "by_project": by_project,
             "by_tool": by_tool.most_common(5), "escalations": escalations[-5:]}
+
+
+def share_footer(saved, asked):
+    """The one place Tapproval asks a terminal for anything.
+
+    Deliberately narrow. It belongs at the end of `--report` and nowhere
+    else: `--report` is run out of curiosity about what the tool bought
+    you, which is the moment it has just proved itself, whereas
+    `--status` is run when something is *wrong*. Asking at the second
+    moment costs more than it earns.
+
+    It asks for one thing (tell someone), never for a rating — an iOS
+    app cannot be reviewed from a desktop browser, so a rating ask here
+    is a dead end — and it offers nothing in exchange, because a reward
+    attached to a recommendation measurably shrinks it.
+
+    A pure builder returning lines, so a test can read the words without
+    capturing stdout.
+    """
+    return [
+        "-" * 60,
+        "That's %s prompts Tapproval answered for you, and %s"
+        % (format(saved, ",d"), format(asked, ",d")),
+        "it stopped to ask about.",
+        "",
+        "It's one person, no company. If it saves you steps, tell",
+        "one other person who leaves Claude running:",
+        "  %s" % PROJECT_SITE,
+    ]
 
 
 def run_report():
@@ -1518,6 +1855,9 @@ def run_report():
     print("  Next: look at the escalations above. If each one is something you")
     print("  would genuinely want to be interrupted for, the policy is working.")
     print("  If they look routine, the threshold is set too low for you.")
+    print("")
+    for line in share_footer(saved, escalated):
+        print(line)
     return 0
 
 
@@ -1688,6 +2028,7 @@ def _split_assignments(parts):
 
 def _manifest_hook(wiring):
     """Our PermissionRequest handler in a hooks manifest: (env, timeout)."""
+    import shlex
     for entry in wiring.get("hooks", {}).get("PermissionRequest", []):
         for handler in entry.get("hooks", []):
             if not _is_our_hook(handler):
@@ -1825,6 +2166,7 @@ def _write_settings(path, data):
     # ours. A crash mid-write would corrupt all of it, so render to a temp
     # file in the same directory and rename — os.replace() is atomic on the
     # same filesystem, so the settings are always either the old or the new.
+    import tempfile
     payload = json.dumps(data, indent=2) + "\n"
     fd, tmp = tempfile.mkstemp(dir=directory or ".", suffix=".tmp")
     try:
@@ -1904,14 +2246,10 @@ def run_install(then_watch=False):
     normally for a week" three lines before --watch prints "Wrist
     approvals are ON" — the installer said both, in that order.
     """
-    path = _settings_path()
-    try:
-        data = _read_settings(path)
-    except ValueError as error:
-        print("Could not read %s" % path)
-        print("  It is not valid JSON (%s)." % error)
-        print("  Nothing was changed. Fix or move that file, then try again.")
+    found = _settings_or_explain()
+    if found is None:
         return 1
+    path, data = found
 
     command = _hook_command()
     relay_command = _relay_command() if os.path.exists(_relay_path()) else None
@@ -1963,14 +2301,28 @@ def run_install(then_watch=False):
     return 0
 
 
-def run_uninstall():
-    """Remove our hook entry, leaving everything else in settings untouched."""
+def _settings_or_explain():
+    """``(path, data)`` — or None, having told the user why not.
+
+    Every command that writes settings starts here, so the explanation a
+    user gets for an unreadable file is one sentence, not three variants.
+    """
     path = _settings_path()
     try:
-        data = _read_settings(path)
+        return path, _read_settings(path)
     except ValueError as error:
-        print("Could not read %s (%s). Nothing was changed." % (path, error))
+        print("Could not read %s" % path)
+        print("  It is not valid JSON (%s)." % error)
+        print("  Nothing was changed. Fix or move that file, then try again.")
+        return None
+
+
+def run_uninstall():
+    """Remove our hook entry, leaving everything else in settings untouched."""
+    found = _settings_or_explain()
+    if found is None:
         return 1
+    path, data = found
 
     # Nothing of ours in settings, but the plugin has us wired: removing
     # nothing and reporting success would leave the hook running.
@@ -1987,7 +2339,6 @@ def run_uninstall():
         print("Not installed — nothing to remove.")
         return 0
 
-    backup = _backup(path)
     removed = _remove_our_hooks(hooks)
     if not removed:
         print("Not installed — nothing to remove.")
@@ -1996,6 +2347,9 @@ def run_uninstall():
     if not hooks:
         data.pop("hooks", None)
     _strip_our_env(data)
+    # Backed up only once there is something to write: the backup exists
+    # to undo a write, and a run that changes nothing must leave nothing.
+    backup = _backup(path)
     _write_settings(path, data)
     remove_launch_agent()
 
@@ -2040,12 +2394,10 @@ def _edit_settings_env(mutate):
     ``mutate`` returning None means everything was already as requested
     (it prints its own explanation); nothing is written then.
     """
-    path = _settings_path()
-    try:
-        data = _read_settings(path)
-    except ValueError as error:
-        print("Could not read %s (%s). Nothing was changed." % (path, error))
+    found = _settings_or_explain()
+    if found is None:
         return 1
+    path, data = found
     data.setdefault("env", {})
     message = mutate(data)
     if message is None:
@@ -2162,6 +2514,8 @@ def check_command(command):
     instead, so the failure is silent and the log quietly stops growing.
     Returns a list of human-readable problems; empty means healthy.
     """
+    import shlex
+    import shutil
     problems = []
     try:
         parts = shlex.split(command, posix=(os.name != "nt"))
@@ -2304,6 +2658,7 @@ def run_status():
 
 
 def main(argv=None):
+    import argparse
     parser = argparse.ArgumentParser(
         description="Risk triage for Claude Code permission prompts.",
         epilog="With no arguments, reads a PermissionRequest event on stdin.",

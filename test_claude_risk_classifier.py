@@ -14,8 +14,11 @@ The module is pure standard library, so nothing needs mocking beyond the
 filesystem for audit-log tests.
 """
 
+import ast
 import json
 import os
+from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -28,9 +31,38 @@ import urllib.error
 import urllib.request
 
 import watch_relay
+import watch_dashboard
 
 import ClaudeRiskClassifier as crc
 from ClaudeRiskClassifier import Risk
+
+# serve_forever() checks for shutdown every poll_interval; the default is
+# half a second, and shutdown() blocks until that check comes round. With
+# fifty-odd relay tests that is ~27 s of the suite spent waiting for a
+# server to notice it was told to stop. Nothing observable changes.
+_POLL = 0.02
+
+
+@pytest.fixture(autouse=True)
+def _no_leftover_conditions():
+    """The relay's condition registry is module-wide, like SITE_RULES: a
+    condition left behind by one test would make the next pass for the
+    wrong reason. Cleared around every test, once, here — two classes
+    used to carry their own copy, one of them rebinding the dict out
+    from under the lock that guards it."""
+    watch_relay._CONDITIONS.clear()
+    yield
+    watch_relay._CONDITIONS.clear()
+
+
+def _serve(server):
+    """Run a test relay on a daemon thread; returns the thread. The one
+    place the poll interval is set — thirteen call sites each carried
+    the lambda, which is how a tuning knob gets missed at one of them."""
+    thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=_POLL),
+                              daemon=True)
+    thread.start()
+    return thread
 
 
 def _behavior(payload):
@@ -78,22 +110,14 @@ def _no_real_self_update(tmp_path, monkeypatch):
 
 @pytest.fixture
 def settings(tmp_path, monkeypatch):
-    """A throwaway settings.json, and no ambient wrist-approval settings.
+    """The throwaway settings.json every test already has, as a Path.
 
-    Four test classes carried their own copy of this fixture, three of them
-    without the env-clearing — which is why the same test could pass on a
-    machine with CLAUDE_RISK_MODE exported and fail on a fresh checkout.
-    The installer must never touch a real config, so the path is the one
-    thing every installer test needs; the env is cleared because the
-    default behaviour is usually the subject.
+    The isolation itself — no ambient wrist-approval settings, and the
+    file and audit log pointed at a throwaway — is `_no_ambient_policy`,
+    which runs for every test whether it asks or not. This fixture only
+    hands the installer tests the path so they can read it back.
     """
-    path = tmp_path / "settings.json"
-    monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(path))
-    monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
-    for key in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY",
-                "CLAUDE_RISK_RELAY_WAIT", "CLAUDE_RISK_CONFIG"):
-        monkeypatch.delenv(key, raising=False)
-    return path
+    return Path(os.environ["CLAUDE_SETTINGS_PATH"])
 
 
 @pytest.fixture
@@ -148,6 +172,33 @@ def _no_real_launch_agent(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_LAUNCH_AGENT_PATH",
                        str(tmp_path / "com.tapproval.relay.plist"))
     monkeypatch.setattr(crc, "_launchctl", lambda *args: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_policy(tmp_path, monkeypatch):
+    """Every test starts from the machine CI has: no wrist-approval
+    settings in the environment, and the settings file and audit log
+    pointed at a throwaway.
+
+    Twenty-two tests set CLAUDE_SETTINGS_PATH by hand and none of them
+    cleared CLAUDE_RISK_MODE — so the same test could pass on a machine
+    with enforce mode exported and fail on a fresh checkout, which is
+    precisely what the `settings` fixture's docstring warned about, in
+    the tests that did not use it. CLAUDE_RISK_AUTO_ALLOW was cleared by
+    nothing at all: an exported threshold would have changed what a
+    classifier test observed. One autouse fixture is the isolation rule
+    itself; a test that wants a mode sets it, after this has run, and
+    gets exactly that mode and nothing ambient underneath.
+
+    The two paths are defaults, not overrides: a test that names its own
+    settings file or audit log still wins. They exist so that a test
+    which forgets can never write to ~/.claude.
+    """
+    for key in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY", "CLAUDE_RISK_RELAY_WAIT",
+                "CLAUDE_RISK_CONFIG", "CLAUDE_RISK_AUTO_ALLOW"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
 
 
 class TestClassifyBashReadOnly:
@@ -419,6 +470,95 @@ class TestClassifyDispatch:
         result = crc.classify({"tool_name": "mcp__github__get_file_contents",
                                "tool_input": {}})
         assert result["risk"] == Risk.MEDIUM
+
+    @pytest.mark.parametrize("tool,tier", [
+        # The old regex used [^_]+ for the server, so a server whose name
+        # carries an underscore never matched and every write on it read
+        # as an unknown MCP tool — two tiers below the same write elsewhere.
+        ("mcp__ccd_session_mgmt__send_message", Risk.HIGH),
+        ("mcp__scheduled_tasks__delete_scheduled_task", Risk.HIGH),
+        ("mcp__scheduled_tasks__update_scheduled_task", Risk.HIGH),
+        # Two things that regex did that a whole-word split lost, found in
+        # review: it matched camelCase names, and it matched a verb as a
+        # prefix. Neither may read lower than it did.
+        ("mcp__gh__createIssue", Risk.HIGH),
+        ("mcp__gh__deleteFile", Risk.HIGH),
+        ("mcp__gh__getFileContents", Risk.MEDIUM),
+        ("mcp__x__setup_webhook", Risk.HIGH),
+        ("mcp__x__runtime_info", Risk.HIGH),
+        # The verb is the first word. Judging every word made get_label a
+        # write, because "label" is a verb somewhere else.
+        ("mcp__github__get_label", Risk.MEDIUM),
+        ("mcp__x__list_things", Risk.MEDIUM),
+        # Verbs the hand-picked list did not have, that the vocabulary does.
+        ("mcp__x__destroy_cluster", Risk.HIGH),
+        ("mcp__x__revoke_key", Risk.HIGH),
+        # PUBLISH and GRANT beyond the machine are CRITICAL by G3 — but the
+        # classifier cannot tell a WordPress from a PDF viewer, so for a
+        # server TOOL_REACH does not know the tier is capped at HIGH. Under
+        # critical_action: deny, CRITICAL here would refuse an image upload.
+        ("mcp__github__deploy_project", Risk.HIGH),
+        ("mcp__claude-in-chrome__upload_image", Risk.HIGH),
+        # A read that hands over a credential is a credential read (G4);
+        # writing or rotating one is CRITICAL, and G4 does not depend on
+        # reach, so the cap does not apply.
+        ("mcp__x__get_secret", Risk.HIGH),
+        ("mcp__vault__read_api_key", Risk.HIGH),
+        ("mcp__vault__get_private_key", Risk.HIGH),
+        ("mcp__x__create_secret", Risk.CRITICAL),
+        ("mcp__x__delete_secret", Risk.CRITICAL),
+        ("mcp__cf__rotate_token", Risk.CRITICAL),
+    ])
+    def test_mcp_tools_are_judged_by_their_verb_not_their_server(self, tool, tier):
+        result = crc.classify({"tool_name": tool, "tool_input": {}})
+        assert result["risk"] == tier, (tool, result)
+
+    def test_mcp_delete_ranks_the_same_on_every_server(self):
+        """One act, one tier — whatever the server is called."""
+        tiers = {crc.classify({"tool_name": t, "tool_input": {}})["risk"]
+                 for t in ("mcp__github__delete_repository",
+                           "mcp__a_b__delete_thing", "mcp__a_b_c__delete_x",
+                           "mcp__gh__deleteRepository")}
+        assert tiers == {Risk.HIGH}
+
+    def test_every_mcp_verb_lands_at_exactly_the_tier_its_effect_implies(self):
+        """Enumerated, not exampled, over all three vocabularies and several
+        server-name shapes. Exact, not a floor: a floor could not see a
+        deploy quietly becoming CRITICAL. The finding this holds was found
+        by exactly one missing example — an underscored server."""
+        shapes = ("github", "a_b", "a_b_c", "x-y")
+        for word, effect in crc.EFFECT_WORDS.items():
+            if "-" in word:
+                continue                  # split apart before lookup; not an MCP verb shape
+            expected = max(min(crc.derive_risk(effect, crc.Reach.SHARED), Risk.HIGH),
+                           Risk.MEDIUM)
+            for server in shapes:
+                tool = "mcp__%s__%s_something" % (server, word)
+                got = crc.classify({"tool_name": tool, "tool_input": {}})["risk"]
+                assert got == expected, (tool, got, expected)
+        for word in crc.MCP_MUTATE_WORDS | crc.MCP_EXECUTE_WORDS:
+            for server in shapes:
+                tool = "mcp__%s__%s_something" % (server, word)
+                got = crc.classify({"tool_name": tool, "tool_input": {}})["risk"]
+                assert got == Risk.HIGH, (tool, got)
+        for word in crc.SECRET_WORDS:
+            if "-" in word:
+                continue
+            tool = "mcp__x__get_%s" % word
+            got = crc.classify({"tool_name": tool, "tool_input": {}})["risk"]
+            assert got == Risk.HIGH, (tool, got)
+
+    def test_a_server_the_reach_table_knows_is_not_capped(self, monkeypatch):
+        """The cap is for servers the classifier cannot place. One it can —
+        a row in TOOL_REACH, the same table binaries use — gets the tier
+        the ontology says."""
+        monkeypatch.setitem(crc.TOOL_REACH, "wp", crc.Reach.PUBLIC)
+        got = crc.classify({"tool_name": "mcp__wp__publish_post", "tool_input": {}})
+        assert got["risk"] == Risk.CRITICAL
+
+    def test_an_mcp_name_with_no_server_is_still_not_auto_allowed(self):
+        for tool in ("mcp__", "mcp__weird", "mcp__a__", "mcp____x"):
+            assert crc.classify({"tool_name": tool, "tool_input": {}})["risk"] >= Risk.MEDIUM
 
     def test_write_payload_can_escalate_a_benign_path(self):
         """A .md file is LOW, but a DROP TABLE payload inside it is not."""
@@ -861,8 +1001,12 @@ class TestInstaller:
         assert json.loads(settings.read_text(encoding="utf-8")) == {}
 
     def test_uninstall_when_not_installed_is_a_no_op(self, settings, capsys):
+        settings.write_text('{"hooks": {"PermissionRequest": []}}')
         assert crc.run_uninstall() == 0
         assert "nothing to remove" in capsys.readouterr().out.lower()
+        # A run that changed nothing must leave nothing: the backup exists
+        # to undo a write, and this used to drop a .bak on every clean run.
+        assert not list(settings.parent.glob("settings.json.bak*"))
 
     def test_install_uninstall_round_trip_restores_the_file(self, settings, capsys):
         original = {"model": "claude-opus-5",
@@ -906,6 +1050,86 @@ class TestStatus:
         out = capsys.readouterr().out
         assert "Decisions     : 2 recorded" in out
         assert "since 2026-08-14" in out
+
+
+class TestShareFooter:
+    """The only place the CLI asks a terminal for anything.
+
+    Its whole design is where it does NOT appear. `--report` is run out of
+    curiosity about what the tool bought you — the moment it has just
+    proved itself. `--status` is run when something is wrong. Asking at
+    the second moment costs more than it earns, so these tests pin the
+    absence as hard as the presence.
+    """
+
+    def _audit(self, tmp_path, monkeypatch):
+        for key in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY", "CLAUDE_RISK_CONFIG"):
+            monkeypatch.delenv(key, raising=False)
+        log = tmp_path / "audit.jsonl"
+        log.write_text(
+            '{"ts": "2026-09-01T10:00:00+00:00", "tier": "SAFE",'
+            ' "decision": "allow", "tool": "Read"}\n'
+            '{"ts": "2026-09-01T10:01:00+00:00", "tier": "HIGH",'
+            ' "decision": "escalate", "tool": "Bash"}\n',
+            encoding="utf-8")
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(log))
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+
+    def test_it_names_both_numbers_readably(self):
+        text = "\n".join(crc.share_footer(1503, 118))
+        assert "1,503" in text
+        assert "118" in text
+
+    def test_it_carries_the_project_site_and_no_personal_address(self):
+        text = "\n".join(crc.share_footer(10, 1))
+        assert crc.PROJECT_SITE in text
+        # One contact address for the whole project, and this is not the
+        # place for it: a footer is not a support channel.
+        assert "@" not in text
+
+    def test_it_offers_nothing_in_exchange(self):
+        # Attaching a reward to a recommendation measurably shrinks it, and
+        # rewarding a review outright breaks the App Store guidelines. The
+        # vocabulary of either must never reach this string.
+        text = "\n".join(crc.share_footer(10, 1)).lower()
+        for bribe in ("free", "discount", "% off", "reward", "coupon", "unlock"):
+            assert bribe not in text, bribe
+
+    def test_it_asks_for_one_thing_and_never_for_a_rating(self):
+        # An iOS app cannot be reviewed from a desktop browser, so a rating
+        # ask in a terminal is a dead end. The terminal gets the share; the
+        # wrist gets the rating.
+        text = "\n".join(crc.share_footer(10, 1)).lower()
+        assert "tell" in text
+        for dead_end in ("rate", "review", "star"):
+            assert dead_end not in text, dead_end
+
+    def test_report_prints_it(self, tmp_path, monkeypatch, capsys):
+        self._audit(tmp_path, monkeypatch)
+        assert crc.run_report() == 0
+        assert crc.PROJECT_SITE in capsys.readouterr().out
+
+    def test_status_never_prints_it(self, tmp_path, monkeypatch, capsys):
+        self._audit(tmp_path, monkeypatch)
+        crc.run_status()
+        assert crc.PROJECT_SITE not in capsys.readouterr().out
+
+    def test_install_never_prints_it(self, tmp_path, monkeypatch, capsys):
+        # Nothing has been earned at install time.
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
+        crc.run_install()
+        assert crc.PROJECT_SITE not in capsys.readouterr().out
+
+    def test_an_empty_audit_log_asks_for_nothing(self, tmp_path, monkeypatch, capsys):
+        # No decisions recorded means the tool has not yet done anything for
+        # this person. Reciprocity runs one way only.
+        for key in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY", "CLAUDE_RISK_CONFIG"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+        assert crc.run_report() == 0
+        assert crc.PROJECT_SITE not in capsys.readouterr().out
 
 
 class TestInstallerCLI:
@@ -1105,8 +1329,7 @@ class TestWatchRelayBridge:
     def relay(self):
 
         server, queue = watch_relay.serve(port=0)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        _serve(server)
         url = "http://127.0.0.1:%d" % server.server_address[1]
         yield url, queue
         server.shutdown()
@@ -1224,6 +1447,108 @@ class TestWatchRelayBridge:
         assert decision == "escalate"
 
 
+class TestRecapSummary:
+    """The lifetime numbers behind the recap screen.
+
+    Today's figures read only what was appended since the last call, because
+    the audit log grows for the product's whole lifetime. A lifetime figure
+    cannot do that, so this pays for one full pass — and therefore has to
+    survive everything a log that size can contain, including a torn last
+    line and a file that is not there at all.
+    """
+
+    import datetime as _dt
+    NOW = _dt.datetime(2026, 9, 4, tzinfo=_dt.timezone.utc).timestamp()
+
+    def _log(self, tmp_path, rows, trailing=""):
+        path = tmp_path / "audit.jsonl"
+        path.write_text("\n".join(_json.dumps(r) for r in rows) + "\n" + trailing,
+                        encoding="utf-8")
+        return str(path)
+
+    def _rows(self, allowed=120, asked=9):
+        rows = [{"ts": "2026-08-05T10:00:00+00:00", "tier": "SAFE",
+                 "decision": "allow"} for _ in range(allowed)]
+        rows += [{"ts": "2026-09-01T10:00:00+00:00", "tier": "CRITICAL",
+                  "decision": "escalate", "watch": "deny"} for _ in range(asked)]
+        return rows
+
+    def test_it_counts_the_whole_log(self, tmp_path):
+        import watch_dashboard as wd
+        facts = wd.recap_summary(self._log(tmp_path, self._rows()), self.NOW)
+        assert facts["total"] == 129
+        assert facts["silenced"] == 120
+        assert facts["asked"] == 9
+        assert facts["critical"] == 9
+        assert facts["answered_on_watch"] == 9
+        assert facts["silenced_percent"] == 93
+
+    def test_a_torn_last_line_is_not_a_failure(self, tmp_path):
+        # The hook appends while this reads. A half-written line is normal.
+        import watch_dashboard as wd
+        path = self._log(tmp_path, self._rows(), trailing='{"ts": "2026-09-0')
+        assert wd.recap_summary(path, self.NOW)["total"] == 129
+
+    def test_days_span_the_first_entry_to_now_inclusive(self, tmp_path):
+        import watch_dashboard as wd
+        facts = wd.recap_summary(self._log(tmp_path, self._rows()), self.NOW)
+        assert facts["first_day"] == "2026-08-05"
+        assert facts["days"] == 31
+
+    def test_time_saved_is_the_documented_estimate(self, tmp_path):
+        # Named and conservative on purpose: a number that flatters the tool
+        # is worse than no number, and every screen showing it must say
+        # "estimate".
+        import watch_dashboard as wd
+        facts = wd.recap_summary(self._log(tmp_path, self._rows()), self.NOW)
+        assert facts["seconds_saved"] == 120 * wd.SECONDS_PER_SILENCED_PROMPT
+
+    def test_a_missing_log_is_zeros_not_an_exception(self, tmp_path):
+        import watch_dashboard as wd
+        facts = wd.recap_summary(str(tmp_path / "nope.jsonl"), self.NOW)
+        assert facts["total"] == 0
+        assert facts["silenced_percent"] == 0
+        assert facts["days"] == 0
+
+    def test_an_empty_log_does_not_divide_by_zero(self, tmp_path):
+        import watch_dashboard as wd
+        path = tmp_path / "audit.jsonl"
+        path.write_text("", encoding="utf-8")
+        assert wd.recap_summary(str(path), self.NOW)["silenced_percent"] == 0
+
+    def test_a_changing_log_is_not_rescanned_on_every_call(self, tmp_path):
+        """The one route where a (mtime, size) cache is not enough.
+
+        The hook appends throughout a session, so that key changes
+        constantly and every open of the screen would re-read the whole
+        file. Nothing rate-limits a GET, so the floor is what bounds the
+        work — navigating in and out must not have the relay scanning a
+        lifetime of decisions each time.
+        """
+        import watch_dashboard as wd
+        path = self._log(tmp_path, self._rows())
+        assert wd.recap_summary(path, self.NOW)["total"] == 129
+        # The log grows, as it does during any live session.
+        with open(path, "a", encoding="utf-8") as handle:
+            for _ in range(50):
+                handle.write(_json.dumps({"ts": "2026-09-02T10:00:00+00:00",
+                                          "tier": "SAFE",
+                                          "decision": "allow"}) + "\n")
+        within = self.NOW + wd.RECAP_MIN_INTERVAL - 1
+        assert wd.recap_summary(path, within)["total"] == 129, "rescanned early"
+        after = self.NOW + wd.RECAP_MIN_INTERVAL + 1
+        assert wd.recap_summary(path, after)["total"] == 179
+
+    def test_an_unchanged_log_is_served_from_cache(self, tmp_path):
+        # The floor bounds the worst case; the stat key still spares the
+        # common one, where nothing has been decided since the last look.
+        import watch_dashboard as wd
+        path = self._log(tmp_path, self._rows())
+        first = wd.recap_summary(path, self.NOW)
+        later = wd.recap_summary(path, self.NOW + 10 * wd.RECAP_MIN_INTERVAL)
+        assert first is later
+
+
 class TestRelayBonjour:
     def test_advertise_returns_none_without_dnssd(self, monkeypatch):
         """Non-macOS hosts have no dns-sd; the relay must degrade quietly."""
@@ -1270,8 +1595,7 @@ class TestRelayTunnelToken:
     @pytest.fixture
     def tokened(self):
         server, queue = watch_relay.serve(port=0, token="s3cret")
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        _serve(server)
         yield "http://127.0.0.1:%d" % server.server_address[1], queue
         server.shutdown()
         server.server_close()
@@ -1287,6 +1611,25 @@ class TestRelayTunnelToken:
         base, _ = tokened
         assert self._get(base + "/pending") == 404
         assert self._get(base + "/health") == 404
+
+    def test_every_lan_only_route_is_absent_through_the_tunnel(self, tokened):
+        """Derived from ROUTES, not from a list of examples: the flag on
+        the route is the ONLY thing that hides it, so a route added with
+        lan_only tomorrow is covered the day it is added. A second tuple
+        used to say which paths the tunnel hid, and nothing checked that
+        it agreed with the table."""
+        base, _ = tokened
+        hidden = [(m, p) for m, routes in watch_relay.RelayHandler.ROUTES.items()
+                  for p, (_, rules) in routes.items() if rules.get("lan_only")]
+        assert {"/pair", "/enroll", "/card", "/heartbeat", "/tunnel"} <= {p for _, p in hidden}
+        assert all(p.startswith("/admin/") or p in ("/pair", "/enroll", "/card",
+                                                     "/heartbeat", "/tunnel")
+                   for _, p in hidden)
+        for method, path in hidden:
+            status, _ = relay_call(base + "/t/s3cret" + path, method=method)
+            # 404, the same answer as a path that does not exist — never
+            # 403, which would tell a stranger the route is there.
+            assert status == 404, (method, path, status)
 
     def test_token_prefix_alone_is_no_longer_enough(self, tokened):
         """The secret path says WHERE, the device token says WHO. Holding a
@@ -1321,7 +1664,7 @@ class TestRelayTunnelDiscovery:
         watch_relay.TUNNEL_URL = "https://example.trycloudflare.com/t/tok"
         try:
             server, _ = watch_relay.serve(port=0)
-            threading.Thread(target=server.serve_forever, daemon=True).start()
+            _serve(server)
             base = "http://127.0.0.1:%d" % server.server_address[1]
             with urllib.request.urlopen(base + "/tunnel", timeout=5) as reply:
                 assert json.loads(reply.read())["url"].endswith("/t/tok")
@@ -1332,7 +1675,7 @@ class TestRelayTunnelDiscovery:
 
     def test_tunnel_url_not_exposed_through_tunnel_listener(self):
         server, _ = watch_relay.serve(port=0, token="tok")
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        _serve(server)
         base = "http://127.0.0.1:%d" % server.server_address[1]
         try:
             urllib.request.urlopen(base + "/t/tok/tunnel", timeout=5)
@@ -1373,7 +1716,7 @@ class TestSelfStartingRelay:
 
     def test_ensure_detects_running_relay(self, monkeypatch, capsys):
         server, _ = watch_relay.serve(port=0)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        _serve(server)
         monkeypatch.setattr(watch_relay, "DEFAULT_PORT",
                             server.server_address[1])
         spawned = []
@@ -1425,7 +1768,7 @@ class TestWatchSeenAttribution:
 
     def test_bridge_polls_do_not_count_as_watch(self):
         server, queue = watch_relay.serve(port=0)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        _serve(server)
         base = "http://127.0.0.1:%d" % server.server_address[1]
 
         urllib.request.urlopen(base + "/pending?source=bridge", timeout=5).read()
@@ -1613,12 +1956,7 @@ class TestUsageSummary:
     the wrist is what was actually spent — never an estimate."""
 
     def _transcript(self, tmp_path, name, entries):
-        pdir = tmp_path / "-Users-x-proj"
-        pdir.mkdir(parents=True, exist_ok=True)
-        path = pdir / name
-        path.write_text("\n".join(json.dumps(e) for e in entries) + "\n",
-                        encoding="utf-8")
-        return path
+        return _write_transcript(tmp_path, "-Users-x-proj", name, entries)
 
     def _entry(self, minutes_ago, out_tokens, model="claude-opus-5"):
         import datetime as _dt
@@ -2417,8 +2755,7 @@ class TestLanSourceIsNotTrusted:
             return sock, ("192.168.1.77", addr[1])
 
         server.get_request = spoofed
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        _serve(server)
         yield "http://127.0.0.1:%d" % server.server_address[1], queue, auth
         server.shutdown()
         server.server_close()
@@ -2715,6 +3052,123 @@ class TestPlainTextForTheWatch:
         assert opening == "Fix the checkout"
 
 
+class TestTheMoreListIsWhatThisMachineCanAnswer:
+    """The watch's More list used to be a fixed set typed into the app,
+    which is how /verify and /debug sat there for weeks answering
+    "Unknown command". The relay now lists what the machine actually
+    has — user, project and plugin skills and commands — described in
+    each file's own words, plus the two read-only built-ins."""
+
+    def _machine(self, tmp_path):
+        home = tmp_path / "home"
+        (home / ".claude" / "skills" / "debug").mkdir(parents=True)
+        (home / ".claude" / "skills" / "debug" / "SKILL.md").write_text(
+            "---\nname: debug\ndescription: \"Digs into why the last thing failed.\"\n---\n# Debug\n")
+        (home / ".claude" / "commands").mkdir()
+        (home / ".claude" / "commands" / "standup.md").write_text("Write today's standup from the log.\n")
+        plugin = tmp_path / "plugins" / "eng" / "skills" / "incident"
+        plugin.mkdir(parents=True)
+        (plugin / "SKILL.md").write_text("---\ndescription: Runs an incident.\n---\n")
+        (home / ".claude" / "plugins").mkdir()
+        (home / ".claude" / "plugins" / "installed_plugins.json").write_text(json.dumps(
+            {"version": 2, "plugins": {"eng@x": [{"installPath": str(tmp_path / "plugins" / "eng")}]}}))
+        project = tmp_path / "proj"
+        (project / ".claude" / "skills" / "deploy").mkdir(parents=True)
+        (project / ".claude" / "skills" / "deploy" / "SKILL.md").write_text("---\ndescription: Ships it.\n---\n")
+        return str(home), str(project)
+
+    def test_every_source_is_listed_in_its_own_words(self, tmp_path):
+        home, project = self._machine(tmp_path)
+        rows = {r["name"]: r for r in watch_relay.known_skills(project, home=home, now=1.0)}
+        assert rows["/debug"] == {"name": "/debug", "description": "Digs into why the last thing failed.", "source": "user"}
+        assert rows["/standup"]["description"] == "Write today's standup from the log."
+        assert rows["/incident"]["source"] == "plugin"
+        assert rows["/deploy"]["source"] == "project"
+        assert rows["/code-review"]["source"] == "builtin" and rows["/security-review"]["source"] == "builtin"
+        assert "/verify" not in rows                        # never existed; never listed
+
+    def test_a_project_without_its_own_skills_still_gets_the_users(self, tmp_path):
+        home, _ = self._machine(tmp_path)
+        names = [r["name"] for r in watch_relay.known_skills(str(tmp_path / "elsewhere"), home=home, now=2.0)]
+        assert "/debug" in names and "/deploy" not in names
+
+    def test_the_route_answers_a_paired_watch_and_nobody_else(self, fresh_auth):
+        server, _queue = watch_relay.serve(port=0, auth=_known_watch(fresh_auth))
+        _serve(server)
+        try:
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            status, body = relay_call(base + "/skills", token="devicetoken")
+            assert status == 200
+            assert any(r["name"] == "/code-review" for r in body["skills"])
+            assert all(r["name"].startswith("/") and "description" in r for r in body["skills"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestSlashCommandsReachTheWrist:
+    """A slash command sent from the watch is answered by the CLI itself,
+    not by Claude: /recap runs zero model turns and writes its output as
+    a system line. The phone paints that red with a warning triangle;
+    the watch dropped it with every other "<"-prefixed line, so Recap
+    looked like it did nothing. Measured 2026-09-08 on Claude Code 2.1.260."""
+
+    def test_a_local_command_shows_its_echo_and_its_output(self, tmp_path):
+        _write_transcript(tmp_path, "-p", "recap1.jsonl", [
+            {"cwd": "/x", "message": {"role": "user", "content": "Fix the checkout"}},
+            {"message": {"role": "user", "content": "<command-name>/recap</command-name>"
+                                                   "<command-message>recap</command-message>"
+                                                   "<command-args></command-args>"}},
+            {"type": "system", "subtype": "local_command", "level": "info",
+             "content": "<local-command-stdout>Goal: fix checkout. Now: the race. Next: wait for the job.</local-command-stdout>"},
+        ])
+        turns = watch_relay.session_thread("recap1", projects_dir=str(tmp_path))
+        kinds = [(t["role"], t.get("kind"), t["text"]) for t in turns]
+        assert ("user", "text", "/recap") in kinds
+        assert ("system", "notice", "Goal: fix checkout. Now: the race. Next: wait for the job.") in kinds
+
+    def test_an_unknown_command_is_a_notice_not_silence(self, tmp_path):
+        _write_transcript(tmp_path, "-p", "recap2.jsonl", [
+            {"cwd": "/x", "message": {"role": "user", "content": "hello"}},
+            {"message": {"role": "user", "content": "<command-name>/verify</command-name><command-args></command-args>"}},
+            {"type": "system", "subtype": "local_command", "level": "info",
+             "content": "<local-command-stderr>Unknown command: /verify</local-command-stderr>"},
+        ])
+        turns = watch_relay.session_thread("recap2", projects_dir=str(tmp_path))
+        assert [t["text"] for t in turns if t.get("kind") == "notice"] == ["Unknown command: /verify"]
+
+    def test_a_system_error_is_a_notice_and_info_chatter_is_not(self, tmp_path):
+        _write_transcript(tmp_path, "-p", "recap3.jsonl", [
+            {"cwd": "/x", "message": {"role": "user", "content": "hello"}},
+            {"type": "system", "level": "info", "content": "Context left until auto-compact: 12%"},
+            {"type": "system", "level": "error", "content": "API rate limit reached"},
+        ])
+        turns = watch_relay.session_thread("recap3", projects_dir=str(tmp_path))
+        assert [t["text"] for t in turns if t.get("kind") == "notice"] == ["API rate limit reached"]
+
+    def test_claudes_nothing_to_add_after_a_local_command_is_not_a_reply(self, tmp_path):
+        """Measured on a live session, 2026-09-08: the wrist's /recap was
+        answered by the CLI, then Claude's turn said "No response
+        requested." — which the watch showed as a reply bubble under a
+        recap that had already arrived. Not a turn."""
+        _write_transcript(tmp_path, "-p", "recap4.jsonl", [
+            {"cwd": "/x", "message": {"role": "user", "content": "hello"}},
+            {"message": {"role": "user", "content": "<command-name>/recap</command-name>"}},
+            {"type": "system", "subtype": "local_command", "level": "info",
+             "content": "<local-command-stdout>Goal: ship. Next: merge.</local-command-stdout>"},
+            {"message": {"role": "assistant", "content": [{"type": "text", "text": "No response requested."}]}},
+            {"message": {"role": "assistant", "content": [{"type": "text", "text": "A real reply."}]}},
+        ])
+        turns = watch_relay.session_thread("recap4", projects_dir=str(tmp_path))
+        texts = [t["text"] for t in turns if t["role"] == "assistant"]
+        assert texts == ["A real reply."]
+
+    def test_the_args_ride_with_the_command(self):
+        assert watch_dashboard._command_sent(
+            "<command-name>/loop</command-name><command-args>5m /x</command-args>") == "/loop 5m /x"
+        assert watch_dashboard._command_sent("plain words") is None
+
+
 class TestFenceNesting:
     """Four-backtick fences exist to contain ``` lines — an inner fence
     must not flip the state (the motivating case for the {3,} widening)."""
@@ -2746,7 +3200,7 @@ def live_relay():
     server teardown cannot drift apart between copies."""
     queue = watch_relay.CardQueue()
     server, _ = watch_relay.serve("127.0.0.1", 0, queue=queue)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    _serve(server)
     queue.pending(from_watch=True)
     yield server.server_address[1], queue
     server.shutdown()
@@ -3456,16 +3910,11 @@ class TestTaskVerdictsCanRecover:
     again — and an exit marker beats a stale mtime."""
 
     def test_exit_marker_wins_even_when_stale(self, tmp_path, monkeypatch):
-        import watch_dashboard
         tasks = tmp_path / "claude-1" / "x" / "sess" / "tasks"
         tasks.mkdir(parents=True)
         out = tasks / "tid1.output"
         out.write_text("...\n[exited with code 0]\n")
         os.utime(out, (1, 1))                       # ancient mtime
-        monkeypatch.setattr(watch_dashboard, "_task_state",
-                            watch_relay._task_state)  # no-op; direct call
-        # Patch the glob pattern root by calling through a wrapper that
-        # rewrites the pattern? Simpler: exercise the tail logic directly.
         import glob as _glob
         monkeypatch.setattr(_glob, "glob",
                             lambda pattern: [str(out)])
@@ -3549,7 +3998,7 @@ class TestHostRebindingDefense:
         import http.client
         queue = watch_relay.CardQueue()
         server, _ = watch_relay.serve("127.0.0.1", 0, queue=queue)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        _serve(server)
         port = server.server_address[1]
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -4212,7 +4661,7 @@ class TestNewSessionFromTheWatch:
         monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
         watch_relay.LIMITS.reset()
         server, _ = watch_relay.serve(port=0)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        _serve(server)
         base = "http://127.0.0.1:%d" % server.server_address[1]
         try:
             # 15 s, not 3: both routes scan ~/.claude/projects, which on a
@@ -4244,8 +4693,7 @@ class TestRelayRoutes:
         auth = _known_watch(fresh_auth)
         auth.devices = []
         server, queue = watch_relay.serve(port=0, auth=auth)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        _serve(server)
         yield "http://127.0.0.1:%d" % server.server_address[1], queue, auth
         server.shutdown()
         server.server_close()
@@ -4586,6 +5034,18 @@ class TestFirstPairingIsAWindow:
         assert not auth.window_open()
         assert auth.claim_window("192.168.1.9") is None
 
+    def test_the_window_a_relay_start_lights_is_the_first_window(self, fresh_auth):
+        """main() used to call open_window() with its default — the
+        ten-minute --pair fuse — on a never-paired relay, cutting the half
+        hour Auth() had just lit to a third. relight() is the operation
+        that means 'first contact', and a no-op once anything has paired."""
+        auth = fresh_auth
+        auth.paired_ever = False
+        before = time.time()
+        until = auth.relight()
+        assert until - before >= watch_relay.PAIR_FIRST_WINDOW_SECONDS - 5
+        assert until - before > watch_relay.PAIR_WINDOW_SECONDS
+
     def test_a_session_start_relights_it(self, fresh_auth, monkeypatch):
         auth = fresh_auth
         now = time.time()
@@ -4670,11 +5130,9 @@ class TestNoPersonalIdentityInTrackedFiles:
 
     def test_tracked_files_carry_none_of_them(self):
         root, words = self._forbidden()
-        listed = subprocess.run(["git", "-C", root, "ls-files", "-z"],
-                                capture_output=True, check=True).stdout
         offenders = []
-        for rel in listed.decode("utf-8", "replace").split("\0"):
-            if not rel or rel.startswith("design/"):
+        for rel in _tracked_files(root):
+            if rel.startswith("design/"):
                 continue
             try:
                 with open(os.path.join(root, rel), "rb") as handle:
@@ -4685,6 +5143,488 @@ class TestNoPersonalIdentityInTrackedFiles:
                 if word.lower() in text:
                     offenders.append("%s: %s" % (rel, word))
         assert not offenders, "\n".join(offenders)
+
+
+def _tracked_files(root):
+    """Every path git tracks under ``root``, NUL-separated so a space in a
+    name cannot split it, and checked so a missing git fails the test
+    rather than emptying it. Files deleted but not yet staged are
+    skipped. Two tests walk the tree; this is the one walk."""
+    listed = subprocess.run(["git", "-C", root, "ls-files", "-z"],
+                            capture_output=True, check=True).stdout
+    names = [rel for rel in listed.decode("utf-8", "replace").split("\0")
+             if rel and os.path.exists(os.path.join(root, rel))]
+    assert names, "git ls-files returned nothing — not a checkout?"
+    return names
+
+
+class TestTheDocumentsDoNotRestateTheBuildNumber:
+    """WatchApp/BUILD_NUMBER is the one place the current build lives;
+    deploy-testflight.sh rewrites and commits it. Five documents once
+    said "reads 108" a day after it read 109 — two of them in the same
+    sentence that named the file as the authority. Prose may cite a
+    build in its history ("build 106 retired"); it may not restate what
+    that file currently holds, because that sentence is stale the next
+    time the script runs and nothing tells anyone."""
+
+    # The shapes the five documents used: "It reads 108", "as build 108",
+    # "build 108 is on TestFlight / on every tester's watch", "is at 108".
+    # History may name a build ("build 106 retired", "shipped build 108
+    # with it") — those are dated facts, not claims about now.
+    RESTATES = re.compile(
+        r"\b(reads|is at|as build|is build|current build is|newest build is|latest build is)\s+1\d\d\b"
+        r"|\bbuild\s+1\d\d\b[^\n.]{0,50}\b(is on TestFlight|is on every|is live|is current|is the newest|is the latest)",
+        re.I)
+
+    def test_no_tracked_document_restates_the_current_build(self):
+        offenders = []
+        for rel in _tracked_files(_ROOT):
+            if not rel.endswith(".md"):
+                continue
+            with open(os.path.join(_ROOT, rel), encoding="utf-8") as handle:
+                for number, line in enumerate(handle, 1):
+                    if self.RESTATES.search(line):
+                        offenders.append("%s:%d: %s" % (rel, number, line.strip()[:80]))
+        assert not offenders, "these restate WatchApp/BUILD_NUMBER in prose:\n" + "\n".join(offenders)
+
+    @pytest.mark.parametrize("sentence", [
+        "as part of shipping it. It reads 108.",
+        "**1.1 has shipped to TestFlight as build 108** — the growth",
+        "on TestFlight as build 108 since",
+        "| nothing — build 108 is on every tester's watch now | owner |",
+        "`BUILD_NUMBER` reads 108 — the script commits the bump",
+        "`WatchApp/BUILD_NUMBER` reads 108 — that file, not this list, is the",
+    ])
+    def test_the_guard_catches_every_sentence_the_documents_actually_used(self, sentence):
+        """Replayed against the lines the tidy removed. A guard that
+        matched two of six was the first version of this test."""
+        assert self.RESTATES.search(sentence), sentence
+
+    @pytest.mark.parametrize("sentence", [
+        "retired build 106: 200",
+        "after it had shipped build 108 with it. The likeliest reason",
+        "Done: 108 on 2026-09-04 (the 1.1 code), 109 on 2026-09-07",
+    ])
+    def test_history_is_allowed_to_name_a_build(self, sentence):
+        assert not self.RESTATES.search(sentence), sentence
+
+
+class TestTheReportingItselfIsChecked:
+    """Issue #38's other half: three of its cases were checks that could
+    not fail — TEST BUILD SUCCEEDED with no test action in the scheme, a CI
+    list read from a stale commit, a watcher whose regex could not match
+    its own success. "A confident statement nobody has seen be false is not
+    a check."
+
+    Pieces one and two of that issue added reporting. These two hold the
+    reporting to the same standard it was built to enforce, over the whole
+    source rather than over chosen examples — the shape
+    test_the_ontology_obeys_its_own_guardrails already uses.
+    """
+
+    # Every condition the relay can record. Adding a note_condition() with
+    # a key that is not here fails the first test below, which is the
+    # moment to also give it a test that fires it — the entries here are
+    # exercised by a test that fires them, not merely declared.
+    VOCABULARY = {"bonjour", "helper", "tunnel", "update"}
+
+    @staticmethod
+    def _module_source(name):
+        with open(os.path.join(_ROOT, name), encoding="utf-8") as handle:
+            return ast.parse(handle.read())
+
+    @staticmethod
+    def _note_keys(tree):
+        """Every literal key passed to note_condition() in this module."""
+        keys = set()
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "note_condition"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)):
+                keys.add(node.args[0].value)
+        return keys
+
+    def test_every_condition_the_code_can_report_has_a_test_that_fires_it(self):
+        """A reporting path nobody has seen fire is not a reporting path.
+
+        The vocabulary above is the list the sibling class exercises one by
+        one. A new note_condition() lands here first, before it can be
+        believed."""
+        found = self._note_keys(self._module_source("watch_relay.py"))
+        assert found == self.VOCABULARY, (
+            "condition keys in the code and keys with a test disagree: "
+            "only in code %s, only in the test %s"
+            % (sorted(found - self.VOCABULARY),
+               sorted(self.VOCABULARY - found)))
+
+    def test_a_function_that_reports_one_failure_reports_all_of_them(self):
+        """The regression this cannot allow: a second `return None` added
+        to a function that already knows its failures matter.
+
+        advertise() had exactly that shape before — one path logged, one
+        returned in silence — and the silent one was the case that actually
+        happens on a machine without dns-sd. Scoped to functions that
+        already call note_condition, so ordinary "no match found" helpers
+        are not dragged in: returning None is not a fault, but reporting
+        one failure and not its neighbour is."""
+        tree = self._module_source("watch_relay.py")
+        silent = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if not self._note_keys(node):
+                continue                       # not a reporting function
+            silent += ["%s:%d" % (node.name, line)
+                       for line in _unreported_none_returns(node)]
+        assert not silent, (
+            "these return None with nothing said on the way out, in a "
+            "function that reports its other failures: %s" % silent)
+
+
+def _unreported_none_returns(func):
+    """Lines in `func` returning None with no note_condition before them.
+
+    "Before" means earlier in the same block, or earlier in any block
+    enclosing it — a note ahead of the `if` counts for a return inside it.
+    """
+    parents = {}
+    for node in ast.walk(func):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def notes(node):
+        return any(isinstance(sub, ast.Call)
+                   and isinstance(sub.func, ast.Name)
+                   and sub.func.id == "note_condition"
+                   for sub in ast.walk(node))
+
+    def announced(stmt):
+        node = stmt
+        while node in parents:
+            parent = parents[node]
+            for field in ("body", "orelse", "finalbody"):
+                block = getattr(parent, field, None)
+                if isinstance(block, list) and node in block:
+                    if any(notes(earlier) for earlier in block[:block.index(node)]):
+                        return True
+            node = parent
+        return False
+
+    lines = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Return):
+            continue
+        if node.value is not None and not (isinstance(node.value, ast.Constant)
+                                           and node.value.value is None):
+            continue
+        if not announced(node):
+            lines.append(node.lineno)
+    return lines
+
+
+
+class TestSilentFailuresStayLoud:
+    """#94 and #95, the two cases #38 deferred: an announcer that dies
+    after startup, and an update held back by a pending card. Each used
+    to be reported nowhere a person looks."""
+
+    class _Alive:
+        def __init__(self):
+            self.terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+    class _Dead:
+        def poll(self):
+            return 143                     # what SIGTERM leaves behind
+
+        def terminate(self):
+            pass                           # already gone; _republish may still ask
+
+    def _advertiser(self, monkeypatch, first, *replacements):
+        """A real _Advertiser whose announcer is ``first`` and whose later
+        spawns — restarts and republishes alike — hand out ``replacements``
+        in order (None = could not start). Built by the constructor, with
+        its two seams stubbed — not by __new__ and three hand-set fields,
+        which is the shape the fresh_auth fixture was written to end."""
+        monkeypatch.setattr(watch_relay, "advertise_txt", lambda _port: {})
+        queue = [first, *replacements]
+        monkeypatch.setattr(watch_relay, "advertise",
+                            lambda port, txt=None: queue.pop(0) if queue else None)
+        return watch_relay._Advertiser(8977)
+
+    def test_the_proof_holds_against_the_real_advertise(self, monkeypatch, capsys):
+        """The first cut of this passed only in the stub: the real
+        advertise() withdrew the condition itself on every successful
+        exec, so a dns-sd that died fifty milliseconds later was noted,
+        cleared and "restarted" every tick and /health never saw it. Run
+        the real function, with only the spawn faked."""
+        spawned = [self._Dead(), self._Alive()]
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda name: "/usr/bin/dns-sd")
+        monkeypatch.setattr(watch_relay.subprocess, "Popen", lambda *a, **k: spawned.pop(0))
+        monkeypatch.setattr(watch_relay, "advertise_txt", lambda _port: {})
+        adv = watch_relay._Advertiser(8977)
+        assert watch_relay.conditions() == []                  # startup: fine
+        assert adv.check_once() == "restarted"
+        assert [c["key"] for c in watch_relay.conditions()] == ["bonjour"]   # still standing
+        assert adv.check_once() == "fine"
+        assert watch_relay.conditions() == []                  # proven, withdrawn
+
+    def test_an_announcer_that_exits_is_said_restarted_and_only_then_cleared(self, monkeypatch, capsys):
+        """dns-sd ran with both pipes to DEVNULL and nothing polled it;
+        when it died the relay believed it was announced. And a restart
+        is not a recovery: the condition is withdrawn only once the
+        replacement is still alive at the next look."""
+        adv = self._advertiser(monkeypatch, self._Dead(), self._Alive())
+        assert adv.check_once() == "restarted"
+        assert "announcement stopped" in capsys.readouterr().err
+        assert [c["key"] for c in watch_relay.conditions()] == ["bonjour"]   # not yet
+        assert adv.check_once() == "fine"
+        assert watch_relay.conditions() == []                               # now
+        assert "announcing again" in capsys.readouterr().err
+
+    def test_an_announcer_that_keeps_dying_is_given_up_on_and_said_so(self, monkeypatch):
+        """Restart forever is a fork bomb with good intentions. After
+        MAX_RESTARTS in a row the relay stops and leaves a sentence that
+        says what is true; the watchdog thread then has nothing to do."""
+        deaths = [self._Dead() for _ in range(watch_relay._Advertiser.MAX_RESTARTS)]
+        adv = self._advertiser(monkeypatch, self._Dead(), *deaths)
+        for _ in range(watch_relay._Advertiser.MAX_RESTARTS):
+            assert adv.check_once() == "restarted"
+        assert adv.check_once() == "down"
+        detail = watch_relay.conditions()[0]["detail"]
+        assert "keeps stopping" in detail and "by hand" in detail
+        assert adv.process is None
+        assert adv.check_once() == "none"              # nothing left to watch
+
+    def test_an_announcer_that_cannot_be_restarted_stays_reported(self, monkeypatch):
+        adv = self._advertiser(monkeypatch, self._Dead())      # no replacement at all
+        # advertise() reports its own reason on that path; stand in for it.
+        monkeypatch.setattr(watch_relay, "advertise",
+                            lambda port, txt=None: watch_relay.note_condition("bonjour", "no dns-sd") or None)
+        assert adv.check_once() == "down"
+        assert [c["key"] for c in watch_relay.conditions()] == ["bonjour"]
+        assert adv.check_once() == "none"
+
+    def test_a_deliberate_republish_is_not_a_death(self, monkeypatch, capsys):
+        """The one false alarm that kept this out of #92: _republish
+        terminates the announcer on purpose when the tunnel URL arrives.
+        The swap happens under the watchdog's lock, so it never sees the
+        process it would have blamed."""
+        old = self._Alive()
+        adv = self._advertiser(monkeypatch, old, self._Alive())
+        monkeypatch.setattr(watch_relay, "TUNNEL_URL", "https://x.trycloudflare.com/t/tok")
+        monkeypatch.setattr(watch_relay.time, "sleep", lambda seconds: None)
+        adv._republish()
+        assert old.terminated
+        assert adv.process is not old                          # the replacement, not the corpse
+        assert adv.check_once() == "fine"
+        assert watch_relay.conditions() == []
+        assert "stopped" not in capsys.readouterr().err
+
+    def test_a_republish_after_unproven_restarts_does_not_inherit_their_count(self, monkeypatch):
+        """Three unproven restarts, then the tunnel comes up and
+        _republish installs a fresh announcer. One later death must not
+        be the fourth in a row — but the condition from the restarts
+        stands until the republished process has lived a tick."""
+        dead = [self._Dead() for _ in range(2)]
+        adv = self._advertiser(monkeypatch, self._Dead(), *dead, self._Alive(), self._Alive())
+        assert adv.check_once() == "restarted"
+        assert adv.check_once() == "restarted"                 # two unproven
+        monkeypatch.setattr(watch_relay, "TUNNEL_URL", "https://x.trycloudflare.com/t/tok")
+        monkeypatch.setattr(watch_relay.time, "sleep", lambda seconds: None)
+        adv._republish()                                        # installs an _Alive
+        assert [c["key"] for c in watch_relay.conditions()] == ["bonjour"]   # not yet proven
+        assert adv.check_once() == "fine"
+        assert watch_relay.conditions() == []
+        assert adv._restarts == 0
+
+    def test_a_deferred_update_is_recorded_on_the_relay_and_reaches_health(self, fresh_auth):
+        """The launcher used to say 'update deferred' on stderr, in a log
+        on a Mac nobody is looking at, and the machine ran yesterday's
+        rules. The relay now records it about itself; /health carries it.
+        The sentence says only what stays true after the card is answered."""
+        server, _queue = watch_relay.serve(port=0, auth=_known_watch(fresh_auth))
+        _serve(server)
+        try:
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            status, body = relay_call(base + "/admin/update-deferred", method="POST")
+            assert (status, body) == (200, {"ok": True})
+            _status, body = relay_call(base + "/health", token="devicetoken")
+            assert [c["key"] for c in body["conditions"]] == ["update"]
+            assert "pending" not in body["conditions"][0]["detail"]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_an_admin_path_the_handler_does_not_know_is_a_404(self, fresh_auth, monkeypatch):
+        """The chain used to end in `else: rotate`, so a route added to
+        ROUTES without a handler branch rotated the key and opened the
+        pairing window. Add such a route; it must answer 404, and the
+        key must be what it was."""
+        monkeypatch.setitem(watch_relay.RelayHandler.ROUTES["POST"], "/admin/nope",
+                            ("_post_admin", dict(local=True, admin=True, lan_only=True)))
+        auth = _known_watch(fresh_auth)
+        server, _queue = watch_relay.serve(port=0, auth=auth)
+        _serve(server)
+        try:
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            status, body = relay_call(base + "/admin/nope", method="POST")
+            assert (status, body.get("error")) == (404, "unknown admin route")
+            assert not auth.window_open()                       # no fall-through to rotate
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_ensure_running_tells_the_relay_it_is_being_held_back(self, monkeypatch):
+        calls = []
+        stopped = []
+        monkeypatch.setattr(watch_relay, "_self_update", lambda: None)
+        monkeypatch.setattr(watch_relay, "_admin_call",
+                            lambda path, timeout=5: calls.append((path, timeout)) or {"ok": True})
+        monkeypatch.setattr(watch_relay, "_stop_relay", lambda: stopped.append(True))
+        health = {"version": watch_relay.RELAY_VERSION - 1, "pending": 2, "paired_ever": True}
+        monkeypatch.setattr(watch_relay, "_probe_relay", lambda: health)
+        assert watch_relay.ensure_running() == 0
+        assert calls == [("/admin/update-deferred", 2)]     # the probe's bound, not the default 5
+        assert stopped == []                            # a relay holding a card is holding an approval
+
+class TestConditionsAreSaidOutLoud:
+    """Issue #38: the relay knew several things were wrong and reported them
+    only to a log file on a Mac nobody is looking at. These hold that each
+    one now reaches /health, and so the wrist."""
+
+    def test_a_condition_is_recorded_and_withdrawn(self):
+        watch_relay.note_condition("tunnel", "off")
+        assert watch_relay.conditions() == [{"key": "tunnel", "detail": "off"}]
+        watch_relay.clear_condition("tunnel")
+        assert watch_relay.conditions() == []
+
+    def test_withdrawing_something_that_was_never_wrong_is_harmless(self):
+        watch_relay.clear_condition("never-happened")
+        assert watch_relay.conditions() == []
+
+    def test_the_same_complaint_is_printed_once(self, capsys):
+        """A warning that repeats on every retry teaches the reader to skip
+        warnings — which is how a real one goes unread."""
+        watch_relay.note_condition("tunnel", "off")
+        watch_relay.note_condition("tunnel", "off")
+        assert capsys.readouterr().err.count("off") == 1
+        # A changed detail is news again.
+        watch_relay.note_condition("tunnel", "off, differently")
+        assert "off, differently" in capsys.readouterr().err
+
+    def test_bonjour_with_no_tool_at_all_is_no_longer_silent(self, monkeypatch):
+        """The exact hole: advertise() returned None with no log line, and
+        its caller prints only on success, so "the watch cannot find this
+        computer" was reported nowhere."""
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _name: None)
+        assert watch_relay.advertise(8977) is None
+        assert [c["key"] for c in watch_relay.conditions()] == ["bonjour"]
+
+    def test_a_successful_start_withdraws_the_complaint(self, monkeypatch):
+        """At startup the announcer is withdrawn on exec — there is no
+        earlier process whose death is being recovered from. advertise()
+        itself no longer clears anything: a process that exec'd is not
+        one that works, and the watchdog's proof depends on the clear
+        being the caller's decision."""
+        watch_relay.note_condition("bonjour", "stale complaint")
+        monkeypatch.setattr(watch_relay.shutil, "which",
+                            lambda name: "/usr/bin/dns-sd")
+        # advertise_txt reaches for the LAN address through subprocess, and
+        # a stubbed Popen would break that on the way past.
+        monkeypatch.setattr(watch_relay, "advertise_txt", lambda _port: {})
+        monkeypatch.setattr(watch_relay.subprocess, "Popen",
+                            lambda *a, **k: "a running dns-sd")
+        assert watch_relay.advertise(8977) is not None
+        assert [c["key"] for c in watch_relay.conditions()] == ["bonjour"]   # not advertise's call
+        watch_relay._Advertiser(8977)
+        assert watch_relay.conditions() == []
+
+    def test_a_missing_tunnel_binary_is_a_condition(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "_cloudflared", lambda: None)
+        assert watch_relay.start_tunnel(8978, "tok") is None
+        detail = watch_relay.conditions()[0]["detail"]
+        assert "cloudflared" in detail
+
+    def test_a_stranger_is_not_told_what_is_weak_about_this_machine(
+            self, fresh_auth):
+        """The list names where this computer is soft — not announcing, no
+        way in from away. That is the machine's business, not a passer-by's,
+        so it rides the same credential as the rest of the detail."""
+        watch_relay.LIMITS.reset()
+        watch_relay.note_condition("bonjour", "not announcing")
+        server, _queue = watch_relay.serve(port=0, auth=_known_watch(fresh_auth))
+        real = server.get_request
+
+        def spoofed():
+            sock, addr = real()
+            return sock, ("192.168.1.77", addr[1])
+
+        server.get_request = spoofed
+        _serve(server)
+        try:
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            _status, body = relay_call(base + "/health")
+            assert body == {"ok": True}
+            _status, body = relay_call(base + "/health", token="devicetoken")
+            assert body["conditions"] == [{"key": "bonjour",
+                                           "detail": "not announcing"}]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_relay_that_cannot_see_the_helper_says_so(self, monkeypatch):
+        """The third key, and the one that was unreachable: it lived inline
+        in main(), so nothing could fire it. It is also the explanation for
+        the watch showing the helper version as "unknown"."""
+        monkeypatch.setattr(watch_relay, "HELPER_VERSION", "unknown")
+        assert watch_relay.check_helper_is_visible() is False
+        assert [c["key"] for c in watch_relay.conditions()] == ["helper"]
+
+    def test_a_relay_that_can_see_the_helper_withdraws_the_complaint(
+            self, monkeypatch):
+        watch_relay.note_condition("helper", "stale complaint")
+        monkeypatch.setattr(watch_relay, "HELPER_VERSION", "1.1.1")
+        assert watch_relay.check_helper_is_visible() is True
+        assert watch_relay.conditions() == []
+
+    def test_health_carries_conditions_to_a_credentialed_caller(self, fresh_auth):
+        watch_relay.note_condition("bonjour", "not announcing")
+        server, _queue = watch_relay.serve(port=0, auth=_known_watch(fresh_auth))
+        _serve(server)
+        try:
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            _status, body = relay_call(base + "/health")
+            assert body["conditions"] == [{"key": "bonjour",
+                                           "detail": "not announcing"}]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+def test_the_watch_names_the_helper_version_this_repository_ships():
+    """The watch warns when the helper on the computer is behind it, and it
+    can only do that against a version it was told to expect. That constant
+    lives in Swift, `__version__` lives here, and nothing would notice them
+    drifting apart: the row would simply stop firing, or fire forever. The
+    same trap Version.xcconfig fell into when it said 1.1 and every build
+    shipped 1.0."""
+    swift = os.path.join(_ROOT, "WatchApp", "Tapproval", "RelayModel.swift")
+    if not os.path.isfile(swift):
+        pytest.skip("no watch app in this layout")
+    with open(swift, encoding="utf-8") as handle:
+        found = re.search(r'static let expected = "([^"]+)"', handle.read())
+    assert found, "HelperVersion.expected is gone from RelayModel.swift"
+    assert found.group(1) == crc.__version__, (
+        "the watch expects helper %s, this repository ships %s"
+        % (found.group(1), crc.__version__))
 
 
 def test_the_two_ci_workflows_share_their_test_steps():
@@ -4700,3 +5640,140 @@ def test_the_two_ci_workflows_share_their_test_steps():
         end = next(i for i, line in enumerate(lines) if "shellcheck" in line and "run:" in line)
         return lines[:end]
     assert python_steps(private) == python_steps(public)
+
+
+class TestTheEffectOntology:
+    """Risk derived from what a command does, not from which binary does it.
+
+    Fourteen tables in the classifier answer "what does this verb do", every
+    one keyed on a binary's name — which is how `flyctl apps destroy myapp`
+    read SAFE, and SAFE is auto-allowed under `--quiet`. These hold the
+    derivation, the guardrails it must obey, and the commands that were
+    wrong before it existed.
+    """
+
+    E, RE, U = crc.Effect, crc.Reach, crc.Undo
+
+    # --- the guardrails, over the whole table rather than per example -----
+
+    def test_the_ontology_obeys_its_own_guardrails(self):
+        """G1-G4 hold for every combination, not for chosen examples. A rule
+        added tomorrow that contradicts one from last month fails here."""
+        for effect in self.E:
+            for reach in self.RE:
+                for undo in self.U:
+                    for secret in (False, True):
+                        tier = crc.derive_risk(effect, reach, undo, secret=secret)
+                        where = (effect.name, reach.name, undo.name, secret)
+                        if secret:                                    # G4
+                            assert tier >= crc.Risk.HIGH, where
+                        if effect == self.E.DESTROY and reach > self.RE.SCRATCH:
+                            assert tier >= crc.Risk.HIGH, where       # G2
+                        if effect in (self.E.GRANT, self.E.PUBLISH):
+                            assert tier >= crc.Risk.HIGH, where       # G3
+                            if reach >= self.RE.SYSTEM:
+                                assert tier == crc.Risk.CRITICAL, where
+                        if (undo == self.U.IRREVERSIBLE
+                                and reach >= self.RE.SHARED
+                                and effect >= self.E.DESTROY):        # G1
+                            assert tier == crc.Risk.CRITICAL, where
+
+    def test_observing_is_safe_unless_the_resource_is_a_credential(self):
+        """Looking is what an agent does all day; looking at a secret is not."""
+        for reach in self.RE:
+            assert crc.derive_risk(self.E.OBSERVE, reach) == crc.Risk.SAFE
+            assert crc.derive_risk(self.E.OBSERVE, reach, secret=True) >= crc.Risk.HIGH
+
+    def test_a_command_naming_no_effect_yields_no_opinion(self):
+        """G5: absence of a fact is not a licence. The ontology returns None
+        and the ordinary rules decide — it may never invent a SAFE."""
+        for command in ("ls -la", "git status", "docker ps", "kubectl get pods",
+                        "gh pr view 123", "defaults read com.apple.dock",
+                        "sort -d notes.txt", "docker logs web"):
+            assert crc._ontology_risk(command) is None, command
+
+    def test_it_can_only_raise(self):
+        """Wired ahead of every recognition table, and bump() takes the
+        maximum — so adding it cannot make the classifier more permissive.
+        Whatever the ontology says, the shipped tier is at least that."""
+        for command in ("flyctl apps destroy myapp --yes", "terraform destroy",
+                        "kubectl delete namespace production", "ls -la",
+                        "rm -rf build/", "git status"):
+            named = crc._ontology_risk(command)
+            shipped, _ = crc.classify_bash(command)
+            assert shipped >= (named[1] if named else crc.Risk.SAFE), command
+
+    # --- the commands that were wrong -------------------------------------
+
+    @pytest.mark.parametrize("command,floor", [
+        # Read verb recognised, the word after it never read.
+        ("flyctl apps destroy myapp --yes", crc.Risk.CRITICAL),
+        ("kubectl delete namespace production", crc.Risk.CRITICAL),
+        ("terraform destroy -auto-approve", crc.Risk.CRITICAL),
+        ("aws s3 rm s3://prod-bucket --recursive", crc.Risk.CRITICAL),
+        ("aws s3 sync . s3://prod --delete", crc.Risk.CRITICAL),
+        ("vercel deploy --prod", crc.Risk.CRITICAL),
+        ("rclone sync /empty remote:backups", crc.Risk.HIGH),
+        # A subcommand on the git read list, with the flags unexamined.
+        ("git branch -D main", crc.Risk.HIGH),
+        ("git remote set-url origin https://evil.example/r.git", crc.Risk.MEDIUM),
+        ("git config --global alias.x '!rm -rf ~'", crc.Risk.CRITICAL),
+        # find is a read-only command; -delete is not a read.
+        ("find / -name '*.log' -delete", crc.Risk.CRITICAL),
+        # Reads that hand over a live credential.
+        ("gh auth token", crc.Risk.HIGH),
+        ("kubectl get secret db -o yaml", crc.Risk.HIGH),
+        ("cat ~/.kube/config", crc.Risk.HIGH),
+        ("cat ~/.npmrc", crc.Risk.HIGH),
+        # The same word, joined to its neighbours the way AWS, GCP and
+        # curl actually spell it — in a flag, a NAME=value, an environment
+        # variable. Whole-token matching missed every one.
+        ("aws secretsmanager get-secret-value --secret-id prod", crc.Risk.HIGH),
+        ("printenv AWS_SECRET_ACCESS_KEY", crc.Risk.HIGH),
+        ("echo $GITHUB_TOKEN", crc.Risk.HIGH),
+        ("curl -H 'x-api-key=abc' https://api.example/", crc.Risk.HIGH),
+        ("gcloud secrets versions access latest --secret=db", crc.Risk.HIGH),
+        ("vault kv get -field=api_key secret/prod", crc.Risk.HIGH),
+    ])
+    def test_every_command_that_used_to_read_safe(self, command, floor):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= floor, "%s -> %s (%s)" % (command, risk.name, rules)
+        assert risk > crc.Risk.LOW, "--quiet would auto-allow %s" % command
+
+    @pytest.mark.parametrize("command", [
+        "ls -la", "git status", "git log --oneline", "docker ps",
+        "kubectl get pods", "gh pr view 123", "defaults read com.apple.dock",
+        "docker logs web", "sort -d notes.txt", "git config --list",
+        "git config --get remote.origin.url", "git config user.email",
+        # A word that names a credential inside a FILENAME is not one:
+        # design tokens and a docs page about passwords are ordinary reads.
+        "cat design/tokens.md", "ls tokens/", "cat docs/passwords.md",
+    ])
+    def test_the_ordinary_reads_are_still_safe(self, command):
+        """The cost of a false positive here is a card the user learns to
+        tap through, which is how a wrist app stops working."""
+        assert crc.classify_bash(command)[0] == crc.Risk.SAFE, command
+
+    @pytest.mark.parametrize("command", [
+        # A credential word inside an ordinary NAME — a test file, a branch,
+        # a namespace, a compose service, an npm script — is not a
+        # credential. Review found the first cut of the joiner split made
+        # every one of these a HIGH card.
+        "python -m pytest test_token_refresh.py",
+        "cat token-bucket.js", "head token_bucket.py",
+        "kubectl get pods -n token-service",
+        "git log --oneline release-token-fix",
+        "git checkout -b fix-token-expiry",
+        "npm run build:tokens",
+        "docker compose up -d secret-manager",
+        "mkdir design-tokens", "cat password-reset.md",
+    ])
+    def test_a_credential_word_inside_a_name_is_not_a_credential(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk < crc.Risk.HIGH, (command, risk.name, rules)
+
+    def test_a_credential_store_is_a_secret_path(self):
+        """The paths SECRET_PATH did not name, each holding a live token."""
+        for path in ("~/.kube/config", "~/.npmrc", "~/.pypirc",
+                     "~/.docker/config.json", "~/.config/gh/hosts.yml"):
+            assert crc.SECRET_PATH.search(path), path

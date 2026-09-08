@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import glob
 import json
 import shlex
 import functools
@@ -83,6 +84,69 @@ VALID_DECISIONS = ("allow", "deny", "answer", "always")
 
 # The Bonjour service type the watch app browses for.
 BONJOUR_TYPE = "_wristtriage._tcp"
+
+
+# --------------------------------------------------------------------------
+# Conditions: what is quietly wrong right now
+# --------------------------------------------------------------------------
+#
+# Several things degrade this relay without breaking it — Bonjour not
+# advertising, the off-Wi-Fi tunnel missing, the helper not importable. Each
+# was reported by one line on stderr, which lands in a log file on a Mac
+# nobody is looking at. That is the same as not reporting it, and it is what
+# issue #38 is about: the whole presentation of the failure is nothing
+# happening.
+#
+# A condition recorded here rides /health to the watch, which is the only
+# screen the user actually looks at. The relay sends the sentence and not
+# only a key, so a condition invented by a newer relay still reads correctly
+# on a watch app that has never heard of it.
+
+_CONDITIONS = {}
+_CONDITIONS_LOCK = threading.Lock()
+
+
+def note_condition(key, detail):
+    """Record something degraded, and say it on stderr the first time.
+
+    Re-noting the same detail is silent: a warning that repeats on every
+    retry teaches the reader to skip warnings.
+    """
+    with _CONDITIONS_LOCK:
+        repeated = _CONDITIONS.get(key) == detail
+        _CONDITIONS[key] = detail
+    if not repeated:
+        print("relay: %s" % detail, file=sys.stderr)
+
+
+def clear_condition(key):
+    """Withdraw a condition that has since resolved. Never raises."""
+    with _CONDITIONS_LOCK:
+        _CONDITIONS.pop(key, None)
+
+
+def conditions():
+    """Everything currently wrong, key order, for /health and the tests."""
+    with _CONDITIONS_LOCK:
+        return [{"key": key, "detail": detail}
+                for key, detail in sorted(_CONDITIONS.items())]
+
+
+def check_helper_is_visible():
+    """Record whether the classifier could be imported beside this relay.
+
+    Three lines inside main() to begin with, which left it the one
+    condition no test could fire — and a reporting path nobody has seen
+    fire is exactly what issue #38 says is not a check.
+    """
+    if HELPER_VERSION == "unknown":
+        note_condition(
+            "helper",
+            "This relay cannot see the Tapproval helper on this computer, "
+            "so it cannot tell you which version is running.")
+        return False
+    clear_condition("helper")
+    return True
 
 
 def lan_ips():
@@ -140,7 +204,7 @@ def _machine_name():
     return ("Tapproval on %s" % host) if host else "Tapproval"
 
 
-def advertise(port):
+def advertise(port, txt=None):
     """Advertise the relay over Bonjour so the watch app finds it by itself.
 
     macOS ships ``dns-sd``; most Linux distributions ship Avahi. Either
@@ -150,21 +214,39 @@ def advertise(port):
     Never raises.
     """
     name = _machine_name()
+    # ``txt`` lets the caller reuse a record it already built; each build
+    # probes the interfaces with a subprocess per candidate address.
     pairs = ["%s=%s" % (key, value)
-             for key, value in advertise_txt(port).items()]
+             for key, value in (txt or advertise_txt(port)).items()]
     if shutil.which("dns-sd"):
         command = ["dns-sd", "-R", name, BONJOUR_TYPE, ".", str(port)] + pairs
     elif shutil.which("avahi-publish"):
         command = ["avahi-publish", "-s", name, BONJOUR_TYPE, str(port)] + pairs
     else:
+        # This returned None in complete silence: no log line here, and the
+        # caller prints only on success. "Your watch cannot find this
+        # computer by itself" was reported nowhere at all.
+        note_condition(
+            "bonjour",
+            "Nothing is announcing this computer on the network, so the "
+            "watch cannot find it by itself. Enter its address by hand, or "
+            "install Bonjour (dns-sd) or Avahi.")
         return None
     try:
-        return subprocess.Popen(
+        process = subprocess.Popen(
             command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as error:
-        print("relay: bonjour advertising unavailable (%s)" % error,
-              file=sys.stderr)
+        note_condition(
+            "bonjour",
+            "This computer could not announce itself on the network (%s), "
+            "so the watch cannot find it by itself. Enter its address by "
+            "hand." % error)
         return None
+    # No clear_condition here: a process that exec'd is not an announcer
+    # that works. Whoever started it decides when the condition is
+    # withdrawn — at startup, immediately; on a restart, once the
+    # replacement has lived a tick (see _Advertiser.check_once).
+    return process
 
 
 def _spawn_detached(command, log_path, cwd=None):
@@ -223,10 +305,10 @@ def _stop_relay(deadline=8.0):
     return False
 
 
-def _admin_call(path):
+def _admin_call(path, timeout=5):
     """Loopback-only administration: the relay owns the state, this just
     asks it. Returns the parsed reply or None."""
-    return _loopback_json(path, data=b"{}")
+    return _loopback_json(path, data=b"{}", timeout=timeout)
 
 
 def run_admin(args):
@@ -385,6 +467,14 @@ def ensure_running(updated=False):
         # replace it only when nothing is waiting.
         if running.get("pending"):
             print("relay: update deferred — a card is waiting", file=sys.stderr)
+            # Say it where it can be seen: the running relay records the
+            # condition and the watch shows it. A relay old enough not to
+            # know the route answers 404 and nothing is recorded — which
+            # is exactly the relay this is about, the first time. From the
+            # next version on it is visible.
+            if _admin_call("/admin/update-deferred", timeout=2) is None:
+                print("relay: (the running relay could not record that — "
+                      "it predates the route)", file=sys.stderr)
             return 0
         print("relay: replacing an older relay (v%s -> v%d)"
               % (version or "?", RELAY_VERSION), file=sys.stderr)
@@ -579,7 +669,8 @@ class CardQueue:
 # transcripts is large and harmless. Re-exported here so `watch_relay.X`
 # keeps working for everything that already calls it.
 from watch_dashboard import (  # noqa: E402,F401  (re-exports, see above)
-    activity_summary, derive_title, _find_transcript, live_sessions,
+    activity_summary, recap_summary, derive_title, _find_transcript,
+    live_sessions,
     _parse_thread, plain_text, prewarm_threads, _read_appended,
     recent_sessions, repo_slug, _REPO_SLUG_CACHE, resolve_session,
     session_meta, session_registry, session_thread, _task_state,
@@ -624,6 +715,90 @@ def say_to_session(prefix, text, projects_dir=None, brief=True):
     return "could not start: %s" % error if error else "sent"
 
 
+# The read-only built-ins the watch offers by name. Built-ins live inside
+# the CLI, not on disk, so they cannot be discovered; these are the two
+# that a headless run can honestly deliver (they read, they do not write).
+SKILL_BUILTINS = {
+    "code-review": "Reviews the diff for bugs and risks before it ships.",
+    "security-review": "Checks the changes for vulnerabilities.",
+}
+_SKILLS_CACHE = {}          # cwd -> (expires, rows)
+SKILLS_CACHE_SECONDS = 60.0
+
+
+def _frontmatter_description(path):
+    """The one-line ``description:`` from a skill or command file's
+    frontmatter — the sentence its author wrote for exactly this use —
+    or the first line of prose when there is none. Stdlib only: the
+    frontmatter is a handful of ``key: value`` lines, not full YAML."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            lines = handle.read(20000).split("\n")
+    except OSError:
+        return ""
+    if lines and lines[0].strip() == "---":
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            if line.startswith("description:"):
+                return " ".join(line[len("description:"):].strip().strip("'\"").split())[:300]
+    for line in lines:
+        text = line.strip()
+        if text and not text.startswith(("---", "#", "name:")):
+            return text[:300]
+    return ""
+
+
+def known_skills(cwd=None, home=None, now=None):
+    """Every slash command this machine can answer for a session in
+    ``cwd``: the read-only built-ins, the user's own skills and commands,
+    the project's, and each installed plugin's. One row per name, with
+    the description its file carries, so the watch lists a skill only
+    where it exists and describes it in its author's words rather than
+    in ours. A minute's cache per directory: the More list opens far
+    less often than the session list polls.
+
+    Not every skill listed will do what a headless run can — one that
+    writes gets a refusal — but a command the CLI does not know now
+    arrives on the wrist as a red notice rather than as nothing, so an
+    honest list beats a curated one that goes stale.
+    """
+    home = home or os.path.expanduser("~")
+    now = now or time.time()
+    key = (cwd or "", home)
+    hit = _SKILLS_CACHE.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    found = {}
+    for name, description in SKILL_BUILTINS.items():
+        found[name] = (description, "builtin")
+    roots = [(os.path.join(home, ".claude"), "user")]
+    if cwd:
+        roots.append((os.path.join(cwd, ".claude"), "project"))
+    try:
+        with open(os.path.join(home, ".claude", "plugins", "installed_plugins.json"),
+                  encoding="utf-8") as handle:
+            registry = json.load(handle).get("plugins", {})
+    except (OSError, ValueError):
+        registry = {}
+    for entries in registry.values():
+        for entry in (entries if isinstance(entries, list) else [entries]):
+            path = entry.get("installPath") if isinstance(entry, dict) else None
+            if path:
+                roots.append((path, "plugin"))
+    for root, source in roots:
+        for skill in glob.glob(os.path.join(root, "skills", "*", "SKILL.md")):
+            name = os.path.basename(os.path.dirname(skill))
+            found.setdefault(name, (_frontmatter_description(skill), source))
+        for command in glob.glob(os.path.join(root, "commands", "*.md")):
+            name = os.path.splitext(os.path.basename(command))[0]
+            found.setdefault(name, (_frontmatter_description(command), source))
+    rows = [{"name": "/" + name, "description": desc, "source": source}
+            for name, (desc, source) in sorted(found.items())]
+    _SKILLS_CACHE[key] = (now + SKILLS_CACHE_SECONDS, rows)
+    return rows
+
+
 def known_projects(projects_dir=None, limit=50):
     """The projects a new session may be started in: one row per directory
     Claude Code has recently worked in, most recent first. Derived from the
@@ -632,7 +807,7 @@ def known_projects(projects_dir=None, limit=50):
     already seen Claude Code run."""
     seen, rows = set(), []
     for session in recent_sessions(limit=limit, projects_dir=projects_dir,
-                                   include_idle=True):
+                                   include_idle=True, light=True):
         path = session.get("path") or ""
         if not path or path in seen or not os.path.isdir(path):
             continue
@@ -1017,9 +1192,6 @@ def _socket_alive(sock):
 # /pair is on this list because on the tunnel listener the caller looks like
 # loopback (it is cloudflared), which once made the pairing key reachable
 # from the whole internet.
-TUNNEL_HIDDEN = ("/card", "/heartbeat", "/pair", "/enroll", "/tunnel")
-
-
 class RelayHandler(BaseHTTPRequestHandler):
     queue = None            # installed by serve()
     required_token = None   # when set, only /t/<token>/... paths are served
@@ -1194,25 +1366,32 @@ class RelayHandler(BaseHTTPRequestHandler):
     #              obtained, so they cannot require one.
     #   lan_only   never served through the tunnel listener; the address a
     #              stranger could reach is not where the travel secret,
-    #              cards or presence may change hands.
+    #              cards or presence may change hands — nor where a key is
+    #              handed out (/pair, /enroll) or the relay is administered.
+    #              Through the tunnel such a route is a 404, indistinguishable
+    #              from a path that does not exist. This flag is the ONLY
+    #              list of what the tunnel hides; there used to be a second
+    #              tuple that had to agree with it, and no test that it did.
     #   local      only a process on this machine: the hook, the bridge,
     #              the --pair / --rotate-token commands. Never the network,
     #              because a forged card harvests a real tap.
 
     ROUTES = {
         "GET": {
-            "/pair": ("_get_pair", dict(auth=False)),
+            "/pair": ("_get_pair", dict(auth=False, lan_only=True)),
             "/pending": ("_get_pending", {}),
             "/health": ("_get_health", {}),
             "/projects": ("_get_projects", {}),
+            "/skills": ("_get_skills", {}),
             "/sessions": ("_get_sessions", {}),
             "/activity": ("_get_activity", {}),
+            "/recap": ("_get_recap", {}),
             "/usage": ("_get_usage", {}),
             "/thread": ("_get_thread", {}),
             "/tunnel": ("_get_tunnel", dict(lan_only=True)),
         },
         "POST": {
-            "/enroll": ("_post_enroll", dict(auth=False)),
+            "/enroll": ("_post_enroll", dict(auth=False, lan_only=True)),
             "/card": ("_post_card", dict(local=True, lan_only=True)),
             "/heartbeat": ("_post_heartbeat", dict(local=True, lan_only=True)),
             "/new": ("_post_new", {}),
@@ -1221,10 +1400,11 @@ class RelayHandler(BaseHTTPRequestHandler):
             # not be able to answer its own card or speak into a session.
             "/say": ("_post_say", dict(token=True)),
             "/decision": ("_post_decision", dict(token=True)),
-            "/admin/pair-open": ("_post_admin", dict(local=True, admin=True)),
-            "/admin/pair-relight": ("_post_admin", dict(local=True, admin=True)),
-            "/admin/pair-reset": ("_post_admin", dict(local=True, admin=True)),
-            "/admin/rotate": ("_post_admin", dict(local=True, admin=True)),
+            "/admin/pair-open": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
+            "/admin/pair-relight": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
+            "/admin/pair-reset": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
+            "/admin/rotate": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
+            "/admin/update-deferred": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
         },
     }
 
@@ -1234,13 +1414,13 @@ class RelayHandler(BaseHTTPRequestHandler):
             return
         path, query = self._route()
         on_tunnel = self.required_token is not None
-        if path is not None and on_tunnel and (
-                path in TUNNEL_HIDDEN or path.startswith("/admin/")):
-            # Wrong (or absent) secret prefix on the tunnel listener, or a
-            # route that does not exist there: say nothing about what
-            # lives here.
-            path = None
         route = self.ROUTES[method].get(path) if path else None
+        if route is not None and on_tunnel and route[1].get("lan_only"):
+            # A LAN-only route on the tunnel listener: say nothing about
+            # what lives here — the same 404 as a wrong secret prefix or a
+            # path that does not exist. Decided before the auth check so a
+            # stranger cannot tell "hidden" from "absent" by the status.
+            route = None
         if route is None:
             self._send_json({"error": "not found"}, 404)
             return
@@ -1256,9 +1436,6 @@ class RelayHandler(BaseHTTPRequestHandler):
         if rules.get("token") and not self._proves_key():
             self._send_json({"error": "a device key is required, even from "
                                       "this machine"}, 403)
-            return
-        if rules.get("lan_only") and on_tunnel:
-            self._send_json({"error": "not found"}, 404)
             return
         getattr(self, handler)(path, query)
 
@@ -1290,12 +1467,21 @@ class RelayHandler(BaseHTTPRequestHandler):
                                  self.queue.watch_seen_seconds_ago(),
                              "version": RELAY_VERSION,
                              "helper": HELPER_VERSION,
+                             "conditions": conditions(),
                              "paired_ever": getattr(self.auth, "paired_ever", True)})
         else:
             self._send_json({"ok": True})
 
     def _get_projects(self, path, query):
         self._send_json({"projects": known_projects()})
+
+    def _get_skills(self, path, query):
+        # The slash commands this machine can answer for one session:
+        # what the watch's More list shows, and describes, in each
+        # skill's own words. Without a session it is the user's set.
+        prefix = (query.get("session_id") or [""])[0][:64]
+        _, cwd = resolve_session(prefix) if prefix else (None, None)
+        self._send_json({"skills": known_skills(cwd)})
 
     def _get_sessions(self, path, query):
         rows = recent_sessions()
@@ -1304,6 +1490,11 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def _get_activity(self, path, query):
         self._send_json(activity_summary())
+
+    def _get_recap(self, path, query):
+        # A lifetime summary, not today's. Costs a full pass over the audit
+        # log, which is why nothing polls it.
+        self._send_json(recap_summary())
 
     def _get_usage(self, path, query):
         self._send_json(usage_summary())
@@ -1432,12 +1623,34 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.auth.open_window()
             self._send_json({"ok": True, "devices": 0,
                              "seconds": PAIR_WINDOW_SECONDS})
-        else:
+        elif path == "/admin/update-deferred":
+            # The launcher found a newer helper but a card is pending, so
+            # it left this relay in place. That used to be one line on
+            # stderr, in a log on a Mac nobody is looking at, while the
+            # machine ran yesterday's rules. The relay records it about
+            # itself; /health carries it to the wrist. It clears itself:
+            # the only resolution is being replaced, and the replacement
+            # starts with nothing recorded.
+            # Worded to stay true after the card is answered: the deferral
+            # ends only at the next session start, and a sentence that
+            # said "a card is pending" would sit on the wrist, false, for
+            # the rest of a long session.
+            note_condition(
+                "update",
+                "A newer helper is waiting to take over. It will replace "
+                "this one the next time Claude Code starts with no card "
+                "waiting.")
+            self._send_json({"ok": True})
+        elif path == "/admin/rotate":
             secret = self.auth.rotate()
             type(self).required_token = None   # main listener unchanged
             _rotate_tunnel_prefix(secret)
             self.auth.open_window()
             self._send_json({"ok": True, "rotated": True})
+        else:
+            # Fail closed by shape: an admin route added to ROUTES without
+            # a branch here used to fall through to a key rotation.
+            self._send_json({"error": "unknown admin route"}, 404)
 
     def _post_heartbeat(self, path, query):
         # The bridge relays the watch's CloudKit heartbeat: how many
@@ -1464,18 +1677,15 @@ def _rotate_tunnel_prefix(secret):
 
 
 def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, queue=None, token=None,
-          auth=None, auth_token=None):
+          auth=None):
     """Build a server (does not block). Caller runs serve_forever().
 
     With ``token`` set, the server answers only under ``/t/<token>/…`` — the
     shape exposed through a public tunnel, where that path is a rendezvous
     address rather than a credential. ``auth`` carries the device tokens
-    every non-local caller must present. (``auth_token`` accepts a bare
-    string for callers that predate per-device tokens.)
+    every non-local caller must present.
     """
     queue = queue if queue is not None else CardQueue()
-    if auth is None:
-        auth = auth_token
     handler = type("BoundRelayHandler", (RelayHandler,),
                    {"queue": queue, "required_token": token,
                     "auth": auth})
@@ -1829,9 +2039,10 @@ def start_tunnel(port, token):
     """
     binary = _cloudflared()
     if not binary:
-        print("relay: cloudflared not installed — off-Wi-Fi tunnel disabled.\n"
-              "       install it with:  brew install cloudflared",
-              file=sys.stderr)
+        note_condition(
+            "tunnel",
+            "Answering from away is off: cloudflared is not installed on "
+            "this computer. Install it with: brew install cloudflared")
         return None
     _reap_stale_tunnels(port)
     proc = subprocess.Popen(
@@ -1845,11 +2056,20 @@ def start_tunnel(port, token):
             match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
             if match:
                 TUNNEL_URL = "%s/t/%s" % (match.group(0), token)
+                clear_condition("tunnel")
                 print("relay: off-Wi-Fi tunnel up — the watch learns this "
                       "address automatically while on the same Wi-Fi.\n"
                       "       (manual fallback: %s)" % TUNNEL_URL,
                       file=sys.stderr)
                 break
+        else:
+            # cloudflared's output ended without ever naming a URL, so the
+            # tunnel died on the way up. Nothing said so before: the thread
+            # simply finished and the away address never appeared.
+            note_condition(
+                "tunnel",
+                "Answering from away is not working: the connection closed "
+                "before it opened. Answers still work on your own Wi-Fi.")
         for _ in proc.stderr:   # drain quietly
             pass
 
@@ -1944,14 +2164,39 @@ def _start_tunnel(queue, auth):
 
 class _Advertiser:
     """The Bonjour advertisement, re-published once the tunnel URL exists
-    so the TXT record carries every address the watch might need."""
+    so the TXT record carries every address the watch might need — and
+    watched afterwards, because a process nobody looks at can die.
+
+    advertise() starts dns-sd with both pipes to DEVNULL and nothing ever
+    polled it. If it exited — an mDNSResponder restart, a stray killall,
+    a crash — the relay carried on believing it was announced, and the
+    watch simply stopped finding the computer with no screen and no log
+    line saying why. #92 made "never started" visible; this is "started
+    and then died". A name conflict is NOT the exit case: measured, two
+    registrations of the same name from one host both stay up.
+
+    The swap in _republish is deliberate and must not read as a death, so
+    the process is only ever replaced under the same lock the watchdog
+    takes: by the time the watchdog looks, it sees the new process.
+    """
+
+    WATCH_SECONDS = 5.0          # how often the watchdog looks
+    WATCH_BACKOFF_MAX = 60.0     # when restarts keep failing, look less often
+    MAX_RESTARTS = 3             # after this many in a row, stop and say so
 
     def __init__(self, port):
         self.port = port
-        self.process = advertise(port)
+        self._lock = threading.Lock()
+        # Consecutive restarts whose replacement has not yet lived a tick.
+        # Non-zero means "unproven": the condition noted at the death
+        # stands until the next look finds the replacement alive.
+        self._restarts = 0
+        txt = advertise_txt(port)
+        self.process = advertise(port, txt)
         if self.process is not None:
+            clear_condition("bonjour")
             print("relay: advertising as \"Tapproval\" (%s) with %s"
-                  % (BONJOUR_TYPE, advertise_txt(port)), file=sys.stderr)
+                  % (BONJOUR_TYPE, txt), file=sys.stderr)
 
     def republish_when_tunnel_is_up(self):
         threading.Thread(target=self._republish, daemon=True).start()
@@ -1961,16 +2206,92 @@ class _Advertiser:
             time.sleep(1)
             if TUNNEL_URL:
                 break
-        if not TUNNEL_URL or self.process is None:
+        if not TUNNEL_URL:
             return
-        self.process.terminate()
-        self.process = advertise(self.port)
+        with self._lock:
+            if self.process is None:
+                return
+            self.process.terminate()
+            self.process = advertise(self.port)
+            # A deliberate fresh start: whatever run of unproven restarts
+            # came before does not carry into the give-up count. But if a
+            # condition is standing from one, this new process still has
+            # to live a tick before it is withdrawn — so one, not zero.
+            self._restarts = min(self._restarts, 1)
+            # If advertise() returned None it said why; the watchdog then
+            # finds nothing to watch and ends. No further restarts: the
+            # tool that was there a minute ago is gone, not flapping.
         print("relay: re-advertised with the away address included",
               file=sys.stderr)
 
+    def watch(self):
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    def _watch(self):
+        pause = self.WATCH_SECONDS
+        while True:
+            time.sleep(pause)
+            outcome = self.check_once()
+            if outcome in ("none", "down"):
+                return                  # nothing left to watch, and it has been said
+            # A relay that restarts a dying announcer every five seconds
+            # forever is a fork bomb with good intentions; back off while
+            # it keeps failing, and come straight back once it holds.
+            pause = (min(pause * 2, self.WATCH_BACKOFF_MAX) if outcome == "restarted"
+                     else self.WATCH_SECONDS)
+
+    def check_once(self):
+        """One look at the announcer. Returns what was found, for the
+        watchdog's pacing and for the tests: "none" (nothing to watch —
+        whoever stopped it said why), "fine", "restarted" (it had exited
+        and a replacement is up) or "down" (it had exited and there will
+        be no more restarts; the condition stands).
+
+        A restart is not a recovery. The first cut withdrew the condition
+        the moment advertise() returned a process — which says only that
+        the exec succeeded. A dns-sd that dies fifty milliseconds later
+        would have been noted, cleared and "restarted" every tick, and
+        /health would almost never have caught the condition existing:
+        the #94 failure reproduced one level up. Now the condition is
+        withdrawn only once the replacement is still alive at the NEXT
+        look, and after MAX_RESTARTS in a row the relay stops trying and
+        leaves a sentence that says what is actually true.
+        """
+        with self._lock:
+            if self.process is None:
+                return "none"
+            code = self.process.poll()
+            if code is None:
+                if self._restarts:
+                    self._restarts = 0
+                    clear_condition("bonjour")
+                    print("relay: announcing again after the announcer exited",
+                          file=sys.stderr)
+                return "fine"
+            self._restarts += 1
+            if self._restarts > self.MAX_RESTARTS:
+                note_condition(
+                    "bonjour",
+                    "The network announcement keeps stopping (dns-sd exited %d "
+                    "times in a row, last with code %s), so the watch may not "
+                    "find this computer by itself. Enter its address by hand."
+                    % (self._restarts, code))
+                self.process = None
+                return "down"
+            note_condition(
+                "bonjour",
+                "The network announcement stopped (dns-sd exited with code %s), "
+                "so the watch may no longer find this computer by itself. "
+                "Trying to announce again." % code)
+            self.process = advertise(self.port)
+            if self.process is None:
+                return "down"          # advertise() has said why, in its own words
+        return "restarted"
+
     def terminate(self):
-        if self.process is not None:
-            self.process.terminate()
+        with self._lock:
+            if self.process is not None:
+                self.process.terminate()
 
 
 def _inject_startup_cards(args, queue):
@@ -2002,13 +2323,17 @@ def main(argv=None):
     # listener they arrive on. First contact from the user's own network
     # fetches it via /pair — pairing is automatic and never broadcast.
     auth = Auth()
-    if not auth.paired_ever:
-        # Nothing has ever paired: the door stays open until the first
-        # watch enrols (see Auth.window_open). open_window() here only
-        # resets the claim budget and clears a slam from an earlier run.
-        auth.open_window()
+    # A machine that has never paired lights the first-contact window
+    # (see Auth.window_open); a paired one is left alone. This used to
+    # call open_window() with its default — the ten-minute --pair fuse —
+    # which quietly cut the half hour Auth() had just lit to a third, on
+    # the only path that runs at startup. relight() uses the right
+    # constant and is a no-op once anything has paired.
+    if auth.relight() > time.time():
         print("relay: pairing open until the first watch connects",
               file=sys.stderr)
+
+    check_helper_is_visible()
 
     server, queue = serve(args.host, args.port, auth=auth)
     print("relay: listening on http://%s:%d" % (args.host, args.port),
@@ -2017,6 +2342,7 @@ def main(argv=None):
     advertiser = None
     if not args.no_bonjour:
         advertiser = _Advertiser(args.port)
+        advertiser.watch()
         if args.tunnel:
             advertiser.republish_when_tunnel_is_up()
     _inject_startup_cards(args, queue)

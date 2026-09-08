@@ -307,6 +307,62 @@ def derive_title(text):
 _META_CACHE = {}   # path -> ((mtime, size), (cwd, opening, turns))
 
 
+
+# Prefixes the harness injects as a "user" turn that no human typed. Both
+# the session list (its title) and the thread (its first turn) skip them;
+# they used to each carry this tuple, and a prefix Claude Code adds
+# tomorrow would have been skipped on one screen and shown on the other.
+_SYSTEM_OPENERS = ("<", "Caveat:", "[Request")
+
+
+_COMMAND_NAME = re.compile(r"<command-name>\s*(/?[\w:-]+)\s*</command-name>")
+_COMMAND_ARGS = re.compile(r"<command-args>(.*?)</command-args>", re.S)
+_TAGGED_OUT = re.compile(r"<local-command-(?:stdout|stderr)>(.*?)</local-command-(?:stdout|stderr)>", re.S)
+
+
+def _command_sent(lead):
+    """"/recap" — or "/loop 5m /x" — from the tagged echo of a slash
+    command, or None when this is not one."""
+    m = _COMMAND_NAME.search(lead)
+    if not m:
+        return None
+    args = _COMMAND_ARGS.search(lead)
+    tail = " ".join(args.group(1).split()) if args else ""
+    return (m.group(1) + " " + tail).strip()
+
+
+def _system_text(entry):
+    """What a system line says, with the CLI's own tags peeled off."""
+    for key in ("content", "message", "text"):
+        value = entry.get(key)
+        if isinstance(value, dict):
+            value = value.get("content")
+        if isinstance(value, str) and value.strip():
+            inner = " ".join(m.group(1) for m in _TAGGED_OUT.finditer(value))
+            return " ".join((inner or value).split())[:200]
+    return ""
+
+
+def _message_parts(content):
+    """``(text, tool_use part)`` of a transcript message, in one pass: the
+    first NON-EMPTY text part — Claude Code does emit empty leading text
+    blocks, and taking the first one would drop the real reply — and the
+    first tool_use part, or None. Both screens that read messages go
+    through here, so an added part type is handled once."""
+    if isinstance(content, str):
+        return content, None
+    text, tool = "", None
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text" and not text:
+                text = part.get("text", "")
+            elif kind == "tool_use" and tool is None:
+                tool = part
+    return text, tool
+
 def session_meta(path, scan_lines=600):
     """Cached front for :func:`_session_meta` —
     /sessions re-reads a dozen transcripts per watch visit otherwise."""
@@ -342,18 +398,10 @@ def _session_meta(path, scan_lines=600):
                 turns += 1
                 if opening is not None:
                     continue
-                content = message.get("content")
-                text = ""
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            text = part.get("text", "")
-                            break
+                text, _ = _message_parts(message.get("content"))
                 lead = str(text).lstrip()
                 # Skip system-injected openers; we want what the human asked.
-                if lead and not lead.startswith(("<", "Caveat:", "[Request")):
+                if lead and not lead.startswith(_SYSTEM_OPENERS):
                     opening = " ".join(plain_text(text).split())[:120]
     except OSError:
         pass
@@ -378,6 +426,46 @@ def _audit_log_path():
         return os.path.expanduser("~/.claude/risk-audit.jsonl")
 
 
+# What one silenced prompt is worth in seconds of somebody's attention.
+#
+# Deliberately mean. The real cost of a permission prompt is the context
+# switch back to the laptop, which is a good deal more than five seconds —
+# but a number that flatters the tool is worse than no number at all, and
+# every screen that shows this must call it an estimate. Five seconds is
+# the figure that survives an argument.
+SECONDS_PER_SILENCED_PROMPT = 5
+
+
+def _count_decision(stats, entry):
+    """Fold one audit entry into the four counts the Today screen and the
+    recap share. Returns whether the wrist answered it.
+
+    Both screens used to keep this arithmetic by hand, beside a comment
+    promising they could never disagree. A promise kept by a comment is
+    kept until the next edit; one function keeps it structurally.
+    The classifier's verdict is counted, not the mode: in shadow mode
+    nothing is acted on, but "would not have bothered you" is still the
+    honest measure of the triage.
+    """
+    stats["total"] += 1
+    if entry.get("decision") == "allow":
+        stats["silenced"] += 1
+    else:
+        stats["asked"] += 1
+    answered = entry.get("watch") in ("allow", "deny", "answer")
+    if answered:
+        stats["answered_on_watch"] += 1
+    return answered
+
+
+def _finish_counts(stats):
+    """The two derived numbers, from the same constant on both screens."""
+    stats["silenced_percent"] = (int(round(100.0 * stats["silenced"]
+                                           / stats["total"]))
+                                 if stats["total"] else 0)
+    stats["seconds_saved"] = stats["silenced"] * SECONDS_PER_SILENCED_PROMPT
+    return stats
+
 # Running per-day totals per audit log, so each request reads only the
 # bytes appended since the last one — the audit log grows for the
 # product's whole lifetime and must never be rescanned from byte zero.
@@ -401,10 +489,10 @@ def activity_summary(audit_log=None, now=None):
     # lines into the same totals, and the day's numbers would be wrong for
     # the rest of the day with nothing to show why.
     with _ACTIVITY_LOCK:
-        return _activity_summary_locked(path, today, now)
+        return _activity_summary_locked(path, today)
 
 
-def _activity_summary_locked(path, today, now):
+def _activity_summary_locked(path, today):
     """The body of :func:`activity_summary`, holding ``_ACTIVITY_LOCK``."""
 
     def fresh_state():
@@ -432,21 +520,11 @@ def _activity_summary_locked(path, today, now):
             entry = json.loads(line)
         except ValueError:
             continue
-        state["total"] += 1
         tier = entry.get("tier", "?")
         state["tiers"][tier] = state["tiers"].get(tier, 0) + 1
-        # Count the classifier's verdict, not the mode: in shadow
-        # mode nothing is acted on, but "would not have bothered
-        # you" is still the honest measure of the triage.
-        if entry.get("decision") == "allow":
-            state["silenced"] += 1
-        else:
-            state["asked"] += 1
-        verdict = entry.get("watch")
-        if verdict in ("allow", "deny", "answer"):
-            state["answered_on_watch"] += 1
+        if _count_decision(state, entry):
             state["recent"].append({
-                "verdict": verdict,
+                "verdict": entry.get("watch"),
                 "tier": tier,
                 "headline": entry.get("headline", ""),
                 "project": entry.get("project") or "",
@@ -458,9 +536,83 @@ def _activity_summary_locked(path, today, now):
              ("total", "silenced", "asked", "answered_on_watch")}
     stats["tiers"] = dict(state["tiers"])
     stats["recent"] = list(reversed(state["recent"]))
-    stats["silenced_percent"] = (int(round(100.0 * stats["silenced"]
-                                           / stats["total"]))
-                                 if stats["total"] else 0)
+    return _finish_counts(stats)
+
+
+# The recap costs one full pass over the audit log, which the Today screen
+# deliberately never does — that log grows for the product's whole lifetime.
+#
+# A plain (mtime, size) cache is not enough here, and this is the one route
+# where that matters: the hook appends to the audit log throughout a
+# session, so the key changes constantly and every open of the screen would
+# re-read the whole file. Navigating in and out a few times would have the
+# relay scanning a lifetime of decisions on the user's own machine, and
+# nothing rate-limits a GET.
+#
+# So: return the cached answer when the file has not changed, and otherwise
+# not more often than this. A lifetime figure does not notice a minute of
+# staleness, and the work per caller is now bounded however the screen is
+# used.
+RECAP_MIN_INTERVAL = 60
+
+_RECAP_CACHE = OrderedDict()   # path -> (stat_key, computed_at, stats)
+
+
+def recap_summary(audit_log=None, now=None):
+    """Everything the triage has done since the log began. Never raises.
+
+    A lifetime figure by definition, so unlike :func:`activity_summary` it
+    cannot read only what was appended since last time.
+    """
+    path = audit_log or _audit_log_path()
+    clock = now or time.time()
+    try:
+        st = os.stat(path)
+        key = (st.st_mtime, st.st_size)
+    except OSError:
+        key = None
+    cached = _RECAP_CACHE.get(path)
+    if cached is not None:
+        cached_key, computed_at, stats = cached
+        unchanged = key is not None and cached_key == key
+        if unchanged or clock - computed_at < RECAP_MIN_INTERVAL:
+            return stats
+    stats = _recap_uncached(path, now)
+    _RECAP_CACHE[path] = (key, clock, stats)
+    while len(_RECAP_CACHE) > 8:
+        _RECAP_CACHE.pop(next(iter(_RECAP_CACHE)), None)
+    return stats
+
+
+def _recap_uncached(path, now=None):
+    stats = {"total": 0, "silenced": 0, "asked": 0, "answered_on_watch": 0,
+             "critical": 0, "first_day": "", "days": 0,
+             "silenced_percent": 0, "seconds_saved": 0}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue          # a torn last line is not a reason to fail
+                _count_decision(stats, entry)
+                day = str(entry.get("ts", ""))[:10]
+                if day and (not stats["first_day"] or day < stats["first_day"]):
+                    stats["first_day"] = day
+                if entry.get("tier") == "CRITICAL":
+                    stats["critical"] += 1
+    except OSError:
+        return stats
+
+    _finish_counts(stats)
+    if stats["first_day"]:
+        from datetime import datetime, timezone
+        try:
+            start = datetime.strptime(stats["first_day"], "%Y-%m-%d")
+            today = datetime.fromtimestamp(now or time.time(), timezone.utc)
+            stats["days"] = max(1, (today.date() - start.date()).days + 1)
+        except ValueError:
+            pass
     return stats
 
 
@@ -636,15 +788,31 @@ def _task_state(session_id, task_id):
     resumes writing, or a transient read error, must be able to come
     back — only an exit marker is forever.
     """
+    return _judge_task_files(_task_output_files(session_id).get(task_id, ()))
+
+
+def _task_output_files(session_id):
+    """``{task_id: [paths]}`` for every task output a session has written.
+
+    One walk of the tmp tree per session. Judging each task with its own
+    glob walked the same two wildcard levels once per outstanding task,
+    and the tree only grows — stale claude-* directories are never swept.
+    """
     import glob as _glob
-    patterns = ["/private/tmp/claude-*/*/%s/tasks/%s.output" % (session_id, task_id)]
+    patterns = ["/private/tmp/claude-*/*/%s/tasks/*.output" % session_id]
     tmpdir = os.environ.get("TMPDIR")
     if tmpdir:
         patterns.append(os.path.join(
-            tmpdir, "claude-*", "*", session_id, "tasks", "%s.output" % task_id))
-    found = []
+            tmpdir, "claude-*", "*", session_id, "tasks", "*.output"))
+    by_task = {}
     for pattern in patterns:
-        found.extend(_glob.glob(pattern))
+        for path in _glob.glob(pattern):
+            by_task.setdefault(os.path.basename(path)[:-7], []).append(path)
+    return by_task
+
+
+def _judge_task_files(found):
+    """The verdict for one task, from its output files (see _task_state)."""
     # No file at all is no evidence, and no evidence is not "running".
     #
     # This used to let the transcript's word stand, which sounds humble and
@@ -654,9 +822,7 @@ def _task_state(session_id, task_id):
     # the file that would retire it. The wrist reported a running task for
     # the rest of the day while the phone, which tracks real tasks, showed
     # none.
-    verdict = "unknown"
     for path in found:
-        verdict = "unknown"
         try:
             with open(path, "rb") as handle:
                 size = os.path.getsize(path)
@@ -668,7 +834,7 @@ def _task_state(session_id, task_id):
                 return "running"
         except OSError:
             continue
-    return verdict
+    return "unknown"
 
 # Incremental per-transcript thread state: a byte offset plus the running
 # accumulations, so a live session's every-2.5s poll parses only the lines
@@ -814,8 +980,10 @@ def _running_task_count(state, session_id):
     "unknown" counts as not running now but is asked again next time —
     quiet tasks may wake, read errors pass."""
     running = 0
-    for tid in list(state["launched"] - state["finished"]):
-        verdict = _task_state(session_id, tid)
+    outstanding = state["launched"] - state["finished"]
+    files = _task_output_files(session_id) if outstanding else {}
+    for tid in list(outstanding):
+        verdict = _judge_task_files(files.get(tid, ()))
         if verdict == "done":
             state["finished"].add(tid)
         elif verdict == "running":
@@ -871,34 +1039,52 @@ def _thread_line(state, line, limit):
             state["finished"].update(_TASK_DONE.findall(line))
     if '"tool_result"' in line:
         state["running_tool"] = None
+    if entry.get("type") == "system":
+        # A slash command the CLI answered itself — /recap, /cost, an
+        # unknown command — writes its output here, not as an assistant
+        # turn, and the phone paints it red with a warning triangle. So
+        # does the watch now; it used to drop the line, and a send that
+        # bounced showed nothing, which read as the watch being broken.
+        if entry.get("subtype") == "local_command" or entry.get("level") == "error":
+            text = _system_text(entry)
+            if text:
+                state["turns"].append({"role": "system", "kind": "notice", "text": text,
+                                       "desc": "", "at": entry.get("timestamp", "")})
+        return
     if role not in ("user", "assistant"):
         return
-    content = message.get("content")
-    text, tool, tool_description = "", "", ""
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") == "text" and not text:
-                text = part.get("text", "")
-            elif part.get("type") == "tool_use" and not tool:
-                tool = part.get("name", "")
-                inp = part.get("input") or {}
-                tool_description = inp.get("description")
-                state["running_tool"] = (
-                    " ".join(str(inp.get("description")
-                                 or "").split())
-                    or _tool_phrase(tool)[:1].upper()
-                    + _tool_phrase(tool)[1:])
+    text, part = _message_parts(message.get("content"))
+    tool, tool_description = "", ""
+    if part is not None:
+        tool = part.get("name", "")
+        inp = part.get("input") or {}
+        tool_description = inp.get("description")
+        phrase = _tool_phrase(tool)
+        state["running_tool"] = (
+            " ".join(str(tool_description or "").split())
+            or phrase[:1].upper() + phrase[1:])
     kind = "text"
     lead = str(text).lstrip()
     description = ""
     if not lead and tool:
         lead, kind = tool, "tool"
         description = " ".join(str(tool_description or "").split())[:60]
-    if not lead or lead.startswith(("<", "Caveat:", "[Request")):
+    # The echo of a slash command the user sent — "/recap" — arrives
+    # wrapped in <command-name> tags, which used to be dropped with every
+    # other "<"-prefixed line. It is the user's own bubble, like any send;
+    # the command's OUTPUT follows as a system line, handled above.
+    command = _command_sent(lead)
+    if command:
+        state["turns"].append({"role": "user", "kind": "text", "text": command,
+                               "desc": "", "at": entry.get("timestamp", "")})
+        return
+    if not lead or lead.startswith(_SYSTEM_OPENERS):
+        return
+    # After the CLI has answered a slash command itself, the headless run
+    # still gives Claude a turn, and Claude — having nothing to add —
+    # says exactly this. It is not a reply; on the wrist it read as one,
+    # right under a Recap that had already been answered in red.
+    if role == "assistant" and kind == "text" and lead.strip() == "No response requested.":
         return
     # The watch shows the FULL text of a message, like the phone — a 2KB
     # cap here once cut a real reply mid-sentence on the wrist. Bound the
@@ -947,6 +1133,8 @@ _GH_VERB = {"\u00e5ben": "opened", "\u00e5bnet": "opened",
 def _last_github_fact(text):
     """"PR #142 opened" from the last event-shaped mention, or None."""
     fact = None
+    if "#" not in text:
+        return None
     for match in _GH_FACT.finditer(text):
         verb = (match.group(1) or match.group(4) or "").lower()
         number = match.group(2) or match.group(3)
@@ -958,7 +1146,7 @@ def _thread_activity(path):
     """The list row's share of the thread state: (running_tasks,
     running_tool, github, latest_ask). Same limit as /thread, so the list
     and the detail screen share one incremental parse per transcript."""
-    _, running, running_tool = _parse_thread(path, 14)
+    _, running, running_tool = _parse_thread(path, THREAD_TURN_LIMIT)
     state = _THREAD_STATE.get(path) or {}
     return running, running_tool, state.get("github"), state.get("latest_ask")
 
@@ -976,13 +1164,20 @@ def resolve_session(prefix, projects_dir=None):
     return os.path.basename(path)[:-6], cwd
 
 
-def recent_sessions(limit=12, projects_dir=None, include_idle=False):
+def recent_sessions(limit=12, projects_dir=None, include_idle=False,
+                    light=False):
     """The user's ACTIVE Claude Code sessions, straight from local storage.
 
     ``include_idle`` lifts the liveness filter. The session LIST never wants
     that — it mirrors the phone, which shows active sessions — but the
     "start a new session where?" list does: a project you worked in
     yesterday is exactly where you might start one today.
+
+    ``light`` skips the per-session work only the list screen shows — the
+    thread parse behind running_tasks/running_tool/github, and the git
+    remote behind repo. The projects picker wants a path and an age per
+    row and used to pay a full transcript parse for each of fifty rows:
+    six seconds, on a blocked handler thread, to answer "where?".
 
     Claude Code keeps transcripts at ~/.claude/projects/<munged-path>/<id>.jsonl
     — the only sanctioned way to enumerate sessions today (no remote API).
@@ -1011,6 +1206,9 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False):
         return []
 
     found.sort(reverse=True)
+    # Two reads of the same directory, on purpose: live_sessions() is the
+    # seam the tests patch to stage a live set, and a registry read costs
+    # about 2 ms — not worth taking that seam away.
     live = live_sessions()
     registry = session_registry()
     if not include_idle:
@@ -1029,7 +1227,11 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False):
         name = os.path.basename(str(cwd).rstrip("/")) if cwd else ""
         if not name:
             name = project.rstrip("-").rsplit("-", 1)[-1] or project
-        running_tasks, running_tool, github, latest_ask = _thread_activity(path)
+        if light:
+            running_tasks, running_tool, github, repo = 0, None, None, ""
+        else:
+            running_tasks, running_tool, github, _ = _thread_activity(path)
+            repo = repo_slug(cwd)
         # A name given with /rename wins outright. Otherwise the opening
         # ask: the phone titles a session once, from how it began, and a
         # wrist that re-titled by the newest message showed a different
@@ -1038,7 +1240,7 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False):
         sessions.append({
             "title": named or derive_title(opening) or name,
             "project": name,
-            "repo": repo_slug(cwd),
+            "repo": repo,
             "status": live.get(session_id, ""),
             "live": session_id in live,
             "path": cwd or "",
