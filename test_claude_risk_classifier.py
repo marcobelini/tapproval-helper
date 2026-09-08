@@ -2819,6 +2819,18 @@ class TestLanSourceIsNotTrusted:
         status, body = self._call(base + "/health", token="devicetoken")
         assert status == 200 and "pending" in body and "version" in body
 
+    def test_health_tells_a_paired_watch_where_the_helper_code_is_from(self, lan, monkeypatch):
+        """The receipt behind the version number — see
+        TestTheHelperSaysWhereItsCodeIsFrom. Paired callers only: which
+        day a machine's software is from is a fact for its owner."""
+        monkeypatch.setattr(watch_relay, "_PROVENANCE", ("abc1234", "2026-09-08T10:00:00+02:00"))
+        base, _, _ = lan
+        _status, body = self._call(base + "/health", token="devicetoken")
+        assert body["helper_commit"] == "abc1234"
+        assert body["helper_date"] == "2026-09-08T10:00:00+02:00"
+        _status, stranger = self._call(base + "/health")
+        assert "helper_commit" not in stranger
+
     def test_pairing_is_shut_once_a_device_is_enrolled(self, lan):
         base, _, _ = lan
         status, body = self._call(base + "/pair")
@@ -4560,6 +4572,45 @@ class TestInstallTranscript:
         assert crc._human_duration(seconds) == expected
 
 
+class TestTheHelperSaysWhereItsCodeIsFrom:
+    """A version number is a claim the code makes about itself; the
+    checkout's commit and date are the receipt. On 2026-09-08 a helper
+    four days behind the repository reported the same v1.1.1 the app
+    expected, and nothing on the wrist could have said otherwise."""
+
+    def _repo(self, tmp_path):
+        import subprocess
+        root = tmp_path / "helper"
+        root.mkdir()
+        (root / "watch_relay.py").write_text("# me\n")
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@x", "PATH": os.environ["PATH"], "HOME": str(tmp_path)}
+        for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "one"]):
+            subprocess.run(["git", "-C", str(root)] + args, check=True, env=env, capture_output=True)
+        return str(root)
+
+    def test_a_git_checkout_names_its_commit_and_day(self, tmp_path):
+        commit, date = watch_relay.helper_provenance(self._repo(tmp_path))
+        assert re.fullmatch(r"[0-9a-f]{7,}", commit)
+        assert re.match(r"\d{4}-\d{2}-\d{2}T", date), date
+
+    def test_an_install_without_a_checkout_says_nothing_rather_than_guessing(self, tmp_path):
+        plain = tmp_path / "plugin"
+        plain.mkdir()
+        assert watch_relay.helper_provenance(str(plain)) == (None, None)
+
+    def test_main_reads_the_receipt_before_serving(self):
+        """/health answers from what main() read at startup; a request
+        must never be the thing that runs git."""
+        with open(watch_relay.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        body = source.split("def main(", 1)[1]
+        assert body.index("helper_provenance()") < body.index("serve(args.host")
+        health = source.split("def _get_health", 1)[1].split("def _get_projects", 1)[0]
+        assert "helper_provenance(" not in health
+
+
+
 class TestNewSessionFromTheWatch:
     """Starting a real Claude Code session from the wrist.
 
@@ -4630,6 +4681,39 @@ class TestNewSessionFromTheWatch:
                                            projects_dir=root, platform="darwin")
         assert status.startswith("could not open Terminal: ")
         assert "Not authorized" in status
+        assert ".command" in status, "the fallback must say it was tried too"
+
+    def test_a_terminal_that_ignores_apple_events_gets_a_command_file_instead(self, tmp_path, monkeypatch):
+        """Measured on the release Mac, 2026-09-08: osascript hung until
+        its timeout on every tap, because the automation consent a
+        background relay cannot ask for was never given. `open` on a
+        .command file needs no consent."""
+        import subprocess as sp
+        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
+        calls = []
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[0] == "osascript":
+                raise sp.TimeoutExpired(cmd, kw.get("timeout"))
+            return sp.CompletedProcess(cmd, 0, "", "")
+        monkeypatch.setattr(watch_relay.subprocess, "run", fake_run)
+        root = self._projects(tmp_path)
+        status = watch_relay.start_session(str(tmp_path / "acme"), "Fix CI; it's red",
+                                           projects_dir=root, platform="darwin")
+        assert status == "started"
+        assert [c[0] for c in calls] == ["osascript", "open"]
+        command_file = calls[1][1]
+        assert command_file.endswith(".command")
+        assert oct(os.stat(command_file).st_mode & 0o777) == "0o700"
+        with open(command_file) as handle:
+            lines = handle.read().splitlines()
+        os.unlink(command_file)
+        assert lines[0] == "#!/bin/bash"
+        assert lines[1] == 'rm -f -- "$0"', "the file must remove itself, not pile up in tmp"
+        import shlex
+        assert lines[2] == "cd %s && claude %s" % (
+            shlex.quote(str(tmp_path / "acme")), shlex.quote("Fix CI; it's red"))
 
     def test_success_opens_terminal_in_that_directory_with_that_message(self, tmp_path, monkeypatch):
         import subprocess as sp
@@ -5156,6 +5240,39 @@ def _tracked_files(root):
              if rel and os.path.exists(os.path.join(root, rel))]
     assert names, "git ls-files returned nothing — not a checkout?"
     return names
+
+
+class TestTheHookStaysFast:
+    """The hook runs in a fresh interpreter on every tool call, before the
+    call. Measured 2026-09-08 on the release Mac: 19 ms to import, 15 µs
+    to classify. These ceilings are ten and twenty times that — not to
+    catch a micro-regression (nothing this coarse can) but the
+    accidental network call, directory walk or sleep that would put a
+    visible pause in front of every command."""
+
+    CORPUS = ["ls -la", "git status", "rm -rf build", "npm test", "cat ~/.ssh/id_rsa",
+              "curl -X POST https://api.example.com/v1 -d @x", "git push --force origin main",
+              "python3 -m pytest -q", "find . -name '*.pyc' -delete", "docker compose up -d",
+              "gh pr merge 5", "echo hi > /etc/hosts", "aws s3 rm s3://bucket --recursive",
+              "sed -i 's/a/b/' file.txt", "kubectl delete ns prod"] * 20
+
+    def test_classifying_three_hundred_commands_is_quick(self):
+        import time
+        for command in self.CORPUS[:15]:                       # warm caches
+            crc.classify({"tool_name": "Bash", "tool_input": {"command": command}})
+        started = time.perf_counter()
+        for command in self.CORPUS:
+            crc.classify({"tool_name": "Bash", "tool_input": {"command": command}})
+        per_call = (time.perf_counter() - started) / len(self.CORPUS)
+        assert per_call < 300e-6, "classify() now averages %.0f µs" % (per_call * 1e6)
+
+    def test_importing_the_hook_is_quick(self):
+        import importlib
+        import time
+        started = time.perf_counter()
+        importlib.reload(crc)
+        took = time.perf_counter() - started
+        assert took < 0.2, "importing ClaudeRiskClassifier took %.0f ms" % (took * 1e3)
 
 
 class TestTheDocumentsDoNotRestateTheBuildNumber:

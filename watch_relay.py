@@ -46,6 +46,7 @@ import select
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -78,6 +79,42 @@ try:
 except Exception:                                  # standalone deployment
     MAX_WAIT = 3600.0
     HELPER_VERSION = "unknown"
+
+
+_PROVENANCE = None
+
+
+def helper_provenance(here=None):
+    """``(commit, date)`` of a git-installed helper, or ``(None, None)``.
+
+    The version number is a claim; this is the receipt. On 2026-09-08 the
+    wrist ran a helper four days behind the repository while /health said
+    v1.1.1 — the same v1.1.1 the app expected — because two thousand
+    changed lines had not moved the number. The watch shows this date on
+    Check connection, so "the helper is old" is something a person can
+    see rather than something the number would have to admit.
+
+    Read once, by main() before serving: the checkout does not move
+    underneath a running relay (an update replaces the process), and a
+    request handler must not be the thing that runs git. A plugin install
+    has no ``.git`` and answers nothing, honestly. Never raises.
+    """
+    global _PROVENANCE
+    root = here or os.path.dirname(os.path.abspath(__file__))
+    found = (None, None)
+    if os.path.exists(os.path.join(root, ".git")):
+        try:
+            done = subprocess.run(
+                ["git", "-C", root, "log", "-1", "--format=%h %cI"],
+                capture_output=True, text=True, timeout=5)
+            parts = done.stdout.split()
+            if done.returncode == 0 and len(parts) == 2:
+                found = (parts[0], parts[1])
+        except Exception:                                  # never blocks a start
+            pass
+    if here is None:
+        _PROVENANCE = found
+    return found
 MAX_BODY = 64 * 1024   # nobody's wrist card is 64KB
 
 VALID_DECISIONS = ("allow", "deny", "answer", "always")
@@ -850,13 +887,33 @@ def start_session(path, text, projects_dir=None, platform=None):
              'end tell' % json.dumps(script))
     try:
         done = subprocess.run(["osascript", "-e", apple], capture_output=True,
-                              text=True, timeout=8)
+                              text=True, timeout=4)
     except (OSError, subprocess.SubprocessError) as error:
-        return "could not open Terminal: %s" % error
-    if done.returncode != 0:
-        why = (done.stderr or done.stdout or "").strip().splitlines()
-        return "could not open Terminal: %s" % (why[-1] if why else "no reason given")
-    return "started"
+        why = str(error)
+    else:
+        if done.returncode == 0:
+            return "started"
+        lines = (done.stderr or done.stdout or "").strip().splitlines()
+        why = lines[-1] if lines else "no reason given"
+    # Scripting Terminal needs an automation consent this relay, a
+    # background process, cannot ask for — on one Mac the request simply
+    # hung until the timeout, every time. Opening a .command file asks
+    # nothing of anyone: Launch Services hands it to Terminal, which runs
+    # it in a new window. The file removes itself as its first act.
+    try:
+        handle, command_file = tempfile.mkstemp(prefix="tapproval-", suffix=".command")
+        with os.fdopen(handle, "w") as out:
+            out.write('#!/bin/bash\nrm -f -- "$0"\n%s\n' % script)
+        os.chmod(command_file, 0o700)
+        opened = subprocess.run(["open", command_file], capture_output=True,
+                                text=True, timeout=8)
+    except (OSError, subprocess.SubprocessError) as error:
+        return "could not open Terminal: %s (nor a .command file: %s)" % (why, error)
+    if opened.returncode == 0:
+        return "started"
+    also = (opened.stderr or opened.stdout or "").strip().splitlines()
+    return "could not open Terminal: %s (nor a .command file: %s)" % (
+        why, also[-1] if also else "no reason given")
 
 
 # How often the resolver looks for subagent transcripts that did not exist
@@ -1467,6 +1524,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                                  self.queue.watch_seen_seconds_ago(),
                              "version": RELAY_VERSION,
                              "helper": HELPER_VERSION,
+                             "helper_commit": (_PROVENANCE or (None, None))[0],
+                             "helper_date": (_PROVENANCE or (None, None))[1],
                              "conditions": conditions(),
                              "paired_ever": getattr(self.auth, "paired_ever", True)})
         else:
@@ -2334,6 +2393,7 @@ def main(argv=None):
               file=sys.stderr)
 
     check_helper_is_visible()
+    helper_provenance()
 
     server, queue = serve(args.host, args.port, auth=auth)
     print("relay: listening on http://%s:%d" % (args.host, args.port),
