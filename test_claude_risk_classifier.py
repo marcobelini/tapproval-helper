@@ -30,6 +30,7 @@ import threading
 import urllib.error
 import urllib.request
 
+import crash_report
 import watch_permission_tool as wpt
 import watch_relay
 import watch_dashboard
@@ -1728,16 +1729,88 @@ class TestSelfStartingRelay:
         server.shutdown()
         server.server_close()
 
-    def test_ensure_spawns_when_down(self, monkeypatch):
+    def test_ensure_spawns_when_down_and_says_so_only_once_it_answers(self, monkeypatch, capsys):
+        """A spawn that produces nothing is not a start. Until 2026-09-09
+        --ensure printed "started in the background" the moment Popen
+        returned, over a child that had already died on a held port."""
         monkeypatch.setattr(watch_relay, "DEFAULT_PORT", 1)  # nothing there
+        monkeypatch.setattr(watch_relay, "RELAY_START_WAIT", 0.0)
         spawned = []
         class FakeProc:
             pass
         monkeypatch.setattr(watch_relay.subprocess, "Popen",
                             lambda cmd, **k: spawned.append(cmd) or FakeProc())
-        assert watch_relay.ensure_running() == 0
-        assert len(spawned) == 1
-        assert "--tunnel" in spawned[0]
+        assert watch_relay.ensure_running() == 1
+        assert len(spawned) == 1 and "--tunnel" in spawned[0]
+        err = capsys.readouterr().err
+        assert "did not come up" in err and "started" not in err
+
+    def test_ensure_says_started_when_the_child_actually_serves(self, monkeypatch, capsys):
+        started = {}
+        def spawn(cmd, **k):
+            server, _ = watch_relay.serve(port=0)
+            _serve(server)
+            started["server"] = server
+            monkeypatch.setattr(watch_relay, "DEFAULT_PORT", server.server_address[1])
+            return object()
+        monkeypatch.setattr(watch_relay, "DEFAULT_PORT", 1)
+        monkeypatch.setattr(watch_relay.subprocess, "Popen", spawn)
+        try:
+            assert watch_relay.ensure_running() == 0
+            assert "started in the background" in capsys.readouterr().err
+        finally:
+            started["server"].shutdown()
+            started["server"].server_close()
+
+    def test_ensure_will_not_start_a_second_relay_on_a_held_port(self, monkeypatch, capsys):
+        """The 2026-09-09 shape: an older relay that will not die. The
+        honest answer is that the old one keeps serving — not a corpse
+        on the port and a cheerful line in the log."""
+        monkeypatch.setattr(watch_relay, "_probe_relay",
+                            lambda timeout=2: {"version": watch_relay.RELAY_VERSION - 1, "pending": 0})
+        monkeypatch.setattr(watch_relay, "_stop_relay", lambda deadline=8.0: False)
+        monkeypatch.setattr(watch_relay, "_relay_pid", lambda port=None: 4242)
+        spawned = []
+        monkeypatch.setattr(watch_relay.subprocess, "Popen",
+                            lambda cmd, **k: spawned.append(cmd))
+        assert watch_relay.ensure_running(updated=True) == 1
+        assert spawned == []
+        err = capsys.readouterr().err
+        assert "could not stop" in err and "4242" in err and "keeps serving" in err
+
+    def test_stop_asks_by_pid_then_insists_and_reports_the_truth(self, monkeypatch):
+        """pkill -f could not see the relay at all; the pid can always be
+        signalled. TERM first; KILL when TERM is ignored; and the return
+        value is whether the port is actually free, nothing else."""
+        sent = []
+        monkeypatch.setattr(watch_relay, "_relay_pid", lambda port=None: 4242)
+        monkeypatch.setattr(watch_relay.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+        monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: {"version": 2})
+        assert watch_relay._stop_relay(deadline=0.0) is False
+        assert sent == [(4242, watch_relay.signal.SIGTERM), (4242, watch_relay.signal.SIGKILL)]
+
+    def test_stop_is_content_with_a_relay_that_leaves_when_asked(self, monkeypatch):
+        sent = []
+        alive = {"up": True}
+        monkeypatch.setattr(watch_relay, "_relay_pid", lambda port=None: 4242)
+        def kill(pid, sig):
+            sent.append(sig)
+            alive["up"] = False
+        monkeypatch.setattr(watch_relay.os, "kill", kill)
+        monkeypatch.setattr(watch_relay, "_probe_relay",
+                            lambda timeout=2: {"version": 2} if alive["up"] else None)
+        assert watch_relay._stop_relay(deadline=1.0) is True
+        assert sent == [watch_relay.signal.SIGTERM], "KILL must not follow a TERM that worked"
+
+    def test_the_relay_is_found_by_the_pid_it_wrote(self, tmp_path, monkeypatch):
+        pidfile = tmp_path / "relay.pid"
+        pidfile.write_text(str(os.getpid()))
+        monkeypatch.setattr(watch_relay, "PID_FILE", str(pidfile))
+        assert watch_relay._relay_pid() == os.getpid()
+        pidfile.write_text("999999999")                # a pid that is not alive
+        monkeypatch.setattr(watch_relay.subprocess, "run",
+                            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", ""))
+        assert watch_relay._relay_pid(port=1) is None, "a stale pidfile is not a relay"
 
 
 class TestStatusRelayAwareness:
@@ -2814,6 +2887,35 @@ class TestLanSourceIsNotTrusted:
         status, _body = self._call(base + "/admin/pair-open", method="POST")
         assert status == 403
         assert not auth.window_open()
+
+    def test_the_watch_can_report_its_own_trouble(self, lan):
+        """watchOS has no MetricKit and Tapproval has no server, so the one
+        channel that exists is this: the watch telling the owner's own Mac,
+        over the token it already holds."""
+        base, _, _ = lan
+        status, body = self._call(
+            base + "/diagnostic", token="devicetoken", method="POST",
+            body={"kind": "caught", "message": "decode failed: /sessions",
+                  "detail": "keyNotFound(status)", "app_version": "1.1",
+                  "build": "115"})
+        assert status == 200 and body["ok"] is True
+        # Honest about what happened to it: recorded is not e-mailed.
+        assert body["reported"] in ("mail_not_configured", "sent", "duplicate",
+                                    "rate_limited", "send_failed")
+
+    def test_a_report_with_nothing_in_it_is_refused(self, lan):
+        base, _, _ = lan
+        status, body = self._call(base + "/diagnostic", token="devicetoken",
+                                  method="POST", body={"kind": "caught"})
+        assert status == 400 and "message" in body["error"]
+
+    def test_a_local_process_cannot_file_a_fault_in_the_watchs_name(self, lan):
+        """Same rule as /say: a command Claude runs is a local process, and
+        loopback is not a credential for speaking as the watch."""
+        base, _, _ = lan
+        status, _ = self._call(base + "/diagnostic", method="POST",
+                               body={"kind": "caught", "message": "x"})
+        assert status == 403
 
     def test_health_tells_a_stranger_nothing_but_alive(self, lan):
         """Liveness is public; a pending count and "is a watch on the wrist
@@ -4692,6 +4794,183 @@ class TestWhatWeKnowAboutTheTranscript:
         assert "a_shape_from_the_future" in capsys.readouterr().err
 
 
+class TestTheHelperReportsItsOwnCrashes:
+    """Pantri shipped to TestFlight with only the push half of this and the
+    owner sent crash reports for weeks that reached nobody — the absence of
+    reports looks exactly like the absence of crashes. So: written down
+    first, shown on the wrist second, e-mailed third, and every failure in
+    the chain says which."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh(self):
+        crash_report._reset_for_tests()
+        yield
+        crash_report._reset_for_tests()
+
+    SETTINGS = ("key", "to@example.org", "from@example.org")
+
+    class _Post:
+        """A stand-in for Resend that records what it was handed."""
+        def __init__(self, status=200):
+            self.status, self.calls = status, []
+
+        def __call__(self, request, timeout=None):
+            self.calls.append(json.loads(request.data.decode("utf-8")))
+            outer = self
+
+            class Reply:
+                status = outer.status
+                def __enter__(self_inner): return self_inner
+                def __exit__(self_inner, *a): return False
+            return Reply()
+
+    def test_the_same_crash_from_the_same_place_is_one_report(self):
+        a = crash_report.fingerprint("ValueError: boom",
+                                     '  File "relay.py", line 9, in serve')
+        b = crash_report.fingerprint("ValueError: boom",
+                                     '  File "relay.py", line 9, in serve')
+        c = crash_report.fingerprint("ValueError: boom",
+                                     '  File "other.py", line 3, in advertise')
+        assert a == b and a != c
+
+    def test_it_is_written_down_before_anything_is_sent(self, tmp_path):
+        """The file is the record; e-mail is only the push. A crash with no
+        network, or one that kills the process first, must still be findable."""
+        log = tmp_path / "crashes.jsonl"
+        reason, _ = crash_report.report("ValueError: boom", 'File "a.py", line 1',
+                                        path=str(log),
+                                        settings=(None, None, None))
+        assert reason == "mail_not_configured"
+        written = json.loads(log.read_text().strip())
+        assert written["message"] == "ValueError: boom"
+        assert written["source"] == "process" and written["at"]
+        assert oct(os.stat(log).st_mode & 0o777) == "0o600"
+
+    def test_a_machine_with_no_key_says_so_rather_than_pretending(self, tmp_path):
+        reason, _ = crash_report.report("boom", "stack", path=str(tmp_path / "c"),
+                                        settings=(None, "to@x", "from@x"))
+        assert reason == "mail_not_configured"
+
+    def test_a_configured_machine_sends_one_and_counts_the_rest(self, tmp_path):
+        post = self._Post()
+        log = str(tmp_path / "c")
+        first, _ = crash_report.report("ValueError: boom", 'File "a.py", line 1',
+                                       helper="1.1.3", path=log,
+                                       settings=self.SETTINGS, opener=post)
+        again, _ = crash_report.report("ValueError: boom", 'File "a.py", line 1',
+                                       helper="1.1.3", path=log,
+                                       settings=self.SETTINGS, opener=post)
+        assert (first, again) == ("sent", "duplicate")
+        assert len(post.calls) == 1, "the second identical crash is counted, not sent"
+        sent = post.calls[0]
+        assert sent["to"] == ["to@example.org"] and sent["from"] == "from@example.org"
+        assert "Tapproval helper 1.1.3" in sent["subject"] and "boom" in sent["subject"]
+        assert 'File "a.py"' in sent["text"], "the stack is the whole point"
+        # Both crashes are on disk even though one e-mail went.
+        assert len(log_lines(log)) == 2
+
+    def test_a_crash_loop_cannot_send_a_thousand_e_mails(self, tmp_path):
+        post = self._Post()
+        reasons = [crash_report.report("boom %d" % i, "File \"a.py\", line %d" % i,
+                                       path=str(tmp_path / "c"),
+                                       settings=self.SETTINGS, opener=post)[0]
+                   for i in range(crash_report.MAX_SENDS_PER_WINDOW + 3)]
+        assert reasons.count("sent") == crash_report.MAX_SENDS_PER_WINDOW
+        assert reasons[-1] == "rate_limited"
+
+    def test_a_refused_send_is_loud_rather_than_silent(self, tmp_path, capsys):
+        """Resend refuses any from-address on a domain it has not verified,
+        and a swallowed refusal looks exactly like "no crashes" — the state
+        Pantri sat in with all three secrets correctly set."""
+        def angry(request, timeout=None):
+            raise urllib.error.HTTPError("u", 403, "Forbidden", {}, None)
+        reason, _ = crash_report.report("boom", "stack", path=str(tmp_path / "c"),
+                                        settings=self.SETTINGS, opener=angry)
+        assert reason == "send_failed"
+        assert "send failed" in capsys.readouterr().err
+
+    def test_the_reporter_never_raises_into_a_crash(self, tmp_path):
+        """A reporter that throws inside the crash path destroys the evidence
+        it exists to preserve — so anything the send does, however unlikely,
+        comes back as a reason."""
+        def explode(request, timeout=None):
+            raise RecursionError("something absurd, deep in urllib")
+        reason, entry = crash_report.report("boom", "stack", path=str(tmp_path / "c"),
+                                            settings=self.SETTINGS, opener=explode)
+        assert reason == "send_failed"
+        assert entry["message"] == "boom", "and the crash is still recorded"
+
+    def test_it_does_not_swallow_the_owner_pressing_ctrl_c(self, tmp_path):
+        """The one thing it must NOT catch. `except Exception` is deliberate:
+        a reporter that eats KeyboardInterrupt makes a hung send unkillable,
+        which is a worse failure than a lost report."""
+        def interrupted(request, timeout=None):
+            raise KeyboardInterrupt
+        with pytest.raises(KeyboardInterrupt):
+            crash_report.report("boom", "stack", path=str(tmp_path / "c"),
+                                settings=self.SETTINGS, opener=interrupted)
+        assert log_lines(str(tmp_path / "c")), "written down before the send"
+
+    def test_an_unwritable_log_is_reported_not_thrown(self, tmp_path, capsys):
+        reason, _ = crash_report.report("boom", "stack",
+                                        path=str(tmp_path / "no" / "such" / "c"),
+                                        settings=(None, None, None))
+        assert reason == "mail_not_configured"
+        assert "could not write" in capsys.readouterr().err
+
+    def test_the_key_is_read_from_a_file_outside_the_repository(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("RESEND_API_KEY", raising=False)
+        assert crash_report.api_key(str(tmp_path / "absent")) is None
+        key = tmp_path / "resend-key"
+        key.write_text("re_secret\n")
+        assert crash_report.api_key(str(key)) == "re_secret"
+
+    def test_no_key_lives_in_a_tracked_file(self):
+        """A public clone records and shows crashes and sends nothing. That
+        is only true while no key is committed."""
+        for rel in _tracked_files(_ROOT):
+            if not rel.endswith((".py", ".sh", ".json", ".md")):
+                continue
+            with open(os.path.join(_ROOT, rel), encoding="utf-8", errors="ignore") as handle:
+                assert "re_" + "live_" not in handle.read(), rel
+
+    def test_a_dead_thread_reaches_the_wrist(self, tmp_path, monkeypatch):
+        """The crash worth catching: a thread dies, the relay keeps
+        answering, and nothing looks wrong until something you needed did
+        not happen. After it there is still a wrist to tell."""
+        import threading
+        monkeypatch.setattr(crash_report, "CRASH_LOG", str(tmp_path / "c"))
+        monkeypatch.setattr(crash_report, "KEY_FILE", str(tmp_path / "no-key"))
+        monkeypatch.delenv("RESEND_API_KEY", raising=False)
+        chained = []
+        monkeypatch.setattr(threading, "excepthook", lambda args: chained.append(args))
+        assert watch_relay.install_crash_reporting() is True
+        try:
+            def angry():
+                raise ValueError("the advertiser died")
+            worker = threading.Thread(target=angry)
+            worker.start()
+            worker.join()
+            keys = [c["key"] for c in watch_relay.conditions()]
+            assert "crash" in keys, "the wrist must be told a thread died"
+            said = [c["detail"] for c in watch_relay.conditions() if c["key"] == "crash"][0]
+            assert "did not expect" in said and "restarting Claude Code" in said
+            assert chained, "the hook that was already there must still run"
+            assert json.loads(open(str(tmp_path / "c")).read().strip())["source"] == "thread"
+        finally:
+            watch_relay.clear_condition("crash")
+
+    def test_main_installs_it_before_serving(self):
+        with open(watch_relay.__file__, encoding="utf-8") as handle:
+            body = handle.read().split("def main(", 1)[1]
+        assert body.index("install_crash_reporting()") < body.index("serve(args.host")
+
+
+def log_lines(path):
+    with open(path, encoding="utf-8") as handle:
+        return [line for line in handle if line.strip()]
+
+
 class TestTheWristAnswersAHeadlessSend:
     """Every quick send runs `claude --resume -p`, and a headless run never
     fires the PermissionRequest hook — the hook belongs to the interactive
@@ -5597,7 +5876,7 @@ class TestTheReportingItselfIsChecked:
     # a key that is not here fails the first test below, which is the
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
-    VOCABULARY = {"bonjour", "helper", "tunnel", "update"}
+    VOCABULARY = {"bonjour", "crash", "helper", "tunnel", "update"}
 
     @staticmethod
     def _module_source(name):

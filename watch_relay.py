@@ -43,12 +43,14 @@ import functools
 import os
 import re
 import select
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -82,6 +84,54 @@ except Exception:                                  # standalone deployment
 
 
 _PROVENANCE = None
+
+
+def install_crash_reporting(hooks=None):
+    """Make the helper's own crashes visible instead of silent.
+
+    A thread that dies takes its job with it — the advertiser stops
+    announcing, the resolver stops resolving — and the relay carries on
+    answering, so nothing looks wrong until something you needed did not
+    happen. That is the crash worth catching here, which is why
+    ``threading.excepthook`` matters more than the process one: after it,
+    there is still a wrist to tell.
+
+    Chains rather than replaces. Swallowing a fatal error turns a visible
+    crash into a frozen process, which is harder to report, not easier.
+    """
+    import threading
+    try:
+        import crash_report
+    except Exception as error:                       # never blocks a start
+        print("relay: crash reporting unavailable (%s)" % error, file=sys.stderr)
+        return False
+
+    def _wrist(entry):
+        note_condition("crash", "Tapproval's helper hit a problem it did not "
+                       "expect (%s). It is written down on the computer; "
+                       "restarting Claude Code clears this."
+                       % entry.get("message", "")[:80])
+
+    previous_thread = threading.excepthook
+    previous_process = sys.excepthook
+
+    def on_thread(args):
+        stack = "".join(traceback.format_exception(
+            args.exc_type, args.exc_value, args.exc_traceback))
+        crash_report.report("%s: %s" % (args.exc_type.__name__, args.exc_value),
+                            stack, source="thread", helper=HELPER_VERSION,
+                            note=_wrist)
+        previous_thread(args)
+
+    def on_process(kind, value, tb):
+        stack = "".join(traceback.format_exception(kind, value, tb))
+        crash_report.report("%s: %s" % (kind.__name__, value), stack,
+                            source="process", helper=HELPER_VERSION)
+        previous_process(kind, value, tb)
+
+    threading.excepthook = on_thread
+    sys.excepthook = on_process
+    return True
 
 
 def helper_provenance(here=None):
@@ -327,19 +377,65 @@ def _probe_relay(timeout=2):
     return _loopback_json("/health", timeout=timeout)
 
 
-def _stop_relay(deadline=8.0):
-    """Ask the running relay to exit, then wait for the port to come free."""
+PID_FILE = os.environ.get("TAPPROVAL_PID_FILE") or os.path.expanduser("~/.tapproval-relay.pid")
+# How long --ensure gives a freshly spawned relay to answer /health before
+# it stops claiming the relay "started". A seam for tests.
+RELAY_START_WAIT = 6.0
+
+
+def _relay_pid(port=None):
+    """The pid of the relay on the port, or None. The pidfile first — the
+    relay writes its own — then whoever is listening, asked of lsof."""
     try:
-        subprocess.run(["pkill", "-f", "watch_relay.py --host"],
-                       capture_output=True, timeout=5)
-    except Exception:
-        return False
-    end = time.time() + deadline
-    while time.time() < end:
-        if _probe_relay(timeout=1) is None:
-            return True
-        time.sleep(0.4)
-    return False
+        with open(PID_FILE, encoding="utf-8") as handle:
+            pid = int(handle.read().strip())
+        os.kill(pid, 0)                                 # alive?
+        return pid
+    except (OSError, ValueError):
+        pass
+    try:
+        done = subprocess.run(
+            ["lsof", "-nP", "-iTCP:%d" % (port or DEFAULT_PORT),
+             "-sTCP:LISTEN", "-t"], capture_output=True, text=True, timeout=5)
+        first = done.stdout.split()
+        return int(first[0]) if first else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _stop_relay(deadline=8.0):
+    """Stop the running relay and wait for the port to come free. True
+    only when it is free — the caller must not start a second relay on
+    the strength of a stop that did not happen.
+
+    This used to be one `pkill -f "watch_relay.py --host"`, its exit code
+    unread. On 2026-09-09 pkill returned 1 — it could not see a relay
+    that `ps` and `lsof` both could — so nothing was stopped, the new
+    relay died on "Address already in use", and --ensure printed
+    "started in the background" over the corpse. The machine kept
+    running yesterday's helper while /health, asked by the watch, said
+    so to nobody. The relay is now found by the pid it wrote, or by who
+    holds the port, and asked to stop by pid: TERM, then KILL.
+    """
+    pid = _relay_pid()
+    if pid is None:
+        try:                                            # last resort, as before
+            subprocess.run(["pkill", "-f", "watch_relay.py --host"],
+                           capture_output=True, timeout=5)
+        except Exception:
+            pass
+    for signum, wait in ((signal.SIGTERM, deadline), (signal.SIGKILL, 3.0)):
+        if pid is not None:
+            try:
+                os.kill(pid, signum)
+            except OSError:
+                pass
+        end = time.time() + wait
+        while time.time() < end:
+            if _probe_relay(timeout=1) is None:
+                return True
+            time.sleep(0.4)
+    return _probe_relay(timeout=1) is None
 
 
 def _admin_call(path, timeout=5):
@@ -515,7 +611,14 @@ def ensure_running(updated=False):
             return 0
         print("relay: replacing an older relay (v%s -> v%d)"
               % (version or "?", RELAY_VERSION), file=sys.stderr)
-        _stop_relay()
+        if not _stop_relay():
+            # Starting a second relay on a held port produces a corpse
+            # and a log line nobody reads. Say the true thing instead.
+            print("relay: could not stop the relay on port %d (pid %s); "
+                  "not starting a second one. The old one keeps serving. "
+                  "See %s" % (DEFAULT_PORT, _relay_pid() or "?", RELAY_LOG),
+                  file=sys.stderr)
+            return 1
     log_path = RELAY_LOG
     _rotate_log(log_path)
     error = _spawn_detached(
@@ -523,10 +626,19 @@ def ensure_running(updated=False):
          "--host", "0.0.0.0", "--tunnel"], log_path)
     if error:
         print("relay: could not start (%s)" % error, file=sys.stderr)
-    else:
-        print("relay: started in the background (log: %s)" % log_path,
-              file=sys.stderr)
-    return 0
+        return 1
+    # "Started" is a claim about the child, not about the spawn. Wait for
+    # it to answer, and say so only when it has.
+    end = time.time() + RELAY_START_WAIT
+    while time.time() < end:
+        if _probe_relay(timeout=1) is not None:
+            print("relay: started in the background (log: %s)" % log_path,
+                  file=sys.stderr)
+            return 0
+        time.sleep(0.3)
+    print("relay: did not come up within %.0fs — read %s"
+          % (RELAY_START_WAIT, log_path), file=sys.stderr)
+    return 1
 
 
 class CardQueue:
@@ -1501,6 +1613,10 @@ class RelayHandler(BaseHTTPRequestHandler):
             # and a command Claude runs is a local process too — it must
             # not be able to answer its own card or speak into a session.
             "/say": ("_post_say", dict(token=True)),
+            # The watch reporting its own trouble. A device token, like
+            # /say: a local process must not be able to file a fault in
+            # the watch's name.
+            "/diagnostic": ("_post_diagnostic", dict(token=True)),
             "/decision": ("_post_decision", dict(token=True)),
             "/admin/pair-open": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
             "/admin/pair-relight": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
@@ -1701,6 +1817,38 @@ class RelayHandler(BaseHTTPRequestHandler):
                            body.get("text", ""),
                            brief=body.get("brief") is not False),
             "sent"))
+
+    def _post_diagnostic(self, path, query):
+        """The watch telling this computer something went wrong on it.
+
+        watchOS has no MetricKit, so the app cannot be handed Apple's own
+        crash report on the next launch; and Tapproval has no server to
+        POST one to. What it does have is this: an authenticated channel
+        to the owner's own Mac, already open. So the app reports what it
+        CAN see — an error it caught, or a launch that follows a run which
+        never ended cleanly — and the computer writes it down, exactly
+        where the helper's own crashes go.
+
+        It goes no further than that machine unless its owner has given it
+        a key. Somebody else's watch reports to somebody else's Mac.
+        """
+        body = self._read_json() or {}
+        kind = str(body.get("kind") or "")[:40]
+        message = str(body.get("message") or "").strip()[:500]
+        if not message:
+            self._send_json({"error": "expected {\"kind\", \"message\"}"}, 400)
+            return
+        import crash_report
+        where = " / ".join(part for part in (
+            str(body.get("app_version") or "")[:40],
+            str(body.get("build") or "")[:20]) if part)
+        reason, _entry = crash_report.report(
+            message, str(body.get("detail") or "")[:8000],
+            source="watch:%s" % (kind or "problem"),
+            helper="watch %s" % (where or "unknown"))
+        # The reason is the honest answer: "recorded, not e-mailed" is a
+        # different fact from "e-mailed", and the watch may want to say so.
+        self._send_json({"ok": True, "reported": reason})
 
     def _post_decision(self, path, query):
         body = self._read_json()
@@ -2439,6 +2587,7 @@ def main(argv=None):
 
     check_helper_is_visible()
     helper_provenance()
+    install_crash_reporting()
 
     server, queue = serve(args.host, args.port, auth=auth)
     print("relay: listening on http://%s:%d" % (args.host, args.port),
@@ -2462,6 +2611,11 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, _stop)
 
     try:
+        with open(PID_FILE, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+    except OSError:
+        pass                                            # lsof still finds us
+    try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("relay: stopped", file=sys.stderr)
@@ -2471,6 +2625,10 @@ def main(argv=None):
         if tunnel_proc is not None:
             tunnel_proc.terminate()
         server.server_close()
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
     return 0
 
 
