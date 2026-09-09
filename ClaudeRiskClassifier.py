@@ -102,7 +102,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way

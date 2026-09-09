@@ -20,6 +20,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -306,6 +307,68 @@ def derive_title(text):
 
 _META_CACHE = {}   # path -> ((mtime, size), (cwd, opening, turns))
 
+
+
+# --------------------------------------------------------------------------
+# What we know about Claude Code's transcript
+#
+# Every line below is a shape this file reads out of a file another product
+# writes, in a format with no version number and no promise. When one of
+# them changes upstream, the thread on the wrist quietly loses something —
+# that is how "No response requested." became a reply bubble and how a
+# /recap once showed nothing at all. So each shape is named here with the
+# date it was last seen with our own eyes, and the code below refers to
+# this table rather than repeating the string. A test fails if any of them
+# is spelled out a second time somewhere else in this file.
+#
+# Seen means seen: each date is a transcript on this machine that contained
+# it, not a date from documentation.
+UPSTREAM_SHAPES = {
+    "system.subtype.local_command":
+        ("local_command", "A slash command the CLI answered itself; its "
+         "output is a system line, not an assistant turn.", "2026-09-08"),
+    "system.level.error":
+        ("error", "A system line the CLI marks as a failure. The phone "
+         "paints both of these red.", "2026-09-08"),
+    "tag.command_name":
+        ("<command-name>", "The echo of a slash command a person sent, "
+         "carried as a user turn.", "2026-09-08"),
+    "tag.command_args":
+        ("<command-args>", "Its arguments, in a second tag.", "2026-09-08"),
+    "tag.local_command_out":
+        ("<local-command-", "What the command printed: stdout and stderr are "
+         "the same tag with a different word, which is why the reader below "
+         "matches the stem.", "2026-09-08"),
+    "text.nothing_to_add":
+        ("No response requested.", "What Claude says when the CLI already "
+         "answered and its own turn has nothing to add. Not a reply.",
+         "2026-09-08"),
+    "part.tool_result":
+        ('"tool_result"', "A tool has answered, so nothing is running now.",
+         "2026-09-04"),
+}
+
+
+def shape(name):
+    """The upstream string named in UPSTREAM_SHAPES. Reading them through
+    one door is what makes the table true rather than decorative."""
+    return UPSTREAM_SHAPES[name][0]
+
+
+# System subtypes we have no reading for. Not an error — Claude Code emits
+# plenty this file has no business rendering — but a new one is the first
+# sign that a transcript has grown a shape we do not know, so the relay log
+# gets one line the first time each is seen rather than nothing at all.
+_UNKNOWN_SUBTYPES = set()
+
+
+def note_unknown_subtype(subtype):
+    if not subtype or subtype in _UNKNOWN_SUBTYPES:
+        return False
+    _UNKNOWN_SUBTYPES.add(subtype)
+    print("watch_dashboard: transcript has a system line this helper does "
+          "not read: subtype %r" % subtype, file=sys.stderr)
+    return True
 
 
 # Prefixes the harness injects as a "user" turn that no human typed. Both
@@ -1037,7 +1100,7 @@ def _thread_line(state, line, limit):
                 state["launched"].add(a or b)
         if "<task-id>" in line:
             state["finished"].update(_TASK_DONE.findall(line))
-    if '"tool_result"' in line:
+    if shape("part.tool_result") in line:
         state["running_tool"] = None
     if entry.get("type") == "system":
         # A slash command the CLI answered itself — /recap, /cost, an
@@ -1045,7 +1108,11 @@ def _thread_line(state, line, limit):
         # turn, and the phone paints it red with a warning triangle. So
         # does the watch now; it used to drop the line, and a send that
         # bounced showed nothing, which read as the watch being broken.
-        if entry.get("subtype") == "local_command" or entry.get("level") == "error":
+        subtype = entry.get("subtype")
+        if subtype not in (shape("system.subtype.local_command"), None):
+            note_unknown_subtype(subtype)
+        if (subtype == shape("system.subtype.local_command")
+                or entry.get("level") == shape("system.level.error")):
             text = _system_text(entry)
             if text:
                 state["turns"].append({"role": "system", "kind": "notice", "text": text,
@@ -1084,7 +1151,8 @@ def _thread_line(state, line, limit):
     # still gives Claude a turn, and Claude — having nothing to add —
     # says exactly this. It is not a reply; on the wrist it read as one,
     # right under a Recap that had already been answered in red.
-    if role == "assistant" and kind == "text" and lead.strip() == "No response requested.":
+    if (role == "assistant" and kind == "text"
+            and lead.strip() == shape("text.nothing_to_add")):
         return
     # The watch shows the FULL text of a message, like the phone — a 2KB
     # cap here once cut a real reply mid-sentence on the wrist. Bound the

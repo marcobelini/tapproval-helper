@@ -722,6 +722,49 @@ from watch_dashboard import (  # noqa: E402,F401  (re-exports, see above)
 # quietly follow them back to the keyboard.
 BRIEF_REPLY_SETTINGS = json.dumps({"outputStyle": "Concise"})
 
+# The permission tool that lets a headless run ask the wrist. A `-p` run
+# never fires the PermissionRequest hook — the hook belongs to the
+# interactive terminal — so until this existed, a wrist instruction that
+# needed a yes simply stopped at the first risky command and said nothing
+# about why. Claude Code hands the question to this MCP tool instead, and
+# it asks the same watch through the same relay.
+PERMISSION_TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "watch_permission_tool.py")
+
+# What a wrist-started run is told about itself. A `-p` run ends the
+# moment its reply is written, and Claude Code then stops every process
+# it started — which is how, on 2026-09-08, a message from the watch that
+# said "create a TestFlight build" archived build 111, began the upload,
+# wrote "uploading in the background, I'll report when it lands", and
+# was killed mid-upload before anyone was told. The run believed it had a
+# background; it did not. Telling it so is the honest fix: work that
+# cannot finish inside one reply is refused in words, not started and
+# abandoned. Refusing is a product rule, so it is stated once, here.
+WRIST_RUN_RULES = (
+    "This run was started from the user's watch and ends the moment you "
+    "reply; every process you leave running is stopped then, and nothing "
+    "tells the user. Do not start builds, deploys, uploads, long test "
+    "runs, or anything you would report on later — say what you would "
+    "have started and that it needs a session at the keyboard. Finish "
+    "what fits inside one reply.")
+
+
+def _permission_tool_flags(tool_path=None):
+    """The flags that put the wrist in charge of a headless run's prompts,
+    or nothing at all when the tool is not installed beside this file.
+
+    Nothing, rather than a broken flag: an older install that updates the
+    relay but not its neighbours must keep sending messages, not fail
+    every send on a missing file.
+    """
+    path = tool_path or PERMISSION_TOOL
+    if not os.path.isfile(path):
+        return []
+    config = json.dumps({"mcpServers": {"tapproval": {
+        "command": sys.executable or "python3", "args": [path]}}})
+    return ["--mcp-config", config,
+            "--permission-prompt-tool", "mcp__tapproval__approve"]
+
 
 def say_to_session(prefix, text, projects_dir=None, brief=True):
     """Send an instruction to a session, the way the terminal would.
@@ -744,6 +787,8 @@ def say_to_session(prefix, text, projects_dir=None, brief=True):
     command = ["claude", "--resume", session_id]
     if brief:
         command += ["--settings", BRIEF_REPLY_SETTINGS]
+    command += _permission_tool_flags()
+    command += ["--append-system-prompt", WRIST_RUN_RULES]
     command += ["-p", text]
     error = _spawn_detached(
         command,

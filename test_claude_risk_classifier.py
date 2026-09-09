@@ -30,6 +30,7 @@ import threading
 import urllib.error
 import urllib.request
 
+import watch_permission_tool as wpt
 import watch_relay
 import watch_dashboard
 
@@ -2304,7 +2305,11 @@ class TestSessionReplies:
     def test_the_watch_can_ask_for_full_replies(self, tmp_path, monkeypatch):
         cmd = self._spawned(tmp_path, monkeypatch, brief=False)
         assert "--settings" not in cmd
-        assert cmd == ["claude", "--resume", "abc12345", "-p", "run the tests"]
+        # The permission flags ride on every send, brief or not — a prompt
+        # raised by a full reply needs the wrist as much as a short one.
+        assert cmd[:3] == ["claude", "--resume", "abc12345"]
+        assert cmd[-2:] == ["-p", "run the tests"]
+        assert "--permission-prompt-tool" in cmd
 
 
 class TestRecognisedTooling:
@@ -4609,6 +4614,255 @@ class TestTheHelperSaysWhereItsCodeIsFrom:
         health = source.split("def _get_health", 1)[1].split("def _get_projects", 1)[0]
         assert "helper_provenance(" not in health
 
+
+
+class TestWhatWeKnowAboutTheTranscript:
+    """watch_dashboard reads a file another product writes, in a format
+    with no version number and no promise. Each shape it leans on is named
+    in UPSTREAM_SHAPES with the date it was last seen here — because when
+    one changes upstream the wrist quietly loses something, which is how
+    "No response requested." became a reply bubble and how a /recap once
+    showed nothing at all."""
+
+    @staticmethod
+    def _source_outside_the_table():
+        """The module's source with the table itself cut out. The first
+        version of this check read the whole file, so every entry proved
+        its own existence and the guard could never fail — a confident
+        statement nobody had seen be false (#38)."""
+        with open(watch_dashboard.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        start = source.index("UPSTREAM_SHAPES = {")
+        end = source.index("\ndef shape(", start)
+        return source[:start] + source[end:]
+
+    def test_every_shape_named_is_one_the_code_actually_reads(self):
+        """A table that outlives its readers is documentation, not a
+        registry. An entry earns its place two ways: something calls
+        shape() for it, or the string appears in a reader — the tag
+        regexes spell theirs out, which is where a regex has to say it.
+        Anything else is a shape nobody reads, and no test upstream will
+        ever tell us it changed."""
+        source = self._source_outside_the_table()
+        orphans = [name for name, (value, _m, _s) in watch_dashboard.UPSTREAM_SHAPES.items()
+                   if 'shape("%s")' % name not in source and value not in source]
+        assert not orphans, ("named in UPSTREAM_SHAPES and read nowhere: %s"
+                             % ", ".join(orphans))
+
+    def test_each_shape_carries_a_day_somebody_saw_it(self):
+        import datetime
+        today = datetime.date.today()
+        for name, (_value, meaning, seen) in watch_dashboard.UPSTREAM_SHAPES.items():
+            day = datetime.date.fromisoformat(seen)          # raises if not a date
+            assert day <= today, "%s claims to have been seen in the future" % name
+            assert meaning.endswith("."), "%s: say what it means, in a sentence" % name
+
+    def test_the_readers_go_through_the_table(self):
+        """A reader that spells an upstream string out again is the drift
+        this table exists to stop."""
+        with open(watch_dashboard.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        for name in ("system.subtype.local_command", "text.nothing_to_add",
+                     "part.tool_result"):
+            assert 'shape("%s")' % name in source, name
+
+    def test_a_system_line_we_have_no_reading_for_is_said_once(self, capsys):
+        watch_dashboard._UNKNOWN_SUBTYPES.clear()
+        assert watch_dashboard.note_unknown_subtype("compact_boundary") is True
+        assert watch_dashboard.note_unknown_subtype("compact_boundary") is False
+        said = capsys.readouterr().err
+        assert said.count("compact_boundary") == 1
+        assert "does not read" in said
+
+    def test_nothing_is_said_about_a_line_with_no_subtype(self, capsys):
+        watch_dashboard._UNKNOWN_SUBTYPES.clear()
+        assert watch_dashboard.note_unknown_subtype(None) is False
+        assert capsys.readouterr().err == ""
+
+    def test_a_transcript_carrying_an_unfamiliar_line_says_so(self, tmp_path, capsys):
+        """End to end: the notice comes from reading a real transcript, not
+        from calling the reporter by hand."""
+        watch_dashboard._UNKNOWN_SUBTYPES.clear()
+        _write_transcript(tmp_path, "-p", "shapes.jsonl", [
+            {"cwd": "/x", "message": {"role": "user", "content": "hello"}},
+            {"type": "system", "subtype": "a_shape_from_the_future",
+             "content": "something new"},
+        ])
+        watch_relay.session_thread("shapes", projects_dir=str(tmp_path))
+        assert "a_shape_from_the_future" in capsys.readouterr().err
+
+
+class TestTheWristAnswersAHeadlessSend:
+    """Every quick send runs `claude --resume -p`, and a headless run never
+    fires the PermissionRequest hook — the hook belongs to the interactive
+    terminal. Until 2026-09-09 a wrist instruction that needed a yes
+    stopped at the first risky command and said nothing about why.
+    Claude Code's --permission-prompt-tool hands the question to an MCP
+    tool instead; this is that tool."""
+
+    class _Fake:
+        """Enough of the classifier to answer, without a relay. `decide`
+        is the real one: the point of these tests is that the headless
+        path obeys the same policy as the hook, so stubbing it would be
+        testing the stub."""
+        def __init__(self, verdict, relay="http://127.0.0.1:8977", risk=None):
+            self.verdict, self.relay = verdict, relay
+            self.risk = risk if risk is not None else crc.Risk.HIGH
+            self.asked, self.policy_extra = [], {}
+            self.asked_the_watch = False
+
+        Risk = crc.Risk
+        decide = staticmethod(crc.decide)
+
+        def load_policy(self):
+            policy = {"relay": self.relay, "relay_wait": 6.0}
+            policy.update(self.policy_extra)
+            return policy
+
+        def classify(self, event):
+            self.asked.append(event)
+            return {"risk": self.risk, "project": "acme"}
+
+        def wrist_card(self, tool, tool_input, risk):
+            return {"headline": tool, "tier": risk.name}
+
+        def ask_watch(self, card, policy, project=None):
+            self.asked_the_watch = True
+            return self.verdict, None
+
+    def test_the_threshold_the_hook_obeys_is_obeyed_here_too(self):
+        """A wrist asked about every `ls` stops reading the cards. With a
+        raised threshold the harmless ones are answered here, exactly as
+        the hook answers them at the keyboard — and CRITICAL never is."""
+        fake = self._Fake("deny", risk=crc.Risk.SAFE)  # the wrist would say no
+        fake.policy_extra = {"auto_allow_at_or_below": "LOW"}
+        out = wpt.decide("Bash", {"command": "ls"}, crc=fake)
+        assert out["behavior"] == "allow", "a SAFE call under the threshold never travels"
+        assert fake.asked_the_watch is False
+
+    def test_critical_still_reaches_the_wrist_whatever_the_threshold(self):
+        fake = self._Fake("allow", risk=crc.Risk.CRITICAL)
+        fake.policy_extra = {"auto_allow_at_or_below": "CRITICAL"}
+        out = wpt.decide("Bash", {"command": "git push --force origin main"}, crc=fake)
+        assert fake.asked_the_watch is True
+        assert out["behavior"] == "allow"
+
+    def test_a_yes_on_the_wrist_lets_the_command_run(self):
+        fake = self._Fake("allow")
+        out = wpt.decide("Bash", {"command": "npm test"}, crc=fake)
+        assert out == {"behavior": "allow", "updatedInput": {"command": "npm test"}}
+        assert fake.asked[0]["tool_name"] == "Bash"
+
+    def test_a_no_on_the_wrist_is_a_no(self):
+        out = wpt.decide("Bash", {"command": "rm -rf build"}, crc=self._Fake("deny"))
+        assert out["behavior"] == "deny" and "watch" in out["message"]
+
+    def test_silence_denies_and_says_why(self):
+        """The hook may answer "none" and let the ordinary prompt appear,
+        because someone is at the terminal. Here nobody is: the run came
+        from a wrist. There is no second surface, so silence is a denial
+        that explains itself rather than a hang."""
+        out = wpt.decide("Bash", {"command": "npm test"}, crc=self._Fake("none"))
+        assert out["behavior"] == "deny"
+        assert "did not answer" in out["message"] and "Nothing was run" in out["message"]
+
+    def test_no_relay_configured_is_said_in_words(self):
+        out = wpt.decide("Bash", {"command": "ls"}, crc=self._Fake("allow", relay=""))
+        assert out["behavior"] == "deny" and "no relay address" in out["message"]
+
+    def test_a_classifier_that_throws_still_answers(self):
+        class Angry:
+            def load_policy(self): raise RuntimeError("boom")
+        out = wpt.decide("Bash", {"command": "ls"}, crc=Angry())
+        assert out["behavior"] == "deny" and "boom" in out["message"]
+
+    def test_it_speaks_the_handshake_claude_code_expects(self):
+        hello = wpt.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+        assert hello["result"]["protocolVersion"] == wpt.PROTOCOL
+        assert hello["result"]["capabilities"] == {"tools": {}}
+        listed = wpt.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        names = [t["name"] for t in listed["result"]["tools"]]
+        assert names == ["approve"]
+
+    def test_a_notification_is_answered_with_silence(self):
+        assert wpt.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
+
+    def test_an_unknown_tool_is_an_error_not_an_allow(self):
+        reply = wpt.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                            "params": {"name": "something_else", "arguments": {}}})
+        assert "error" in reply and "result" not in reply
+
+    def test_the_decision_rides_as_json_in_a_text_block(self):
+        reply = wpt.handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                            "params": {"name": "approve", "arguments": {
+                                "tool_name": "Bash", "input": {"command": "ls"}}}},
+                           crc=self._Fake("allow"))
+        block = reply["result"]["content"][0]
+        assert block["type"] == "text"
+        assert json.loads(block["text"])["behavior"] == "allow"
+
+    def test_it_holds_a_real_conversation_over_a_real_pipe(self, tmp_path):
+        """The functions above are not the contract; the pipe is. This
+        starts the file the way Claude Code starts it and speaks JSON-RPC
+        down stdin, with no relay configured so the answer is a refusal in
+        words rather than a wait."""
+        import subprocess
+        env = dict(os.environ, CLAUDE_RISK_RELAY="", CLAUDE_RISK_CONFIG=str(tmp_path / "none.json"))
+        talk = "\n".join(json.dumps(m) for m in [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": "approve", "arguments": {"tool_name": "Bash",
+                                                 "input": {"command": "ls"}}}}])
+        done = subprocess.run(
+            [sys.executable, os.path.join(_ROOT, "watch_permission_tool.py")],
+            input=talk + "\n", capture_output=True, text=True, timeout=30, env=env)
+        replies = [json.loads(line) for line in done.stdout.splitlines() if line.strip()]
+        assert [r["id"] for r in replies] == [1, 2, 3], done.stderr
+        assert replies[0]["result"]["serverInfo"]["name"] == "tapproval"
+        decision = json.loads(replies[2]["result"]["content"][0]["text"])
+        assert decision["behavior"] == "deny"
+
+    def test_a_send_carries_the_wrist_as_its_permission_surface(self, tmp_path, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(watch_relay, "resolve_session", lambda p, d=None: ("s1", str(tmp_path)))
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/bin/claude")
+        monkeypatch.setattr(watch_relay, "_spawn_detached",
+                            lambda command, log, cwd=None: seen.update(command=command))
+        watch_relay.say_to_session("s1", "what changed?")
+        command = seen["command"]
+        assert "--permission-prompt-tool" in command
+        assert command[command.index("--permission-prompt-tool") + 1] == "mcp__tapproval__approve"
+        config = json.loads(command[command.index("--mcp-config") + 1])
+        assert config["mcpServers"]["tapproval"]["args"] == [watch_relay.PERMISSION_TOOL]
+
+    def test_a_wrist_run_is_told_it_ends_with_its_reply(self, tmp_path, monkeypatch):
+        """On 2026-09-08 a message from the watch — "create a TestFlight
+        build" — archived build 111, began the upload, wrote "I'll report
+        when it lands", and was killed the moment that reply was written.
+        The run believed it had a background. It did not. Now it is told."""
+        seen = {}
+        monkeypatch.setattr(watch_relay, "resolve_session", lambda p, d=None: ("s1", str(tmp_path)))
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/bin/claude")
+        monkeypatch.setattr(watch_relay, "_spawn_detached",
+                            lambda command, log, cwd=None: seen.update(command=command))
+        watch_relay.say_to_session("s1", "ship a build")
+        command = seen["command"]
+        rule = command[command.index("--append-system-prompt") + 1]
+        assert "ends the moment you reply" in rule
+        for word in ("builds", "deploys", "uploads"):
+            assert word in rule, "the rule must name the work it forbids"
+        assert "session at the keyboard" in rule, "and where that work belongs instead"
+        # The rule precedes the message: a flag after -p would be read as
+        # part of what the user said.
+        assert command.index("--append-system-prompt") < command.index("-p")
+
+    def test_a_relay_without_its_neighbour_still_sends(self, monkeypatch):
+        """An install that updated the relay but not the file beside it
+        must keep sending messages, not fail every send on a missing
+        file."""
+        assert watch_relay._permission_tool_flags("/nowhere/absent.py") == []
 
 
 class TestNewSessionFromTheWatch:
