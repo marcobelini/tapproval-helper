@@ -4927,6 +4927,80 @@ class TestTheHelperReportsItsOwnCrashes:
         assert target.read_text().strip() == "re_abc123"
         assert oct(os.stat(target).st_mode & 0o777) == "0o600"
 
+    def test_a_pipe_is_read_and_a_person_is_asked(self):
+        """Two ways in, because the clipboard is not always where the key
+        is. Piped, it is read. On a terminal it is asked for — the old
+        behaviour there was sys.stdin.read() against a tty: no prompt, no
+        cursor, waiting for a Ctrl-D nobody had been told about, which
+        looks exactly like a hang."""
+        class Pipe:
+            @staticmethod
+            def isatty(): return False
+            @staticmethod
+            def read(): return "re_from_a_pipe\n"
+        assert crash_report.key_from_stdin(Pipe()) == "re_from_a_pipe\n"
+
+        class Terminal:
+            @staticmethod
+            def isatty(): return True
+            @staticmethod
+            def read(): raise AssertionError("a terminal must be asked, not read")
+        asked = []
+        def ask(prompt):
+            asked.append(prompt)
+            return "re_typed_by_hand"
+        assert crash_report.key_from_stdin(Terminal(), ask=ask) == "re_typed_by_hand"
+        assert asked and "press return" in asked[0], asked
+
+    def test_the_typed_key_is_never_echoed(self):
+        """It is asked for through getpass, so it does not reach the
+        scrollback of a shared terminal or a screen recording."""
+        import ast
+        source = open(crash_report.__file__, encoding="utf-8").read()
+        func = next(node for node in ast.walk(ast.parse(source))
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "key_from_stdin")
+        used = {ast.dump(n) for n in ast.walk(func) if isinstance(n, ast.Attribute)}
+        assert any("getpass" in u for u in used), (
+            "the terminal path must not echo the key — use getpass")
+        assert "input(" not in ast.dump(func), "input() would echo it"
+
+    def test_a_real_key_is_not_refused_for_its_capital_letter(self, tmp_path):
+        """2026-09-10: the owner pasted a key beginning "Re_" and this
+        refused it, insisting keys begin with "re_" — a validator turning
+        away the exact thing it exists to accept, and saying the form it
+        had just been handed. The prefix is here to catch a URL or a
+        command pasted by mistake, not to police capitalisation."""
+        target = tmp_path / "resend-key"
+        said = crash_report.install_key("Re_BiYMaoUu_Ag8NP1", path=str(target))
+        assert "stored" in said, said
+        assert target.read_text().strip() == "Re_BiYMaoUu_Ag8NP1", (
+            "the key is stored exactly as given — case included")
+
+    @pytest.mark.parametrize("pasted, stored", [
+        ('"re_quoted"', "re_quoted"),
+        ("'re_quoted'", "re_quoted"),
+        ("RESEND_API_KEY=re_from_a_dotenv", "re_from_a_dotenv"),
+        ("export RESEND_API_KEY='re_from_a_shell_line'", "re_from_a_shell_line"),
+        ("  re_with_space\n", "re_with_space"),
+    ])
+    def test_a_key_arrives_wearing_whatever_it_was_copied_from(
+            self, tmp_path, pasted, stored):
+        """Copying out of a dashboard, a .env or a shell export brings
+        decoration along. None of that is the person making a mistake, and
+        a key stored with its quotes still attached fails later, at Resend,
+        where the reason is much harder to see."""
+        target = tmp_path / "resend-key"
+        assert "stored" in crash_report.install_key(pasted, path=str(target))
+        assert target.read_text().strip() == stored
+
+    def test_the_refusal_describes_what_arrived_without_printing_it(self, tmp_path):
+        target = tmp_path / "resend-key"
+        said = crash_report.install_key("re_a_real_looking_key", path=str(target))
+        assert "stored" in said
+        said = crash_report.install_key("https://resend.com/api-keys", path=str(target))
+        assert "27 characters" in said and "'htt'" in said, said
+
     def test_something_that_is_not_a_key_is_refused_before_it_is_written(self, tmp_path):
         target = tmp_path / "resend-key"
         said = crash_report.install_key("https://resend.com/api-keys", path=str(target))

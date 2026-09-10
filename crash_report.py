@@ -27,6 +27,7 @@ remember. Standard library only, like everything else here.
 **It never raises.** A reporter that throws inside the crash path destroys
 the evidence it exists to preserve.
 """
+import getpass
 import hashlib
 import json
 import os
@@ -277,10 +278,25 @@ def install_key(text, path=None):
     """
     path = path or KEY_FILE
     key = (text or "").strip()
+    # Take what a person's clipboard actually holds. Copying a key out of
+    # a dashboard, a .env line or a shell export brings decoration with
+    # it, and none of it is the person making a mistake.
+    if "=" in key.split("\n")[0][:40]:
+        key = key.split("=", 1)[1].strip()      # RESEND_API_KEY=re_…
+    key = key.strip("\"'").strip()             # "re_…" or 're_…'
     if not key:
         return "nothing on the clipboard — copy the key first"
-    if not key.startswith("re_"):
-        return "that does not look like a Resend key (they begin with re_)"
+    # Case-insensitively, because on 2026-09-10 a real key of the owner's
+    # began "Re_" and this refused it — a validator that rejects the very
+    # thing it exists to accept, with a message insisting on the form it
+    # had just been handed. The prefix is here to catch a URL or a command
+    # pasted by accident, not to police capitalisation.
+    if not key.lower().startswith("re_"):
+        # Say what arrived without printing it: a length and a shape are
+        # enough to tell "I copied the wrong thing" from "it is right and
+        # this is broken", and neither leaks the key if it was one.
+        return ("that does not look like a Resend key: %d characters, "
+                "starting %r. They begin with re_." % (len(key), key[:3]))
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -324,17 +340,42 @@ def selftest(settings=None, opener=None, path=None):
                "unverified sending domain is the usual answer." % (reason, route))
 
 
+def key_from_stdin(stream=None, ask=None):
+    """The key, from a pipe or from a person, whichever is there.
+
+    `pbpaste | … --install-key` stays the one-liner. But somebody who
+    runs the command on its own — because the key is in a password
+    manager, or because the clipboard held the wrong thing a moment ago —
+    used to get sys.stdin.read() against a terminal: no prompt, no
+    cursor, waiting for a Ctrl-D nobody was told about. That is
+    indistinguishable from a hang, and it is why this grew a second way
+    in.
+
+    On a terminal the key is asked for and not echoed. A pasted key still
+    arrives in full; it simply does not appear on screen, and does not
+    reach the scrollback of a shared terminal or a screen recording.
+    """
+    stream = sys.stdin if stream is None else stream
+    if getattr(stream, "isatty", lambda: False)():
+        ask = ask or getpass.getpass
+        return ask("Paste the Resend key and press return "
+                   "(it will not be shown): ")
+    return stream.read()
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["--install-key"]:
-        print(install_key(sys.stdin.read()))
+        print(install_key(key_from_stdin()))
         return 0
     if argv[:1] == ["--test"]:
         code, said = selftest()
         print(said)
         return code
     print(__doc__.strip().splitlines()[0])
-    print("\n  pbpaste | python3 crash_report.py --install-key"
+    print("\n  python3 crash_report.py --install-key      "
+          "# asks for the key, does not echo it"
+          "\n  pbpaste | python3 crash_report.py --install-key"
           "\n  python3 crash_report.py --test")
     return 0
 
