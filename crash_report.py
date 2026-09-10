@@ -57,6 +57,30 @@ KEY_FILE = os.path.expanduser("~/.appstoreconnect/resend-key")
 DEFAULT_TO = "tapproval@thoughtfulsteward.org"
 DEFAULT_FROM = "tapproval@send.thoughtfulsteward.org"
 
+# These names carry the app's own prefix, and that is the whole point.
+# `RESEND_API_KEY`, `CRASH_REPORT_TO` and `CRASH_REPORT_FROM` are the
+# names every app that uses Resend reaches for, so an environment that
+# has them set for something else was silently configuring this. Two ways
+# that went wrong, both found on 2026-09-10 on a machine that had them
+# exported for a sibling project:
+#
+#   * On a stranger's computer: a `RESEND_API_KEY` they exported for
+#     their own work, with no recipient set, meant this helper posted
+#     their crash — traceback and all — to Resend under their account,
+#     addressed to the author. Resend refuses the send, their account
+#     having verified no such domain, but the POST has already left the
+#     machine. The privacy policy says nothing reaches us. It has to be
+#     true of a machine we did not configure.
+#   * On the owner's own: the sibling project's key and inbox were
+#     picked up, so `--test` would have reported success while sending
+#     through another app's account to another app's mailbox.
+#
+# A generic name is a shared namespace. This is a config file, not a
+# namespace, so it gets its own.
+KEY_ENV = "TAPPROVAL_RESEND_API_KEY"
+TO_ENV = "TAPPROVAL_CRASH_REPORT_TO"
+FROM_ENV = "TAPPROVAL_CRASH_REPORT_FROM"
+
 _seen = {}                       # fingerprint -> {count, first, notified}
 _window_start = 0.0
 _sent_in_window = 0
@@ -79,25 +103,44 @@ def fingerprint(message, stack):
     return digest.hexdigest()[:16]
 
 
-def api_key(path=None):
-    """The Resend key, or None. Never logged, never returned in a status."""
-    from_env = os.environ.get("RESEND_API_KEY")
-    if from_env:
-        return from_env.strip() or None
+def key_and_source(path=None, env=None):
+    """``(key, where_it_came_from)``, or ``(None, None)``.
+
+    The file wins over the environment, which is the opposite of the
+    order this had first. `--install-key` writes the file, so the old
+    order meant a paste could appear to work and then be ignored by a
+    variable the person had forgotten was exported. The thing you just
+    did should beat the thing you did months ago.
+
+    The source travels with the key so `--test` can say which one it
+    used. It is the key's *origin* that is returned, never the key.
+    """
+    env = os.environ if env is None else env
     try:
         with open(path or KEY_FILE, "r", encoding="utf-8") as handle:
-            return handle.read().strip() or None
+            from_file = handle.read().strip()
+        if from_file:
+            return from_file, "the key file"
     except OSError:
-        return None
+        pass
+    from_env = (env.get(KEY_ENV) or "").strip()
+    if from_env:
+        return from_env, "$" + KEY_ENV
+    return None, None
+
+
+def api_key(path=None, env=None):
+    """The Resend key, or None. Never logged, never returned in a status."""
+    return key_and_source(path, env)[0]
 
 
 def mail_settings(env=None, key_path=None):
     """``(key, to, from)`` — each None when unset. Honest about absence:
     the reason a report was not sent must be sayable."""
     env = os.environ if env is None else env
-    return (api_key(key_path),
-            (env.get("CRASH_REPORT_TO") or DEFAULT_TO).strip() or None,
-            (env.get("CRASH_REPORT_FROM") or DEFAULT_FROM).strip() or None)
+    return (api_key(key_path, env),
+            (env.get(TO_ENV) or DEFAULT_TO).strip() or None,
+            (env.get(FROM_ENV) or DEFAULT_FROM).strip() or None)
 
 
 def _rotate(path, limit=CRASH_LOG_MAX):
@@ -225,7 +268,82 @@ def report(message, stack, source="process", helper=None, now=None,
         return "reporter_failed", {}
 
 
+def install_key(text, path=None):
+    """Store a Resend key, readable by nobody else. Never echoes it.
+
+    The key is the one thing in this whole path that a person has to
+    provide, so the step is one command and the value never passes through
+    a shell argument (where it would land in the history) or a log.
+    """
+    path = path or KEY_FILE
+    key = (text or "").strip()
+    if not key:
+        return "nothing on the clipboard — copy the key first"
+    if not key.startswith("re_"):
+        return "that does not look like a Resend key (they begin with re_)"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(handle, "w") as out:
+            out.write(key + "\n")
+        os.chmod(path, 0o600)
+    except OSError as error:
+        return "could not write %s (%s)" % (path, error)
+    return "stored in %s, readable only by you" % path
+
+
+def selftest(settings=None, opener=None, path=None):
+    """Send one real report and say exactly what happened.
+
+    Resend refuses a from-address on a domain it has not verified, and a
+    crash path must swallow that refusal — which is why the failure of
+    this whole idea looks like silence. This is the one place that asks
+    out loud.
+    """
+    key, to, sender = settings or mail_settings()
+    _key, source = key_and_source(path=None) if settings is None else (key, "the settings given")
+    # Say the route before saying the result. A report that arrives is not
+    # proof it went where you meant: on 2026-09-10 this machine had a
+    # sibling project's key and inbox in its environment, and a "sent"
+    # naming neither would have been believed.
+    route = "using %s, addressed to %s from %s" % (source or "no key", to, sender)
+
+    reason, _entry = report(
+        "Test report from the Tapproval helper",
+        "No traceback: this is the check that the path works, run by hand.",
+        source="selftest", helper=os.environ.get("TAPPROVAL_VERSION", "helper"),
+        settings=settings, opener=opener, path=path)
+    if reason == "sent":
+        return 0, "sent %s — look in that inbox" % route
+    if reason == "mail_not_configured":
+        missing = [name for name, value in (("a key", key), (TO_ENV, to),
+                                            (FROM_ENV, sender)) if not value]
+        return 1, ("not sent: %s missing. The crash is on disk either way."
+                   % ", ".join(missing))
+    return 1, ("not sent (%s), %s. The message above from Resend says why — an "
+               "unverified sending domain is the usual answer." % (reason, route))
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["--install-key"]:
+        print(install_key(sys.stdin.read()))
+        return 0
+    if argv[:1] == ["--test"]:
+        code, said = selftest()
+        print(said)
+        return code
+    print(__doc__.strip().splitlines()[0])
+    print("\n  pbpaste | python3 crash_report.py --install-key"
+          "\n  python3 crash_report.py --test")
+    return 0
+
+
 def _reset_for_tests():
     global _window_start, _sent_in_window
     _seen.clear()
     _window_start, _sent_in_window = 0.0, 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

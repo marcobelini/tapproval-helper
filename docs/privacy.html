@@ -35,10 +35,24 @@ conversations, or your taps.</p>
 Store. We receive no payment details and keep no purchase records
 beyond what StoreKit provides on-device.</p>
 <h2>What the open-source helper stores locally</h2>
-<p>The helper keeps a small audit log on your computer (which prompts
-appeared and how they were answered) so the app can show you your day.
-It records project folder names only — never full paths, never file
-contents — and it never leaves your machine.</p>
+<p>The helper writes two files on your computer. Neither of them leaves it.</p>
+<p><strong>An audit log</strong> — which prompts appeared and how they were answered — so
+the app can show you your day. It records project folder names only:
+never full paths, never file contents.</p>
+<p><strong>A crash record.</strong> If the helper itself fails, it writes down what failed
+before it tries anything else, so that a fault cannot pass unnoticed. This
+one is a programmer's diagnostic rather than a summary, so it holds the
+error and the trace of the code that led to it — and a trace does name the
+files the code was running in, which means full paths to them. It does not
+contain your prompts, your code or your conversations. Your watch reports
+its own faults the same way, to your own computer, over the connection it
+is already using.</p>
+<p>The helper can also e-mail a crash record, and on your machine it will
+not: doing so needs a mail key kept outside the program, and a copy you
+install does not have one. So it records the fault and shows it to you,
+and sends nothing to anybody. If you ever want us to see one, you send
+it — see the support section below for what happens to a message you
+write to us.</p>
 <h2>GDPR</h2>
 <p>Tapproval is made in Denmark, so European data protection law (the GDPR)
 applies to it. Most privacy policies use this section to list everything

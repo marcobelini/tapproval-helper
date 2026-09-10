@@ -24,7 +24,10 @@ jobs:
       - name: Refuse third-party dependencies
         run: |
           # Standard library only is a hard constraint: hooks run under an
-          # interpreter we do not control. Guard it in CI, not in review.
+          # interpreter we do not control. This half catches the packaging
+          # files; what the code actually imports is walked by
+          # TestStandardLibraryOnly in the suite below, because "no
+          # requirements.txt" is not what the rule says.
           test ! -f requirements.txt
           test ! -f pyproject.toml
       - run: pip install pytest

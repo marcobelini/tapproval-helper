@@ -15,12 +15,14 @@ filesystem for audit-log tests.
 """
 
 import ast
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import sysconfig
 import time
 
 import pytest
@@ -4918,12 +4920,107 @@ class TestTheHelperReportsItsOwnCrashes:
         assert reason == "mail_not_configured"
         assert "could not write" in capsys.readouterr().err
 
+    def test_the_key_is_stored_where_only_its_owner_can_read_it(self, tmp_path):
+        target = tmp_path / "keys" / "resend-key"
+        said = crash_report.install_key("re_abc123\n", path=str(target))
+        assert "stored" in said and "re_abc123" not in said, "never echo the key"
+        assert target.read_text().strip() == "re_abc123"
+        assert oct(os.stat(target).st_mode & 0o777) == "0o600"
+
+    def test_something_that_is_not_a_key_is_refused_before_it_is_written(self, tmp_path):
+        target = tmp_path / "resend-key"
+        said = crash_report.install_key("https://resend.com/api-keys", path=str(target))
+        assert "does not look like" in said
+        assert not target.exists()
+        assert "nothing on the clipboard" in crash_report.install_key("  ", path=str(target))
+
+    def test_the_selftest_says_which_piece_is_missing(self, tmp_path):
+        code, said = crash_report.selftest(settings=(None, "to@x", None),
+                                           path=str(tmp_path / "c"))
+        assert code == 1
+        assert "a key" in said and "CRASH_REPORT_FROM" in said
+        assert "on disk either way" in said
+
+    def test_the_selftest_names_the_inbox_when_it_works(self, tmp_path):
+        class Post:
+            status = 200
+            def __call__(self, request, timeout=None): return self
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        code, said = crash_report.selftest(
+            settings=("key", "to@example.org", "from@example.org"),
+            opener=Post(), path=str(tmp_path / "c"))
+        assert code == 0 and "to@example.org" in said
+
     def test_the_key_is_read_from_a_file_outside_the_repository(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("RESEND_API_KEY", raising=False)
+        monkeypatch.delenv(crash_report.KEY_ENV, raising=False)
         assert crash_report.api_key(str(tmp_path / "absent")) is None
         key = tmp_path / "resend-key"
         key.write_text("re_secret\n")
         assert crash_report.api_key(str(key)) == "re_secret"
+
+    def test_a_sibling_apps_key_does_not_configure_this_one(self, tmp_path, monkeypatch):
+        """Found on 2026-09-10, and the reason these names carry a prefix.
+
+        `RESEND_API_KEY` is what every app that speaks to Resend calls its
+        key, so a machine with one exported for other work was silently
+        configuring this helper. On a stranger's computer that meant their
+        crash — traceback and paths included — posted to Resend under their
+        own account and addressed, by default, to the author. Resend
+        refuses it, their account having verified no such domain, but the
+        POST has already left. "Nothing reaches us" has to hold on a
+        machine nobody configured.
+        """
+        monkeypatch.delenv(crash_report.KEY_ENV, raising=False)
+        monkeypatch.setenv("RESEND_API_KEY", "re_someone_elses_key")
+        assert crash_report.api_key(str(tmp_path / "absent")) is None
+
+    def test_a_sibling_apps_inbox_does_not_redirect_this_one(self, tmp_path, monkeypatch):
+        """The same collision on the addresses, which is how a `--test`
+        could have reported success while sending through another app's
+        account to another app's mailbox."""
+        monkeypatch.setenv("CRASH_REPORT_TO", "someone-else@example.org")
+        monkeypatch.setenv("CRASH_REPORT_FROM", "someone-else@send.example.org")
+        _key, to, sender = crash_report.mail_settings(
+            key_path=str(tmp_path / "absent"))
+        assert to == crash_report.DEFAULT_TO
+        assert sender == crash_report.DEFAULT_FROM
+
+    def test_the_prefixed_names_still_configure_it(self, tmp_path, monkeypatch):
+        """Overriding is allowed — it just has to be this app you mean."""
+        monkeypatch.setenv(crash_report.TO_ENV, "mine@example.org")
+        monkeypatch.setenv(crash_report.FROM_ENV, "mine@send.example.org")
+        _key, to, sender = crash_report.mail_settings(
+            key_path=str(tmp_path / "absent"))
+        assert (to, sender) == ("mine@example.org", "mine@send.example.org")
+
+    def test_the_key_file_beats_the_environment(self, tmp_path, monkeypatch):
+        """`--install-key` writes the file, so the file has to win: a paste
+        that appears to work and is then ignored by a variable exported
+        months ago is the worst of both."""
+        monkeypatch.setenv(crash_report.KEY_ENV, "re_from_the_environment")
+        key = tmp_path / "resend-key"
+        key.write_text("re_from_the_file\n")
+        assert crash_report.api_key(str(key)) == "re_from_the_file"
+        assert crash_report.key_and_source(str(key))[1] == "the key file"
+        key.unlink()
+        found, source = crash_report.key_and_source(str(key))
+        assert found == "re_from_the_environment"
+        assert source == "$" + crash_report.KEY_ENV
+
+    def test_the_selftest_names_the_route_and_never_the_key(self, tmp_path):
+        """A result that does not say where it went is not proof."""
+        class Post:
+            status = 200
+            def __call__(self, request, timeout=None): return self
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        code, said = crash_report.selftest(
+            settings=("re_never_print_me", "to@example.org", "from@example.org"),
+            opener=Post(), path=str(tmp_path / "c"))
+        assert code == 0
+        assert "to@example.org" in said and "from@example.org" in said
+        assert "re_never_print_me" not in said, "never echo the key"
 
     def test_no_key_lives_in_a_tracked_file(self):
         """A public clone records and shows crashes and sends nothing. That
@@ -4941,7 +5038,7 @@ class TestTheHelperReportsItsOwnCrashes:
         import threading
         monkeypatch.setattr(crash_report, "CRASH_LOG", str(tmp_path / "c"))
         monkeypatch.setattr(crash_report, "KEY_FILE", str(tmp_path / "no-key"))
-        monkeypatch.delenv("RESEND_API_KEY", raising=False)
+        monkeypatch.delenv(crash_report.KEY_ENV, raising=False)
         chained = []
         monkeypatch.setattr(threading, "excepthook", lambda args: chained.append(args))
         assert watch_relay.install_crash_reporting() is True
@@ -6427,3 +6524,121 @@ class TestTheEffectOntology:
         for path in ("~/.kube/config", "~/.npmrc", "~/.pypirc",
                      "~/.docker/config.json", "~/.config/gh/hosts.yml"):
             assert crc.SECRET_PATH.search(path), path
+
+
+class TestStandardLibraryOnly:
+    """Hard constraint 1, held by something that has been seen to fail.
+
+    CI's guard for this was `test ! -f requirements.txt` — which is not
+    what the rule says. The rule is about what the code imports, and a
+    `import requests` added to the relay passes that check every time. In
+    practice the suite caught it anyway, because CI installs only pytest
+    and this file imports every module; but that is an accident of how
+    the imports at the top of this file happen to be written, not a
+    check, and it lasts exactly as long as somebody remembers to add the
+    next module to them.
+
+    This walks the source instead, and it takes **every** .py at the top
+    of the repository rather than a list. That is the actual defect the
+    2026-09-09 audit found twice: a guard that names its files by hand
+    does not cover the file added tomorrow. `crash_report.py` and
+    `watch_permission_tool.py` shipped on 2026-09-09 and joined neither
+    the lint list nor any import check.
+
+    WatchApp/asc is deliberately excluded: the release tooling runs on
+    one machine, in a virtual environment, and genuinely uses PyJWT and
+    cryptography. The constraint is about code that runs on a stranger's
+    computer.
+    """
+
+    #: pytest is the one third-party import allowed, and only here: the
+    #: test suite is not what a user's interpreter is asked to run.
+    ALLOWED_THIRD_PARTY = {"test_claude_risk_classifier.py": {"pytest"}}
+
+    @staticmethod
+    def _root_modules():
+        """Every .py at the top of the repository, discovered not listed."""
+        found = sorted(name for name in os.listdir(_ROOT)
+                       if name.endswith(".py"))
+        # If this ever comes back short, the discovery broke, not the repo.
+        assert len(found) >= 5, found
+        return found
+
+    @staticmethod
+    def _imported_names(source):
+        """Top-level package of every import anywhere in the module.
+
+        Includes imports inside functions and `try:` blocks — several
+        modules import urllib lazily, and a third-party import hidden in
+        a rarely-taken branch is the one that would survive review.
+        """
+        names = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                names.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:      # relative: our own package, by definition
+                    continue
+                if node.module:
+                    names.add(node.module.split(".")[0])
+        return names
+
+    @staticmethod
+    def _is_standard_library(name):
+        """True for a module that ships with the interpreter itself.
+
+        `sys.stdlib_module_names` would say this in one line, and does
+        not exist before 3.10 — and 3.9 is in the matrix precisely
+        because macOS still ships it. So resolve the module and ask where
+        it lives: builtin, frozen, or under the interpreter's own stdlib
+        directory. Anything from site-packages fails, which is the case
+        this exists to catch.
+        """
+        if name in sys.builtin_module_names:
+            return True
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, ValueError):
+            return False
+        if spec is None:
+            return False
+        origin = spec.origin or ""
+        if origin in ("built-in", "frozen"):
+            return True
+        stdlib = sysconfig.get_paths()["stdlib"]
+        return (os.path.commonpath([os.path.abspath(origin), stdlib]) == stdlib
+                and "site-packages" not in origin)
+
+    def test_every_module_at_the_root_imports_only_the_standard_library(self):
+        ours = {name[:-3] for name in self._root_modules()}
+        for module in self._root_modules():
+            with open(os.path.join(_ROOT, module), encoding="utf-8") as handle:
+                imported = self._imported_names(handle.read())
+            allowed = ours | self.ALLOWED_THIRD_PARTY.get(module, set())
+            for name in sorted(imported - allowed):
+                assert self._is_standard_library(name), (
+                    "%s imports %r, which is not in the standard library. "
+                    "Hooks run under whatever python3 is on the user's "
+                    "PATH; see CLAUDE.md, hard constraint 1." % (module, name))
+
+    def test_the_guard_can_fail(self):
+        """Issue #38: prove it, do not assert it.
+
+        The check above passes today. It would also pass today if it were
+        written wrongly, so this hands it a module that must fail.
+        """
+        assert not self._is_standard_library("pytest"), (
+            "pytest resolved as standard library — the check cannot fail, "
+            "which means it is not a check")
+        imported = self._imported_names("import os\nimport requests\n")
+        assert imported == {"os", "requests"}
+        assert self._is_standard_library("os")
+
+    def test_an_import_hidden_in_a_branch_is_still_seen(self):
+        """The shape that would otherwise slip through review."""
+        source = ("def send():\n"
+                  "    try:\n"
+                  "        import requests\n"
+                  "    except ImportError:\n"
+                  "        from urllib import request\n")
+        assert self._imported_names(source) == {"requests", "urllib"}
