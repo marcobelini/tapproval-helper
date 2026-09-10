@@ -4927,6 +4927,45 @@ class TestTheHelperReportsItsOwnCrashes:
         assert target.read_text().strip() == "re_abc123"
         assert oct(os.stat(target).st_mode & 0o777) == "0o600"
 
+    def test_the_request_carries_a_user_agent(self):
+        """Cloudflare fronts Resend and refuses urllib's default agent with
+        a bare 403 and "error code: 1010" — nothing from Resend at all. So
+        no key of any kind could send from here, and the failure looked
+        exactly like a rejected key. Found 2026-09-10 against a live key,
+        which then answered 401 restricted_api_key: through Cloudflare, and
+        the right answer for a send-only key."""
+        seen = {}
+        class Reply:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        def opener(request, timeout=None):
+            seen["headers"] = {k.lower(): v for k, v in request.header_items()}
+            return Reply()
+        crash_report.send({"at": "now", "message": "m", "stack": "s",
+                           "source": "test", "helper": "h"}, 1, 0,
+                          settings=("re_k", "to@x", "from@x"), opener=opener)
+        assert seen["headers"].get("User-agent".lower()), (
+            "without a User-Agent Cloudflare answers 403 before Resend sees it")
+
+    def test_a_refusal_carries_the_servers_own_words(self):
+        """The selftest promised "the message above from Resend says why"
+        and printed "HTTP Error 403: Forbidden" — a number and no reason,
+        which sends the reader looking for an explanation never written."""
+        class Refusal(urllib.error.HTTPError):
+            def __init__(self):
+                urllib.error.HTTPError.__init__(
+                    self, "https://api.resend.com/emails", 401, "Unauthorized",
+                    {}, None)
+            def read(self):
+                return b'{"statusCode":401,"name":"restricted_api_key"}'
+        said = crash_report._why(Refusal())
+        assert "401" in said and "restricted_api_key" in said, said
+
+    def test_a_refusal_with_no_body_still_reads_as_an_error(self):
+        said = crash_report._why(OSError("connection reset"))
+        assert "connection reset" in said
+
     def test_a_pipe_is_read_and_a_person_is_asked(self):
         """Two ways in, because the clipboard is not always where the key
         is. Piped, it is read. On a terminal it is asked for — the old

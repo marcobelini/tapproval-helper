@@ -52,6 +52,10 @@ CRASH_LOG_MAX = 512 * 1024
 # which is why a public clone sends nothing.
 KEY_FILE = os.path.expanduser("~/.appstoreconnect/resend-key")
 
+# Sent with every request, and not decoration: Cloudflare fronts Resend
+# and blocks urllib's default agent with a bare 403.
+USER_AGENT = "Tapproval-helper"
+
 # One contact address for the whole project (CLAUDE.md), and the shared
 # sending subdomain, with the app in the local part so a report in the
 # inbox can be told from another app's.
@@ -206,7 +210,15 @@ def send(entry, count, first, settings=None, opener=None):
     request = urllib.request.Request(
         "https://api.resend.com/emails", data=payload,
         headers={"Authorization": "Bearer " + key,
-                 "Content-Type": "application/json"})
+                 "Content-Type": "application/json",
+                 # Cloudflare fronts Resend and refuses urllib's default
+                 # agent outright — 403, "error code: 1010", nothing from
+                 # Resend at all. So no key of any kind could ever have
+                 # sent from here; the failure was in the request, and it
+                 # looked exactly like a rejected key. Found 2026-09-10
+                 # against a live key, which then answered 401
+                 # restricted_api_key: through Cloudflare, and correct.
+                 "User-Agent": USER_AGENT})
     try:
         with (opener or urllib.request.urlopen)(
                 request, timeout=SEND_TIMEOUT) as reply:
@@ -215,8 +227,26 @@ def send(entry, count, first, settings=None, opener=None):
         # Resend refuses a from-address on a domain it has not verified, and
         # the refusal must be visible: a silent failure here is precisely the
         # state that looked like "no crashes" for weeks.
-        print("crash_report: send failed (%s)" % error, file=sys.stderr)
+        print("crash_report: send failed (%s)" % _why(error), file=sys.stderr)
         return "send_failed"
+
+
+def _why(error):
+    """The error with the server's own words, when it left any.
+
+    `HTTPError` stringifies to "HTTP Error 403: Forbidden", which names a
+    number and no reason, while the body says `restricted_api_key` or
+    which domain is unverified. The selftest promised "the message above
+    from Resend says why" and printed the number — a sentence that made
+    the reader look for an explanation that was never there.
+    """
+    body = ""
+    try:
+        raw = error.read()                    # HTTPError is a response too
+        body = raw.decode("utf-8", "replace").strip()[:MAX_MESSAGE]
+    except Exception:
+        pass
+    return "%s%s" % (error, " — %s" % body if body else "")
 
 
 def report(message, stack, source="process", helper=None, now=None,
