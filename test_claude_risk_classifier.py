@@ -2901,9 +2901,12 @@ class TestLanSourceIsNotTrusted:
                   "detail": "keyNotFound(status)", "app_version": "1.1",
                   "build": "115"})
         assert status == 200 and body["ok"] is True
-        # Honest about what happened to it: recorded is not e-mailed.
-        assert body["reported"] in ("mail_not_configured", "sent", "duplicate",
-                                    "rate_limited", "send_failed")
+        # Honest about what happened to it: recorded is not e-mailed. And
+        # "sent" is NOT among the acceptable answers — on 2026-09-10 this
+        # very fixture reached the owner's inbox, twice, because a key had
+        # been installed and nothing stopped a test run from using it.
+        assert body["reported"] in ("mail_not_configured", "not_sent_in_tests",
+                                    "duplicate", "rate_limited"), body["reported"]
 
     def test_a_report_with_nothing_in_it_is_refused(self, lan):
         base, _, _ = lan
@@ -5071,6 +5074,43 @@ class TestTheHelperReportsItsOwnCrashes:
         key = tmp_path / "resend-key"
         key.write_text("re_secret\n")
         assert crash_report.api_key(str(key)) == "re_secret"
+
+    def test_a_test_run_never_sends_real_mail(self, tmp_path, monkeypatch):
+        """The owner got a crash report about a watch build that had not
+        crashed. It was this suite's own fixture: a test posts to
+        /diagnostic, the handler calls report() for real, and once a key
+        existed the reporter did what it is for.
+
+        The guard is about the process, not the caller. Injecting settings
+        fixes the tests you thought of, and this was not one of them.
+        """
+        key = tmp_path / "resend-key"
+        key.write_text("re_a_real_looking_key\n")
+        monkeypatch.setattr(crash_report, "KEY_FILE", str(key))
+        # No opener: without the guard this would reach api.resend.com.
+        reason = crash_report.send(
+            {"at": "now", "message": "m", "stack": "s",
+             "source": "test", "helper": "h"}, 1, 0)
+        assert reason == "not_sent_in_tests", reason
+
+    def test_an_injected_opener_still_exercises_the_send_path(self, tmp_path):
+        """The guard must not make the send path untestable — an opener is
+        a test saying which door to use, and that stays allowed."""
+        class Post:
+            status = 200
+            def __call__(self, request, timeout=None): return self
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        assert crash_report.send(
+            {"at": "now", "message": "m", "stack": "s",
+             "source": "test", "helper": "h"}, 1, 0,
+            settings=("re_k", "to@x", "from@x"), opener=Post()) == "sent"
+
+    def test_the_guard_reads_the_process_not_a_flag(self):
+        assert crash_report.running_under_test(env={}, modules={"pytest": object()})
+        assert crash_report.running_under_test(
+            env={"PYTEST_CURRENT_TEST": "x"}, modules={})
+        assert not crash_report.running_under_test(env={}, modules={})
 
     def test_a_sibling_apps_key_does_not_configure_this_one(self, tmp_path, monkeypatch):
         """Found on 2026-09-10, and the reason these names carry a prefix.

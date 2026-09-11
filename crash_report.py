@@ -197,11 +197,39 @@ def body_for(entry, count, first):
     return "\n".join(lines)
 
 
+def running_under_test(env=None, modules=None):
+    """True inside a test run, where sending real mail is a defect.
+
+    On 2026-09-10 the owner received a crash report about a watch build
+    that had not crashed. It was a fixture: a test POSTs to /diagnostic,
+    the handler calls report() for real, and once a key existed the
+    reporter did what it is for. `uvx pytest` mailed the production
+    inbox, twice, and the test even listed "sent" among its acceptable
+    outcomes — so the suite was not merely allowed to do this, it was
+    written expecting it might.
+
+    A crash reporter is exactly the wrong thing to leave a live side
+    effect in. It runs inside error paths, so a test that reaches one at
+    all reaches this, and the cost lands in a real inbox and a real
+    sending quota. The check is deliberately about the *process*, not
+    about any one caller: injecting settings fixes the tests you thought
+    of, and this one was not thought of.
+    """
+    env = os.environ if env is None else env
+    modules = sys.modules if modules is None else modules
+    return bool(env.get("PYTEST_CURRENT_TEST")) or "pytest" in modules
+
+
 def send(entry, count, first, settings=None, opener=None):
     """POST one report to Resend. Returns a reason string, never raises."""
     key, to, sender = settings or mail_settings()
     if not (key and to and sender):
         return "mail_not_configured"
+    # An injected opener is a test saying which door to use; that is fine
+    # and is how the send path is exercised. Reaching the real network
+    # from a test run is not.
+    if opener is None and running_under_test():
+        return "not_sent_in_tests"
     payload = json.dumps({
         "from": sender, "to": [to],
         "subject": subject_for(entry, count),
