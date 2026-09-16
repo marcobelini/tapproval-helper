@@ -432,10 +432,34 @@ def _stop_relay(deadline=8.0):
                 pass
         end = time.time() + wait
         while time.time() < end:
-            if _probe_relay(timeout=1) is None:
+            if _relay_is_down():
                 return True
             time.sleep(0.4)
-    return _probe_relay(timeout=1) is None
+    return _relay_is_down()
+
+
+def _port_in_use(port, host="127.0.0.1", timeout=1.0):
+    """True while something is listening. Unknown counts as in use: this
+    answers "may I bind?", and a maybe is a no."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (ConnectionRefusedError, socket.timeout, OSError):
+        return False
+
+
+def _relay_is_down():
+    """Both listeners gone, not just the one that answers /health.
+
+    The old check asked the main port only, and on 2026-09-11 that was
+    enough to report a stop that had not finished: the main port came
+    free, --ensure started a replacement, and the replacement died
+    binding the TUNNEL port the dying relay still held. A stop proved on
+    one of two sockets is the same class of mistake as the pkill whose
+    exit code nobody read.
+    """
+    return _probe_relay(timeout=1) is None and not _port_in_use(TUNNEL_PORT)
 
 
 def _admin_call(path, timeout=5):
@@ -1038,10 +1062,21 @@ def start_session(path, text, projects_dir=None, platform=None):
     if not shutil.which("claude"):
         return "claude not on PATH"
     script = 'cd %s && claude %s' % (shlex.quote(path), shlex.quote(text))
+    # json.dumps is the right escaper for the quotes and backslashes an
+    # AppleScript string literal understands — but only with
+    # ensure_ascii=False. Left at its default it writes \u00e5 for "å",
+    # and AppleScript has no \u escape: it does not mangle the text, it
+    # refuses to parse, "Expected \u201d\"\u201d but found unknown token".
+    # So every session started from the wrist in Danish, or with an emoji
+    # or a smart quote, lost this route and limped along on the .command
+    # fallback below — which uses the unescaped string and therefore
+    # worked, which is exactly why nobody noticed for the life of the
+    # feature. A fallback that hides a failure is a fallback that stops
+    # you fixing it.
     apple = ('tell application "Terminal"\n'
              '  activate\n'
              '  do script %s\n'
-             'end tell' % json.dumps(script))
+             'end tell' % json.dumps(script, ensure_ascii=False))
     try:
         done = subprocess.run(["osascript", "-e", apple], capture_output=True,
                               text=True, timeout=4)
@@ -2407,8 +2442,25 @@ def _start_tunnel(queue, auth):
     independent secrets on the public path: the unguessable rendezvous
     prefix says where, the device token says who."""
     global _TUNNEL_HANDLER
-    tunnel_server, _ = serve("127.0.0.1", TUNNEL_PORT,
-                             queue=queue, token=auth.tunnel_secret, auth=auth)
+    try:
+        tunnel_server, _ = serve("127.0.0.1", TUNNEL_PORT,
+                                 queue=queue, token=auth.tunnel_secret,
+                                 auth=auth)
+    except OSError as error:
+        # 2026-09-11, 23:58: this raised out of main() and killed a relay
+        # whose MAIN listener had already bound. The away route is the
+        # fallback, not the product — losing it must never cost the local
+        # path, which is the one the wrist uses at the desk all day. Same
+        # rule the missing-cloudflared branch below already follows: say
+        # so on Check connection and carry on.
+        note_condition(
+            "tunnel",
+            "Answering from away is off: the travel port is already in use "
+            "on this computer, usually another Tapproval still shutting "
+            "down. Approvals at home are unaffected.")
+        print("relay: tunnel port %d unavailable (%s) — continuing without "
+              "the away route" % (TUNNEL_PORT, error), file=sys.stderr)
+        return None
     _TUNNEL_HANDLER = tunnel_server.RequestHandlerClass
     threading.Thread(target=tunnel_server.serve_forever, daemon=True).start()
     return start_tunnel(TUNNEL_PORT, auth.tunnel_secret)

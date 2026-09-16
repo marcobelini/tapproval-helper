@@ -20,8 +20,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import sysconfig
 import time
 
@@ -155,7 +157,7 @@ def relay_call(url, token=None, method="GET", body=None):
     headers = {"Content-Type": "application/json"}
     if token:
         headers["X-Tapproval-Token"] = token
-    data = _json.dumps(body or {}).encode() if method == "POST" else None
+    data = json.dumps(body or {}).encode() if method == "POST" else None
     request = urllib.request.Request(url, data=data, headers=headers,
                                      method=method)
     try:
@@ -1466,7 +1468,7 @@ class TestRecapSummary:
 
     def _log(self, tmp_path, rows, trailing=""):
         path = tmp_path / "audit.jsonl"
-        path.write_text("\n".join(_json.dumps(r) for r in rows) + "\n" + trailing,
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n" + trailing,
                         encoding="utf-8")
         return str(path)
 
@@ -1535,7 +1537,7 @@ class TestRecapSummary:
         # The log grows, as it does during any live session.
         with open(path, "a", encoding="utf-8") as handle:
             for _ in range(50):
-                handle.write(_json.dumps({"ts": "2026-09-02T10:00:00+00:00",
+                handle.write(json.dumps({"ts": "2026-09-02T10:00:00+00:00",
                                           "tier": "SAFE",
                                           "decision": "allow"}) + "\n")
         within = self.NOW + wd.RECAP_MIN_INTERVAL - 1
@@ -1651,7 +1653,7 @@ class TestRelayTunnelToken:
         base, queue = tokened
         request = urllib.request.Request(
             base + "/t/s3cret/card",
-            data=_json.dumps({"card": {"tier": "HIGH", "headline": "x",
+            data=json.dumps({"card": {"tier": "HIGH", "headline": "x",
                                        "detail": "x"}}).encode(),
             headers={"Content-Type": "application/json"})
         try:
@@ -1695,6 +1697,23 @@ class TestSelfStartingRelay:
     """--install wires a SessionStart hook so the relay's lifecycle is
     automatic: it exists whenever Claude Code does. No extra hardware, no
     always-on machine, nothing for the user to run."""
+
+    @pytest.fixture(autouse=True)
+    def _off_the_machines_ports(self, monkeypatch):
+        """Point TUNNEL_PORT at a port nobody holds.
+
+        Since a stop is only proved when BOTH listeners are gone, these
+        tests would otherwise consult the developer's own running relay
+        and fail on a laptop while passing in CI — the worst direction for
+        a test to be wrong in, and a coupling this suite already had one
+        of elsewhere.
+        """
+        import socket
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        free = probe.getsockname()[1]
+        probe.close()
+        monkeypatch.setattr(watch_relay, "TUNNEL_PORT", free)
 
     def test_install_registers_session_start_relay(self, settings, capsys):
         crc.run_install()
@@ -3251,6 +3270,48 @@ class TestSlashCommandsReachTheWrist:
         assert ("user", "text", "/recap") in kinds
         assert ("system", "notice", "Goal: fix checkout. Now: the race. Next: wait for the job.") in kinds
 
+    def test_a_recap_arrives_whole_with_its_lines(self, tmp_path):
+        """The fixture above is 58 characters, which is why nobody saw
+        that a real /recap — several paragraphs — was flattened to one
+        line and cut at 200 with no marker before it left the Mac. On the
+        wrist, the tap that opens a collapsed bubble then revealed the
+        same 200 characters, so it read as the command's own answer."""
+        recap = ("Goal: get Tapproval onto the App Store.\n"
+                 "\n"
+                 "Today: build 117 went to every TestFlight group, the purchase "
+                 "error wording was fixed, and Apple's rejection under 2.1(b) was "
+                 "traced to the Paid Apps Agreement rather than the code.\n"
+                 "\n"
+                 "Next: confirm the agreement is active, rename the rejected "
+                 "version to 1.1, attach a build that carries the fix, buy the "
+                 "unlock once in sandbox on a real wrist, and resubmit.\n"
+                 "\n"
+                 "Blocked: nothing store-side until the agreement shows active.")
+        assert len(recap) > 200, "the case the old cap would have cut"
+        _write_transcript(tmp_path, "-p", "recap3.jsonl", [
+            {"cwd": "/x", "message": {"role": "user", "content": "status?"}},
+            {"message": {"role": "user", "content": "<command-name>/recap</command-name>"
+                                                   "<command-message>recap</command-message>"
+                                                   "<command-args></command-args>"}},
+            {"type": "system", "subtype": "local_command", "level": "info",
+             "content": "<local-command-stdout>%s</local-command-stdout>" % recap},
+        ])
+        turns = watch_relay.session_thread("recap3", projects_dir=str(tmp_path))
+        notice = [t["text"] for t in turns if t.get("kind") == "notice"][0]
+        assert notice.endswith("until the agreement shows active."), (
+            "cut short: %r" % notice[-60:])
+        assert "…" not in notice, "nothing this size should be marked as cut"
+        assert notice.count("\n") >= 3, (
+            "a recap has paragraphs; flattening them to one line is its own "
+            "kind of truncation: %r" % notice[:120])
+
+    def test_only_something_enormous_is_cut_and_it_says_so(self):
+        huge = {"type": "system", "subtype": "local_command",
+                "content": "<local-command-stdout>%s</local-command-stdout>"
+                           % ("word " * 5000)}
+        said = watch_dashboard._system_text(huge)
+        assert len(said) <= 12002 and said.endswith(" …"), (len(said), said[-10:])
+
     def test_an_unknown_command_is_a_notice_not_silence(self, tmp_path):
         _write_transcript(tmp_path, "-p", "recap2.jsonl", [
             {"cwd": "/x", "message": {"role": "user", "content": "hello"}},
@@ -3728,7 +3789,7 @@ class TestCloudHeartbeat:
         assert not queue.watch_present()
         request = urllib.request.Request(
             "http://127.0.0.1:%d/heartbeat" % port,
-            data=_json.dumps({"watch_seen_seconds_ago": 12}).encode(),
+            data=json.dumps({"watch_seen_seconds_ago": 12}).encode(),
             headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=5) as reply:
             assert _json.loads(reply.read())["ok"] is True
@@ -4674,7 +4735,13 @@ class TestInstallTranscript:
         crc.main(["--install", "--watch"])
         out = capsys.readouterr().out
         assert "24 hours" in out
-        assert "1440" not in out
+        # Held to the sentence, not the whole transcript. The transcript
+        # also prints a backup filename stamped with the clock, and at
+        # 14:40:54 on 2026-09-16 that stamp contained "1440" — CI went red
+        # on a pull request that had not touched this code, and would have
+        # gone red at 14:40 on any day.
+        line = next(row for row in out.splitlines() if "24 hours" in row)
+        assert "1440" not in line
 
     @pytest.mark.parametrize("seconds,expected", [
         (60, "1 minute"), (300, "5 minutes"), (3600, "1 hour"),
@@ -5392,6 +5459,144 @@ class TestTheWristAnswersAHeadlessSend:
         must keep sending messages, not fail every send on a missing
         file."""
         assert watch_relay._permission_tool_flags("/nowhere/absent.py") == []
+
+
+class TestALostTunnelIsNotALostRelay:
+    """2026-09-11, 23:58, from the crash reporter's first real e-mail.
+
+    A relay started while the previous one was still shutting down. The
+    main listener bound; the tunnel listener hit "Address already in use";
+    the OSError left main() and killed a process whose primary socket was
+    already serving. The away route is the fallback, not the product.
+    """
+
+    def test_a_busy_tunnel_port_does_not_kill_the_relay(self, monkeypatch):
+        import socket
+        holder = socket.socket()
+        holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        busy = holder.getsockname()[1]
+        monkeypatch.setattr(watch_relay, "TUNNEL_PORT", busy)
+        watch_relay.clear_condition("tunnel")
+        try:
+            auth = watch_relay.Auth(path=None) if hasattr(watch_relay, "Auth") else None
+            got = watch_relay._start_tunnel(watch_relay.CardQueue(), auth)
+        finally:
+            holder.close()
+        assert got is None, "a busy tunnel port must not raise"
+        keys = [c["key"] for c in watch_relay.conditions()]
+        assert "tunnel" in keys, "and it must not be silent either"
+        said = [c["detail"] for c in watch_relay.conditions()
+                if c["key"] == "tunnel"][0]
+        assert "away" in said.lower() and "unaffected" in said.lower(), said
+        watch_relay.clear_condition("tunnel")
+
+    def test_a_stop_is_not_proved_by_one_of_two_ports(self, monkeypatch):
+        """The trigger. --ensure watched the main port only, saw it free,
+        and started a replacement into a tunnel port still held."""
+        import socket
+        holder = socket.socket()
+        holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        busy = holder.getsockname()[1]
+        monkeypatch.setattr(watch_relay, "TUNNEL_PORT", busy)
+        monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: None)
+        try:
+            assert watch_relay._relay_is_down() is False, (
+                "the main port being free is not the whole answer"
+            )
+        finally:
+            holder.close()
+        assert watch_relay._relay_is_down() is True
+
+    def test_a_port_nobody_holds_reads_as_free(self):
+        import socket
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        free = probe.getsockname()[1]
+        probe.close()
+        assert watch_relay._port_in_use(free) is False
+
+
+class TestAWatchThatSpeaksDanish:
+    """The wrist is Danish, and so is much of what gets typed on it.
+
+    Found by review on 2026-09-11 against the real compiler rather than by
+    reading. ``json.dumps`` at its default writes a \\u escape for any
+    non-ASCII character, and AppleScript has no such escape: it does not
+    mangle the text, it refuses to compile. Every session started from the
+    wrist containing a Danish letter, an emoji or one of the smart quotes
+    iOS substitutes as you type lost the Terminal route for the whole life
+    of the feature — and nobody noticed, because the .command fallback
+    uses the unescaped string and quietly worked.
+
+    Compiled with osacompile, never osascript: running it would ask
+    Terminal for an automation consent a test cannot give, and hang.
+    """
+
+    @staticmethod
+    def _compiles(text, ensure_ascii=False):
+        """(ok, what it said) for the AppleScript the relay would build."""
+        import shlex as _shlex
+        script = "cd %s && claude %s" % (_shlex.quote("/tmp/p"),
+                                         _shlex.quote(text))
+        apple = ('tell application "Terminal"\n'
+                 "  activate\n"
+                 "  do script %s\n"
+                 "end tell" % json.dumps(script, ensure_ascii=ensure_ascii))
+        target = os.path.join(tempfile.mkdtemp(), "t.scpt")
+        done = subprocess.run(["osacompile", "-o", target, "-e", apple],
+                              capture_output=True, text=True, timeout=30)
+        return done.returncode == 0, ((done.stderr or "") + (done.stdout or "")).strip()
+
+    @pytest.mark.parametrize("text", [
+        "ordinary ascii",
+        "k\u00f8r testene",                       # Danish
+        "ship it \U0001f680",                     # emoji
+        "fix the \u201csmart\u201d quotes",        # what iOS types for you
+    ])
+    def test_what_the_relay_builds_compiles(self, text):
+        if sys.platform != "darwin" or not shutil.which("osacompile"):
+            pytest.skip("osacompile only exists on macOS")
+        ok, said = self._compiles(text)
+        assert ok, said
+
+    def test_the_old_escaping_is_what_broke_it(self):
+        """Prove the bug, not just the fix. Without this the test above
+        would pass on a version that was never broken in the first place."""
+        if sys.platform != "darwin" or not shutil.which("osacompile"):
+            pytest.skip("osacompile only exists on macOS")
+        ok, said = self._compiles("k\u00f8r testene", ensure_ascii=True)
+        assert not ok and "-2741" in said, said
+        assert self._compiles("ordinary ascii", ensure_ascii=True)[0], (
+            "ASCII was always fine; the fault is the escape, not the quoting")
+
+    def test_the_relay_does_not_use_the_default(self):
+        """Walked as syntax, not as text.
+
+        The first version searched start_session's source for
+        "ensure_ascii=False" and passed with the fix removed, because the
+        comment explaining the fix says the same words. A check a comment
+        can satisfy is not a check.
+        """
+        with open(watch_relay.__file__, encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        func = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "start_session")
+        dumps = [node for node in ast.walk(func)
+                 if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute)
+                 and node.func.attr == "dumps"]
+        assert dumps, "start_session no longer builds the AppleScript here"
+        for call in dumps:
+            kwargs = {kw.arg: kw.value for kw in call.keywords}
+            assert "ensure_ascii" in kwargs, (
+                "json.dumps at its default writes a \\u escape AppleScript "
+                "cannot read — a Danish word becomes a compilation error")
+            assert getattr(kwargs["ensure_ascii"], "value", None) is False
 
 
 class TestNewSessionFromTheWatch:

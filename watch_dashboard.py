@@ -395,14 +395,31 @@ def _command_sent(lead):
 
 
 def _system_text(entry):
-    """What a system line says, with the CLI's own tags peeled off."""
+    """What a system line says, with the CLI's own tags peeled off.
+
+    This is the whole output of a slash command — a /recap is several
+    paragraphs — and it used to be flattened to one line and cut at 200
+    characters with no marker, before it ever left the Mac. The cap was
+    written for the one-line notices ("Unknown command: /verify") that
+    share this shape, and the test fixture for a recap was 58 characters
+    long, which is why nobody saw it. On the wrist the tap that opens a
+    collapsed bubble then revealed the same 200 characters, so the
+    truncation looked like the command's own answer.
+
+    Same rule as an assistant reply now: keep the lines, bound the work
+    rather than the sentence, and if something truly enormous is ever
+    cut, cut at a word and say so.
+    """
     for key in ("content", "message", "text"):
         value = entry.get(key)
         if isinstance(value, dict):
             value = value.get("content")
         if isinstance(value, str) and value.strip():
-            inner = " ".join(m.group(1) for m in _TAGGED_OUT.finditer(value))
-            return " ".join((inner or value).split())[:200]
+            inner = "\n".join(m.group(1) for m in _TAGGED_OUT.finditer(value))
+            text = plain_text((inner or value)[:32768])
+            if len(text) > 12000:
+                text = text[:12000].rsplit(" ", 1)[0] + " …"
+            return text
     return ""
 
 
