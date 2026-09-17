@@ -952,9 +952,9 @@ def _task_state(session_id, task_id):
     a terminal notification; the phone knows better. Each task writes
     .../<session>/tasks/<id>.output. Returns one of three verdicts:
     "done" (an exit marker — terminal, safe to remember forever),
-    "running" (a fresh file with no marker, or no file at all — the
-    transcript's word stands), or "unknown" (stale or unreadable right
-    now). "unknown" is deliberately NOT terminal: a long-quiet task that
+    "running" (a fresh file with no marker), or "unknown" (no file at
+    all, or a stale or unreadable one — see _judge_task_files for why a
+    missing file is not "running"). "unknown" is deliberately NOT terminal: a long-quiet task that
     resumes writing, or a transient read error, must be able to come
     back — only an exit marker is forever.
     """

@@ -151,6 +151,14 @@ def _known_watch(auth):
     return auth
 
 
+def _watch_present(queue):
+    """What /health's watch_seen_seconds_ago means to the wrist: seen
+    within WATCH_PRESENT_SECONDS. The queue used to carry this as a
+    method nothing in production called."""
+    seen = queue.watch_seen_seconds_ago()
+    return seen is not None and seen <= queue.WATCH_PRESENT_SECONDS
+
+
 def relay_call(url, token=None, method="GET", body=None):
     """One HTTP call to a test relay: (status, parsed body). An HTTP
     error is an answer here, not an exception."""
@@ -169,6 +177,27 @@ def relay_call(url, token=None, method="GET", body=None):
         except Exception:
             return error.code, {}
 
+
+
+@pytest.fixture(autouse=True)
+def _no_real_home_files(tmp_path, monkeypatch):
+    """No test may read or write the owner's own Tapproval files.
+
+    Found 2026-09-17: the real crash log held 57 copies of one test's
+    "decode failed: /sessions", a test created the real pairing file with
+    fresh secrets when it was missing, and the say and relay logs were
+    written on every run. Each path is fixed at import, so HOME alone
+    would not have redirected them.
+    """
+    home = tmp_path / "home-files"
+    home.mkdir()
+    monkeypatch.setattr(crash_report, "CRASH_LOG", str(home / "crashes.jsonl"))
+    monkeypatch.setattr(crash_report, "KEY_FILE", str(home / "no-resend-key"))
+    crash_report._reset_for_tests()
+    monkeypatch.setattr(watch_relay, "AUTH_FILE", str(home / "auth.json"))
+    monkeypatch.setattr(watch_relay, "TOKEN_FILE", str(home / "no-token"))
+    monkeypatch.setattr(watch_relay, "RELAY_LOG", str(home / "relay.log"))
+    monkeypatch.setattr(watch_relay, "SAY_LOG", str(home / "say.log"))
 
 
 @pytest.fixture(autouse=True)
@@ -1025,12 +1054,6 @@ class TestInstaller:
 
 
 class TestStatus:
-    def test_reports_not_installed(self, tmp_path, monkeypatch, capsys):
-        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
-        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
-        assert crc.run_status() == 0
-        assert "Installed     : no" in capsys.readouterr().out
-
     def test_reports_installed_and_shadow_mode(self, tmp_path, monkeypatch, capsys):
         # The machine may have wrist approvals switched on globally; this
         # test is about the default, so clear the ambient settings.
@@ -2002,11 +2025,11 @@ class TestSessionsLikeTheApp:
         (tmp_path / "2.json").write_text(json.dumps(
             {"pid": 999999, "sessionId": "dead-1",
              "entrypoint": "claude-desktop"}), encoding="utf-8")
-        live = watch_relay.live_sessions(sessions_dir=str(tmp_path))
+        live = watch_dashboard.live_sessions(sessions_dir=str(tmp_path))
         assert live == {"alive-1": "VS Code"}
 
     def test_live_sessions_survives_a_missing_directory(self, tmp_path):
-        assert watch_relay.live_sessions(sessions_dir=str(tmp_path / "no")) == {}
+        assert watch_dashboard.live_sessions(sessions_dir=str(tmp_path / "no")) == {}
 
     def test_unattended_sdk_runs_stay_off_the_wrist(self, tmp_path):
         """The phone app never lists headless SDK runs; the wrist mirrors
@@ -2017,7 +2040,7 @@ class TestSessionsLikeTheApp:
         (tmp_path / "2.json").write_text(json.dumps(
             {"pid": os.getpid(), "sessionId": "human-1",
              "entrypoint": "claude-vscode"}), encoding="utf-8")
-        live = watch_relay.live_sessions(sessions_dir=str(tmp_path))
+        live = watch_dashboard.live_sessions(sessions_dir=str(tmp_path))
         assert live == {"human-1": "VS Code"}
 
     @pytest.mark.parametrize("url,expected", [
@@ -2033,8 +2056,8 @@ class TestSessionsLikeTheApp:
         # Module-wide cache, so reset it like the site rules — this used to
         # reach into the function's mutable default argument, which is the
         # thing that made the cache invisible and unbounded.
-        watch_relay._REPO_SLUG_CACHE.clear()
-        assert watch_relay.repo_slug("/some/path") == expected
+        watch_dashboard._REPO_SLUG_CACHE.clear()
+        assert watch_dashboard.repo_slug("/some/path") == expected
 
     @pytest.mark.parametrize("text,expected", [
         ("Pantri app seems unresponsive. /debug and verify", "Pantri app seems unresponsive"),
@@ -2043,7 +2066,7 @@ class TestSessionsLikeTheApp:
         ("x" * 80, "X" + "x" * 42 + "…"),
     ])
     def test_derive_title(self, text, expected):
-        assert watch_relay.derive_title(text) == expected
+        assert watch_dashboard.derive_title(text) == expected
 
 
 class TestUsageSummary:
@@ -2244,16 +2267,16 @@ class TestWatchPresence:
 
     def test_a_recent_poll_counts_as_present(self):
         queue = watch_relay.CardQueue()
-        assert not queue.watch_present()
+        assert not _watch_present(queue)
         queue.pending(from_watch=True)
-        assert queue.watch_present()
+        assert _watch_present(queue)
 
     def test_a_stale_poll_does_not(self, monkeypatch):
         import time as _time
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
         queue.last_poll = _time.monotonic() - (queue.WATCH_PRESENT_SECONDS + 5)
-        assert not queue.watch_present()
+        assert not _watch_present(queue)
 
 
 class TestLateDecisions:
@@ -2924,8 +2947,10 @@ class TestLanSourceIsNotTrusted:
         # "sent" is NOT among the acceptable answers — on 2026-09-10 this
         # very fixture reached the owner's inbox, twice, because a key had
         # been installed and nothing stopped a test run from using it.
-        assert body["reported"] in ("mail_not_configured", "not_sent_in_tests",
-                                    "duplicate", "rate_limited"), body["reported"]
+        # Not "duplicate" or "rate_limited" either: the crash log and the
+        # dedupe state are this test's own, so neither can be left over.
+        assert body["reported"] in ("mail_not_configured",
+                                    "not_sent_in_tests"), body["reported"]
 
     def test_a_report_with_nothing_in_it_is_refused(self, lan):
         base, _, _ = lan
@@ -3125,7 +3150,7 @@ class TestThreadForTheWatch:
 
     def test_tool_turns_are_typed_and_text_is_cleaned(self, tmp_path):
         self._transcript(tmp_path)
-        turns = watch_relay.session_thread("livethread1",
+        turns = watch_dashboard.session_thread("livethread1",
                                            projects_dir=str(tmp_path))
         kinds = [(t["kind"], t["text"]) for t in turns]
         assert ("tool", "Ran a command") in kinds        # the phone's words
@@ -3169,7 +3194,7 @@ class TestASendIntoALiveSessionAsksFirst:
             {"cwd": "/x", "entrypoint": "sdk-cli",
              "message": {"role": "user", "content": "from the wrist"}},
         ])
-        turns = watch_relay.session_thread("fork1", projects_dir=str(tmp_path))
+        turns = watch_dashboard.session_thread("fork1", projects_dir=str(tmp_path))
         origins = {t["text"]: t.get("origin") for t in turns}
         assert origins == {"from the desk": None, "from the wrist": "headless"}
 
@@ -3181,23 +3206,23 @@ class TestCodeBlocksForTheWatch:
 
     def test_a_fence_becomes_a_code_block_between_text_blocks(self):
         md = "Run this:\n\n```python\nx = 1\nprint(x)\n```\n\nthen **stop**."
-        assert watch_relay.blocks(md) == [
+        assert watch_dashboard.blocks(md) == [
             {"kind": "text", "text": "Run this:"},
             {"kind": "code", "lang": "python", "text": "x = 1\nprint(x)"},
             {"kind": "text", "text": "then **stop**."},   # marks kept for the watch to render
         ]
-        assert watch_relay.plain_text(md) == "Run this:\n\n[code]\n\nthen stop."
+        assert watch_dashboard.plain_text(md) == "Run this:\n\n[code]\n\nthen stop."
 
     def test_no_fence_means_no_blocks(self):
-        assert watch_relay.blocks("just **prose** here") == []
-        assert watch_relay.blocks("") == []
+        assert watch_dashboard.blocks("just **prose** here") == []
+        assert watch_dashboard.blocks("") == []
 
     def test_a_markdown_fence_is_prose_and_a_nested_fence_is_content(self):
         md = "````markdown\n# T\n```\ninner\n```\n````"
-        assert watch_relay.blocks(md) == [{"kind": "text", "text": "T\ninner"}]
+        assert watch_dashboard.blocks(md) == [{"kind": "text", "text": "T\ninner"}]
 
     def test_an_unclosed_fence_is_still_code(self):
-        assert watch_relay.blocks("```sh\nls -la") == [
+        assert watch_dashboard.blocks("```sh\nls -la") == [
             {"kind": "code", "lang": "sh", "text": "ls -la"}]
 
     def test_the_thread_carries_blocks_only_where_there_is_code(self, tmp_path):
@@ -3208,7 +3233,7 @@ class TestCodeBlocksForTheWatch:
             {"message": {"role": "assistant",
                          "content": [{"type": "text", "text": "plain reply"}]}},
         ])
-        turns = watch_relay.session_thread("blocks1", projects_dir=str(tmp_path))
+        turns = watch_dashboard.session_thread("blocks1", projects_dir=str(tmp_path))
         by_text = {t["text"]: t for t in turns}
         assert by_text["See:\n[code]"]["blocks"] == [
             {"kind": "text", "text": "See:"},
@@ -3238,30 +3263,30 @@ class TestPlainTextForTheWatch:
         ("~~gone~~ kept", "gone kept"),
     ])
     def test_markers_go_structure_stays(self, md, expected):
-        assert watch_relay.plain_text(md) == expected
+        assert watch_dashboard.plain_text(md) == expected
 
     def test_markdown_fence_is_prose_in_disguise(self):
         md = "```markdown\n# Title\n- item\n```"
-        assert watch_relay.plain_text(md) == "Title\n• item"
+        assert watch_dashboard.plain_text(md) == "Title\n• item"
 
     def test_four_backtick_markdown_fence_is_prose_too(self):
         """Claude uses ````markdown when the content itself holds ```."""
         md = "````markdown\n# PKT-003 — bygget\n## Runde 2\n````"
-        assert watch_relay.plain_text(md) == "PKT-003 — bygget\nRunde 2"
+        assert watch_dashboard.plain_text(md) == "PKT-003 — bygget\nRunde 2"
 
     def test_code_fence_becomes_one_marker(self):
         """Code renders as a box on the phone; the wrist shows one [code]
         marker per block instead of verbatim lines."""
         md = "```python\n# a comment\nx = 1\n```"
-        assert watch_relay.plain_text(md) == "[code]"
+        assert watch_dashboard.plain_text(md) == "[code]"
 
     def test_identifiers_with_double_underscores_survive(self):
-        assert watch_relay.plain_text("ran mcp__github__merge_pull_request") == \
+        assert watch_dashboard.plain_text("ran mcp__github__merge_pull_request") == \
             "ran mcp__github__merge_pull_request"
 
     def test_empty_and_none(self):
-        assert watch_relay.plain_text("") == ""
-        assert watch_relay.plain_text(None) == ""
+        assert watch_dashboard.plain_text("") == ""
+        assert watch_dashboard.plain_text(None) == ""
 
     def test_thread_turns_and_titles_are_flattened(self, tmp_path):
         _write_transcript(tmp_path, "-p", "mdthread1.jsonl", [
@@ -3271,10 +3296,10 @@ class TestPlainTextForTheWatch:
                          "content": [{"type": "text",
                                       "text": "Done:\n- [PR #9](https://x/9)\n- tests green"}]}},
         ])
-        turns = watch_relay.session_thread("mdthread1", projects_dir=str(tmp_path))
+        turns = watch_dashboard.session_thread("mdthread1", projects_dir=str(tmp_path))
         assert turns[0]["text"] == "Fix the checkout"
         assert turns[1]["text"] == "Done:\n• PR #9\n• tests green"
-        _, opening, _ = watch_relay.session_meta(
+        _, opening, _ = watch_dashboard.session_meta(
             str(tmp_path / "-p" / "mdthread1.jsonl"))
         assert opening == "Fix the checkout"
 
@@ -3349,7 +3374,7 @@ class TestSlashCommandsReachTheWrist:
             {"type": "system", "subtype": "local_command", "level": "info",
              "content": "<local-command-stdout>Goal: fix checkout. Now: the race. Next: wait for the job.</local-command-stdout>"},
         ])
-        turns = watch_relay.session_thread("recap1", projects_dir=str(tmp_path))
+        turns = watch_dashboard.session_thread("recap1", projects_dir=str(tmp_path))
         kinds = [(t["role"], t.get("kind"), t["text"]) for t in turns]
         assert ("user", "text", "/recap") in kinds
         assert ("system", "notice", "Goal: fix checkout. Now: the race. Next: wait for the job.") in kinds
@@ -3380,7 +3405,7 @@ class TestSlashCommandsReachTheWrist:
             {"type": "system", "subtype": "local_command", "level": "info",
              "content": "<local-command-stdout>%s</local-command-stdout>" % recap},
         ])
-        turns = watch_relay.session_thread("recap3", projects_dir=str(tmp_path))
+        turns = watch_dashboard.session_thread("recap3", projects_dir=str(tmp_path))
         notice = [t["text"] for t in turns if t.get("kind") == "notice"][0]
         assert notice.endswith("until the agreement shows active."), (
             "cut short: %r" % notice[-60:])
@@ -3403,7 +3428,7 @@ class TestSlashCommandsReachTheWrist:
             {"type": "system", "subtype": "local_command", "level": "info",
              "content": "<local-command-stderr>Unknown command: /verify</local-command-stderr>"},
         ])
-        turns = watch_relay.session_thread("recap2", projects_dir=str(tmp_path))
+        turns = watch_dashboard.session_thread("recap2", projects_dir=str(tmp_path))
         assert [t["text"] for t in turns if t.get("kind") == "notice"] == ["Unknown command: /verify"]
 
     def test_a_system_error_is_a_notice_and_info_chatter_is_not(self, tmp_path):
@@ -3412,7 +3437,7 @@ class TestSlashCommandsReachTheWrist:
             {"type": "system", "level": "info", "content": "Context left until auto-compact: 12%"},
             {"type": "system", "level": "error", "content": "API rate limit reached"},
         ])
-        turns = watch_relay.session_thread("recap3", projects_dir=str(tmp_path))
+        turns = watch_dashboard.session_thread("recap3", projects_dir=str(tmp_path))
         assert [t["text"] for t in turns if t.get("kind") == "notice"] == ["API rate limit reached"]
 
     def test_claudes_nothing_to_add_after_a_local_command_is_not_a_reply(self, tmp_path):
@@ -3428,7 +3453,7 @@ class TestSlashCommandsReachTheWrist:
             {"message": {"role": "assistant", "content": [{"type": "text", "text": "No response requested."}]}},
             {"message": {"role": "assistant", "content": [{"type": "text", "text": "A real reply."}]}},
         ])
-        turns = watch_relay.session_thread("recap4", projects_dir=str(tmp_path))
+        turns = watch_dashboard.session_thread("recap4", projects_dir=str(tmp_path))
         texts = [t["text"] for t in turns if t["role"] == "assistant"]
         assert texts == ["A real reply."]
 
@@ -3444,7 +3469,7 @@ class TestFenceNesting:
 
     def test_inner_fence_stays_inside_the_outer(self):
         text = "before\n````markdown\ninner prose\n```\nstill inside\n````\nafter"
-        flat = watch_relay.plain_text(text)
+        flat = watch_dashboard.plain_text(text)
         # prose fences still flatten their content; the inner ``` does not
         # close the outer four-tick block
         assert "still inside" in flat
@@ -3455,7 +3480,7 @@ class TestFenceNesting:
         [code] marker — never verbatim soup, never more than one marker
         per block."""
         text = "before\n````\ncode line\n```\nmore code\n````\ntail"
-        flat = watch_relay.plain_text(text)
+        flat = watch_dashboard.plain_text(text)
         assert "more code" not in flat
         assert flat.count("[code]") == 1
         assert "tail" in flat
@@ -3555,7 +3580,7 @@ class TestPhoneVocabulary:
         lines.append({"message": {"role": "assistant",
                       "content": [{"type": "text", "text": "done"}]}})
         _write_transcript(tmp_path, "-p", "phrase01.jsonl", lines)
-        turns = watch_relay.session_thread("phrase01",
+        turns = watch_dashboard.session_thread("phrase01",
                                            projects_dir=str(tmp_path))
         tool_turns = [t for t in turns if t["kind"] == "tool"]
         assert len(tool_turns) == 1
@@ -3864,31 +3889,31 @@ class TestPromptParity:
 class TestCloudHeartbeat:
     """An away watch is seen through the cloud: the bridge reads its
     CloudKit heartbeat and reports the age to /heartbeat, which must count
-    as presence — otherwise the presence gate refuses to queue the very
-    cards the bridge exists to mirror."""
+    as presence — otherwise /health tells the wrist nobody has been seen
+    while the watch is answering over iCloud. (Cards queue regardless.)"""
 
     def test_fresh_heartbeat_counts_as_presence(self, live_relay):
         port, queue = live_relay
         queue.last_poll = None      # no direct watch poll ever
-        assert not queue.watch_present()
+        assert not _watch_present(queue)
         request = urllib.request.Request(
             "http://127.0.0.1:%d/heartbeat" % port,
             data=json.dumps({"watch_seen_seconds_ago": 12}).encode(),
             headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=5) as reply:
             assert _json.loads(reply.read())["ok"] is True
-        assert queue.watch_present()
+        assert _watch_present(queue)
 
     def test_stale_heartbeat_is_ignored(self):
         queue = watch_relay.CardQueue()
         queue.note_watch_indirect(watch_relay.CardQueue.WATCH_PRESENT_SECONDS + 5)
-        assert not queue.watch_present()
+        assert not _watch_present(queue)
 
     def test_garbage_never_crashes_or_counts(self):
         queue = watch_relay.CardQueue()
         for junk in (None, "soon", -3, {"a": 1}):
             queue.note_watch_indirect(junk)
-        assert not queue.watch_present()
+        assert not _watch_present(queue)
 
     def test_indirect_never_rewinds_a_direct_poll(self):
         queue = watch_relay.CardQueue()
@@ -4187,7 +4212,7 @@ class TestTaskVerdictsCanRecover:
         import glob as _glob
         monkeypatch.setattr(_glob, "glob",
                             lambda pattern: [str(out)])
-        assert watch_relay._task_state("sess", "tid1") == "done"
+        assert watch_dashboard._task_state("sess", "tid1") == "done"
 
     def test_stale_but_alive_is_unknown_not_done(self, tmp_path, monkeypatch):
         import glob as _glob
@@ -4195,10 +4220,10 @@ class TestTaskVerdictsCanRecover:
         out.write_text("still working\n")
         os.utime(out, (1, 1))                       # quiet for years
         monkeypatch.setattr(_glob, "glob", lambda pattern: [str(out)])
-        assert watch_relay._task_state("sess", "tid2") == "unknown"
+        assert watch_dashboard._task_state("sess", "tid2") == "unknown"
         # The task wakes and writes again: the verdict must recover.
         out.write_text("still working\nmore output\n")
-        assert watch_relay._task_state("sess", "tid2") == "running"
+        assert watch_dashboard._task_state("sess", "tid2") == "running"
 
 
 class TestAlwaysMirrorsThePhone:
@@ -4407,6 +4432,138 @@ HELPER_DIR = (os.path.join(_ROOT, "helper")
 def _helper_manifest(*parts):
     with open(os.path.join(HELPER_DIR, *parts), encoding="utf-8") as handle:
         return json.load(handle)
+
+
+class TestTheSyncScriptSaysWhatItDidAndDidNot:
+    """`sync-helper.sh` publishes to the public repo. Two of the things it
+    said about itself were wrong on 2026-09-17, in the same way: a
+    sentence nobody had checked.
+
+    Its version refusal named two files to bump. Four carry the number,
+    and someone who followed the message literally left marketplace.json
+    behind — the suite caught that one, but only after the message had
+    been believed.
+
+    Its personal-identifier gate reads a gitignored file and skipped
+    itself when that file was absent, printing nothing. Every machine but
+    the owner's is such a machine, so a sync that checked nothing looked
+    exactly like a sync that checked everything. The privacy renderer a
+    few lines above already announces its own absence; this holds the gate
+    to the same standard."""
+
+    # Every file that carries the helper's version. The refusal message is
+    # checked against this list, so a fifth carrier added here fails until
+    # the message names it too.
+    CARRIERS = (
+        "ClaudeRiskClassifier.py",
+        "WatchApp/Tapproval/RelayModel.swift",
+        "helper/.claude-plugin/plugin.json",
+        "helper/.claude-plugin/marketplace.json",
+    )
+
+    def _script(self):
+        """Absent in the public layout: sync-helper.sh is what publishes to
+        that repo, not something it ships. The sync runs this suite in the
+        layout it produces, and caught the first version of these tests
+        failing there — which is the whole reason that step exists."""
+        path = os.path.join(_ROOT, "sync-helper.sh")
+        if not os.path.isfile(path):
+            pytest.skip("no sync script in this layout")
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def _gate(self, script):
+        """The identifier gate, from its filename to the fi that ends it."""
+        gate = script[script.index('FORBIDDEN="'):]
+        return gate[:gate.index("\n  fi")]
+
+    def test_every_carrier_really_holds_the_version(self):
+        """The list is only worth checking a message against if it is
+        itself true."""
+        for rel in self.CARRIERS:
+            path = os.path.join(_ROOT, rel)
+            if not os.path.isfile(path):
+                pytest.skip("not the product layout: %s" % rel)
+            with open(path, encoding="utf-8") as handle:
+                assert crc.__version__ in handle.read(), (
+                    "%s does not carry %s" % (rel, crc.__version__))
+
+    def _refusal(self, script):
+        """The version refusal alone, not the whole script.
+
+        Scoped deliberately: every one of these paths also appears in a
+        `cp` line further up, so a search of the file passes whether or
+        not the message says anything. The first version of this test did
+        exactly that and would have let the old message through."""
+        start = script.index("the helper's sources changed")
+        return script[start:script.index("exit 1", start)]
+
+    def test_the_version_refusal_names_every_file_that_carries_it(self):
+        refusal = self._refusal(self._script())
+        missing = [rel for rel in self.CARRIERS if rel not in refusal]
+        assert not missing, (
+            "sync-helper.sh tells the operator which files to bump and does "
+            "not name: %s. A message that names some of them is how "
+            "marketplace.json was left behind." % (missing,))
+
+    def test_the_script_refuses_to_publish_a_version_backwards(self):
+        """The gate above asks only whether the number changed. It cannot
+        see a number that changed downwards, and on 2026-09-17 the public
+        repo really was a version ahead of the product repo's main, so a
+        sync from main would have published 1.1.6 over 1.1.7 in silence."""
+        script = self._script()
+        assert "sort -V" in script, (
+            "nothing compares the two versions by order, so a downgrade "
+            "reads the same as an upgrade")
+        assert "older than the one already there" in script
+
+    @pytest.mark.parametrize("local,published,refuses", [
+        ("1.1.6", "1.1.7", True),    # the live case on 2026-09-17
+        ("1.1.7", "1.1.6", False),   # the ordinary one
+        ("1.1.6", "1.1.6", False),   # unchanged: the other gate's business
+        ("1.1.9", "1.1.10", True),   # 10 > 9, which a string compare denies
+        ("1.2.0", "1.1.99", False),
+    ])
+    def test_the_comparison_orders_versions_as_numbers_not_text(
+            self, local, published, refuses):
+        """Run the script's own condition. Sorting these as strings puts
+        1.1.10 before 1.1.9, which would wave through exactly the case the
+        gate exists for."""
+        condition = (
+            '[ "$1" != "$2" ] && '
+            '[ "$(printf \'%s\\n%s\\n\' "$1" "$2" | sort -V | head -1)" = "$1" ]')
+        done = subprocess.run(["bash", "-c", condition, "bash", local, published])
+        assert (done.returncode == 0) is refuses, (
+            "%s over %s: expected refuses=%s" % (local, published, refuses))
+
+    def test_the_identifier_gate_says_so_when_it_does_not_run(self):
+        """The else is the whole point: without it the gate is silent
+        exactly when it is inert."""
+        gate = self._gate(self._script())
+        assert "else" in gate, "the identifier gate has no else: it skips in silence"
+        assert [line for line in gate.splitlines()
+                if ">&2" in line and "did NOT run" in line], (
+            "the skip must say on stderr that it did not run")
+
+    def test_the_refusal_is_read_apart_from_the_cp_lines_above_it(self):
+        """Prove the scoping matters: the whole file mentions every
+        carrier even when the message names none of them."""
+        script = self._script()
+        assert all(rel in script for rel in self.CARRIERS)
+        refusal = self._refusal(script)
+        assert len(refusal) < len(script) / 2, (
+            "the refusal should be a few lines, not most of the script")
+
+    def test_the_guard_catches_a_gate_that_skips_in_silence(self):
+        """Prove it can fail, against the gate as it stood while inert."""
+        was = ('FORBIDDEN=".private/forbidden-strings.txt"\n'
+               '  if [ -f "$FORBIDDEN" ]; then\n'
+               '    echo "a personal identifier is in a file bound for the '
+               'public repo" >&2\n'
+               '    exit 1\n'
+               '  fi\n')
+        gate = was[:was.index("\n  fi")]
+        assert "else" not in gate
 
 
 class TestPluginManifest:
@@ -4691,6 +4848,84 @@ class TestSubagentCardsRetract:
         assert check() is False
 
 
+class TestAnsweredElsewhereDespiteExtraFields:
+    """Claude Code gives the hook fields it never writes to the transcript.
+
+    Seen 2026-09-17: two DesignSync prompts answered on the phone at 08:24
+    were still on the wrist at 12:40. The hook's copy of the input carried
+    consent fields the transcript's tool_use does not, so the whole-input
+    fingerprint could never match and nothing retracted the cards.
+    """
+
+    TOOL = "DesignSync"
+    RECORDED = {"method": "create_project", "name": "HOV – Ugerytmen forslag"}
+    HOOK_SAW = dict(RECORDED, consentBitShown="none", consentAskCanReachUser="no")
+
+    def _check(self, tmp_path, hook_input=None, digests=True):
+        sid = "028d9dce-1dd1-4a2a-a64b-36164180af42"
+        project = tmp_path / "-Users-someone-Developer-Demo"
+        project.mkdir()
+        transcript = project / (sid + ".jsonl")
+        transcript.write_text("", encoding="utf-8")
+        seen = hook_input or self.HOOK_SAW
+        card = {"session_id": sid, "tool": self.TOOL,
+                "fingerprint": crc._card_fingerprint(self.TOOL, seen)}
+        if digests:
+            card["input_digests"] = crc._input_digests(self.TOOL, seen)
+        return watch_relay._prompt_resolver(card, projects_dir=str(tmp_path)), transcript
+
+    def _append(self, transcript, recorded, use_id="toolu_DS"):
+        with open(transcript, "a", encoding="utf-8") as handle:
+            for block in ({"type": "tool_use", "id": use_id, "name": self.TOOL,
+                           "input": recorded},
+                          {"type": "tool_result", "tool_use_id": use_id,
+                           "content": "ok"}):
+                handle.write(json.dumps({"type": "assistant",
+                                         "message": {"content": [block]}}) + "\n")
+
+    def test_the_fingerprints_really_differ(self):
+        """The premise, so this class cannot pass for the wrong reason."""
+        assert (crc._card_fingerprint(self.TOOL, self.HOOK_SAW)
+                != crc._card_fingerprint(self.TOOL, self.RECORDED))
+
+    def test_a_card_is_retracted_when_the_transcript_recorded_less(self, tmp_path):
+        check, transcript = self._check(tmp_path)
+        assert check() is False
+        self._append(transcript, self.RECORDED)
+        assert check() is True
+
+    def test_a_card_from_an_older_hook_without_digests_still_matches_exactly(self, tmp_path):
+        check, transcript = self._check(tmp_path, hook_input=self.RECORDED, digests=False)
+        check()
+        self._append(transcript, self.RECORDED)
+        assert check() is True
+
+    def test_a_different_value_is_a_different_call(self, tmp_path):
+        check, transcript = self._check(tmp_path)
+        check()
+        self._append(transcript, dict(self.RECORDED, name="Another project"))
+        assert check() is False
+
+    def test_a_key_the_hook_never_saw_is_a_different_call(self, tmp_path):
+        check, transcript = self._check(tmp_path)
+        check()
+        self._append(transcript, dict(self.RECORDED, extra="x"))
+        assert check() is False
+
+    def test_an_empty_recorded_input_matches_nothing(self, tmp_path):
+        check, transcript = self._check(tmp_path)
+        check()
+        self._append(transcript, {})
+        assert check() is False
+
+    def test_the_hook_puts_digests_on_every_card(self):
+        event = {"tool_name": self.TOOL, "tool_input": self.HOOK_SAW,
+                 "session_id": "s", "cwd": "/tmp"}
+        _, _, card = crc.build_response(event, dict(crc.DEFAULT_POLICY))
+        assert card["input_digests"] == crc._input_digests(self.TOOL, self.HOOK_SAW)
+        assert set(card["input_digests"]) == set(self.HOOK_SAW)
+
+
 class TestTunnelBinaryLookup:
     """The travel tunnel must survive being started by launchd.
 
@@ -4946,7 +5181,7 @@ class TestWhatWeKnowAboutTheTranscript:
             {"type": "system", "subtype": "a_shape_from_the_future",
              "content": "something new"},
         ])
-        watch_relay.session_thread("shapes", projects_dir=str(tmp_path))
+        watch_dashboard.session_thread("shapes", projects_dir=str(tmp_path))
         assert "a_shape_from_the_future" in capsys.readouterr().err
 
 
@@ -5156,7 +5391,9 @@ class TestTheHelperReportsItsOwnCrashes:
         used = {ast.dump(n) for n in ast.walk(func) if isinstance(n, ast.Attribute)}
         assert any("getpass" in u for u in used), (
             "the terminal path must not echo the key — use getpass")
-        assert "input(" not in ast.dump(func), "input() would echo it"
+        calls_input = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                          and n.func.id == "input" for n in ast.walk(func))
+        assert not calls_input, "input() would echo it"
 
     def test_a_real_key_is_not_refused_for_its_capital_letter(self, tmp_path):
         """2026-09-10: the owner pasted a key beginning "Re_" and this
@@ -5554,7 +5791,7 @@ class TestALostTunnelIsNotALostRelay:
     already serving. The away route is the fallback, not the product.
     """
 
-    def test_a_busy_tunnel_port_does_not_kill_the_relay(self, monkeypatch):
+    def test_a_busy_tunnel_port_does_not_kill_the_relay(self, monkeypatch, fresh_auth):
         import socket
         holder = socket.socket()
         holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -5564,8 +5801,7 @@ class TestALostTunnelIsNotALostRelay:
         monkeypatch.setattr(watch_relay, "TUNNEL_PORT", busy)
         watch_relay.clear_condition("tunnel")
         try:
-            auth = watch_relay.Auth(path=None) if hasattr(watch_relay, "Auth") else None
-            got = watch_relay._start_tunnel(watch_relay.CardQueue(), auth)
+            got = watch_relay._start_tunnel(watch_relay.CardQueue(), fresh_auth)
         finally:
             holder.close()
         assert got is None, "a busy tunnel port must not raise"
@@ -5630,9 +5866,10 @@ class TestAWatchThatSpeaksDanish:
                  "  activate\n"
                  "  do script %s\n"
                  "end tell" % json.dumps(script, ensure_ascii=ensure_ascii))
-        target = os.path.join(tempfile.mkdtemp(), "t.scpt")
-        done = subprocess.run(["osacompile", "-o", target, "-e", apple],
-                              capture_output=True, text=True, timeout=30)
+        with tempfile.TemporaryDirectory() as scratch:
+            done = subprocess.run(["osacompile", "-o", os.path.join(scratch, "t.scpt"),
+                                   "-e", apple],
+                                  capture_output=True, text=True, timeout=30)
         return done.returncode == 0, ((done.stderr or "") + (done.stdout or "")).strip()
 
     @pytest.mark.parametrize("text", [
@@ -5707,14 +5944,14 @@ class TestNewSessionFromTheWatch:
         return str(root)
 
     def test_known_projects_are_recent_directories_newest_first(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})   # nothing live
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})   # nothing live
         rows = watch_relay.known_projects(projects_dir=self._projects(tmp_path))
         assert [r["name"] for r in rows] == ["acme", "pantri"]
         assert all(os.path.isdir(r["path"]) for r in rows)
 
     def test_known_projects_drop_directories_that_no_longer_exist(self, tmp_path, monkeypatch):
         import shutil
-        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
         root = self._projects(tmp_path)
         shutil.rmtree(tmp_path / "pantri")
         assert [r["name"] for r in watch_relay.known_projects(projects_dir=root)] == ["acme"]
@@ -5728,13 +5965,13 @@ class TestNewSessionFromTheWatch:
     def test_refuses_a_directory_claude_code_has_never_worked_in(self, tmp_path, monkeypatch):
         """The watch never types a path, and the relay never opens a
         terminal somewhere it has not already seen Claude Code run."""
-        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
         root = self._projects(tmp_path)
         assert watch_relay.start_session(str(tmp_path / "elsewhere"), "go",
                                          projects_dir=root, platform="darwin") == "unknown project"
 
     def test_says_when_claude_is_missing(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: None)
         root = self._projects(tmp_path)
         assert watch_relay.start_session(str(tmp_path / "acme"), "go",
@@ -5744,7 +5981,7 @@ class TestNewSessionFromTheWatch:
         """No one logged in at the screen is the usual reason; the watch
         must be able to say so rather than spin."""
         import subprocess as sp
-        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
         monkeypatch.setattr(watch_relay.subprocess, "run", lambda *a, **k: sp.CompletedProcess(
             a[0], 1, "", "execution error: Not authorized to send Apple events to Terminal. (-1743)"))
@@ -5761,7 +5998,7 @@ class TestNewSessionFromTheWatch:
         background relay cannot ask for was never given. `open` on a
         .command file needs no consent."""
         import subprocess as sp
-        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
         calls = []
         def fake_run(cmd, **kw):
@@ -5789,7 +6026,7 @@ class TestNewSessionFromTheWatch:
 
     def test_success_opens_terminal_in_that_directory_with_that_message(self, tmp_path, monkeypatch):
         import subprocess as sp
-        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
         seen = {}
         def fake_run(cmd, **kw):
@@ -5817,7 +6054,7 @@ class TestNewSessionFromTheWatch:
         the version, `claude -p -- --version` sends the words."""
         import subprocess as sp
         import shlex
-        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
         seen = {}
         monkeypatch.setattr(watch_relay.subprocess, "run",
@@ -5833,7 +6070,7 @@ class TestNewSessionFromTheWatch:
     def test_projects_and_new_are_ordinary_data_routes(self, tmp_path, monkeypatch):
         """/projects needs the same key as every other data route, and /new
         answers a refusal as JSON the watch can show — never a 500."""
-        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
         watch_relay.LIMITS.reset()
         server, _ = watch_relay.serve(port=0)
         _serve(server)
@@ -6425,6 +6662,158 @@ class TestTheHookStaysFast:
         assert took < 0.2, "importing ClaudeRiskClassifier took %.0f ms" % (took * 1e3)
 
 
+def _ci_files(*names):
+    """The release machinery's files, or a skip.
+
+    sync-helper.sh runs this suite in the layout it publishes, and the
+    public repo gets the hook and the tests but none of the release
+    tooling — no workflow, no ci-local.sh, no ci-runner.sh. Read blindly,
+    fourteen tests turned that absence into fourteen failures and stopped
+    a sync that was not broken.
+    """
+    root = os.path.dirname(os.path.abspath(__file__))
+    out = []
+    for name in names:
+        path = os.path.join(root, name)
+        if not os.path.isfile(path):
+            pytest.skip("%s is not in this layout (the public repo)" % name)
+        with open(path, encoding="utf-8") as handle:
+            out.append(handle.read())
+    return out
+
+
+class TestTheLocalFallbackRunsWhatCiRuns:
+    """`ci-local.sh` is the proof when GitHub will not run the workflow.
+
+    On 2026-09-17 every job failed in three seconds with no steps at all —
+    GitHub had stopped starting them over billing — which looks exactly
+    like a broken tree and is not one. The fallback exists for that day,
+    and a fallback that quietly checks less than CI is worse than none: it
+    would report green over a matrix entry or a locale nobody ran.
+
+    The two files are deliberately not generated from one another (a
+    workflow that sources a shell script is harder to read than either),
+    so this holds the pieces that matter equal.
+    """
+
+    @staticmethod
+    def _files():
+        return _ci_files(".github/workflows/tests.yml", "ci-local.sh")
+
+    def test_every_interpreter_in_the_matrix_is_run_locally(self):
+        workflow, local = self._files()
+        matrix = re.search(r'python:\s*\[([^\]]+)\]', workflow).group(1)
+        versions = re.findall(r'"([\d.]+)"', matrix)
+        assert versions, "the matrix should name interpreters"
+        loop = re.search(r'for version in ([^;]+); do', local).group(1).split()
+        assert loop == versions, (loop, versions)
+
+    def test_the_same_scripts_are_shellchecked(self):
+        workflow, local = self._files()
+        def targets(text):
+            line = re.search(r'^\s*(?:- run: )?shellcheck (install\.sh[^\n]+)',
+                             text, re.MULTILINE).group(1)
+            # ci-local.sh checks itself too; CI has no such file to check.
+            return sorted(set(line.split()) - {"ci-local.sh"})
+        assert targets(local) == targets(workflow)
+
+    def test_ruff_is_run_with_the_same_rules(self):
+        workflow, local = self._files()
+        def flags(text):
+            return re.search(r'ruff check ([^\n]+)', text).group(1).strip()
+        assert flags(local) == flags(workflow)
+
+    @pytest.mark.parametrize("fragment", [
+        "-destination 'generic/platform=watchOS'",      # the device compile
+        "-only-testing:TapprovalTests",                 # the second pass
+        "-testLanguage en -testRegion DK",              # in the release Mac's locale
+        "CODE_SIGNING_ALLOWED=NO",
+    ])
+    def test_the_watch_job_runs_the_same_xcodebuild(self, fragment):
+        workflow, local = self._files()
+        assert fragment in workflow, "the workflow changed; update ci-local.sh too"
+        assert fragment in local, fragment
+
+    def test_the_dependency_refusal_is_checked_in_both(self):
+        workflow, local = self._files()
+        for name in ("requirements.txt", "pyproject.toml"):
+            assert name in workflow and name in local, name
+
+
+class TestCiCanBeMovedToThisMacAndBack:
+    """Where CI runs is one repository variable, and coming back is
+    deleting it.
+
+    The fallback earns its keep only if the return trip is certain: a
+    switch that has to be reverted in a commit is a switch nobody makes on
+    the bad day, and a default that points at a Mac in someone's house is a
+    repository a stranger cannot build. So the checks are: GitHub is the
+    default everywhere, exactly one of the two paths can run, and the
+    script that flips it names the same variable this file reads.
+    """
+
+    @staticmethod
+    def _files():
+        return _ci_files(".github/workflows/tests.yml", "ci-runner.sh", "ci-local.sh")
+
+    def test_unset_means_github(self):
+        """A fresh clone, and the repository after ./ci-runner.sh github,
+        have no CI_RUNNER at all. Every hosted job must run in that state."""
+        workflow, _, _ = self._files()
+        # Only the jobs: block — "on: push:" is indented the same way.
+        jobs = re.findall(r"^  (\w[\w-]*):\n((?:    .*\n|\n)*)",
+                          workflow.split("\njobs:\n", 1)[1], re.MULTILINE)
+        assert len(jobs) >= 4, [name for name, _ in jobs]
+        for name, body in jobs:
+            guard = re.search(r"if: vars\.CI_RUNNER (==|!=) 'self-hosted'", body)
+            assert guard, "%s has no CI_RUNNER guard; it would run on both" % name
+            runs_on = re.search(r"runs-on: (.+)", body).group(1)
+            if name == "mini":
+                assert guard.group(1) == "==" and "self-hosted" in runs_on
+            else:
+                assert guard.group(1) == "!=", name
+                assert "self-hosted" not in runs_on, (
+                    "%s would point at a machine in someone's house" % name)
+
+    def test_exactly_one_path_runs_in_either_setting(self):
+        workflow, _, _ = self._files()
+        guards = re.findall(r"if: vars\.CI_RUNNER (==|!=) 'self-hosted'", workflow)
+        for setting in ("self-hosted", ""):
+            running = [g for g in guards
+                       if (g == "==") == (setting == "self-hosted")]
+            assert running, "nothing runs when CI_RUNNER=%r" % setting
+
+    def test_the_mac_job_runs_the_same_checks(self):
+        """Not a smaller set: the Mac job runs ci-local.sh, which
+        TestTheLocalFallbackRunsWhatCiRuns holds equal to the hosted jobs."""
+        workflow, _, _ = self._files()
+        mini = workflow.split("  mini:", 1)[1].split("\n  pytest:", 1)[0]
+        assert "./ci-local.sh" in mini
+        assert "actions/checkout" in mini
+
+    def test_the_switch_script_and_the_workflow_agree(self):
+        workflow, switch, _ = self._files()
+        assert "CI_RUNNER" in switch and "CI_RUNNER" in workflow
+        # The labels the workflow selects on must be the labels the runner
+        # registers with, or the job queues for a machine that never answers.
+        wanted = re.search(r"runs-on: \[([^\]]+)\]", workflow).group(1)
+        labels = re.search(r'LABELS="([^"]+)"', switch).group(1).split(",")
+        assert sorted(x.strip() for x in wanted.split(",")) == sorted(labels)
+
+    def test_going_back_deletes_rather_than_sets(self):
+        _, switch, _ = self._files()
+        github = switch.split("  github)", 1)[1].split(";;", 1)[0]
+        assert "gh variable delete CI_RUNNER" in github
+        assert "variable set" not in github, (
+            "going back must clear the variable, not set another value")
+
+    def test_it_refuses_to_point_at_a_mac_that_is_not_listening(self):
+        _, switch, _ = self._files()
+        mini = switch.split("\n  mini)", 1)[1].split(";;", 1)[0]
+        assert "runner_state" in mini, (
+            "switching to a runner nobody registered queues every job forever")
+
+
 class TestTheDocumentsDoNotRestateTheBuildNumber:
     """WatchApp/BUILD_NUMBER is the one place the current build lives;
     deploy-testflight.sh rewrites and commits it. Five documents once
@@ -6903,9 +7292,21 @@ def test_the_two_ci_workflows_share_their_test_steps():
     if not os.path.isfile(private):
         pytest.skip("no private workflow in this layout")
     def python_steps(path):
+        """The pytest job, without the line that says where it runs.
+
+        It used to be "every line before shellcheck", which also covered
+        the header and any job declared above pytest — so adding the
+        CI_RUNNER switch (ci-runner.sh) made the two files differ in a way
+        that says nothing about what the public repo tests. The matrix and
+        the steps are what must match; the runner is deliberately private.
+        """
         lines = open(path, encoding="utf-8").read().split("\n")
-        end = next(i for i, line in enumerate(lines) if "shellcheck" in line and "run:" in line)
-        return lines[:end]
+        start = lines.index("  pytest:")
+        rest = lines[start + 1:]
+        end = next((i for i, line in enumerate(rest)
+                    if line.startswith("  ") and not line.startswith("   ")), len(rest))
+        return [line for line in rest[:end]
+                if "vars.CI_RUNNER" not in line and "runs-on:" not in line]
     assert python_steps(private) == python_steps(public)
 
 

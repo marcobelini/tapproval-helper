@@ -102,7 +102,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.7"
+__version__ = "1.1.8"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -1466,6 +1466,28 @@ def _card_fingerprint(tool, tool_input):
         ("%s\x00%s" % (tool, basis)).encode("utf-8")).hexdigest()[:16]
 
 
+def _input_digests(tool, tool_input):
+    """One short hash per top-level input key: how the relay recognises
+    this call in the transcript when the whole-input fingerprint cannot.
+
+    Claude Code hands the hook more than it writes down. On 2026-09-17 a
+    DesignSync prompt reached the hook carrying consent fields that its
+    transcript entry does not have, so the fingerprints never matched: the
+    prompt was answered on the phone at 08:24 and both cards were still on
+    the wrist four hours later. Per-key digests let the relay ask the
+    looser question — does every key the transcript DID record agree? —
+    while the fingerprint stays exact for "always allow" replay.
+    """
+    if not isinstance(tool_input, dict):
+        return {}
+    digests = {}
+    for key in sorted(tool_input)[:32]:
+        basis = json.dumps(tool_input[key], sort_keys=True, ensure_ascii=False)
+        digests[str(key)[:64]] = hashlib.sha256(
+            ("%s\x00%s\x00%s" % (tool, key, basis)).encode("utf-8")).hexdigest()[:16]
+    return digests
+
+
 def build_response(event, policy):
     """Classify one event; returns ``(response_dict, audit_entry, card)``.
 
@@ -1484,6 +1506,8 @@ def build_response(event, policy):
     card["session_id"] = str((event or {}).get("session_id") or "")[:64]
     card["fingerprint"] = _card_fingerprint(result["tool"],
                                             result["tool_input"])
+    card["input_digests"] = _input_digests(result["tool"],
+                                           result["tool_input"])
     # The phone offers "don't ask again" exactly when Claude Code sends
     # permission suggestions with the prompt — mirror that, so the wrist
     # never offers a third choice the phone doesn't have.

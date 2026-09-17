@@ -99,7 +99,6 @@ def install_crash_reporting(hooks=None):
     Chains rather than replaces. Swallowing a fatal error turns a visible
     crash into a frozen process, which is harder to report, not easier.
     """
-    import threading
     try:
         import crash_report
     except Exception as error:                       # never blocks a start
@@ -500,6 +499,7 @@ def run_admin(args):
 
 
 RELAY_LOG = os.path.expanduser("~/.tapproval-relay.log")
+SAY_LOG = os.path.expanduser("~/.tapproval-say.log")
 RELAY_LOG_MAX = 2 * 1024 * 1024      # keep the tail worth reading
 
 
@@ -686,12 +686,6 @@ class CardQueue:
     # a wrist raised late must still find its card.
     WATCH_PRESENT_SECONDS = 90
 
-    def watch_present(self):
-        with self._lock:
-            return (self.last_poll is not None and
-                    time.monotonic() - self.last_poll
-                    <= self.WATCH_PRESENT_SECONDS)
-
     def submit(self, card, wait, caller_alive=None, resolved_elsewhere=None):
         """Queue a card and block until it is decided or ``wait`` expires.
 
@@ -837,16 +831,14 @@ class CardQueue:
         return True
 
 
-# The session/usage/activity layer lives in its own module now: this file
-# is the relay, and the relay's job is small and dangerous, while reading
-# transcripts is large and harmless. Re-exported here so `watch_relay.X`
-# keeps working for everything that already calls it.
-from watch_dashboard import (  # noqa: E402,F401  (re-exports, see above)
-    activity_summary, recap_summary, derive_title, _find_transcript,
-    live_sessions,
-    _parse_thread, plain_text, blocks, prewarm_threads, _read_appended,
-    recent_sessions, repo_slug, _REPO_SLUG_CACHE, resolve_session,
-    session_meta, session_registry, session_thread, _task_state,
+# The session/usage/activity layer lives in its own module: this file is
+# the relay, and the relay's job is small and dangerous, while reading
+# transcripts is large and harmless. Only what the relay itself calls is
+# imported; tests reach the rest through watch_dashboard.
+from watch_dashboard import (  # noqa: E402
+    activity_summary, recap_summary, _find_transcript,
+    _parse_thread, prewarm_threads, _read_appended,
+    recent_sessions, resolve_session, session_registry,
     THREAD_TURN_LIMIT, usage_summary)
 
 
@@ -958,7 +950,7 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
     command += ["-p", "--", text]
     error = _spawn_detached(
         command,
-        os.path.expanduser("~/.tapproval-say.log"),
+        SAY_LOG,
         cwd=cwd or os.path.expanduser("~"))
     return "could not start: %s" % error if error else "sent"
 
@@ -1166,11 +1158,13 @@ class _PromptResolver:
     RETRY_SECONDS = 30.0
 
     def __init__(self, session_id, tool, fingerprint, fingerprint_of,
-                 projects_dir=None):
+                 projects_dir=None, digests=None, digests_of=None):
         self.session_id = session_id
         self.tool = tool
         self.fingerprint = fingerprint
         self.fingerprint_of = fingerprint_of
+        self.digests = digests if isinstance(digests, dict) else {}
+        self.digests_of = digests_of
         self.projects_dir = projects_dir
         self.path = None            # the session transcript, once found
         self.files = {}             # transcript path -> bytes already read
@@ -1266,9 +1260,7 @@ class _PromptResolver:
                         continue
                     if (part.get("type") == "tool_use"
                             and part.get("name") == self.tool
-                            and self.fingerprint_of(
-                                self.tool, part.get("input") or {})
-                            == self.fingerprint):
+                            and self._same_call(part.get("input") or {})):
                         self.use_ids.add(part.get("id"))
                     elif (part.get("type") == "tool_result"
                           and part.get("tool_use_id") in self.use_ids):
@@ -1276,6 +1268,26 @@ class _PromptResolver:
         except (OSError, ValueError):
             return False
         return False
+
+
+    def _same_call(self, recorded):
+        """Is this transcript tool_use the call the card asks about?
+
+        Exact when the fingerprints agree. Otherwise every key the
+        transcript recorded must hash the same as the hook's copy: Claude
+        Code adds fields to what the hook receives (consent flags, seen
+        live) and never writes them down, and a whole-input hash can then
+        never match. Keys the transcript lacks are the harness's own and
+        do not count; a recorded key that differs, or an empty record,
+        is never the same call.
+        """
+        if self.fingerprint_of(self.tool, recorded) == self.fingerprint:
+            return True
+        if not self.digests or self.digests_of is None or not recorded:
+            return False
+        seen = self.digests_of(self.tool, recorded)
+        return bool(seen) and len(seen) == len(recorded) and all(
+            self.digests.get(key) == value for key, value in seen.items())
 
 
 def _prompt_resolver(card, projects_dir=None):
@@ -1290,8 +1302,13 @@ def _prompt_resolver(card, projects_dir=None):
         from ClaudeRiskClassifier import _card_fingerprint
     except Exception:
         return None
+    try:
+        from ClaudeRiskClassifier import _input_digests
+    except Exception:
+        _input_digests = None
     return _PromptResolver(session_id, tool, fingerprint, _card_fingerprint,
-                           projects_dir)
+                           projects_dir, card.get("input_digests"),
+                           _input_digests)
 
 
 
@@ -2716,7 +2733,6 @@ def main(argv=None):
     # SIGTERM (pkill, launchd, a relay restart from --ensure) must run the
     # same cleanup as Ctrl-C — otherwise the Bonjour advertiser and the
     # tunnel outlive the relay and keep announcing a stale address.
-    import signal
 
     def _stop(signum, frame):
         raise SystemExit(0)
