@@ -953,7 +953,9 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
         command += ["--settings", BRIEF_REPLY_SETTINGS]
     command += _permission_tool_flags()
     command += ["--append-system-prompt", WRIST_RUN_RULES]
-    command += ["-p", text]
+    # "--" ends the options: without it a message reading
+    # "--dangerously-skip-permissions" is parsed as that flag, not sent.
+    command += ["-p", "--", text]
     error = _spawn_detached(
         command,
         os.path.expanduser("~/.tapproval-say.log"),
@@ -1089,7 +1091,9 @@ def start_session(path, text, projects_dir=None, platform=None):
         return "unknown project"
     if not shutil.which("claude"):
         return "claude not on PATH"
-    script = 'cd %s && claude %s' % (shlex.quote(path), shlex.quote(text))
+    # shlex.quote stops the shell reading the text; "--" stops claude
+    # reading it as a flag, which quoting alone does not.
+    script = 'cd %s && claude -- %s' % (shlex.quote(path), shlex.quote(text))
     # json.dumps is the right escaper for the quotes and backslashes an
     # AppleScript string literal understands — but only with
     # ensure_ascii=False. Left at its default it writes \u00e5 for "å",
@@ -1485,6 +1489,23 @@ class RelayHandler(BaseHTTPRequestHandler):
             return True
         return host_allowed(self.headers.get("Host", ""))
 
+    def _from_a_browser(self):
+        """Did a web page send this? The Host check stops DNS rebinding,
+        but not a page that simply posts to 127.0.0.1: the browser runs on
+        this Mac, so the request arrives as loopback — the one free pass.
+        With a text/plain body it needs no CORS preflight, and although
+        the page never reads the reply, the action has already happened:
+        every device revoked, a forged card, a session started.
+
+        No client of this relay is a browser. The watch, the bridge, the
+        hook and the command line send neither header; every browser sends
+        Origin on a cross-site POST and Sec-Fetch-Site on everything.
+        """
+        if self.headers.get("Origin") is not None:
+            return True
+        site = self.headers.get("Sec-Fetch-Site")
+        return site is not None and site != "none"
+
     def _authorized(self, path):
         return authorize_request(
             self.client_address[0], path,
@@ -1692,6 +1713,16 @@ class RelayHandler(BaseHTTPRequestHandler):
     def _dispatch(self, method):
         if not self._host_ok():
             self._send_json({"error": "bad host"}, 403)
+            return
+        if self._from_a_browser():
+            self._send_json({"error": "not from a web page"}, 403)
+            return
+        # A second, independent wall: a JSON content type is what a browser
+        # cannot send cross-site without a preflight, and this relay answers
+        # no preflight. Every real client already sends it.
+        if method == "POST" and not self.headers.get(
+                "Content-Type", "").lower().startswith("application/json"):
+            self._send_json({"error": "expected application/json"}, 415)
             return
         path, query = self._route()
         on_tunnel = self.required_token is not None

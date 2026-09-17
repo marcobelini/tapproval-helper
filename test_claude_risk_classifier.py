@@ -2370,7 +2370,7 @@ class TestSessionReplies:
             "abc123", "run the tests", projects_dir=str(tmp_path)) == "sent"
         assert seen["cmd"][:2] == ["claude", "--resume"]
         assert seen["cmd"][2] == "abc12345"
-        assert seen["cmd"][-2:] == ["-p", "run the tests"]
+        assert seen["cmd"][-3:] == ["-p", "--", "run the tests"]
         assert seen["cwd"] == "/x/proj"
 
     def _spawned(self, tmp_path, monkeypatch, **kwargs):
@@ -2394,7 +2394,7 @@ class TestSessionReplies:
         settings = json.loads(cmd[cmd.index("--settings") + 1])
         assert settings == {"outputStyle": "Concise"}
         # The message itself is still the last thing on the line.
-        assert cmd[-2:] == ["-p", "run the tests"]
+        assert cmd[-3:] == ["-p", "--", "run the tests"]
 
     def test_the_watch_can_ask_for_full_replies(self, tmp_path, monkeypatch):
         cmd = self._spawned(tmp_path, monkeypatch, brief=False)
@@ -2402,7 +2402,7 @@ class TestSessionReplies:
         # The permission flags ride on every send, brief or not — a prompt
         # raised by a full reply needs the wrist as much as a short one.
         assert cmd[:3] == ["claude", "--resume", "abc12345"]
-        assert cmd[-2:] == ["-p", "run the tests"]
+        assert cmd[-3:] == ["-p", "--", "run the tests"]
         assert "--permission-prompt-tool" in cmd
 
 
@@ -5624,7 +5624,7 @@ class TestAWatchThatSpeaksDanish:
     def _compiles(text, ensure_ascii=False):
         """(ok, what it said) for the AppleScript the relay would build."""
         import shlex as _shlex
-        script = "cd %s && claude %s" % (_shlex.quote("/tmp/p"),
+        script = "cd %s && claude -- %s" % (_shlex.quote("/tmp/p"),
                                          _shlex.quote(text))
         apple = ('tell application "Terminal"\n'
                  "  activate\n"
@@ -5784,7 +5784,7 @@ class TestNewSessionFromTheWatch:
         assert lines[0] == "#!/bin/bash"
         assert lines[1] == 'rm -f -- "$0"', "the file must remove itself, not pile up in tmp"
         import shlex
-        assert lines[2] == "cd %s && claude %s" % (
+        assert lines[2] == "cd %s && claude -- %s" % (
             shlex.quote(str(tmp_path / "acme")), shlex.quote("Fix CI; it's red"))
 
     def test_success_opens_terminal_in_that_directory_with_that_message(self, tmp_path, monkeypatch):
@@ -5808,8 +5808,27 @@ class TestNewSessionFromTheWatch:
         # message with quotes or semicolons cannot escape into the shell.
         import shlex
         shell_line = json.loads(script.split("do script ", 1)[1].split("\n")[0])
-        assert shell_line == "cd %s && claude %s" % (
+        assert shell_line == "cd %s && claude -- %s" % (
             shlex.quote(str(tmp_path / "acme")), shlex.quote("Fix CI; it's red"))
+
+    def test_a_message_that_looks_like_a_flag_stays_a_message(self, tmp_path, monkeypatch):
+        """shlex.quote stops the shell; only "--" stops claude. Checked
+        against claude 2.1.260 on 2026-09-17: `claude -p --version` prints
+        the version, `claude -p -- --version` sends the words."""
+        import subprocess as sp
+        import shlex
+        monkeypatch.setattr(watch_relay, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
+        seen = {}
+        monkeypatch.setattr(watch_relay.subprocess, "run",
+                            lambda cmd, **kw: seen.update(cmd=cmd) or sp.CompletedProcess(cmd, 0, "", ""))
+        root = self._projects(tmp_path)
+        text = "--dangerously-skip-permissions"
+        assert watch_relay.start_session(str(tmp_path / "acme"), text,
+                                         projects_dir=root, platform="darwin") == "started"
+        shell_line = json.loads(seen["cmd"][-1].split("do script ", 1)[1].split("\n")[0])
+        words = shlex.split(shell_line)
+        assert words[words.index("claude") + 1:] == ["--", text]
 
     def test_projects_and_new_are_ordinary_data_routes(self, tmp_path, monkeypatch):
         """/projects needs the same key as every other data route, and /new
@@ -5896,6 +5915,65 @@ class TestRelayRoutes:
         assert self._call(base + "/sessions")[1] == {"sessions": []}
         assert self._call(base + "/activity")[1] == {"total": 0}
         assert self._call(base + "/usage")[1] == {"input": 0}
+
+    @staticmethod
+    def _raw(url, headers, body=b"{}"):
+        """A POST with exactly these headers — nothing added."""
+        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as reply:
+                return reply.status
+        except urllib.error.HTTPError as error:
+            return error.code
+
+    # What a web page open on this Mac can send to 127.0.0.1 with no CORS
+    # preflight. Measured on 2026-09-17: each of these, before the check,
+    # revoked every paired device and opened the pairing window.
+    BROWSER_SHAPES = [
+        ({"Origin": "https://evil.example", "Content-Type": "text/plain"}, 403),
+        ({"Origin": "null", "Content-Type": "application/json"}, 403),
+        ({"Sec-Fetch-Site": "cross-site", "Content-Type": "text/plain"}, 403),
+        ({"Sec-Fetch-Site": "same-site", "Content-Type": "application/json"}, 403),
+        ({"Content-Type": "text/plain"}, 415),
+        ({"Content-Type": "application/x-www-form-urlencoded"}, 415),
+        ({}, 415),
+    ]
+
+    @pytest.mark.parametrize("headers,status", BROWSER_SHAPES)
+    def test_a_web_page_cannot_administer_the_relay(self, relay, monkeypatch, headers, status):
+        base, _, auth = relay
+        revoked = []
+        monkeypatch.setattr(auth, "revoke_all", lambda: revoked.append(1))
+        assert self._raw(base + "/admin/pair-reset", headers) == status
+        assert revoked == [], "the action must not happen at all"
+
+    @pytest.mark.parametrize("headers,status", BROWSER_SHAPES)
+    def test_a_web_page_cannot_forge_a_card(self, relay, headers, status):
+        base, queue, _ = relay
+        body = json.dumps({"card": {"headline": "Approve Xcode update"}}).encode()
+        assert self._raw(base + "/card", headers, body) == status
+        assert queue.pending() == []
+
+    def test_a_native_client_is_still_served(self, relay, monkeypatch):
+        """Prove the guard can pass as well as fail: the headers the hook,
+        the bridge and the watch actually send."""
+        base, _, auth = relay
+        revoked = []
+        monkeypatch.setattr(auth, "revoke_all", lambda: revoked.append(1))
+        assert self._raw(base + "/admin/pair-reset",
+                         {"Content-Type": "application/json; charset=utf-8"}) == 200
+        assert revoked == [1]
+        assert self._raw(base + "/admin/pair-reset",
+                         {"Content-Type": "application/json",
+                          "Sec-Fetch-Site": "none"}) == 200
+
+    def test_a_web_page_cannot_read_either(self, relay):
+        base, _, _ = relay
+        request = urllib.request.Request(base + "/pending",
+                                         headers={"Sec-Fetch-Site": "cross-site"})
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=5)
+        assert caught.value.code == 403
 
     def test_an_unknown_thread_is_empty_not_an_error(self, relay):
         base, _, _ = relay
