@@ -745,6 +745,96 @@ _MD_HTML = re.compile(r"</?[a-zA-Z][^>]*>")
 _MD_ESCAPE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!>])")
 
 
+def blocks(markdown):
+    """The same reply as ``plain_text`` gives, but with its code kept.
+
+    A list of ``{"kind": "text", "text"}`` and ``{"kind": "code", "text",
+    "lang"}`` in reading order. Text blocks are flattened exactly as
+    ``plain_text`` flattens them except that inline marks — ``**bold**``,
+    ``*em*``, ```` `code` ```` — survive, because a watch that renders
+    them natively is better than one that strips them; a watch that does
+    not simply shows the marks. Code blocks are verbatim, one per fence,
+    with the language the fence named. A ``markdown`` fence is prose in
+    disguise and lands in a text block, as in ``plain_text``.
+
+    Returns ``[]`` when nothing would be gained — no fence at all — so a
+    turn carries blocks only when it has code to show. Never raises.
+    """
+    lines = str(markdown or "").splitlines()
+    if not any(_MD_FENCE.match(line) for line in lines):
+        return []
+    out, prose, code, lang = [], [], [], ""
+    fence_len, fence_is_prose = 0, False
+
+    def flush_prose():
+        text = _flatten_lines(prose, keep_inline=True)
+        if text:
+            out.append({"kind": "text", "text": text})
+        prose.clear()
+
+    for raw in lines:
+        line = raw.rstrip()
+        fence = _MD_FENCE.match(line)
+        if fence:
+            marker = len(fence.group(1))
+            if fence_len == 0:
+                fence_len = marker
+                fence_is_prose = fence.group(2).lower() in ("markdown", "md")
+                lang = "" if fence_is_prose else fence.group(2).lower()
+                if not fence_is_prose:
+                    flush_prose()
+                continue
+            if marker >= fence_len:
+                if not fence_is_prose:
+                    out.append({"kind": "code", "lang": lang,
+                                "text": "\n".join(code).strip("\n")})
+                    code.clear()
+                fence_len, fence_is_prose = 0, False
+                continue
+            if fence_is_prose:
+                # A shorter fence inside a prose fence is a bare marker
+                # line; plain_text loses it to the inline-code strip.
+                continue
+        if fence_len and not fence_is_prose:
+            code.append(raw)
+            continue
+        prose.append(line)
+    if code:
+        # An unclosed fence at the end of a reply is still code.
+        out.append({"kind": "code", "lang": lang, "text": "\n".join(code).strip("\n")})
+    flush_prose()
+    return out
+
+
+def _flatten_lines(lines, keep_inline=False):
+    """``plain_text``'s line pass over lines already stripped of fences."""
+    out = []
+    for line in lines:
+        if not line.strip() or _MD_HR.match(line) or _MD_TABLE_SEP.match(line):
+            if not line.strip() and out and out[-1]:
+                out.append("")
+            continue
+        line = _MD_HEADING.sub("", line)
+        line = _MD_QUOTE.sub("", line)
+        line = _MD_BULLET.sub(r"\1• ", line)
+        if line.lstrip().startswith("|"):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            line = " · ".join(c for c in cells if c)
+        line = _MD_IMAGE.sub(r"\1", line)
+        line = _MD_LINK.sub(r"\1", line)
+        if not keep_inline:
+            line = _MD_CODE.sub(r"\1", line)
+            line = _MD_STRONG.sub(lambda m: m.group(1) or m.group(2), line)
+            line = _MD_EM.sub(lambda m: m.group(1) or m.group(2), line)
+            line = _MD_STRIKE.sub(r"\1", line)
+        line = _MD_HTML.sub("", line)
+        line = _MD_ESCAPE.sub(r"\1", line)
+        out.append(line.strip())
+    while out and not out[-1]:
+        out.pop()
+    return "\n".join(out)
+
+
 def plain_text(markdown):
     """Flatten Markdown to the plain, line-structured text a watch can show.
 
@@ -1176,6 +1266,7 @@ def _thread_line(state, line, limit):
     # WORK, not the sentence: flatten up to 32KB of raw input and keep up
     # to 12KB flattened (far beyond any real reply); if something truly
     # enormous is ever cut, cut at a word and say so.
+    raw_text = text
     text = (plain_text(str(text)[:32768]) if kind == "text" else lead)
     if len(text) > 12000:
         text = text[:12000].rsplit(" ", 1)[0] + " …"
@@ -1192,13 +1283,27 @@ def _thread_line(state, line, limit):
             and not lead_ask.startswith("/")
             and not lead_ask.startswith("This session is being continued")):
         state["latest_ask"] = lead_ask[:200]
-    state["turns"].append({
+    turn = {
         "role": role,
         "kind": kind,
         "text": text,
         "desc": description,
         "at": entry.get("timestamp", ""),
-    })
+    }
+    # The phone shows code in a box; "[code]" in ``text`` is the wrist's
+    # box for a watch that cannot do better. One that can gets the code
+    # itself, alongside — never instead — so an older watch keeps reading.
+    if kind == "text" and role == "assistant" and "[code]" in text:
+        parts = blocks(str(raw_text)[:32768])
+        if parts:
+            turn["blocks"] = parts
+    # A turn a headless run appended — the wrist's sends arrive this way
+    # — is not one the session's live process has seen. Name it, so a
+    # thread that forks here is legible on both devices rather than
+    # mysterious on one.
+    if role == "user" and kind == "text" and entry.get("entrypoint") == "sdk-cli":
+        turn["origin"] = "headless"
+    state["turns"].append(turn)
     if len(state["turns"]) > limit * 4:
         state["turns"] = state["turns"][-limit * 2:]
 

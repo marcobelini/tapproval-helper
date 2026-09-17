@@ -844,7 +844,7 @@ class CardQueue:
 from watch_dashboard import (  # noqa: E402,F401  (re-exports, see above)
     activity_summary, recap_summary, derive_title, _find_transcript,
     live_sessions,
-    _parse_thread, plain_text, prewarm_threads, _read_appended,
+    _parse_thread, plain_text, blocks, prewarm_threads, _read_appended,
     recent_sessions, repo_slug, _REPO_SLUG_CACHE, resolve_session,
     session_meta, session_registry, session_thread, _task_state,
     THREAD_TURN_LIMIT, usage_summary)
@@ -902,7 +902,32 @@ def _permission_tool_flags(tool_path=None):
             "--permission-prompt-tool", "mcp__tapproval__approve"]
 
 
-def say_to_session(prefix, text, projects_dir=None, brief=True):
+def say_guard(session_id, force=False, live=None):
+    """Why a send should stop before it starts, or None to go ahead.
+
+    A wrist send runs ``claude --resume -p`` — a second process on the
+    session. When a process on this Mac already holds the session open,
+    that second one appends turns the first never reads: a fork, and
+    Claude Code calls it one (``--bg --resume`` "starts a copy" in exactly
+    this case). Measured 2026-09-17 on a desktop session: of 27 desktop
+    turns that followed wrist turns, 17 carried on as if the wrist had
+    said nothing.
+
+    The live ones are what Claude Code's own session registry says they
+    are — the same reading the session list is built from, dead pids and
+    unattended SDK runs already left out — so this costs a directory
+    listing, not a process. "live" is the answer; the watch turns it into
+    a question with two buttons, and ``force`` is the "yes". A failure to
+    read the registry is an empty dict, which lets a send through: this
+    guard can only ever ask, never block.
+    """
+    if force or not session_id:
+        return None
+    rows = session_registry() if live is None else live
+    return "live" if session_id in rows else None
+
+
+def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
     """Send an instruction to a session, the way the terminal would.
 
     Runs ``claude --resume <id> -p <text>`` in that session's directory so
@@ -918,6 +943,9 @@ def say_to_session(prefix, text, projects_dir=None, brief=True):
     session_id, cwd = resolve_session(prefix, projects_dir)
     if not session_id:
         return "unknown session"
+    stop = say_guard(session_id, force=force)
+    if stop:
+        return stop
     if not shutil.which("claude"):
         return "claude not on PATH"
     command = ["claude", "--resume", session_id]
@@ -1850,7 +1878,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         self._serialised_send(lambda body: (
             say_to_session(str(body.get("session_id", ""))[:64],
                            body.get("text", ""),
-                           brief=body.get("brief") is not False),
+                           brief=body.get("brief") is not False,
+                           force=body.get("force") is True),
             "sent"))
 
     def _post_diagnostic(self, path, query):

@@ -3133,6 +3133,90 @@ class TestThreadForTheWatch:
         assert ("text", "Done — see main.py") in kinds   # backticks stripped
 
 
+class TestASendIntoALiveSessionAsksFirst:
+    """A wrist send runs ``claude --resume -p`` — a second process on the
+    session. When a process already holds the session open, that second
+    one appends turns the first never reads. The relay knows the live
+    ones (``claude agents --json``) and says "live" instead of forking;
+    ``force`` is the wrist's "send anyway"."""
+
+    def test_the_live_list_is_the_session_registry(self, tmp_path):
+        # The same files the session list is built from: a registry entry
+        # whose pid is alive and whose entrypoint is not an SDK run.
+        _write_transcript(tmp_path, "sessions", "1.json", [
+            {"sessionId": "abc", "pid": os.getpid(), "entrypoint": "claude-desktop"}])
+        _write_transcript(tmp_path, "sessions", "2.json", [
+            {"sessionId": "gone", "pid": 999999999, "entrypoint": "claude-desktop"}])
+        live = watch_relay.session_registry(str(tmp_path / "sessions"))
+        assert watch_relay.say_guard("abc", live=live) == "live"
+        assert watch_relay.say_guard("gone", live=live) is None
+
+    def test_an_unreadable_registry_blocks_nothing(self, tmp_path):
+        live = watch_relay.session_registry(str(tmp_path / "nowhere"))
+        assert live == {}
+        assert watch_relay.say_guard("abc", live=live) is None
+
+    def test_live_stops_and_force_goes_through(self):
+        live = {"abc": {"name": "x", "status": "idle", "pid": 1}}
+        assert watch_relay.say_guard("abc", live=live) == "live"
+        assert watch_relay.say_guard("abc", force=True, live=live) is None
+        assert watch_relay.say_guard("other", live=live) is None
+
+    def test_a_headless_turn_is_named_in_the_thread(self, tmp_path):
+        _write_transcript(tmp_path, "-p", "fork1.jsonl", [
+            {"cwd": "/x", "entrypoint": "claude-desktop",
+             "message": {"role": "user", "content": "from the desk"}},
+            {"cwd": "/x", "entrypoint": "sdk-cli",
+             "message": {"role": "user", "content": "from the wrist"}},
+        ])
+        turns = watch_relay.session_thread("fork1", projects_dir=str(tmp_path))
+        origins = {t["text"]: t.get("origin") for t in turns}
+        assert origins == {"from the desk": None, "from the wrist": "headless"}
+
+
+class TestCodeBlocksForTheWatch:
+    """The phone shows code in a box; the wrist showed "[code]". A watch
+    that can draw the box now gets the code alongside the flattened text,
+    never instead of it, so an older watch keeps reading."""
+
+    def test_a_fence_becomes_a_code_block_between_text_blocks(self):
+        md = "Run this:\n\n```python\nx = 1\nprint(x)\n```\n\nthen **stop**."
+        assert watch_relay.blocks(md) == [
+            {"kind": "text", "text": "Run this:"},
+            {"kind": "code", "lang": "python", "text": "x = 1\nprint(x)"},
+            {"kind": "text", "text": "then **stop**."},   # marks kept for the watch to render
+        ]
+        assert watch_relay.plain_text(md) == "Run this:\n\n[code]\n\nthen stop."
+
+    def test_no_fence_means_no_blocks(self):
+        assert watch_relay.blocks("just **prose** here") == []
+        assert watch_relay.blocks("") == []
+
+    def test_a_markdown_fence_is_prose_and_a_nested_fence_is_content(self):
+        md = "````markdown\n# T\n```\ninner\n```\n````"
+        assert watch_relay.blocks(md) == [{"kind": "text", "text": "T\ninner"}]
+
+    def test_an_unclosed_fence_is_still_code(self):
+        assert watch_relay.blocks("```sh\nls -la") == [
+            {"kind": "code", "lang": "sh", "text": "ls -la"}]
+
+    def test_the_thread_carries_blocks_only_where_there_is_code(self, tmp_path):
+        _write_transcript(tmp_path, "-p", "blocks1.jsonl", [
+            {"cwd": "/x", "message": {"role": "user", "content": "```\nmine\n```"}},
+            {"message": {"role": "assistant",
+                         "content": [{"type": "text", "text": "See:\n```swift\nlet a = 1\n```"}]}},
+            {"message": {"role": "assistant",
+                         "content": [{"type": "text", "text": "plain reply"}]}},
+        ])
+        turns = watch_relay.session_thread("blocks1", projects_dir=str(tmp_path))
+        by_text = {t["text"]: t for t in turns}
+        assert by_text["See:\n[code]"]["blocks"] == [
+            {"kind": "text", "text": "See:"},
+            {"kind": "code", "lang": "swift", "text": "let a = 1"}]
+        assert "blocks" not in by_text["plain reply"]
+        assert "blocks" not in by_text["[code]"]      # the user's own bubble stays flat
+
+
 class TestPlainTextForTheWatch:
     """Claude writes Markdown; a 40mm screen shows plain lines. Structure
     survives (one line per item), markers do not — and prose wrapped in a
