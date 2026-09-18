@@ -16,6 +16,7 @@ filesystem for audit-log tests.
 
 import ast
 import importlib.util
+import base64
 import json
 import os
 from pathlib import Path
@@ -151,6 +152,11 @@ def _known_watch(auth):
     return auth
 
 
+# The real one, kept before any fixture stubs it: the tests about signing
+# in are the tests that must run it.
+_REAL_SIGNED_IN = watch_relay.signed_in
+
+
 def _watch_present(queue):
     """What /health's watch_seen_seconds_ago means to the wrist: seen
     within WATCH_PRESENT_SECONDS. The queue used to carry this as a
@@ -198,6 +204,23 @@ def _no_real_home_files(tmp_path, monkeypatch):
     monkeypatch.setattr(watch_relay, "TOKEN_FILE", str(home / "no-token"))
     monkeypatch.setattr(watch_relay, "RELAY_LOG", str(home / "relay.log"))
     monkeypatch.setattr(watch_relay, "SAY_LOG", str(home / "say.log"))
+    # And no test may read the owner's own Claude Code transcripts. Routes
+    # that list sessions walked ~/.claude/projects — on this machine a
+    # 97 MB transcript among them — so a routing test could time out
+    # because of what the owner had been working on. A test's world is
+    # its tmp_path; one that wants transcripts writes them there.
+    projects = home / "projects"
+    projects.mkdir()
+    monkeypatch.setattr(watch_dashboard, "CLAUDE_PROJECTS", str(projects))
+    sessions = home / "sessions"
+    sessions.mkdir()
+    monkeypatch.setattr(watch_dashboard, "CLAUDE_SESSIONS", str(sessions))
+    # And no test asks the real CLI whether it is signed in: /health does
+    # that now, so a routing test would otherwise start a subprocess — and
+    # one such test asserts that nothing was spawned at all. The tests
+    # about signing in put the real function back.
+    monkeypatch.setattr(watch_relay, "_SIGNIN", {"at": 0.0, "in": None})
+    monkeypatch.setattr(watch_relay, "signed_in", lambda *a, **k: None)
 
 
 @pytest.fixture(autouse=True)
@@ -4926,6 +4949,179 @@ class TestAnsweredElsewhereDespiteExtraFields:
         assert set(card["input_digests"]) == set(self.HOOK_SAW)
 
 
+class TestASignedOutMacSaysSo:
+    """2026-09-18: the CLI's OAuth session expired with no refresh token,
+    so every wrist send died with "Failed to authenticate: OAuth session
+    expired and could not be refreshed" — which reached the watch looking
+    like Claude's own reply, in a thread, under a working pulse. Nothing
+    anywhere said the Mac needed signing in."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh(self, monkeypatch):
+        # Put the real function back: the suite-wide fixture stubs it so no
+        # other test asks the CLI anything.
+        monkeypatch.setattr(watch_relay, "signed_in", _REAL_SIGNED_IN)
+        monkeypatch.setattr(watch_relay, "_SIGNIN", {"at": 0.0, "in": None})
+        watch_relay.clear_condition("signin")
+        yield
+        watch_relay.clear_condition("signin")
+
+    @staticmethod
+    def _answer(code, out):
+        import subprocess as sp
+        return lambda: sp.CompletedProcess(["claude"], code, out, "")
+
+    def test_signed_in_is_true_and_clears_the_condition(self):
+        watch_relay.note_condition("signin", "stale")
+        assert watch_relay.signed_in(runner=self._answer(0, '{"loggedIn": true}')) is True
+        assert "signin" not in [c["key"] for c in watch_relay.conditions()]
+
+    def test_signed_out_is_reported_where_every_fault_is_reported(self):
+        assert watch_relay.signed_in(runner=self._answer(0, '{"loggedIn": false}')) is False
+        said = [c for c in watch_relay.conditions() if c["key"] == "signin"]
+        assert said, "the wrist learns of this on Check connection or not at all"
+        assert "claude auth login" in said[0]["detail"], "say the fix, not the fault"
+
+    @pytest.mark.parametrize("code,out", [(1, ""), (0, "not json at all")])
+    def test_an_answer_that_cannot_be_read_is_not_a_refusal(self, code, out):
+        """None, never False: this must not become a reason a send fails."""
+        assert watch_relay.signed_in(runner=self._answer(code, out)) is None
+        assert "signin" not in [c["key"] for c in watch_relay.conditions()]
+
+    def test_the_answer_is_cached(self):
+        calls = []
+        def once():
+            import subprocess as sp
+            calls.append(1)
+            return sp.CompletedProcess(["claude"], 0, '{"loggedIn": true}', "")
+        watch_relay.signed_in(runner=once)
+        watch_relay.signed_in(runner=once)
+        assert len(calls) == 1, "a subprocess per health poll is a subprocess too many"
+
+    def test_a_send_refuses_in_words_rather_than_spawning(self, tmp_path, monkeypatch):
+        """Spawning anyway is what put the CLI's error in the transcript."""
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/bin/claude")
+        monkeypatch.setattr(watch_relay, "signed_in", lambda *a, **k: False)
+        spawned = []
+        monkeypatch.setattr(watch_relay, "_spawn_detached",
+                            lambda *a, **k: spawned.append(a) or "")
+        session = tmp_path / "-Users-x-Developer-acme"
+        session.mkdir()
+        (session / "abc12345.jsonl").write_text(json.dumps(
+            {"type": "user", "cwd": str(tmp_path),
+             "message": {"role": "user", "content": "hi"}}) + "\n", encoding="utf-8")
+        assert watch_relay.say_to_session("abc12345", "run the tests",
+                                          projects_dir=str(tmp_path)) == "signed out"
+        assert spawned == [], "nothing may be spawned into a signed-out CLI"
+
+    def test_the_clis_own_error_is_a_notice_not_a_reply(self, tmp_path):
+        sid = "cccccccc-1111-2222-3333-666666666666"
+        project = tmp_path / "-Users-someone-Developer-Demo"
+        project.mkdir()
+        path = project / (sid + ".jsonl")
+        path.write_text(json.dumps({
+            "type": "assistant", "timestamp": "2026-09-18T16:00:00Z",
+            "message": {"role": "assistant", "content": [
+                {"type": "text",
+                 "text": "Failed to authenticate: OAuth session expired and "
+                         "could not be refreshed"}]}}) + "\n", encoding="utf-8")
+        turns, _, _ = watch_dashboard._parse_thread(str(path), watch_dashboard.THREAD_TURN_LIMIT)
+        assert len(turns) == 1
+        assert turns[0]["role"] == "system" and turns[0]["kind"] == "notice"
+        assert "signed out" in turns[0]["text"] and "claude auth login" in turns[0]["text"]
+
+
+class TestPicturesReachTheWrist:
+    """A screenshot pasted into Claude Code is an image part, and every
+    screen here used to drop it: a turn that was only a picture arrived
+    empty, which reads as the watch having lost the message (2026-09-18).
+    """
+
+    PART = {"type": "image",
+            "source": {"type": "base64", "media_type": "image/png",
+                       "data": base64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode()}}
+
+    @pytest.fixture(autouse=True)
+    def _empty_cache(self):
+        watch_dashboard._IMAGES.clear()
+        yield
+        watch_dashboard._IMAGES.clear()
+
+    def test_a_picture_is_remembered_and_served_back(self):
+        ref = watch_dashboard.remember_image(self.PART)
+        assert ref and len(ref) == 16
+        assert watch_dashboard.image_bytes(ref) == ("image/png", b"\x89PNG\r\n\x1a\nfake")
+
+    def test_the_same_picture_twice_is_one_entry(self):
+        first = watch_dashboard.remember_image(self.PART)
+        assert watch_dashboard.remember_image(self.PART) == first
+        assert len(watch_dashboard._IMAGES) == 1
+
+    @pytest.mark.parametrize("part", [
+        {"type": "image", "source": {"type": "url", "url": "http://x/y.png"}},
+        {"type": "image", "source": {"type": "base64", "media_type": "text/html", "data": "eA=="}},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": 7}},
+        {"type": "image"},
+    ])
+    def test_what_is_not_a_picture_is_refused(self, part):
+        assert watch_dashboard.remember_image(part) is None
+
+    def test_an_unknown_reference_is_simply_missing(self):
+        assert watch_dashboard.image_bytes("deadbeefdeadbeef") is None
+        assert watch_dashboard.image_bytes(None) is None
+
+    def test_the_cache_is_bounded_by_count(self, monkeypatch):
+        monkeypatch.setattr(watch_dashboard, "IMAGE_CACHE_MAX", 3)
+        for n in range(6):
+            watch_dashboard.remember_image(
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                             "data": base64.b64encode(b"x" * (n + 1)).decode()}})
+        assert len(watch_dashboard._IMAGES) == 3, "a long session of screenshots must not grow forever"
+
+    def test_a_picture_too_large_to_send_is_not_kept(self, monkeypatch):
+        monkeypatch.setattr(watch_dashboard, "IMAGE_MAX_BYTES", 8)
+        assert watch_dashboard.remember_image(
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                         "data": "A" * 64}}) is None
+
+    def test_a_turn_that_is_only_a_picture_still_says_something(self, tmp_path):
+        sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        project = tmp_path / "-Users-someone-Developer-Demo"
+        project.mkdir()
+        path = project / (sid + ".jsonl")
+        path.write_text(json.dumps({
+            "type": "user", "timestamp": "2026-09-18T12:00:00Z",
+            "message": {"role": "user", "content": [self.PART]}}) + "\n",
+            encoding="utf-8")
+        turns, _, _ = watch_dashboard._parse_thread(str(path), watch_dashboard.THREAD_TURN_LIMIT)
+        assert len(turns) == 1, turns
+        assert turns[0]["text"] == "[image]"
+        assert turns[0]["images"] == [watch_dashboard.remember_image(self.PART)]
+
+
+class TestTheImageRouteIsNotOpenToTheRoom:
+    """The pictures are the user's own screens. Loopback is not a person:
+    /image needs a device key, exactly like /say and /thread's siblings."""
+
+    def test_the_route_demands_a_key(self):
+        rules = watch_relay.RelayHandler.ROUTES["GET"]["/image"][1]
+        assert rules.get("token") is True
+
+    def test_an_unknown_reference_is_a_404_not_an_error(self, tmp_path, monkeypatch):
+        watch_dashboard._IMAGES.clear()
+        auth = _known_watch(watch_relay.Auth(path=str(tmp_path / "auth.json")))
+        auth.save = lambda: None
+        server, _ = watch_relay.serve(port=0, auth=auth)
+        _serve(server)
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        try:
+            status, _ = relay_call(base + "/image?ref=nothing", token="devicetoken")
+            assert status == 404
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 class TestTunnelBinaryLookup:
     """The travel tunnel must survive being started by launchd.
 
@@ -6882,7 +7078,7 @@ class TestTheReportingItselfIsChecked:
     # a key that is not here fails the first test below, which is the
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
-    VOCABULARY = {"bonjour", "crash", "helper", "tunnel", "update"}
+    VOCABULARY = {"bonjour", "crash", "helper", "signin", "tunnel", "update"}
 
     @staticmethod
     def _module_source(name):

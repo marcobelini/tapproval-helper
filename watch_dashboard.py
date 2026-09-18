@@ -16,6 +16,8 @@ Standard library only, like everything else here.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
@@ -339,6 +341,11 @@ UPSTREAM_SHAPES = {
         ("<local-command-", "What the command printed: stdout and stderr are "
          "the same tag with a different word, which is why the reader below "
          "matches the stem.", "2026-09-08"),
+    "text.auth_failed":
+        ("Failed to authenticate", "What Claude Code writes when its own "
+         "sign-in has expired. It is the CLI's fault line, not Claude "
+         "speaking — the wrist showed it as a reply, in a thread, under a "
+         "working pulse.", "2026-09-18"),
     "text.nothing_to_add":
         ("No response requested.", "What Claude says when the CLI already "
          "answered and its own turn has nothing to add. Not a reply.",
@@ -423,15 +430,68 @@ def _system_text(entry):
     return ""
 
 
+# Pictures a transcript carries, kept in memory so the watch can ask for
+# one by name. A screenshot pasted into Claude Code arrives as a base64
+# image part, and until 2026-09-18 every screen here dropped it: a turn
+# that was only a picture showed as nothing at all, which reads as the
+# watch having lost the message.
+#
+# In memory, not on disk: these are the user's own screens, and the
+# relay's promise is that nothing about a session is written anywhere new.
+# Bounded twice — a count and a total size — because a long session of
+# screenshots must not grow the helper until the Mac notices.
+_IMAGES = OrderedDict()      # ref -> (media_type, base64 str)
+IMAGE_CACHE_MAX = 24
+IMAGE_CACHE_BYTES = 24 * 1024 * 1024
+IMAGE_MAX_BYTES = 6 * 1024 * 1024        # one picture; a watch shows less
+
+
+def remember_image(part):
+    """Keep one transcript image part and return its reference, or None if
+    it is not a picture we can serve. Never raises."""
+    try:
+        source = part.get("source") or {}
+        data = source.get("data")
+        media = str(source.get("media_type") or "")
+        if (source.get("type") != "base64" or not isinstance(data, str)
+                or not media.startswith("image/")
+                or len(data) > IMAGE_MAX_BYTES):
+            return None
+        ref = hashlib.sha256(data.encode("ascii", "ignore")).hexdigest()[:16]
+        if ref in _IMAGES:
+            _IMAGES.move_to_end(ref)
+        else:
+            _IMAGES[ref] = (media, data)
+        while (len(_IMAGES) > IMAGE_CACHE_MAX
+               or sum(len(v[1]) for v in _IMAGES.values()) > IMAGE_CACHE_BYTES):
+            _IMAGES.popitem(last=False)
+        return ref
+    except Exception:
+        return None
+
+
+def image_bytes(ref):
+    """``(media_type, bytes)`` for a reference the watch asks for, or None.
+    Never raises — an unreadable picture is a missing one."""
+    got = _IMAGES.get(str(ref or ""))
+    if not got:
+        return None
+    try:
+        return got[0], base64.b64decode(got[1])
+    except Exception:
+        return None
+
+
 def _message_parts(content):
-    """``(text, tool_use part)`` of a transcript message, in one pass: the
-    first NON-EMPTY text part — Claude Code does emit empty leading text
-    blocks, and taking the first one would drop the real reply — and the
-    first tool_use part, or None. Both screens that read messages go
-    through here, so an added part type is handled once."""
+    """``(text, tool_use part, image refs)`` of a transcript message, in one
+    pass: the first NON-EMPTY text part — Claude Code does emit empty
+    leading text blocks, and taking the first one would drop the real reply
+    — the first tool_use part, and a reference per picture. Both screens
+    that read messages go through here, so an added part type is handled
+    once."""
     if isinstance(content, str):
-        return content, None
-    text, tool = "", None
+        return content, None, []
+    text, tool, images = "", None, []
     if isinstance(content, list):
         for part in content:
             if not isinstance(part, dict):
@@ -441,7 +501,11 @@ def _message_parts(content):
                 text = part.get("text", "")
             elif kind == "tool_use" and tool is None:
                 tool = part
-    return text, tool
+            elif kind == "image":
+                ref = remember_image(part)
+                if ref:
+                    images.append(ref)
+    return text, tool, images
 
 def session_meta(path, scan_lines=600):
     """Cached front for :func:`_session_meta` —
@@ -478,7 +542,7 @@ def _session_meta(path, scan_lines=600):
                 turns += 1
                 if opening is not None:
                     continue
-                text, _ = _message_parts(message.get("content"))
+                text, _, _ = _message_parts(message.get("content"))
                 lead = str(text).lstrip()
                 # Skip system-injected openers; we want what the human asked.
                 if lead and not lead.startswith(_SYSTEM_OPENERS):
@@ -1227,7 +1291,7 @@ def _thread_line(state, line, limit):
         return
     if role not in ("user", "assistant"):
         return
-    text, part = _message_parts(message.get("content"))
+    text, part, pictures = _message_parts(message.get("content"))
     tool, tool_description = "", ""
     if part is not None:
         tool = part.get("name", "")
@@ -1252,6 +1316,10 @@ def _thread_line(state, line, limit):
         state["turns"].append({"role": "user", "kind": "text", "text": command,
                                "desc": "", "at": entry.get("timestamp", "")})
         return
+    if not lead and pictures:
+        # A turn that is only a picture: give it words, so a watch that
+        # cannot show the picture still says one arrived.
+        lead, text, kind = "[image]", "[image]", "text"
     if not lead or lead.startswith(_SYSTEM_OPENERS):
         return
     # After the CLI has answered a slash command itself, the headless run
@@ -1260,6 +1328,14 @@ def _thread_line(state, line, limit):
     # right under a Recap that had already been answered in red.
     if (role == "assistant" and kind == "text"
             and lead.strip() == shape("text.nothing_to_add")):
+        return
+    # Claude Code's own authentication failure. It arrives as prose, so it
+    # reads as a reply; it is a fault, and the watch paints a notice red.
+    if kind == "text" and lead.startswith(shape("text.auth_failed")):
+        state["turns"].append({"role": "system", "kind": "notice",
+                               "text": "Claude Code on this computer is signed "
+                                       "out — run: claude auth login",
+                               "desc": "", "at": entry.get("timestamp", "")})
         return
     # The watch shows the FULL text of a message, like the phone — a 2KB
     # cap here once cut a real reply mid-sentence on the wrist. Bound the
@@ -1297,6 +1373,8 @@ def _thread_line(state, line, limit):
         parts = blocks(str(raw_text)[:32768])
         if parts:
             turn["blocks"] = parts
+    if pictures:
+        turn["images"] = pictures
     # A turn a headless run appended — the wrist's sends arrive this way
     # — is not one the session's live process has seen. Name it, so a
     # thread that forks here is legible on both devices rather than

@@ -836,7 +836,7 @@ class CardQueue:
 # transcripts is large and harmless. Only what the relay itself calls is
 # imported; tests reach the rest through watch_dashboard.
 from watch_dashboard import (  # noqa: E402
-    activity_summary, recap_summary, _find_transcript,
+    activity_summary, recap_summary, _find_transcript, image_bytes,
     _parse_thread, prewarm_threads, _read_appended,
     recent_sessions, resolve_session, session_registry,
     THREAD_TURN_LIMIT, usage_summary)
@@ -894,6 +894,47 @@ def _permission_tool_flags(tool_path=None):
             "--permission-prompt-tool", "mcp__tapproval__approve"]
 
 
+# How long a "is Claude Code signed in?" answer is trusted. The question
+# costs a subprocess, and the answer changes about twice a year.
+SIGNIN_CACHE_SECONDS = 120.0
+_SIGNIN = {"at": 0.0, "in": None}
+
+
+def signed_in(runner=None, now=None):
+    """True, False, or None when it cannot be told.
+
+    `claude auth status` prints JSON with `loggedIn`. None — an old CLI
+    without the subcommand, a timeout, anything unparseable — is NOT a
+    refusal: this must never become a reason a send does not happen.
+
+    Why it exists: on 2026-09-18 the CLI's OAuth session expired with no
+    refresh token, so every wrist send died with "Failed to authenticate:
+    OAuth session expired and could not be refreshed" — a sentence that
+    reached the watch looking like Claude's own reply, in a thread, under
+    a working pulse. The wrist should say the Mac needs signing in, and
+    say it on Check connection where every other fault is reported.
+    """
+    stamp = time.time() if now is None else now
+    if _SIGNIN["in"] is not None and stamp - _SIGNIN["at"] < SIGNIN_CACHE_SECONDS:
+        return _SIGNIN["in"]
+    answer = None
+    try:
+        run = runner or (lambda: subprocess.run(
+            ["claude", "auth", "status"], capture_output=True, text=True, timeout=15))
+        done = run()
+        if getattr(done, "returncode", 1) == 0:
+            answer = bool(json.loads(done.stdout or "{}").get("loggedIn"))
+    except Exception:
+        answer = None
+    _SIGNIN.update(at=stamp, **{"in": answer})
+    if answer is False:
+        note_condition("signin", "Claude Code on your computer is signed out. "
+                                 "Open a Terminal there and run: claude auth login")
+    elif answer is True:
+        clear_condition("signin")
+    return answer
+
+
 def say_guard(session_id, force=False, live=None):
     """Why a send should stop before it starts, or None to go ahead.
 
@@ -940,6 +981,10 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
         return stop
     if not shutil.which("claude"):
         return "claude not on PATH"
+    if signed_in() is False:
+        # Spawning anyway would put Claude Code's own authentication error
+        # into the transcript, where the watch reads it as a reply.
+        return "signed out"
     command = ["claude", "--resume", session_id]
     if brief:
         command += ["--settings", BRIEF_REPLY_SETTINGS]
@@ -1083,6 +1128,8 @@ def start_session(path, text, projects_dir=None, platform=None):
         return "unknown project"
     if not shutil.which("claude"):
         return "claude not on PATH"
+    if signed_in() is False:
+        return "signed out"
     # shlex.quote stops the shell reading the text; "--" stops claude
     # reading it as a flag, which quoting alone does not.
     script = 'cd %s && claude -- %s' % (shlex.quote(path), shlex.quote(text))
@@ -1703,6 +1750,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             "/recap": ("_get_recap", {}),
             "/usage": ("_get_usage", {}),
             "/thread": ("_get_thread", {}),
+            # A picture out of a transcript. token, like /say: these are
+            # the user's own screens, and loopback alone is not a person.
+            "/image": ("_get_image", dict(token=True)),
             "/tunnel": ("_get_tunnel", dict(lan_only=True)),
         },
         "POST": {
@@ -1785,11 +1835,35 @@ class RelayHandler(BaseHTTPRequestHandler):
         from_watch = query.get("source", [""])[0] != "bridge"
         self._send_json({"cards": self.queue.pending(from_watch=from_watch)})
 
+    def _get_image(self, path, query):
+        """One picture a transcript carried, by the reference /thread gave.
+
+        Bytes, not JSON: the watch draws it. An unknown reference is a 404
+        rather than an error — a thread scrolled past may have dropped out
+        of the bounded cache, and a missing picture is not a fault.
+        """
+        got = image_bytes(query.get("ref", [""])[0])
+        if got is None:
+            self._send_json({"error": "no such image"}, 404)
+            return
+        media, data = got
+        self.send_response(200)
+        self.send_header("Content-Type", media)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "private, max-age=3600")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _get_health(self, path, query):
         # Liveness is public; the details are not. A pending count plus
         # "is a watch on the wrist right now" tells a stranger when
         # nobody is looking.
         if self._credentialed():
+            # Ask before answering: a watch that opens Check connection
+            # should learn the Mac is signed out without having to send
+            # something first and watch it fail. Cached, so this is a
+            # subprocess about twice a minute at worst.
+            signed_in()
             self._send_json({"ok": True,
                              "pending": len(self.queue.pending()),
                              "watch_seen_seconds_ago":
