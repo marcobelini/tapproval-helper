@@ -4979,7 +4979,7 @@ class TestASignedOutMacSaysSo:
     def test_signed_out_is_reported_where_every_fault_is_reported(self):
         assert watch_relay.signed_in(runner=self._answer(0, '{"loggedIn": false}')) is False
         said = [c for c in watch_relay.conditions() if c["key"] == "signin"]
-        assert said, "the wrist learns of this on Check connection or not at all"
+        assert said, "the wrist learns of this on the Connection screen or not at all"
         assert "claude auth login" in said[0]["detail"], "say the fix, not the fault"
 
     @pytest.mark.parametrize("code,out", [(1, ""), (0, "not json at all")])

@@ -140,7 +140,7 @@ def helper_provenance(here=None):
     wrist ran a helper four days behind the repository while /health said
     v1.1.1 — the same v1.1.1 the app expected — because two thousand
     changed lines had not moved the number. The watch shows this date on
-    Check connection, so "the helper is old" is something a person can
+    the Connection screen, so "the helper is old" is something a person can
     see rather than something the number would have to admit.
 
     Read once, by main() before serving: the checkout does not move
@@ -912,7 +912,7 @@ def signed_in(runner=None, now=None):
     OAuth session expired and could not be refreshed" — a sentence that
     reached the watch looking like Claude's own reply, in a thread, under
     a working pulse. The wrist should say the Mac needs signing in, and
-    say it on Check connection where every other fault is reported.
+    say it on the Connection screen where every other fault is reported.
     """
     stamp = time.time() if now is None else now
     if _SIGNIN["in"] is not None and stamp - _SIGNIN["at"] < SIGNIN_CACHE_SECONDS:
@@ -1859,7 +1859,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         # "is a watch on the wrist right now" tells a stranger when
         # nobody is looking.
         if self._credentialed():
-            # Ask before answering: a watch that opens Check connection
+            # Ask before answering: a watch that opens the Connection screen
             # should learn the Mac is signed out without having to send
             # something first and watch it fail. Cached, so this is a
             # subprocess about twice a minute at worst.
@@ -2603,7 +2603,7 @@ def _start_tunnel(queue, auth):
         # fallback, not the product — losing it must never cost the local
         # path, which is the one the wrist uses at the desk all day. Same
         # rule the missing-cloudflared branch below already follows: say
-        # so on Check connection and carry on.
+        # so on the Connection screen and carry on.
         note_condition(
             "tunnel",
             "Answering from away is off: the travel port is already in use "

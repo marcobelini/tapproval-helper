@@ -13,7 +13,7 @@ Three things happen, in this order, and the order is the design:
    of reports looks exactly like the absence of crashes. The file is the
    record; e-mail is only the push.
 2. **The wrist is told**, through the conditions registry, so "the helper
-   crashed at 12:03" appears on Check connection rather than being
+   crashed at 12:03" appears on the Connection screen rather than being
    something you find out by noticing nothing works.
 3. **An e-mail is sent**, if and only if this machine has been given a
    key. It never can be on anyone else's: the key is read from a file
