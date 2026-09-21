@@ -1845,6 +1845,69 @@ class TestSelfStartingRelay:
         err = capsys.readouterr().err
         assert "could not stop" in err and "4242" in err and "keeps serving" in err
 
+    def test_a_deferred_update_is_tried_again_at_the_next_start(self, monkeypatch, capsys):
+        """The owner's Mac, 2026-09-21: checkout at 1.1.9, relay serving
+        1.1.8 for three days, and the relay's own condition promising to be
+        replaced "the next time Claude Code starts" through dozens of
+        starts. `updated` is true only in the invocation whose pull moved
+        the checkout; defer that once and nothing ever asked again."""
+        monkeypatch.setattr(watch_relay, "_self_update", lambda: None)
+        monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: {
+            "version": watch_relay.RELAY_VERSION, "pending": 0,
+            "helper_commit": "15642ba"})
+        monkeypatch.setattr(watch_relay, "helper_provenance",
+                            lambda here=None: ("8720a1b", "2026-09-18T22:40:00+02:00"))
+        stopped = []
+        monkeypatch.setattr(watch_relay, "_stop_relay",
+                            lambda deadline=8.0: stopped.append(True) or True)
+        monkeypatch.setattr(watch_relay, "RELAY_START_WAIT", 0.0)
+        spawned = []
+        monkeypatch.setattr(watch_relay.subprocess, "Popen",
+                            lambda cmd, **k: spawned.append(cmd) or object())
+        watch_relay.ensure_running()              # a plain start: updated=False
+        assert stopped == [True], "the older relay was left serving"
+        assert len(spawned) == 1 and "--tunnel" in spawned[0]
+        assert "already running" not in capsys.readouterr().err
+
+    def test_the_retry_still_waits_for_a_card(self, monkeypatch, capsys):
+        """Trying again is not permission to interrupt: a relay holding a
+        card is holding someone's approval, on the second try as on the
+        first."""
+        monkeypatch.setattr(watch_relay, "_self_update", lambda: None)
+        monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: {
+            "version": watch_relay.RELAY_VERSION, "pending": 1,
+            "helper_commit": "15642ba"})
+        monkeypatch.setattr(watch_relay, "helper_provenance",
+                            lambda here=None: ("8720a1b", "x"))
+        monkeypatch.setattr(watch_relay, "_admin_call", lambda path, timeout=2: {"ok": True})
+        stopped = []
+        monkeypatch.setattr(watch_relay, "_stop_relay",
+                            lambda deadline=8.0: stopped.append(True) or True)
+        assert watch_relay.ensure_running() == 0
+        assert stopped == []
+        assert "deferred" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("serving, installed", [
+        (None, "8720a1b"),        # an older relay that reports no commit
+        ("15642ba", None),        # a plugin install: no .git to ask
+        (None, None),
+        ("8720a1b", "8720a1b"),   # the same code: nothing to do
+    ])
+    def test_a_working_relay_is_not_replaced_on_a_guess(self, monkeypatch, capsys,
+                                                         serving, installed):
+        monkeypatch.setattr(watch_relay, "_self_update", lambda: None)
+        monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: {
+            "version": watch_relay.RELAY_VERSION, "pending": 0,
+            "paired_ever": True, "helper_commit": serving})
+        monkeypatch.setattr(watch_relay, "helper_provenance",
+                            lambda here=None: (installed, "x"))
+        stopped = []
+        monkeypatch.setattr(watch_relay, "_stop_relay",
+                            lambda deadline=8.0: stopped.append(True) or True)
+        assert watch_relay.ensure_running() == 0
+        assert stopped == []
+        assert "already running" in capsys.readouterr().err
+
     def test_stop_asks_by_pid_then_insists_and_reports_the_truth(self, monkeypatch):
         """pkill -f could not see the relay at all; the pid can always be
         signalled. TERM first; KILL when TERM is ignored; and the return

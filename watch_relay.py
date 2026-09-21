@@ -594,6 +594,28 @@ def _pull_update():
     return moved
 
 
+def _serving_older_code(running):
+    """True when the relay that answered is not the code that is installed.
+
+    Compares the commit the relay recorded about itself at start (``/health``
+    carries it as ``helper_commit``) with the checkout's commit now. Says no
+    whenever either side is unknown — a plugin install has no ``.git``, an
+    older relay reports no commit, git may be missing — because replacing a
+    working relay on a guess is worse than leaving it. Never raises.
+    """
+    try:
+        serving = (running or {}).get("helper_commit")
+        if not serving:
+            # Nothing to compare against, so do not even ask git: this is
+            # the blocking path of a session start, and a relay that says
+            # nothing about itself is answered by leaving it alone.
+            return False
+        installed = helper_provenance(os.path.dirname(os.path.abspath(__file__)))[0]
+    except Exception:
+        return False
+    return bool(installed and serving != installed)
+
+
 def ensure_running(updated=False):
     """Start the relay in the background unless one is already up.
 
@@ -610,6 +632,22 @@ def ensure_running(updated=False):
     running = _probe_relay()
     if running is not None:
         version = running.get("version") or 0
+        # A deferred update has to be tried again, or it is not deferred —
+        # it is cancelled. `updated` is true only in the one invocation
+        # whose pull moved the checkout; if a card was waiting just then,
+        # the replacement was put off, and every later start arrived with
+        # `updated` false, matched the protocol version, and said "already
+        # running". Found on the owner's Mac on 2026-09-21: the checkout at
+        # 1.1.9, the relay serving 1.1.8 for three days, and its own
+        # condition on the wrist promising to be replaced "the next time
+        # Claude Code starts" through dozens of starts.
+        #
+        # So ask the question directly: is the relay that is serving the
+        # code that is installed? Both sides say which commit they are;
+        # when both are known and they differ, the code moved, whoever
+        # moved it and whenever.
+        if not updated and _serving_older_code(running):
+            updated = True
         # A relay started before an update is running the old code even
         # when its protocol version matches, so a fresh pull must replace
         # it — subject to the same "not while a card is waiting" rule.
