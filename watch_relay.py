@@ -133,6 +133,37 @@ def install_crash_reporting(hooks=None):
     return True
 
 
+def _head_commit(root):
+    """The full commit id a checkout's HEAD names, read from the files.
+
+    No git, no subprocess: HEAD, then the ref it points at, then
+    packed-refs. This is the half of the receipt that must not fail — the
+    relay compares it against the checkout's to decide whether the code
+    moved underneath it (`_serving_older_code`). None when it cannot be
+    read. Never raises.
+    """
+    git = os.path.join(root, ".git")
+    try:
+        with open(os.path.join(git, "HEAD"), encoding="utf-8") as handle:
+            head = handle.read().strip()
+        if not head.startswith("ref: "):
+            return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
+        ref = head[len("ref: "):]
+        loose = os.path.join(git, *ref.split("/"))
+        if os.path.exists(loose):
+            with open(loose, encoding="utf-8") as handle:
+                sha = handle.read().strip()
+                return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+        with open(os.path.join(git, "packed-refs"), encoding="utf-8") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) == 2 and parts[1] == ref:
+                    return parts[0]
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def helper_provenance(here=None):
     """``(commit, date)`` of a git-installed helper, or ``(None, None)``.
 
@@ -143,6 +174,16 @@ def helper_provenance(here=None):
     the Connection screen, so "the helper is old" is something a person can
     see rather than something the number would have to admit.
 
+    The commit is read from `.git` itself, not asked of git. On 2026-09-23
+    a relay started at login answered `helper_commit: null` although git
+    worked in that very environment when tried later — a subprocess with a
+    five-second timeout at the busiest moment of a boot is the likeliest
+    culprit, and it failed in silence. That null did more than blank a
+    line on the wrist: it switched off the retry of a deferred update,
+    which needs the commit to compare. So the commit never depends on git,
+    the date (which only git can give without parsing packfiles) gets a
+    longer wait, and when git does fail the log says how.
+
     Read once, by main() before serving: the checkout does not move
     underneath a running relay (an update replaces the process), and a
     request handler must not be the thing that runs git. A plugin install
@@ -152,15 +193,24 @@ def helper_provenance(here=None):
     root = here or os.path.dirname(os.path.abspath(__file__))
     found = (None, None)
     if os.path.exists(os.path.join(root, ".git")):
+        full = _head_commit(root)
+        short, date = (full[:7] if full else None), None
         try:
             done = subprocess.run(
                 ["git", "-C", root, "log", "-1", "--format=%h %cI"],
-                capture_output=True, text=True, timeout=5)
+                capture_output=True, text=True, timeout=20)
             parts = done.stdout.split()
             if done.returncode == 0 and len(parts) == 2:
-                found = (parts[0], parts[1])
-        except Exception:                                  # never blocks a start
-            pass
+                short, date = (short or parts[0]), parts[1]
+            else:
+                print("relay: could not read this checkout's date from git "
+                      "(exit %s): %s" % (done.returncode,
+                                         (done.stderr or "").strip()[:200]),
+                      file=sys.stderr)
+        except Exception as error:                         # never blocks a start
+            print("relay: could not read this checkout's date from git: %s"
+                  % error, file=sys.stderr)
+        found = (short, date)
     if here is None:
         _PROVENANCE = found
     return found
@@ -613,7 +663,10 @@ def _serving_older_code(running):
         installed = helper_provenance(os.path.dirname(os.path.abspath(__file__)))[0]
     except Exception:
         return False
-    return bool(installed and serving != installed)
+    # By prefix: git may abbreviate to more than seven characters, and an
+    # older relay reported git's abbreviation rather than this one.
+    return bool(installed and not (serving.startswith(installed)
+                                   or installed.startswith(serving)))
 
 
 def ensure_running(updated=False):

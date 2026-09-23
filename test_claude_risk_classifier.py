@@ -5356,6 +5356,37 @@ class TestTheHelperSaysWhereItsCodeIsFrom:
         plain.mkdir()
         assert watch_relay.helper_provenance(str(plain)) == (None, None)
 
+    def test_the_commit_does_not_depend_on_git_answering(self, tmp_path, monkeypatch, capsys):
+        """2026-09-23: a relay started at login reported helper_commit null,
+        and with it the retry of a deferred update went dark. The commit is
+        read from .git itself; git failing costs the date, and says so."""
+        import subprocess as sp
+        root = self._repo(tmp_path)
+        expected = sp.run(["git", "-C", root, "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+        def refuse(*a, **k):
+            raise sp.TimeoutExpired(a[0], 20)
+        monkeypatch.setattr(watch_relay.subprocess, "run", refuse)
+        commit, date = watch_relay.helper_provenance(root)
+        assert commit == expected[:7]
+        assert date is None
+        assert "could not read this checkout's date" in capsys.readouterr().err
+
+    def test_a_packed_ref_is_read_too(self, tmp_path):
+        """After `git gc` a branch lives in packed-refs, not its own file."""
+        git = tmp_path / "h" / ".git"
+        git.mkdir(parents=True)
+        (git / "HEAD").write_text("ref: refs/heads/main\n")
+        sha = "b58337a" + "0" * 33
+        (git / "packed-refs").write_text("# pack-refs with: peeled\n%s refs/heads/main\n" % sha)
+        assert watch_relay._head_commit(str(tmp_path / "h")) == sha
+
+    def test_git_abbreviating_differently_is_not_a_move(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "helper_provenance",
+                            lambda here=None: ("b58337a", "x"))
+        assert not watch_relay._serving_older_code({"helper_commit": "b58337a9"})
+        assert watch_relay._serving_older_code({"helper_commit": "15642ba"})
+
     def test_main_reads_the_receipt_before_serving(self):
         """/health answers from what main() read at startup; a request
         must never be the thing that runs git."""
