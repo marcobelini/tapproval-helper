@@ -6959,6 +6959,29 @@ class TestTheLocalFallbackRunsWhatCiRuns:
     def _files():
         return _ci_files(".github/workflows/tests.yml", "ci-local.sh")
 
+    def test_ci_tests_the_watch_on_a_simulator_nobody_else_uses(self):
+        """2026-09-21: CI took the first watchOS simulator on the list, which
+        is the one everybody reaches for by name. A test run from a working
+        session landed on it fifteen seconds earlier; installing the app for
+        one run killed the other's test host, and CI said "Executed 34 tests
+        ... 0 failures" and then TEST FAILED, with no test to blame because
+        none had failed. The runner is the owner's own Mac, so this is the
+        ordinary case, not a freak one."""
+        _, local = self._files()
+        watch = local.split("# --- the watch app", 1)[1]
+        assert 'CI_SIM="Tapproval CI"' in watch
+        assert "simctl create" in watch, "the simulator is made on demand"
+        own = watch.index('grep -F "$CI_SIM ("')
+        shared = watch.index("sharing the first one listed")
+        assert own < shared, "look for CI's own simulator before borrowing one"
+
+    def test_a_run_that_dies_without_a_failing_test_says_why(self):
+        """The output filter keeps assertions and totals. A killed test host
+        fails no assertion, so the reason was in the part thrown away."""
+        _, local = self._files()
+        assert "tee \"$WATCH_LOG\"" in local
+        assert "why the run ended" in local
+
     def test_every_interpreter_in_the_matrix_is_run_locally(self):
         workflow, local = self._files()
         matrix = re.search(r'python:\s*\[([^\]]+)\]', workflow).group(1)
