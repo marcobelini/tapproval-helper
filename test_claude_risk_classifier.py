@@ -6232,6 +6232,9 @@ class TestNewSessionFromTheWatch:
     def test_says_when_claude_is_missing(self, tmp_path, monkeypatch):
         monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: None)
+        # Missing means missing everywhere, including the folders the relay
+        # now searches itself — this Mac has a real one in ~/.local/bin.
+        monkeypatch.setattr(watch_relay, "CLAUDE_HOMES", ())
         root = self._projects(tmp_path)
         assert watch_relay.start_session(str(tmp_path / "acme"), "go",
                                          projects_dir=root, platform="darwin") == "claude not on PATH"
@@ -7147,6 +7150,51 @@ class TestTheDocumentsDoNotRestateTheBuildNumber:
         assert not self.RESTATES.search(sentence), sentence
 
 
+class TestClaudeIsFoundWhoeverStartedTheRelay:
+    """2026-09-23: after a reboot the relay ran with launchd's bare PATH,
+    could not see ~/.local/bin/claude, and every message from the watch
+    came back "Could not send — try again"."""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        watch_relay.clear_condition("claude")
+        yield
+        watch_relay.clear_condition("claude")
+
+    def _fake_claude(self, folder):
+        folder.mkdir(parents=True, exist_ok=True)
+        binary = folder / "claude"
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        return folder
+
+    def test_a_bare_launchd_path_still_finds_a_native_install(self, tmp_path):
+        home = self._fake_claude(tmp_path / "local-bin")
+        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
+        assert watch_relay.ensure_claude_on_path(env, homes=(str(home),))
+        assert str(home) in env["PATH"].split(os.pathsep)
+        assert watch_relay.shutil.which("claude", path=env["PATH"])
+        assert "claude" not in {c["key"] for c in watch_relay.conditions()}
+
+    def test_nothing_changes_when_claude_is_already_on_path(self, tmp_path):
+        home = self._fake_claude(tmp_path / "bin")
+        env = {"PATH": str(home)}
+        assert watch_relay.ensure_claude_on_path(env, homes=())
+        assert env["PATH"] == str(home)
+
+    def test_no_claude_anywhere_is_said_on_the_wrist_not_behind_a_retry(self, tmp_path):
+        env = {"PATH": str(tmp_path)}
+        assert watch_relay.ensure_claude_on_path(env, homes=(str(tmp_path / "nope"),)) is False
+        said = {c["key"]: c["detail"] for c in watch_relay.conditions()}.get("claude", "")
+        assert "cannot find Claude Code" in said
+
+    def test_a_message_from_the_watch_asks_the_same_question(self):
+        source = open(os.path.join(_ROOT, "watch_relay.py"), encoding="utf-8").read()
+        assert 'if not shutil.which("claude")' not in source, \
+            "a bare which() is the check that failed under launchd"
+        assert source.count("if not ensure_claude_on_path():") == 2
+
+
 class TestTheReportingItselfIsChecked:
     """Issue #38's other half: three of its cases were checks that could
     not fail — TEST BUILD SUCCEEDED with no test action in the scheme, a CI
@@ -7164,7 +7212,7 @@ class TestTheReportingItselfIsChecked:
     # a key that is not here fails the first test below, which is the
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
-    VOCABULARY = {"bonjour", "crash", "helper", "signin", "tunnel", "update"}
+    VOCABULARY = {"bonjour", "claude", "crash", "helper", "signin", "tunnel", "update"}
 
     @staticmethod
     def _module_source(name):

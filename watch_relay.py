@@ -998,6 +998,58 @@ def say_guard(session_id, force=False, live=None):
     return "live" if session_id in rows else None
 
 
+# Where Claude Code's own installers put the binary, most likely first. A
+# relay started by launchd — the login agent, or a detached respawn with
+# nothing but launchd's PATH (/usr/bin:/bin:/usr/sbin:/sbin) — sees none of
+# these, and `claude` lives in ~/.local/bin for a native install.
+CLAUDE_HOMES = ("~/.local/bin", "~/.claude/local", "/opt/homebrew/bin",
+                "/usr/local/bin", "~/.npm-global/bin", "~/.bun/bin",
+                "~/.volta/bin")
+
+
+def ensure_claude_on_path(environ=None, homes=None):
+    """Make `claude` findable by name, whoever started this process.
+
+    Found on the owner's Mac on 2026-09-23: after a reboot the relay ran
+    with launchd's bare PATH, `shutil.which("claude")` came back empty, and
+    every message sent from the watch answered "claude not on PATH" — which
+    the watch can only show as "Could not send — try again", on a failure
+    that no number of tries would fix. Fixing PATH here, once, covers every
+    place that runs claude by name: a message, a new session, the sign-in
+    check, and whatever those runs spawn in turn.
+
+    Returns True when claude can be run. When it truly is not installed,
+    says so on the Connection screen rather than behind a retry button.
+    Never raises.
+    """
+    env = os.environ if environ is None else environ
+    homes = CLAUDE_HOMES if homes is None else homes
+    try:
+        # which() with no path reads os.environ, the one this process and
+        # everything it spawns will use.
+        found = (shutil.which("claude") if environ is None
+                 else shutil.which("claude", path=env.get("PATH")))
+        if found:
+            clear_condition("claude")
+            return True
+        for home in homes:
+            folder = os.path.expanduser(home)
+            if os.access(os.path.join(folder, "claude"), os.X_OK):
+                env["PATH"] = os.pathsep.join(
+                    part for part in (env.get("PATH", ""), folder) if part)
+                print("relay: found Claude Code in %s (not on this process's "
+                      "PATH)" % folder, file=sys.stderr)
+                clear_condition("claude")
+                return True
+    except Exception:
+        pass
+    note_condition("claude", "The helper cannot find Claude Code on your "
+                             "computer, so messages from the watch cannot "
+                             "be sent. Open Claude Code there once, then try "
+                             "again.")
+    return False
+
+
 def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
     """Send an instruction to a session, the way the terminal would.
 
@@ -1017,7 +1069,7 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
     stop = say_guard(session_id, force=force)
     if stop:
         return stop
-    if not shutil.which("claude"):
+    if not ensure_claude_on_path():
         return "claude not on PATH"
     if signed_in() is False:
         # Spawning anyway would put Claude Code's own authentication error
@@ -1164,7 +1216,7 @@ def start_session(path, text, projects_dir=None, platform=None):
     path = os.path.expanduser(str(path or ""))
     if path not in {row["path"] for row in known_projects(projects_dir)}:
         return "unknown project"
-    if not shutil.which("claude"):
+    if not ensure_claude_on_path():
         return "claude not on PATH"
     if signed_in() is False:
         return "signed out"
@@ -2827,6 +2879,7 @@ def main(argv=None):
               file=sys.stderr)
 
     check_helper_is_visible()
+    ensure_claude_on_path()
     helper_provenance()
     install_crash_reporting()
 
