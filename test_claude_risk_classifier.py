@@ -1783,20 +1783,22 @@ class TestSelfStartingRelay:
 
     @pytest.fixture(autouse=True)
     def _off_the_machines_ports(self, monkeypatch):
-        """Point TUNNEL_PORT at a port nobody holds.
+        """Point TUNNEL_PORT and DEFAULT_PORT at ports nobody holds.
 
         Since a stop is only proved when BOTH listeners are gone, these
         tests would otherwise consult the developer's own running relay
         and fail on a laptop while passing in CI — the worst direction for
         a test to be wrong in, and a coupling this suite already had one
-        of elsewhere.
+        of elsewhere. The main port too, since --ensure will not start a
+        relay onto a port something already holds.
         """
         import socket
-        probe = socket.socket()
-        probe.bind(("127.0.0.1", 0))
-        free = probe.getsockname()[1]
-        probe.close()
-        monkeypatch.setattr(watch_relay, "TUNNEL_PORT", free)
+        for name in ("TUNNEL_PORT", "DEFAULT_PORT"):
+            probe = socket.socket()
+            probe.bind(("127.0.0.1", 0))
+            free = probe.getsockname()[1]
+            probe.close()
+            monkeypatch.setattr(watch_relay, name, free)
 
     def test_install_registers_session_start_relay(self, settings, capsys):
         crc.run_install()
@@ -6167,6 +6169,130 @@ class TestALostTunnelIsNotALostRelay:
         assert watch_relay._port_in_use(free) is False
 
 
+class TestTwoRelaysOnePort:
+    """2026-09-23, 12:22: a SessionStart asked the relay's /health, got no
+    answer inside two seconds — the relay was waiting on `claude auth
+    status` — and started a second relay. The second died binding port
+    8977, the crash reporter mailed the owner about a relay that was
+    serving fine, and --ensure said "started in the background" because
+    the first one then answered."""
+
+    @staticmethod
+    def _free_port():
+        import socket
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        return port
+
+    @pytest.fixture
+    def relay(self, fresh_auth, monkeypatch):
+        """A real relay holding a port, the way the first one held 8977."""
+        monkeypatch.setattr(watch_relay, "signed_in", lambda: True)
+        server, _ = watch_relay.serve("127.0.0.1", 0, auth=fresh_auth)
+        _serve(server)
+        yield server
+        server.shutdown()
+        server.server_close()
+
+    def test_a_slow_relay_does_not_get_a_second_one_beside_it(
+            self, relay, monkeypatch, capsys):
+        """The trigger, as it happened: /health slower than the probe."""
+        monkeypatch.setattr(watch_relay, "signed_in",
+                            lambda: time.sleep(2.5) or True)
+        monkeypatch.setattr(watch_relay, "DEFAULT_PORT", relay.server_address[1])
+        monkeypatch.setattr(watch_relay, "_self_update", lambda: None)
+        monkeypatch.setattr(watch_relay, "_rotate_log", lambda path: None)
+        monkeypatch.setattr(watch_relay, "RELAY_START_WAIT", 0.5)
+        spawned = []
+        monkeypatch.setattr(watch_relay.subprocess, "Popen",
+                            lambda cmd, **k: spawned.append(cmd) or object())
+        code = watch_relay.ensure_running()
+        assert spawned == [], "a held port gets no second relay, however slow"
+        assert code == 0
+        said = capsys.readouterr().err
+        assert "not starting a second relay" in said
+        assert "started in the background" not in said
+
+    def test_the_relay_that_loses_the_race_leaves_quietly(
+            self, relay, monkeypatch, capsys):
+        port = relay.server_address[1]
+        watch_relay.clear_condition("port")
+        assert watch_relay._port_taken(port) == 0
+        # The holder's own access log shares stderr here; the loser's is one line.
+        said = [line for line in capsys.readouterr().err.splitlines()
+                if '"GET /health' not in line]
+        assert len(said) == 1 and "another relay already serves" in said[0], said
+        assert "port" not in [c["key"] for c in watch_relay.conditions()]
+
+    def test_something_else_on_the_port_is_said_to_the_wrist(
+            self, monkeypatch, capsys):
+        import socket
+        stranger = socket.socket()                  # listens, never answers
+        stranger.bind(("127.0.0.1", 0))
+        stranger.listen(1)
+        monkeypatch.setattr(watch_relay, "PORT_TAKEN_WAIT", 0.5)
+        watch_relay.clear_condition("port")
+        try:
+            assert watch_relay._port_taken(stranger.getsockname()[1]) == 1
+            said = [c["detail"] for c in watch_relay.conditions()
+                    if c["key"] == "port"]
+            assert said and "Another program" in said[0], said
+        finally:
+            stranger.close()
+            watch_relay.clear_condition("port")
+
+    def test_a_port_race_never_reaches_the_crash_reporter_or_the_mail(
+            self, relay, tmp_path, monkeypatch):
+        """main() itself, with the crash hooks really installed: the bind
+        fails, and nothing is recorded, reported or sent."""
+        import threading
+        monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+        monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+        reported, sent = [], []
+        monkeypatch.setattr(crash_report, "report",
+                            lambda *a, **k: reported.append(a) or ("x", {}))
+        monkeypatch.setattr(crash_report, "send",
+                            lambda *a, **k: sent.append(a) or "sent")
+        monkeypatch.setattr(watch_relay, "TOKEN_FILE", str(tmp_path / "no-token"))
+        monkeypatch.setattr(watch_relay, "Auth", lambda: _throwaway_auth(tmp_path))
+        monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: None)
+        monkeypatch.setattr(watch_relay, "helper_provenance", lambda: None)
+        port = relay.server_address[1]
+        try:
+            code = watch_relay.main(["--host", "127.0.0.1", "--port", str(port),
+                                     "--no-bonjour"])
+        except OSError as error:                    # the bug: it escapes
+            sys.excepthook(type(error), error, error.__traceback__)
+            code = "raised"
+        assert code == 0
+        assert reported == [] and sent == []
+
+    def test_and_as_a_real_process_it_writes_no_crash_record(self, relay, tmp_path):
+        """The same race end to end, in the process the crash reporter
+        actually hooks: exit 0, one line, no ~/.tapproval-crashes.jsonl."""
+        env = dict(os.environ, HOME=str(tmp_path),
+                   TAPPROVAL_PID_FILE=str(tmp_path / "pid"))
+        done = subprocess.run(
+            [sys.executable, watch_relay.__file__, "--host", "127.0.0.1",
+             "--port", str(relay.server_address[1]), "--no-bonjour"],
+            capture_output=True, text=True, timeout=60, env=env)
+        assert done.returncode == 0, done.stderr
+        assert "Traceback" not in done.stderr
+        assert "another relay already serves" in done.stderr
+        assert not (tmp_path / ".tapproval-crashes.jsonl").exists()
+
+
+_RealAuth = watch_relay.Auth
+
+
+def _throwaway_auth(tmp_path):
+    auth = _RealAuth(path=str(tmp_path / "auth.json"))
+    auth.save = lambda: None
+    return auth
+
+
 class TestAWatchThatSpeaksDanish:
     """The wrist is Danish, and so is much of what gets typed on it.
 
@@ -7280,7 +7406,7 @@ class TestTheReportingItselfIsChecked:
     # a key that is not here fails the first test below, which is the
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
-    VOCABULARY = {"bonjour", "claude", "crash", "helper", "signin", "tunnel", "update"}
+    VOCABULARY = {"bonjour", "claude", "crash", "helper", "port", "signin", "tunnel", "update"}
 
     @staticmethod
     def _module_source(name):

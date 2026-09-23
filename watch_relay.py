@@ -35,6 +35,7 @@ approval. "none" is the only answer it gives on any doubt.
 from __future__ import annotations
 
 import argparse
+import errno
 import hmac
 import glob
 import json
@@ -401,13 +402,13 @@ def _spawn_detached(command, log_path, cwd=None):
     return ""
 
 
-def _loopback_json(path, data=None, timeout=5):
+def _loopback_json(path, data=None, timeout=5, port=None):
     """One request to the relay on this machine: the parsed JSON reply, or
     None for any failure at all — no relay, a slow one, a bad body. GET
     without ``data``, POST with it."""
     import urllib.request
     request = urllib.request.Request(
-        "http://127.0.0.1:%d%s" % (DEFAULT_PORT, path), data=data,
+        "http://127.0.0.1:%d%s" % (port or DEFAULT_PORT, path), data=data,
         method="POST" if data is not None else "GET",
         headers={"Content-Type": "application/json"})
     try:
@@ -494,8 +495,10 @@ def _port_in_use(port, host="127.0.0.1", timeout=1.0):
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
-    except (ConnectionRefusedError, socket.timeout, OSError):
-        return False
+    except socket.timeout:
+        return True                     # the maybe: something is there, slowly
+    except OSError:
+        return False                    # refused: nothing is listening
 
 
 def _relay_is_down():
@@ -734,6 +737,20 @@ def ensure_running(updated=False):
                   "See %s" % (DEFAULT_PORT, _relay_pid() or "?", RELAY_LOG),
                   file=sys.stderr)
             return 1
+    # /health is not the only witness. On 2026-09-23 a SessionStart asked
+    # it, got no answer inside two seconds — the relay was busy asking
+    # `claude auth status`, which takes seconds on a cold start — and
+    # started a second relay beside the first. The second died binding
+    # the held port, its crash e-mailed the owner, and --ensure printed
+    # "started in the background" because the FIRST relay then answered.
+    # A held port is a relay that is slow, or something that is not a
+    # relay; either way a second one can only die on it.
+    if _port_in_use(DEFAULT_PORT):
+        print("relay: port %d is taken but did not answer /health in time — "
+              "not starting a second relay. A busy relay answers slowly; "
+              "anything else holding the port is named in %s"
+              % (DEFAULT_PORT, RELAY_LOG), file=sys.stderr)
+        return 0
     log_path = RELAY_LOG
     _rotate_log(log_path)
     error = _spawn_detached(
@@ -2904,6 +2921,35 @@ def _inject_startup_cards(args, queue):
                         args=(queue, _classified_card(args.card), args.wait)).start()
 
 
+# How long a relay that lost the race for its port waits for the winner
+# to say what it is. Longer than the probe --ensure uses, because the
+# winner is the relay that was too slow for that probe: /health may be
+# waiting on `claude auth status`, whose own limit is fifteen seconds.
+PORT_TAKEN_WAIT = 20.0
+
+
+def _port_taken(port):
+    """The relay could not bind: say who has the port, and do not crash.
+
+    Two relays racing for one port is not a fault in either — the loser
+    is simply not needed. Until 1.1.15 it died with a traceback, and the
+    crash reporter mailed the owner about a relay that was running fine.
+    Anything else on the port is a real problem, and one the user can act
+    on: it becomes a condition, not a stack trace.
+    """
+    reply = _loopback_json("/health", timeout=PORT_TAKEN_WAIT, port=port)
+    if isinstance(reply, dict) and reply.get("ok") and "version" in reply:
+        print("relay: another relay already serves port %d (helper %s) — "
+              "leaving it to it" % (port, reply.get("helper") or "?"),
+              file=sys.stderr)
+        return 0
+    note_condition("port", "Another program on your computer is using the "
+                           "connection Tapproval needs (port %d), so the "
+                           "helper could not start. Restarting the computer "
+                           "frees it." % port)
+    return 1
+
+
 def main(argv=None):
     args = _build_parser().parse_args(argv)
     if args.ensure:
@@ -2936,7 +2982,12 @@ def main(argv=None):
     helper_provenance()
     install_crash_reporting()
 
-    server, queue = serve(args.host, args.port, auth=auth)
+    try:
+        server, queue = serve(args.host, args.port, auth=auth)
+    except OSError as error:
+        if error.errno != errno.EADDRINUSE:
+            raise
+        return _port_taken(args.port)
     print("relay: listening on http://%s:%d" % (args.host, args.port),
           file=sys.stderr)
     tunnel_proc = _start_tunnel(queue, auth) if args.tunnel else None
