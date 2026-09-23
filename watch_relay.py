@@ -946,7 +946,8 @@ class CardQueue:
 from watch_dashboard import (  # noqa: E402
     activity_summary, recap_summary, _find_transcript, image_bytes,
     _parse_thread, prewarm_threads, _read_appended,
-    recent_sessions, resolve_session, session_registry,
+    project_root, recent_sessions, resolve_session, session_registry, shape,
+    transcript_origin, transcripts_newest_first,
     THREAD_TURN_LIMIT, usage_summary)
 
 
@@ -1244,22 +1245,49 @@ def known_skills(cwd=None, home=None, now=None):
     return rows
 
 
-def known_projects(projects_dir=None, limit=50):
-    """The projects a new session may be started in: one row per directory
-    Claude Code has recently worked in, most recent first. Derived from the
+# Folders that hold throwaway work — Claude Code's own scratchpads live
+# under /tmp. A module constant so the tests, whose temporary projects live
+# there too on Linux, can say so.
+SCRATCH_ROOTS = ("/tmp", "/private/tmp")
+
+
+def known_projects(projects_dir=None, limit=25):
+    """The projects a new session may be started in: one row per repository
+    a person has recently worked in, most recent first. Derived from the
     same transcripts the session list reads, so the watch never has to
     type a path and the relay never opens a terminal somewhere it has not
-    already seen Claude Code run."""
+    already seen Claude Code run.
+
+    Two kinds of folder are not projects, and on 2026-09-23 they were most
+    of the list. A session's own worktree folds into its repository — the
+    picker offered "app-store-version-update-b03a35", and chose it by
+    default, where the desktop app offers "ClaudeWatch". And a folder only
+    ever worked in by unattended runs (`claude -p`, a scheduled loop) is
+    where a machine works, not where a person starts something: twenty of
+    the first twenty-five rows were those. Nor is a scratch folder, or the
+    home folder itself — Claude Code runs there, nobody means to start work
+    there from a wrist.
+    """
+    now = time.time()
     seen, rows = set(), []
-    for session in recent_sessions(limit=limit, projects_dir=projects_dir,
-                                   include_idle=True, light=True):
-        path = session.get("path") or ""
-        if not path or path in seen or not os.path.isdir(path):
+    home = os.path.realpath(os.path.expanduser("~"))
+    scratch = tuple(os.path.realpath(p) + os.sep for p in SCRATCH_ROOTS)
+    for mtime, path, _, _ in transcripts_newest_first(projects_dir):
+        cwd, entry_point = transcript_origin(path)
+        if not cwd or entry_point == shape("entrypoint.sdk_cli"):
             continue
-        seen.add(path)
-        rows.append({"name": session.get("project") or os.path.basename(path),
-                     "path": path,
-                     "minutes_ago": session.get("minutes_ago", 0)})
+        root = project_root(cwd)
+        if root in seen or not os.path.isdir(root):
+            continue
+        seen.add(root)
+        real = os.path.realpath(root)
+        if real == home or (real + os.sep).startswith(scratch):
+            continue
+        rows.append({"name": os.path.basename(root.rstrip("/")) or root,
+                     "path": root,
+                     "minutes_ago": max(0, int((now - mtime) / 60))})
+        if len(rows) >= limit:
+            break
     return rows
 
 

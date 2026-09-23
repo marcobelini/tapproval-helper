@@ -235,7 +235,7 @@ def session_registry(sessions_dir=None):
         # Unattended SDK runs (claude agents, headless drivers) never
         # appear in the phone app's session list — and the wrist mirrors
         # the phone, so they don't belong on the watch either.
-        if data.get("entrypoint") == "sdk-cli":
+        if data.get("entrypoint") == shape("entrypoint.sdk_cli"):
             continue
         try:
             os.kill(int(pid), 0)          # signal 0: "are you there?"
@@ -244,8 +244,16 @@ def session_registry(sessions_dir=None):
         registry[session_id] = {
             "status": ENTRYPOINTS.get(data.get("entrypoint", ""), "Connected"),
             "bridged": bool(data.get("bridgeSessionId")),
+            # The title the phone and the desktop app show. A name the CLI
+            # derived from the folder ("acme-3f") is not a title, so that
+            # one is left out; a /rename and the desktop app's own title
+            # (which carries no nameSource at all) are what a person reads
+            # everywhere else, and the wrist showed neither for desktop
+            # sessions until 2026-09-23 — it showed "Base directory for this
+            # skill…", the first line a skill injected.
             "name": (str(data.get("name") or "").strip()
-                     if data.get("nameSource") == "user" else ""),
+                     if data.get("nameSource") != "derived" else ""),
+            "cwd": str(data.get("cwd") or ""),
         }
     return registry
 
@@ -308,6 +316,66 @@ def derive_title(text):
 
 
 _META_CACHE = {}   # path -> ((mtime, size), (cwd, opening, turns))
+_ORIGIN_CACHE = {}  # path -> ((mtime, size), (cwd, entrypoint))
+
+
+def project_root(cwd):
+    """The repository a directory belongs to, when it is a session's own
+    worktree; otherwise the directory itself. The desktop app and the phone
+    name the repository ("ClaudeWatch"), never the worktree it made for one
+    session ("app-store-version-update-b03a35")."""
+    cwd = str(cwd or "")
+    marker = shape("path.worktree")
+    return cwd.split(marker, 1)[0] if marker in cwd else cwd
+
+
+def transcript_origin(path, scan_lines=60):
+    """Where a transcript was written and what started it: (cwd, entrypoint).
+    Both sit on its first lines, so this reads a handful, and it is cached
+    for many more paths than the list screen's parse — the projects picker
+    walks every transcript on the machine. Never raises."""
+    def read():
+        cwd = entry_point = ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                for index, line in enumerate(handle):
+                    if index >= scan_lines or (cwd and entry_point):
+                        break
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    cwd = cwd or str(entry.get("cwd") or "")
+                    entry_point = entry_point or str(entry.get("entrypoint") or "")
+        except OSError:
+            pass
+        return cwd, entry_point
+    return _stat_cached(_ORIGIN_CACHE, path, read, extra=scan_lines, limit=4096)
+
+
+def transcripts_newest_first(projects_dir=None):
+    """Every transcript on the machine as (mtime, path, folder, session_id),
+    newest first. Never raises."""
+    root = projects_dir or CLAUDE_PROJECTS
+    found = []
+    try:
+        for project in os.listdir(root):
+            pdir = os.path.join(root, project)
+            if not os.path.isdir(pdir):
+                continue
+            for entry in os.listdir(pdir):
+                if not entry.endswith(".jsonl"):
+                    continue
+                path = os.path.join(pdir, entry)
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                found.append((mtime, path, project, entry[:-6]))
+    except OSError:
+        return []
+    found.sort(reverse=True)
+    return found
 
 
 
@@ -353,6 +421,15 @@ UPSTREAM_SHAPES = {
     "part.tool_result":
         ('"tool_result"', "A tool has answered, so nothing is running now.",
          "2026-09-04"),
+    "entrypoint.sdk_cli":
+        ("sdk-cli", "What a transcript and the session registry call a run "
+         "nobody is sitting at: `claude -p`, the Agent SDK, a scheduled "
+         "loop. The phone never lists them, and nobody starts a session "
+         "in the folder a loop works in.", "2026-09-23"),
+    "path.worktree":
+        ("/.claude/worktrees/", "Where Claude Code, and the desktop app, "
+         "put a session's own worktree inside the repository it belongs "
+         "to. The app names the repository, not the worktree.", "2026-09-23"),
 }
 
 
@@ -1379,7 +1456,7 @@ def _thread_line(state, line, limit):
     # — is not one the session's live process has seen. Name it, so a
     # thread that forks here is legible on both devices rather than
     # mysterious on one.
-    if role == "user" and kind == "text" and entry.get("entrypoint") == "sdk-cli":
+    if role == "user" and kind == "text" and entry.get("entrypoint") == shape("entrypoint.sdk_cli"):
         turn["origin"] = "headless"
     state["turns"].append(turn)
     if len(state["turns"]) > limit * 4:
@@ -1454,26 +1531,7 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
     never a graveyard of every transcript on disk. Newest first.
     Never raises.
     """
-    root = projects_dir or CLAUDE_PROJECTS
-    found = []
-    try:
-        for project in os.listdir(root):
-            pdir = os.path.join(root, project)
-            if not os.path.isdir(pdir):
-                continue
-            for entry in os.listdir(pdir):
-                if not entry.endswith(".jsonl"):
-                    continue
-                path = os.path.join(pdir, entry)
-                try:
-                    mtime = os.path.getmtime(path)
-                except OSError:
-                    continue
-                found.append((mtime, path, project, entry[:-6]))
-    except OSError:
-        return []
-
-    found.sort(reverse=True)
+    found = transcripts_newest_first(projects_dir)
     # Two reads of the same directory, on purpose: live_sessions() is the
     # seam the tests patch to stage a live set, and a registry read costs
     # about 2 ms — not worth taking that seam away.
@@ -1492,7 +1550,11 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
     for mtime, path, project, session_id in found:
         # Only the ones we actually return are worth opening.
         cwd, opening, turns = session_meta(path)
-        name = os.path.basename(str(cwd).rstrip("/")) if cwd else ""
+        # The repository, as the app names it: the registry knows where the
+        # session is now (a desktop session can move), the transcript where
+        # it began, and a worktree folds into the repository it is part of.
+        where = project_root(registry.get(session_id, {}).get("cwd") or cwd)
+        name = os.path.basename(where.rstrip("/")) if where else ""
         if not name:
             name = project.rstrip("-").rsplit("-", 1)[-1] or project
         if light:
@@ -1500,10 +1562,12 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
         else:
             running_tasks, running_tool, github, _ = _thread_activity(path)
             repo = repo_slug(cwd)
-        # A name given with /rename wins outright. Otherwise the opening
-        # ask: the phone titles a session once, from how it began, and a
-        # wrist that re-titled by the newest message showed a different
-        # name for the same session — which read as a different session.
+        # The app's own title wins outright — a /rename, or the title the
+        # desktop app gave it, which is what the phone shows too. Otherwise
+        # the opening ask: the phone titles a session once, from how it
+        # began, and a wrist that re-titled by the newest message showed a
+        # different name for the same session — which read as a different
+        # session.
         named = registry.get(session_id, {}).get("name", "")
         sessions.append({
             "title": named or derive_title(opening) or name,

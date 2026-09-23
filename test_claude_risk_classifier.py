@@ -233,6 +233,14 @@ def _no_real_launch_agent(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _temporary_projects_count(monkeypatch):
+    """The suite's projects live in a temporary folder, which on Linux is
+    under /tmp — the very place the projects picker leaves out. Tests that
+    are about that rule set SCRATCH_ROOTS themselves."""
+    monkeypatch.setattr(watch_relay, "SCRATCH_ROOTS", ())
+
+
+@pytest.fixture(autouse=True)
 def _no_ambient_policy(tmp_path, monkeypatch):
     """Every test starts from the machine CI has: no wrist-approval
     settings in the environment, and the settings file and audit log
@@ -6409,6 +6417,60 @@ class TestNewSessionFromTheWatch:
         shutil.rmtree(tmp_path / "pantri")
         assert [r["name"] for r in watch_relay.known_projects(projects_dir=root)] == ["acme"]
 
+    @staticmethod
+    def _transcript(root, slug, cwd, age, entrypoint="claude-desktop"):
+        folder = root / slug
+        folder.mkdir(parents=True, exist_ok=True)
+        f = folder / ("s-%d.jsonl" % len(list(folder.iterdir())))
+        f.write_text(json.dumps({"type": "user", "cwd": str(cwd), "entrypoint": entrypoint,
+                                 "message": {"role": "user", "content": "hi"}}) + "\n",
+                     encoding="utf-8")
+        os.utime(f, (time.time() - age, time.time() - age))
+
+    def test_a_worktree_is_offered_as_its_repository(self, tmp_path):
+        """2026-09-23: the picker offered "app-store-version-update-b03a35",
+        by default, where the desktop app offers "ClaudeWatch"."""
+        repo = tmp_path / "ClaudeWatch"
+        tree = repo / ".claude" / "worktrees" / "app-store-version-update-b03a35"
+        tree.mkdir(parents=True)
+        root = tmp_path / "projects"
+        self._transcript(root, "-wt", tree, 10)
+        self._transcript(root, "-repo", repo, 900)
+        rows = watch_relay.known_projects(projects_dir=str(root))
+        assert [(r["name"], r["path"]) for r in rows] == [("ClaudeWatch", str(repo))]
+        assert rows[0]["minutes_ago"] == 0, "the worktree's recency is the repository's"
+
+    def test_a_folder_only_machines_work_in_is_not_offered(self, tmp_path):
+        loop, mine = tmp_path / "pantri-loop", tmp_path / "pantri"
+        loop.mkdir()
+        mine.mkdir()
+        root = tmp_path / "projects"
+        self._transcript(root, "-loop", loop, 5, entrypoint="sdk-cli")
+        self._transcript(root, "-mine", mine, 600, entrypoint="cli")
+        assert [r["name"] for r in watch_relay.known_projects(projects_dir=str(root))] == ["pantri"]
+
+    def test_scratch_and_home_are_not_projects(self, tmp_path, monkeypatch):
+        scratch, home, work = tmp_path / "tmp", tmp_path / "home", tmp_path / "home" / "work"
+        (scratch / "pad").mkdir(parents=True)
+        work.mkdir(parents=True)
+        monkeypatch.setattr(watch_relay, "SCRATCH_ROOTS", (str(scratch),))
+        monkeypatch.setenv("HOME", str(home))
+        root = tmp_path / "projects"
+        self._transcript(root, "-pad", scratch / "pad", 1)
+        self._transcript(root, "-home", home, 2)
+        self._transcript(root, "-work", work, 3)
+        assert [r["name"] for r in watch_relay.known_projects(projects_dir=str(root))] == ["work"]
+
+    def test_a_session_can_be_started_in_the_folded_repository(self, tmp_path):
+        """start_session accepts only a known project; the fold must not
+        make the repository a stranger to it."""
+        repo = tmp_path / "acme"
+        tree = repo / ".claude" / "worktrees" / "x-1"
+        tree.mkdir(parents=True)
+        root = tmp_path / "projects"
+        self._transcript(root, "-wt", tree, 1)
+        assert str(repo) in {r["path"] for r in watch_relay.known_projects(projects_dir=str(root))}
+
     def test_refuses_anything_but_a_mac(self, tmp_path):
         assert watch_relay.start_session("/x", "go", platform="linux") == "new sessions need a Mac"
 
@@ -6912,6 +6974,27 @@ class TestSessionRegistry:
         reg = watch_relay.session_registry(sessions_dir=str(tmp_path))
         assert reg["phone-1"]["bridged"] is True and reg["phone-1"]["name"] == ""
         assert reg["local-1"]["bridged"] is False and reg["local-1"]["name"] == "Billing fix"
+
+    def test_the_desktop_apps_own_title_is_the_title(self, tmp_path, monkeypatch):
+        """2026-09-23: the desktop app titled a session "Engineering code
+        review" and the phone showed that; the wrist showed "Base directory
+        for this skill: /Users/…", the first line a skill injected. The
+        desktop's registry entry carries the title with no nameSource."""
+        import watch_dashboard
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        (sessions / "1.json").write_text(json.dumps({
+            "pid": os.getpid(), "sessionId": "desk-1", "entrypoint": "claude-desktop",
+            "bridgeSessionId": "session_y", "name": "Engineering code review",
+            "cwd": str(tmp_path / "ClaudeWatch" / ".claude" / "worktrees" / "eng-1")}),
+            encoding="utf-8")
+        monkeypatch.setattr(watch_dashboard, "CLAUDE_SESSIONS", str(sessions))
+        _write_transcript(tmp_path, "-p", "desk-1.jsonl", [{
+            "cwd": str(tmp_path / "elsewhere"),
+            "message": {"role": "user", "content": "Base directory for this skill: /Users/x"}}])
+        [row] = watch_relay.recent_sessions(projects_dir=str(tmp_path))
+        assert row["title"] == "Engineering code review"
+        assert row["project"] == "ClaudeWatch", "the repository, as the app names it"
 
     def test_the_list_mirrors_the_phone_when_the_phone_has_sessions(self, tmp_path, monkeypatch):
         import watch_dashboard
