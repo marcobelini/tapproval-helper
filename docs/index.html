@@ -3,28 +3,36 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tapproval — Claude Code on your wrist</title>
-<meta name="description" content="Tapproval is a remote control for Claude Code on your Apple Watch. Approve commands, answer questions and follow live sessions with one tap. No account, no server.">
+<title>Tapproval — Approve Claude Code from your Apple Watch</title>
+<meta name="description" content="Approve Claude Code permission prompts from your Apple Watch, each marked with its risk. One tap answers. Free, no account, no server.">
+<link rel="canonical" href="https://tapproval.thoughtfulsteward.org/">
+<meta name="theme-color" content="#000000">
+<meta property="og:site_name" content="Tapproval">
+<meta property="og:locale" content="en_US">
 <meta property="og:title" content="Tapproval — Claude Code on your wrist">
 <meta property="og:description" content="Approve commands, answer questions and follow live Claude Code sessions from your Apple Watch. One tap. No account, no server.">
 <meta property="og:image" content="https://tapproval.thoughtfulsteward.org/img/share.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="An Apple Watch showing a Claude Code permission card with deny and allow buttons">
 <meta property="og:url" content="https://tapproval.thoughtfulsteward.org/">
 <meta property="og:type" content="website">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Tapproval — Claude Code on your wrist">
 <meta name="twitter:description" content="Approve commands, answer questions and follow live Claude Code sessions from your Apple Watch. One tap. No account, no server.">
 <meta name="twitter:image" content="https://tapproval.thoughtfulsteward.org/img/share.png">
+<meta name="twitter:image:alt" content="An Apple Watch showing a Claude Code permission card with deny and allow buttons">
 <meta name="apple-itunes-app" content="app-id=6805869018">
 <link rel="icon" href="img/icon.png">
 <link rel="apple-touch-icon" href="img/icon.png">
 <link rel="stylesheet" href="style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/", "description": "A remote control for Claude Code on Apple Watch: approve permission prompts, answer questions and follow live sessions with one tap.", "applicationCategory": "DeveloperApplication", "operatingSystem": "watchOS 10 or later", "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}, "downloadUrl": "https://apps.apple.com/app/tapproval/id6805869018", "installUrl": "https://apps.apple.com/app/tapproval/id6805869018", "image": "https://tapproval.thoughtfulsteward.org/img/share.png", "screenshot": ["https://tapproval.thoughtfulsteward.org/img/card.png", "https://tapproval.thoughtfulsteward.org/img/sessions.png", "https://tapproval.thoughtfulsteward.org/img/thread.png"], "publisher": {"@type": "Organization", "name": "Tapproval", "email": "tapproval@thoughtfulsteward.org", "url": "https://tapproval.thoughtfulsteward.org/"}}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "The watch can't find my computer", "acceptedAnswer": {"@type": "Answer", "text": "The watch and the computer must be on the same Wi-Fi, and a VPN on your iPhone must be fully connected or fully off. Then open Settings → Connection on the watch: every route gets a tick or a reason."}}, {"@type": "Question", "name": "How do I pair a second watch?", "acceptedAnswer": {"@type": "Answer", "text": "Tell Claude Code on your computer “Open Tapproval pairing”, then open Tapproval on the watch. The door stays open for half an hour."}}, {"@type": "Question", "name": "How is Tapproval updated?", "acceptedAnswer": {"@type": "Answer", "text": "The helper checks once a day and updates itself, never while a question is waiting on your wrist."}}, {"@type": "Question", "name": "How do I remove it?", "acceptedAnswer": {"@type": "Answer", "text": "Tell Claude Code “Uninstall Tapproval Base”. It restores your settings, keeps a backup and stops the bridge. Delete the app from the watch like any other."}}, {"@type": "Question", "name": "My phone still shows a question I answered", "acceptedAnswer": {"@type": "Answer", "text": "The command ran. The Claude app on a phone or iPad can keep displaying a prompt the watch already answered; it is a known Claude Code bug, and any message sent from the phone clears it."}}]}</script>
 </head>
 <body>
 <div class="wrap">
 <header class="top">
-  <img src="img/icon.png" alt=""><strong>Tapproval</strong>
+  <img src="img/icon.png" width="36" height="36" alt=""><strong>Tapproval</strong>
   <nav><a href="#how">How it works</a><a href="#what">What it does</a><a href="#privacy">Privacy</a><a href="#support">Support</a><a href="https://apps.apple.com/app/tapproval/id6805869018">App Store</a></nav>
 </header>
 
@@ -33,9 +41,9 @@
     <h1>Claude Code asks.<br><em>Your wrist answers.</em></h1>
     <p class="lede">When the agent on your computer asks permission, the question lands on your Apple Watch and one tap answers it. No account, no server.</p>
     <a class="cta" href="https://apps.apple.com/app/tapproval/id6805869018">Get it on the App Store</a><a class="cta quiet" href="https://testflight.apple.com/join/dW1tYBQG">Or try the beta</a>
-    <p class="lede" style="font-size:.9em;opacity:.75;margin-top:.6em">It is free, with nothing to buy. It needs an Apple Watch and Claude Code on a Mac or Linux machine. Not yet in the EU, where it follows shortly; the beta works everywhere.</p>
+    <p class="lede" style="font-size:.9em;opacity:.75;margin-top:.6em">It is free, with nothing to buy. It needs an Apple Watch and Claude Code on a Mac or Linux machine. Not yet in the EU; the beta works everywhere.</p>
   </div>
-  <div class="watch"><img src="img/card.png" alt="Apple Watch showing a CRITICAL card: git push --force origin main, with deny and allow buttons"></div>
+  <div class="watch"><img src="img/card.png" width="416" height="496" fetchpriority="high" alt="Apple Watch showing a CRITICAL card: git push --force origin main, with deny and allow buttons"></div>
 </section>
 
 <section id="how">
@@ -52,11 +60,12 @@
   <h2>What it does</h2>
   <p class="sub">Everything the agent asks a person for, answered where the person is.</p>
   <div class="shots">
-    <figure><img src="img/card.png" alt="A permission card waiting on the watch"><figcaption>Approve or deny with one tap. Your computer obeys instantly.</figcaption></figure>
-    <figure><img src="img/sessions.png" alt="The session list: one needs a tap, one is working, two are idle"><figcaption>See which session needs you, which one is working, which are idle.</figcaption></figure>
-    <figure><img src="img/thread.png" alt="A live session thread on the watch"><figcaption>Read the conversation and reply: Proceed, Run tests, /code-review, or dictate.</figcaption></figure>
+    <figure><img src="img/card.png" width="416" height="496" loading="lazy" decoding="async" alt="A permission card waiting on the watch"><figcaption>Approve or deny with one tap. Your computer obeys instantly.</figcaption></figure>
+    <figure><img src="img/sessions.png" width="416" height="496" loading="lazy" decoding="async" alt="The session list: one needs a tap, one is working, two are idle"><figcaption>See which session needs you, which one is working, which are idle.</figcaption></figure>
+    <figure><img src="img/thread.png" width="416" height="496" loading="lazy" decoding="async" alt="A live session thread on the watch"><figcaption>Read the conversation and reply: Proceed, Run tests, /code-review, or dictate.</figcaption></figure>
   </div>
   <div class="grid" style="margin-top:24px">
+    <div class="card"><h3>Know which taps matter</h3><p>Every request is sorted into one of five risk tiers on your computer, and the card says which: a force-push to main arrives marked CRITICAL. Nothing is approved for you unless you ask it to be, and a CRITICAL never is.</p></div>
     <div class="card"><h3>Real questions, real options</h3><p>Multiple-choice questions arrive with the same choices as on your desktop.</p></div>
     <div class="card"><h3>Sessions, live</h3><p>Start a session from the wrist, follow it, send it instructions.</p></div>
     <div class="card"><h3>Your day</h3><p>What was handled without you, what you decided, how much you used — and roughly how much time at the desk that saved.</p></div>
