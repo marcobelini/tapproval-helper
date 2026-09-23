@@ -1222,6 +1222,43 @@ class TestInstallerCLI:
         assert decision == "escalate"
 
 
+class TestTestsNeverReachTheRealLaunchd:
+    """2026-09-23: an installer test run as a subprocess replaced the
+    owner's login job `com.tapproval.relay` with one pointing at a pytest
+    temp file. The in-process launchctl stub did not reach the subprocess;
+    CI runs on the owner's Mac, so every CI run did it."""
+
+    def _fake_launchctl(self, tmp_path):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        log = tmp_path / "launchctl.calls"
+        fake = bin_dir / "launchctl"
+        fake.write_text("#!/bin/sh\necho \"$@\" >> %s\n" % log)
+        fake.chmod(0o755)
+        return bin_dir, log
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="launchd is macOS")
+    def test_an_install_with_a_test_path_never_calls_launchctl(self, tmp_path):
+        bin_dir, log = self._fake_launchctl(tmp_path)
+        env = dict(os.environ,
+                   PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
+                   CLAUDE_SETTINGS_PATH=str(tmp_path / "settings.json"),
+                   CLAUDE_RISK_AUDIT_LOG=str(tmp_path / "audit.jsonl"),
+                   CLAUDE_LAUNCH_AGENT_PATH=str(tmp_path / "agent.plist"))
+        for args in (["--install"], ["--uninstall"]):
+            subprocess.run([sys.executable, os.path.join(_ROOT, "ClaudeRiskClassifier.py")]
+                           + args, capture_output=True, text=True, env=env, timeout=60)
+        calls = log.read_text() if log.exists() else ""
+        assert calls == "", "a test install reached launchd: %s" % calls
+
+    def test_the_real_path_still_registers_with_launchd(self, monkeypatch):
+        """The guard must not stop the real install from working."""
+        monkeypatch.delenv("CLAUDE_LAUNCH_AGENT_PATH", raising=False)
+        assert crc._launch_agent_is_real()
+        monkeypatch.setenv("CLAUDE_LAUNCH_AGENT_PATH", "/tmp/x.plist")
+        assert not crc._launch_agent_is_real()
+
+
 class TestPipeHandling:
     """`--report | head` and quitting `less` early must not raise."""
 

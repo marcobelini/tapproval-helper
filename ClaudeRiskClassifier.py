@@ -102,7 +102,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.13"
+__version__ = "1.1.14"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -1928,9 +1928,25 @@ def _relay_command():
 # A reboot must not need a hand: a login item wakes the relay the moment
 # the user logs back in, instead of leaving the watch searching until the
 # first Claude Code session happens to start.
+def _launch_agent_is_real():
+    """True only when the agent file is the one launchd reads at login.
+
+    The file path is overridable for tests; the *label* is not. Every
+    install bootstraps `com.tapproval.relay` into the user's real launchd,
+    so an overridden path used to replace the owner's login job with a
+    job pointing at a pytest temp file — from any test that ran the
+    installer as a subprocess, where the in-process launchctl stub does
+    not reach. CI runs on the owner's Mac, so every CI run did it. Found
+    on 2026-09-23 when a relay stopped for an update did not come back:
+    launchd ran the test's plist, long deleted, and exited 2.
+    """
+    return not os.environ.get("CLAUDE_LAUNCH_AGENT_PATH")
+
+
 def _launch_agent_path():
     """Overridable like CLAUDE_SETTINGS_PATH, so tests never touch the
-    real LaunchAgents directory."""
+    real LaunchAgents directory — and see `_launch_agent_is_real`: with
+    the path overridden, launchd is not touched either."""
     return os.environ.get("CLAUDE_LAUNCH_AGENT_PATH") or os.path.join(
         os.path.expanduser("~"), "Library", "LaunchAgents",
         "com.tapproval.relay.plist")
@@ -1990,9 +2006,10 @@ def install_launch_agent():
             handle.write(plist)
     except OSError:
         return False
-    uid = os.getuid()
-    _launchctl("bootout", "gui/%d/com.tapproval.relay" % uid)
-    _launchctl("bootstrap", "gui/%d" % uid, target)
+    if _launch_agent_is_real():
+        uid = os.getuid()
+        _launchctl("bootout", "gui/%d/com.tapproval.relay" % uid)
+        _launchctl("bootstrap", "gui/%d" % uid, target)
     return True
 
 
@@ -2000,7 +2017,8 @@ def remove_launch_agent():
     """Take the login wake-up out again — part of a clean exit."""
     if sys.platform != "darwin":
         return False
-    _launchctl("bootout", "gui/%d/com.tapproval.relay" % os.getuid())
+    if _launch_agent_is_real():
+        _launchctl("bootout", "gui/%d/com.tapproval.relay" % os.getuid())
     try:
         os.remove(_launch_agent_path())
         return True
