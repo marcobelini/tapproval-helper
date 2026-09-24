@@ -1507,22 +1507,19 @@ def start_session(path, text, projects_dir=None, platform=None):
     # refuses to parse, "Expected \u201d\"\u201d but found unknown token".
     # So every session started from the wrist in Danish, or with an emoji
     # or a smart quote, lost this route and limped along on the .command
-    # fallback below — which uses the unescaped string and therefore
+    # fallback — which uses the unescaped string and therefore
     # worked, which is exactly why nobody noticed for the life of the
     # feature. A fallback that hides a failure is a fallback that stops
     # you fixing it.
-    apple = ('tell application "Terminal"\n'
-             '  activate\n'
-             '  do script %s\n'
-             'end tell' % _applescript_literal(script))
-    ok, why = _run_osascript(apple)
-    if ok:
-        return "started"
-    # Scripting Terminal needs an automation consent this relay, a
-    # background process, cannot ask for — on one Mac the request simply
-    # hung until the timeout, every time. Opening a .command file asks
-    # nothing of anyone: Launch Services hands it to Terminal, which runs
-    # it in a new window. The file removes itself as its first act.
+    # A .command file first. Launch Services hands it to Terminal, which
+    # runs it in a new window, and it asks nothing of anyone; the file
+    # removes itself as its first act. Scripting Terminal comes second
+    # because it needs an automation consent a background relay cannot
+    # ask for, and without it osascript does not fail — it hangs until
+    # its timeout. That wait was spent first, on every tap: measured
+    # 2026-09-24, the relay took 4.3 s to answer on loopback, and the
+    # watch, whose requests give up at 5 s and travel through the phone,
+    # said "Your computer didn't answer" about a session that had started.
     try:
         handle, command_file = tempfile.mkstemp(prefix="tapproval-", suffix=".command")
         with os.fdopen(handle, "w") as out:
@@ -1530,13 +1527,21 @@ def start_session(path, text, projects_dir=None, platform=None):
         os.chmod(command_file, 0o700)
         opened = subprocess.run(["open", command_file], capture_output=True,
                                 text=True, timeout=8)
+        if opened.returncode == 0:
+            return "started"
+        also = (opened.stderr or opened.stdout or "").strip().splitlines()
+        not_opened = also[-1] if also else "no reason given"
     except (OSError, subprocess.SubprocessError) as error:
-        return "could not open Terminal: %s (nor a .command file: %s)" % (why, error)
-    if opened.returncode == 0:
+        not_opened = str(error)
+    apple = ('tell application "Terminal"\n'
+             '  activate\n'
+             '  do script %s\n'
+             'end tell' % _applescript_literal(script))
+    ok, why = _run_osascript(apple)
+    if ok:
         return "started"
-    also = (opened.stderr or opened.stdout or "").strip().splitlines()
     return "could not open Terminal: %s (nor a .command file: %s)" % (
-        why, also[-1] if also else "no reason given")
+        why, not_opened)
 
 
 # How often the resolver looks for subagent transcripts that did not exist

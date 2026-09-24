@@ -6571,63 +6571,77 @@ class TestNewSessionFromTheWatch:
         assert "Not authorized" in status
         assert ".command" in status, "the fallback must say it was tried too"
 
-    def test_a_terminal_that_ignores_apple_events_gets_a_command_file_instead(self, tmp_path, monkeypatch):
+    def _start(self, tmp_path, monkeypatch, text="Fix CI; it's red",
+               open_ok=True, osascript=None):
+        """start_session with Terminal faked. Returns (status, the commands
+        run in order, the shell line Terminal was given). ``osascript`` is
+        what scripting Terminal does: None succeeds, an exception is
+        raised — a TimeoutExpired is the missing automation consent."""
+        import subprocess as sp
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
+        calls, lines = [], {}
+        def fake_run(cmd, **kw):
+            calls.append(cmd[0])
+            if cmd[0] == "open":
+                command_file = cmd[1]
+                assert command_file.endswith(".command")
+                lines["mode"] = oct(os.stat(command_file).st_mode & 0o777)
+                with open(command_file) as handle:
+                    lines["file"] = handle.read().splitlines()
+                os.unlink(command_file)
+                return sp.CompletedProcess(cmd, 0 if open_ok else 1, "",
+                                           "" if open_ok else "LSOpenURLsWithRole() failed")
+            if cmd[0] == "osascript":
+                if osascript is not None:
+                    raise osascript
+                lines["apple"] = cmd[-1]
+                return sp.CompletedProcess(cmd, 0, "", "")
+            return sp.CompletedProcess(cmd, 0, "", "")
+        monkeypatch.setattr(watch_relay.subprocess, "run", fake_run)
+        root = self._projects(tmp_path)
+        status = watch_relay.start_session(str(tmp_path / "acme"), text,
+                                           projects_dir=root, platform="darwin")
+        if "apple" in lines:
+            shell_line = json.loads(lines["apple"].split("do script ", 1)[1].split("\n")[0])
+        else:
+            shell_line = lines.get("file", ["", "", ""])[2]
+        return status, calls, shell_line, lines
+
+    def _expected_line(self, tmp_path, text="Fix CI; it's red"):
+        import shlex
+        return "unset %s; cd %s && claude -- %s" % (
+            " ".join(watch_relay.HOST_SESSION_MARKERS),
+            shlex.quote(str(tmp_path / "acme")), shlex.quote(text))
+
+    def test_a_command_file_goes_first_and_needs_no_consent(self, tmp_path, monkeypatch):
         """Measured on the release Mac, 2026-09-08: osascript hung until
         its timeout on every tap, because the automation consent a
-        background relay cannot ask for was never given. `open` on a
-        .command file needs no consent."""
+        background relay cannot ask for was never given. And 2026-09-24:
+        spending that 4 s wait BEFORE the .command file made the relay
+        answer in 4.3 s, and the watch — which gives up at 5 s, through
+        the phone — said "Your computer didn't answer" about a session
+        that had started. So the file goes first, and Terminal is not
+        scripted at all when it works."""
         import subprocess as sp
-        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
-        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
-        calls = []
-        def fake_run(cmd, **kw):
-            calls.append(cmd)
-            if cmd[0] == "osascript":
-                raise sp.TimeoutExpired(cmd, kw.get("timeout"))
-            return sp.CompletedProcess(cmd, 0, "", "")
-        monkeypatch.setattr(watch_relay.subprocess, "run", fake_run)
-        root = self._projects(tmp_path)
-        status = watch_relay.start_session(str(tmp_path / "acme"), "Fix CI; it's red",
-                                           projects_dir=root, platform="darwin")
+        status, calls, shell_line, lines = self._start(
+            tmp_path, monkeypatch, osascript=sp.TimeoutExpired("osascript", 4))
         assert status == "started"
-        assert [c[0] for c in calls] == ["osascript", "open"]
-        command_file = calls[1][1]
-        assert command_file.endswith(".command")
-        assert oct(os.stat(command_file).st_mode & 0o777) == "0o700"
-        with open(command_file) as handle:
-            lines = handle.read().splitlines()
-        os.unlink(command_file)
-        assert lines[0] == "#!/bin/bash"
-        assert lines[1] == 'rm -f -- "$0"', "the file must remove itself, not pile up in tmp"
-        import shlex
-        assert lines[2] == "unset %s; cd %s && claude -- %s" % (
-            " ".join(watch_relay.HOST_SESSION_MARKERS),
-            shlex.quote(str(tmp_path / "acme")), shlex.quote("Fix CI; it's red"))
+        assert calls == ["open"], "osascript must not be waited on when the file opened"
+        assert lines["mode"] == "0o700"
+        assert lines["file"][0] == "#!/bin/bash"
+        assert lines["file"][1] == 'rm -f -- "$0"', "the file must remove itself, not pile up in tmp"
+        assert shell_line == self._expected_line(tmp_path)
 
-    def test_success_opens_terminal_in_that_directory_with_that_message(self, tmp_path, monkeypatch):
-        import subprocess as sp
-        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
-        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
-        seen = {}
-        def fake_run(cmd, **kw):
-            seen["cmd"] = cmd
-            return sp.CompletedProcess(cmd, 0, "", "")
-        monkeypatch.setattr(watch_relay.subprocess, "run", fake_run)
-        root = self._projects(tmp_path)
-        status = watch_relay.start_session(str(tmp_path / "acme"), "Fix CI; it's red",
-                                           projects_dir=root, platform="darwin")
+    def test_terminal_is_scripted_only_when_the_file_will_not_open(self, tmp_path, monkeypatch):
+        status, calls, shell_line, lines = self._start(tmp_path, monkeypatch, open_ok=False)
         assert status == "started"
-        assert seen["cmd"][0] == "osascript"
-        script = seen["cmd"][-1]
-        assert 'tell application "Terminal"' in script and "do script" in script
+        assert calls == ["open", "osascript"]
+        assert 'tell application "Terminal"' in lines["apple"] and "do script" in lines["apple"]
         # The shell line is a JSON string literal inside the AppleScript;
-        # decode it and check both cwd and message are shell-quoted, so a
-        # message with quotes or semicolons cannot escape into the shell.
-        import shlex
-        shell_line = json.loads(script.split("do script ", 1)[1].split("\n")[0])
-        assert shell_line == "unset %s; cd %s && claude -- %s" % (
-            " ".join(watch_relay.HOST_SESSION_MARKERS),
-            shlex.quote(str(tmp_path / "acme")), shlex.quote("Fix CI; it's red"))
+        # decoded, both cwd and message are shell-quoted, so a message with
+        # quotes or semicolons cannot escape into the shell.
+        assert shell_line == self._expected_line(tmp_path)
 
     def test_a_session_started_from_the_wrist_is_nobodys_child(self, tmp_path, monkeypatch):
         """2026-09-24: Terminal.app had been launched from inside a Claude
@@ -6640,16 +6654,9 @@ class TestNewSessionFromTheWatch:
         Run for real in a shell that carries the markers, so the check
         fails on the old line rather than trusting its text."""
         import subprocess as sp
-        real_run = sp.run  # the fake below replaces sp.run too: same module
-        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
-        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
-        seen = {}
-        monkeypatch.setattr(watch_relay.subprocess, "run",
-                            lambda cmd, **kw: seen.update(cmd=cmd) or sp.CompletedProcess(cmd, 0, "", ""))
-        root = self._projects(tmp_path)
-        assert watch_relay.start_session(str(tmp_path / "acme"), "go",
-                                         projects_dir=root, platform="darwin") == "started"
-        shell_line = json.loads(seen["cmd"][-1].split("do script ", 1)[1].split("\n")[0])
+        real_run = sp.run  # _start replaces sp.run too: same module
+        status, _, shell_line, _ = self._start(tmp_path, monkeypatch, text="go")
+        assert status == "started"
         fake_bin = tmp_path / "bin"
         fake_bin.mkdir()
         (fake_bin / "claude").write_text("#!/bin/sh\nenv\n")
@@ -6682,18 +6689,10 @@ class TestNewSessionFromTheWatch:
         """shlex.quote stops the shell; only "--" stops claude. Checked
         against claude 2.1.260 on 2026-09-17: `claude -p --version` prints
         the version, `claude -p -- --version` sends the words."""
-        import subprocess as sp
         import shlex
-        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
-        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
-        seen = {}
-        monkeypatch.setattr(watch_relay.subprocess, "run",
-                            lambda cmd, **kw: seen.update(cmd=cmd) or sp.CompletedProcess(cmd, 0, "", ""))
-        root = self._projects(tmp_path)
         text = "--dangerously-skip-permissions"
-        assert watch_relay.start_session(str(tmp_path / "acme"), text,
-                                         projects_dir=root, platform="darwin") == "started"
-        shell_line = json.loads(seen["cmd"][-1].split("do script ", 1)[1].split("\n")[0])
+        status, _, shell_line, _ = self._start(tmp_path, monkeypatch, text=text)
+        assert status == "started"
         words = shlex.split(shell_line)
         assert words[words.index("claude") + 1:] == ["--", text]
 
