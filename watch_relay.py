@@ -1085,6 +1085,39 @@ CLAUDE_HOMES = ("~/.local/bin", "~/.claude/local", "/opt/homebrew/bin",
                 "/usr/local/bin", "~/.npm-global/bin", "~/.bun/bin",
                 "~/.volta/bin")
 
+# What a Claude Code session sets in the environment of everything it
+# runs — including this relay, when the SessionStart hook starts it, and
+# Terminal.app, when the relay's `open` is what launches Terminal. Carried
+# on into a session started from the wrist, CLAUDE_CODE_CHILD_SESSION tells
+# that session it is some other session's child, and an interactive child
+# saves no transcript: it ran, it answered, and the watch — which reads
+# transcripts — never saw it exist. Seen 2026-09-24 on two wrist-started
+# sessions in one day. CLAUDE_RISK_* is ours and stays; so does anything
+# a user sets for themselves (CLAUDE_CODE_USE_BEDROCK and the like).
+HOST_SESSION_MARKERS = (
+    "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_AGENT_SDK_VERSION",
+    "CLAUDE_PREVIEW_CLASSIFIER_FLOOR",
+    "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_OAUTH_SCOPES", "CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH",
+    "CLAUDE_CODE_DESKTOP_APP_VERSION", "CLAUDE_CODE_EAGER_FLUSH",
+    "CLAUDE_CODE_REPORT_FINDINGS", "CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES",
+    "CLAUDE_CODE_ENABLE_ASK_USER_QUESTION_TOOL",
+    "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
+    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "CLAUDE_CODE_DISABLE_CRON",
+)
+
+
+def forget_host_session(environ=None):
+    """Drop the markers of whichever Claude Code session started this
+    process, so nothing the relay spawns mistakes itself for that
+    session's child. Returns the names removed."""
+    env = os.environ if environ is None else environ
+    return [name for name in HOST_SESSION_MARKERS
+            if env.pop(name, None) is not None]
+
 
 def ensure_claude_on_path(environ=None, homes=None):
     """Make `claude` findable by name, whoever started this process.
@@ -1462,7 +1495,11 @@ def start_session(path, text, projects_dir=None, platform=None):
         return "signed out"
     # shlex.quote stops the shell reading the text; "--" stops claude
     # reading it as a flag, which quoting alone does not.
-    script = 'cd %s && claude -- %s' % (shlex.quote(path), shlex.quote(text))
+    # The unset is for a Terminal that is already carrying some session's
+    # markers (see HOST_SESSION_MARKERS): scrubbing this process cannot
+    # reach a Terminal launched before it, and its windows inherit.
+    script = 'unset %s; cd %s && claude -- %s' % (
+        " ".join(HOST_SESSION_MARKERS), shlex.quote(path), shlex.quote(text))
     # json.dumps is the right escaper for the quotes and backslashes an
     # AppleScript string literal understands — but only with
     # ensure_ascii=False. Left at its default it writes \u00e5 for "å",
@@ -3116,6 +3153,7 @@ def _port_taken(port):
 
 def main(argv=None):
     args = _build_parser().parse_args(argv)
+    forget_host_session()
     if args.ensure:
         return ensure_running()
     if args.update:

@@ -6600,7 +6600,8 @@ class TestNewSessionFromTheWatch:
         assert lines[0] == "#!/bin/bash"
         assert lines[1] == 'rm -f -- "$0"', "the file must remove itself, not pile up in tmp"
         import shlex
-        assert lines[2] == "cd %s && claude -- %s" % (
+        assert lines[2] == "unset %s; cd %s && claude -- %s" % (
+            " ".join(watch_relay.HOST_SESSION_MARKERS),
             shlex.quote(str(tmp_path / "acme")), shlex.quote("Fix CI; it's red"))
 
     def test_success_opens_terminal_in_that_directory_with_that_message(self, tmp_path, monkeypatch):
@@ -6624,8 +6625,58 @@ class TestNewSessionFromTheWatch:
         # message with quotes or semicolons cannot escape into the shell.
         import shlex
         shell_line = json.loads(script.split("do script ", 1)[1].split("\n")[0])
-        assert shell_line == "cd %s && claude -- %s" % (
+        assert shell_line == "unset %s; cd %s && claude -- %s" % (
+            " ".join(watch_relay.HOST_SESSION_MARKERS),
             shlex.quote(str(tmp_path / "acme")), shlex.quote("Fix CI; it's red"))
+
+    def test_a_session_started_from_the_wrist_is_nobodys_child(self, tmp_path, monkeypatch):
+        """2026-09-24: Terminal.app had been launched from inside a Claude
+        Code session and handed CLAUDE_CODE_CHILD_SESSION=1 to every
+        window. Two sessions started from the wrist that day ran, answered,
+        and saved no transcript, so the watch never listed them. The line
+        Terminal runs must shed the markers itself, because scrubbing the
+        relay cannot reach a Terminal that was started before it.
+
+        Run for real in a shell that carries the markers, so the check
+        fails on the old line rather than trusting its text."""
+        import subprocess as sp
+        real_run = sp.run  # the fake below replaces sp.run too: same module
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
+        seen = {}
+        monkeypatch.setattr(watch_relay.subprocess, "run",
+                            lambda cmd, **kw: seen.update(cmd=cmd) or sp.CompletedProcess(cmd, 0, "", ""))
+        root = self._projects(tmp_path)
+        assert watch_relay.start_session(str(tmp_path / "acme"), "go",
+                                         projects_dir=root, platform="darwin") == "started"
+        shell_line = json.loads(seen["cmd"][-1].split("do script ", 1)[1].split("\n")[0])
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "claude").write_text("#!/bin/sh\nenv\n")
+        (fake_bin / "claude").chmod(0o755)
+        inherited = dict(os.environ, PATH="%s:/usr/bin:/bin" % fake_bin,
+                         CLAUDE_CODE_CHILD_SESSION="1", CLAUDECODE="1",
+                         CLAUDE_CODE_SESSION_ID="parent",
+                         CLAUDE_RISK_RELAY="http://127.0.0.1:8977",
+                         CLAUDE_CODE_USE_BEDROCK="1")
+        def child_env(line):
+            out = real_run(["/bin/sh", "-c", line], env=inherited,
+                         capture_output=True, text=True, check=True).stdout
+            return dict(row.split("=", 1) for row in out.splitlines() if "=" in row)
+        before = child_env(shell_line.split("; ", 1)[1])
+        assert before.get("CLAUDE_CODE_CHILD_SESSION") == "1", "the harness must reproduce the fault"
+        after = child_env(shell_line)
+        for marker in ("CLAUDE_CODE_CHILD_SESSION", "CLAUDECODE", "CLAUDE_CODE_SESSION_ID"):
+            assert marker not in after, marker
+        assert after.get("CLAUDE_RISK_RELAY") == "http://127.0.0.1:8977", "ours must survive"
+        assert after.get("CLAUDE_CODE_USE_BEDROCK") == "1", "a user's own setting must survive"
+
+    def test_the_relay_forgets_the_session_that_started_it(self):
+        env = {"CLAUDE_CODE_CHILD_SESSION": "1", "CLAUDECODE": "1",
+               "CLAUDE_RISK_MODE": "enforce", "CLAUDE_CODE_USE_VERTEX": "1"}
+        removed = watch_relay.forget_host_session(env)
+        assert set(removed) == {"CLAUDE_CODE_CHILD_SESSION", "CLAUDECODE"}
+        assert env == {"CLAUDE_RISK_MODE": "enforce", "CLAUDE_CODE_USE_VERTEX": "1"}
 
     def test_a_message_that_looks_like_a_flag_stays_a_message(self, tmp_path, monkeypatch):
         """shlex.quote stops the shell; only "--" stops claude. Checked
