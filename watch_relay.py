@@ -686,6 +686,14 @@ def ensure_running(updated=False):
     if not updated:
         _self_update()
     running = _probe_relay()
+    if running is None and _port_in_use(DEFAULT_PORT):
+        # Held but silent: a busy relay, most likely (its /health can wait
+        # seconds on `claude auth status`). Ask again, patiently — without
+        # this, a slow answer skipped the whole replace-if-older decision,
+        # and on 2026-09-24 a kickstart left 1.1.16 serving beside 1.1.17
+        # installed. The check before spawning still stands if it stays
+        # silent.
+        running = _probe_relay(timeout=PORT_TAKEN_WAIT)
     if running is not None:
         version = running.get("version") or 0
         # A deferred update has to be tried again, or it is not deferred —

@@ -6261,8 +6261,22 @@ class TestTwoRelaysOnePort:
         assert spawned == [], "a held port gets no second relay, however slow"
         assert code == 0
         said = capsys.readouterr().err
-        assert "not starting a second relay" in said
+        # Asked again with patience, the busy relay answers: it is running.
+        assert "already running" in said
         assert "started in the background" not in said
+
+    def test_a_slow_relay_running_older_code_is_still_replaced(
+            self, relay, monkeypatch):
+        """2026-09-24: kickstart after an update left the old relay serving,
+        because a slow /health skipped the replace decision entirely."""
+        monkeypatch.setattr(watch_relay, "signed_in", lambda: time.sleep(2.5) or True)
+        monkeypatch.setattr(watch_relay, "DEFAULT_PORT", relay.server_address[1])
+        monkeypatch.setattr(watch_relay, "_self_update", lambda: None)
+        monkeypatch.setattr(watch_relay, "_serving_older_code", lambda running: True)
+        stopped = []
+        monkeypatch.setattr(watch_relay, "_stop_relay", lambda: stopped.append(True) or False)
+        watch_relay.ensure_running()
+        assert stopped == [True], "an older relay is replaced however slowly it answers"
 
     def test_the_relay_that_loses_the_race_leaves_quietly(
             self, relay, monkeypatch, capsys):
@@ -7085,6 +7099,45 @@ class TestConnectingToAnExistingSession:
         os.utime(path, (time.time() - 30, time.time() - 30))
         monkeypatch.setattr(watch_relay, "_find_transcript", lambda sid: str(path))
         assert watch_relay.session_is_waiting("busy-1") is False
+
+
+class TestTheThreadKeepsWhatWasSaid:
+    """2026-09-24: "messages disappear in sessions". The watch shows the
+    last 14 turns; a run answering a wrist message writes a turn a step,
+    and the message itself scrolled out within minutes."""
+
+    def test_the_latest_message_survives_a_long_answer(self, tmp_path):
+        import watch_dashboard
+        lines = [{"message": {"role": "user", "content": "Ship the fix, please"}}]
+        lines += [{"message": {"role": "assistant", "content": [{"type": "text", "text": "step %d" % i}]}}
+                  for i in range(30)]
+        path = _write_transcript(tmp_path, "-p", "long-1.jsonl", lines)
+        turns, _, _ = watch_dashboard._parse_thread(str(path), watch_dashboard.THREAD_TURN_LIMIT)
+        assert len(turns) == watch_dashboard.THREAD_TURN_LIMIT
+        assert turns[0]["role"] == "user" and "Ship the fix" in turns[0]["text"]
+        assert "step 29" in turns[-1]["text"], "and the newest work is still at the foot"
+
+    def test_a_short_thread_is_untouched(self, tmp_path):
+        import watch_dashboard
+        lines = [{"message": {"role": "user", "content": "hi"}},
+                 {"message": {"role": "assistant", "content": [{"type": "text", "text": "hello"}]}}]
+        path = _write_transcript(tmp_path, "-p", "short-1.jsonl", lines)
+        turns, _, _ = watch_dashboard._parse_thread(str(path), watch_dashboard.THREAD_TURN_LIMIT)
+        assert [t["role"] for t in turns] == ["user", "assistant"], "no message is shown twice"
+
+
+class TestTheCliNudgeIsNotYourMessage:
+    def test_continue_from_where_you_left_off_is_not_shown(self, tmp_path):
+        import watch_dashboard
+        path = _write_transcript(tmp_path, "-p", "nudge-1.jsonl", [
+            {"message": {"role": "user", "content": "Deploy it"}},
+            {"message": {"role": "assistant", "content": [{"type": "text", "text": "Deployed."}]}},
+            {"entrypoint": "sdk-cli", "message": {"role": "user", "content": "Continue from where you left off."}},
+            {"entrypoint": "sdk-cli", "message": {"role": "assistant", "content": [{"type": "text", "text": "No response requested."}]}}])
+        turns, _, _ = watch_dashboard._parse_thread(str(path), 14)
+        texts = [t.get("text") for t in turns]
+        assert "Continue from where you left off." not in texts
+        assert texts[-1] == "Deployed."
 
 
 class TestSessionRegistry:

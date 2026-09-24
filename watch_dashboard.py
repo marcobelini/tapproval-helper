@@ -419,6 +419,11 @@ UPSTREAM_SHAPES = {
         ("No response requested.", "What Claude says when the CLI already "
          "answered and its own turn has nothing to add. Not a reply.",
          "2026-09-08"),
+    "text.continue_nudge":
+        ("Continue from where you left off.", "What Claude Code itself writes "
+         "as a user turn when a headless run resumes a session mid-answer. "
+         "Nobody said it; the wrist showed it as the owner's own message, "
+         "each time answered by the filler above.", "2026-09-24"),
     "part.tool_result":
         ('"tool_result"', "A tool has answered, so nothing is running now.",
          "2026-09-04"),
@@ -1221,7 +1226,7 @@ def prewarm_threads(session_ids):
 def _fresh_thread_state():
     return {"offset": 0, "turns": [], "launched": set(),
             "finished": set(), "running_tool": None, "github": None,
-            "latest_ask": None,
+            "latest_ask": None, "last_said": None,
             "result": None, "result_at": 0.0, "limit": None}
 
 
@@ -1338,10 +1343,26 @@ def _parse_thread_locked(path, limit):
         merged = _merge_tool_runs(state["turns"])
         session_id = os.path.splitext(os.path.basename(path))[0]
         running = _running_task_count(state, session_id)
-        state["result"] = (merged[-limit:], running, state["running_tool"])
+        state["result"] = (_keep_what_was_said(merged, state["last_said"], limit),
+                           running, state["running_tool"])
         state["result_at"] = time.monotonic()
         state["limit"] = limit
     return state["result"]
+
+
+def _keep_what_was_said(turns, said, limit):
+    """The last `limit` turns — and the person's latest message, always.
+
+    A run answering a message from the wrist writes a turn per step, and
+    within minutes the message it is answering had scrolled out of the
+    window: "messages disappear in sessions" (2026-09-24). The words are
+    what the thread is about, so they stay at its head however long the
+    work beneath them runs. Pure."""
+    window = turns[-limit:]
+    if said is None or limit < 2 or any(t is said or (t.get("at") == said.get("at") and t.get("text") == said.get("text"))
+                                         for t in window):
+        return window
+    return [said] + turns[-(limit - 1):]
 
 
 def _thread_line(state, line, limit):
@@ -1419,6 +1440,9 @@ def _thread_line(state, line, limit):
     if (role == "assistant" and kind == "text"
             and lead.strip() == shape("text.nothing_to_add")):
         return
+    # Its twin on the other side: the CLI's own nudge, not the person's.
+    if role == "user" and kind == "text" and lead.strip() == shape("text.continue_nudge"):
+        return
     # Claude Code's own authentication failure. It arrives as prose, so it
     # reads as a reply; it is a fault, and the watch paints a notice red.
     if kind == "text" and lead.startswith(shape("text.auth_failed")):
@@ -1472,6 +1496,8 @@ def _thread_line(state, line, limit):
     if role == "user" and kind == "text" and entry.get("entrypoint") == shape("entrypoint.sdk_cli"):
         turn["origin"] = "headless"
     state["turns"].append(turn)
+    if role == "user" and kind == "text":
+        state["last_said"] = turn
     if len(state["turns"]) > limit * 4:
         state["turns"] = state["turns"][-limit * 2:]
 
