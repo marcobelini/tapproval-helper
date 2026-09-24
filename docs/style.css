@@ -21,3 +21,5 @@ code, pre { font-family:ui-monospace,"SF Mono",Menlo,monospace; font-size:14px }
 footer { padding:36px 0 56px; border-top:1px solid var(--hair); color:var(--muted); font-size:14px } footer p { margin:6px 0 }
 .policy h1 { font-size:34px } .policy h2 { margin-top:36px } .policy h3 { margin-top:24px } .policy table { border-collapse:collapse; width:100%; margin:16px 0 } .policy th, .policy td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--hair); vertical-align:top; font-size:15px } .policy th { color:var(--muted); font-weight:600 } .policy blockquote { border-left:3px solid var(--coral); margin:0; padding:2px 16px; color:var(--muted) } .policy hr { border:0; border-top:1px solid var(--hair); margin:32px 0 }
 @media (max-width:720px) { .hero { grid-template-columns:1fr; padding-top:24px } .watch { order:-1; width:min(70%,240px) } header.top nav { display:none } .cta.quiet { margin:10px 0 0 } }
+
+.demo { display:block; width:100%; height:auto; max-width:100%; aspect-ratio:16/9; border-radius:18px; background:#000; box-shadow:0 30px 80px rgba(0,0,0,.55) }

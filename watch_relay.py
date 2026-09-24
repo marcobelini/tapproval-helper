@@ -1121,6 +1121,138 @@ def ensure_claude_on_path(environ=None, homes=None):
     return False
 
 
+# How each terminal app reaches the thing with a tty, and types into it.
+# Anything else — the desktop app, VS Code — has no window to type into,
+# and keeps the old route.
+TERMINAL_APPS = {
+    "Terminal": ('if tty of t is %(tty)s then\n'
+                 '  do script %(text)s in t\n'
+                 '  return "typed"\n'
+                 'end if\n'),
+    "iTerm2": ('repeat with s in sessions of t\n'
+               '  if tty of s is %(tty)s then\n'
+               '    tell s to write text %(text)s\n'
+               '    return "typed"\n'
+               '  end if\n'
+               'end repeat\n'),
+}
+TERMINAL_SCRIPT = ('tell application "%(app)s"\n'
+                   '  repeat with w in windows\n'
+                   '    repeat with t in tabs of w\n'
+                   '%(find)s'
+                   '    end repeat\n'
+                   '  end repeat\n'
+                   'end tell\n'
+                   'return "no tab"')
+# A terminal that would not be scripted stays refused for a while: the
+# consent prompt a background process cannot answer hangs until the
+# timeout, and every send should not pay that.
+_TERMINAL_REFUSED = {}
+TERMINAL_RETRY_SECONDS = 600
+
+
+def _applescript_literal(text):
+    """An AppleScript string literal. json.dumps escapes the quotes and
+    backslashes AppleScript understands — with ensure_ascii=False, because
+    AppleScript has no \\u escape and refuses to parse one (see
+    start_session: every Danish message lost its route to that)."""
+    return json.dumps(str(text), ensure_ascii=False)
+
+
+def _run_osascript(script, timeout=4):
+    """(ok, stdout or the reason it failed). Never raises."""
+    try:
+        done = subprocess.run(["osascript", "-e", script], capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, str(error)
+    if done.returncode == 0:
+        return True, done.stdout.strip()
+    lines = (done.stderr or done.stdout or "").strip().splitlines()
+    return False, lines[-1] if lines else "no reason given"
+
+
+def _terminal_of(pid):
+    """(app, tty) of the terminal a process runs in, or None. One `ps`
+    snapshot, walked in memory. Never raises."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,tty=,comm="],
+                             capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    table = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), parts[2], os.path.basename(parts[3]))
+    row = table.get(int(pid or 0))
+    if not row or row[1] in ("", "??"):
+        return None
+    tty, current = "/dev/" + row[1], int(pid)
+    for _ in range(16):
+        ppid, _, name = table.get(current, (1, "", ""))
+        if name in TERMINAL_APPS:
+            return name, tty
+        if ppid <= 1:
+            return None
+        current = ppid
+    return None
+
+
+def session_is_waiting(session_id):
+    """True only when the session sits at its prompt: the last turn is
+    Claude's finished reply, no tool is pending, and the transcript has
+    been still for a moment. A tool that is pending may be a permission
+    prompt, and typed text ending in Return would answer it — so any
+    doubt is a no."""
+    path = _find_transcript(session_id)
+    if not path:
+        return False
+    try:
+        if time.time() - os.path.getmtime(path) < 2.0:
+            return False
+        turns, running, tool_now = _parse_thread(path, THREAD_TURN_LIMIT)
+    except Exception:
+        return False
+    if running or tool_now or not turns:
+        return False
+    last = turns[-1]
+    return last.get("role") == "assistant" and last.get("kind") in (None, "text")
+
+
+def type_into_session(session_id, text, registry):
+    """Type a wrist message into the terminal a live session runs in.
+    True when it was typed; False sends it the old way. Never raises.
+
+    Off unless TAPPROVAL_TYPE_INTO_TERMINAL=1, until it has been seen to
+    work: macOS must first let the helper script Terminal (a consent a
+    background process cannot ask for — the first test on 2026-09-24 hung
+    on it), and whether the line `do script` types ends in the Return
+    Claude Code's prompt submits on has not yet been watched happen. A
+    route that reports "sent" for words left sitting in a prompt would be
+    worse than the fork it replaces."""
+    if os.environ.get("TAPPROVAL_TYPE_INTO_TERMINAL") != "1":
+        return False
+    entry = registry.get(session_id)
+    # Cheapest refusals first: only a session at its prompt is worth a
+    # process walk.
+    if not entry or not session_is_waiting(session_id):
+        return False
+    found = _terminal_of(entry.get("pid"))
+    if not found:
+        return False
+    app, tty = found
+    if time.time() - _TERMINAL_REFUSED.get(app, float("-inf")) < TERMINAL_RETRY_SECONDS:
+        return False
+    # One line, no control characters: what a person could have typed.
+    line = "".join(ch for ch in text if ch.isprintable())
+    find = TERMINAL_APPS[app] % {"tty": _applescript_literal(tty), "text": _applescript_literal(line)}
+    ok, said = _run_osascript(TERMINAL_SCRIPT % {"app": app, "find": find})
+    if not ok:
+        _TERMINAL_REFUSED[app] = time.time()
+    return ok and said == "typed"
+
+
 def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
     """Send an instruction to a session, the way the terminal would.
 
@@ -1134,10 +1266,15 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
     text = " ".join(str(text or "").split())[:500]
     if not text:
         return "empty"
-    session_id, cwd = resolve_session(prefix, projects_dir)
+    registry = session_registry()
+    session_id, cwd = resolve_session(prefix, projects_dir, registry=registry)
     if not session_id:
         return "unknown session"
-    stop = say_guard(session_id, force=force)
+    # Open in a terminal and waiting for input: type it there. The words
+    # land in the live session itself — the one route that does not fork.
+    if type_into_session(session_id, text, registry):
+        return "sent"
+    stop = say_guard(session_id, force=force, live=registry)
     if stop:
         return stop
     if not ensure_claude_on_path():
@@ -1154,10 +1291,7 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
     # "--" ends the options: without it a message reading
     # "--dangerously-skip-permissions" is parsed as that flag, not sent.
     command += ["-p", "--", text]
-    error = _spawn_detached(
-        command,
-        SAY_LOG,
-        cwd=cwd or os.path.expanduser("~"))
+    error = _spawn_detached(command, SAY_LOG, cwd=cwd)
     return "could not start: %s" % error if error else "sent"
 
 
@@ -1335,17 +1469,10 @@ def start_session(path, text, projects_dir=None, platform=None):
     apple = ('tell application "Terminal"\n'
              '  activate\n'
              '  do script %s\n'
-             'end tell' % json.dumps(script, ensure_ascii=False))
-    try:
-        done = subprocess.run(["osascript", "-e", apple], capture_output=True,
-                              text=True, timeout=4)
-    except (OSError, subprocess.SubprocessError) as error:
-        why = str(error)
-    else:
-        if done.returncode == 0:
-            return "started"
-        lines = (done.stderr or done.stdout or "").strip().splitlines()
-        why = lines[-1] if lines else "no reason given"
+             'end tell' % _applescript_literal(script))
+    ok, why = _run_osascript(apple)
+    if ok:
+        return "started"
     # Scripting Terminal needs an automation consent this relay, a
     # background process, cannot ask for — on one Mac the request simply
     # hung until the timeout, every time. Opening a .command file asks
@@ -2077,7 +2204,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         self._send_json({"skills": known_skills(cwd)})
 
     def _get_sessions(self, path, query):
-        rows = recent_sessions()
+        waiting = {card["session_id"] for card in self.queue.pending() if card.get("session_id")}
+        rows = recent_sessions(waiting=waiting)
         prewarm_threads([row["session_id"] for row in rows])
         self._send_json({"sessions": rows})
 

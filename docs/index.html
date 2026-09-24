@@ -26,6 +26,7 @@
 <link rel="icon" href="img/icon.png">
 <link rel="apple-touch-icon" href="img/icon.png">
 <link rel="stylesheet" href="style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "VideoObject", "name": "Approve Claude Code from your Apple Watch — Tapproval", "description": "Tapproval's demo: a CRITICAL command stopped on the wrist, a reply sent to a session, and a new session started from the watch.", "thumbnailUrl": "https://tapproval.thoughtfulsteward.org/img/demo-poster.jpg", "contentUrl": "https://tapproval.thoughtfulsteward.org/media/tapproval-demo.mp4", "uploadDate": "2026-09-24", "duration": "PT52S"}</script>
 <script type="application/ld+json">{"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/", "description": "A remote control for Claude Code on Apple Watch: approve permission prompts, answer questions and follow live sessions with one tap.", "applicationCategory": "DeveloperApplication", "operatingSystem": "watchOS 10 or later", "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}, "downloadUrl": "https://apps.apple.com/app/tapproval/id6805869018", "installUrl": "https://apps.apple.com/app/tapproval/id6805869018", "image": "https://tapproval.thoughtfulsteward.org/img/share.png", "screenshot": ["https://tapproval.thoughtfulsteward.org/img/card.png", "https://tapproval.thoughtfulsteward.org/img/sessions.png", "https://tapproval.thoughtfulsteward.org/img/thread.png"], "publisher": {"@type": "Organization", "name": "Tapproval", "email": "tapproval@thoughtfulsteward.org", "url": "https://tapproval.thoughtfulsteward.org/"}}</script>
 <script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "The watch can't find my computer", "acceptedAnswer": {"@type": "Answer", "text": "The watch and the computer must be on the same Wi-Fi, and a VPN on your iPhone must be fully connected or fully off. Then open Settings → Connection on the watch: every route gets a tick or a reason."}}, {"@type": "Question", "name": "How do I pair a second watch?", "acceptedAnswer": {"@type": "Answer", "text": "Tell Claude Code on your computer “Open Tapproval pairing”, then open Tapproval on the watch. The door stays open for half an hour."}}, {"@type": "Question", "name": "How is Tapproval updated?", "acceptedAnswer": {"@type": "Answer", "text": "The helper checks once a day and updates itself, never while a question is waiting on your wrist."}}, {"@type": "Question", "name": "How do I remove it?", "acceptedAnswer": {"@type": "Answer", "text": "Tell Claude Code “Uninstall Tapproval Base”. It restores your settings, keeps a backup and stops the bridge. Delete the app from the watch like any other."}}, {"@type": "Question", "name": "My phone still shows a question I answered", "acceptedAnswer": {"@type": "Answer", "text": "The command ran. The Claude app on a phone or iPad can keep displaying a prompt the watch already answered; it is a known Claude Code bug, and any message sent from the phone clears it."}}]}</script>
 </head>
@@ -33,7 +34,7 @@
 <div class="wrap">
 <header class="top">
   <img src="img/icon.png" width="36" height="36" alt=""><strong>Tapproval</strong>
-  <nav><a href="#how">How it works</a><a href="#what">What it does</a><a href="#privacy">Privacy</a><a href="#support">Support</a><a href="https://apps.apple.com/app/tapproval/id6805869018">App Store</a></nav>
+  <nav><a href="#demo">Demo</a><a href="#how">How it works</a><a href="#what">What it does</a><a href="#privacy">Privacy</a><a href="#support">Support</a><a href="https://apps.apple.com/app/tapproval/id6805869018">App Store</a></nav>
 </header>
 
 <section class="hero" style="border:0">
@@ -44,6 +45,15 @@
     <p class="lede" style="font-size:.9em;opacity:.75;margin-top:.6em">It is free, with nothing to buy. It needs an Apple Watch and Claude Code on a Mac or Linux machine. Not yet in the EU; the beta works everywhere.</p>
   </div>
   <div class="watch"><img src="img/card.png" width="416" height="496" fetchpriority="high" alt="Apple Watch showing a CRITICAL card: git push --force origin main, with deny and allow buttons"></div>
+</section>
+
+<section id="demo">
+  <h2>See it in fifty seconds</h2>
+  <p class="sub">The watch app&rsquo;s own demo, with nothing real behind it: a CRITICAL command stopped on the wrist, a reply sent, a new session started.</p>
+  <video class="demo" controls playsinline preload="none" width="1280" height="720" poster="img/demo-poster.jpg">
+    <source src="media/tapproval-demo.mp4" type="video/mp4">
+    <a href="media/tapproval-demo.mp4">Watch the demo (MP4, 5 MB)</a>
+  </video>
 </section>
 
 <section id="how">

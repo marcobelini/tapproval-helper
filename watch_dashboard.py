@@ -254,6 +254,7 @@ def session_registry(sessions_dir=None):
             "name": (str(data.get("name") or "").strip()
                      if data.get("nameSource") != "derived" else ""),
             "cwd": str(data.get("cwd") or ""),
+            "pid": int(pid),
         }
     return registry
 
@@ -462,6 +463,15 @@ def note_unknown_subtype(subtype):
 _SYSTEM_OPENERS = ("<", "Caveat:", "[Request")
 
 
+# Claude Code rides its own notes INTO the person's message: memory recall,
+# pending notifications, CLAUDE.md on a first turn arrive as a
+# <system-reminder> block prepended to the very text the person typed.
+# Seen 2026-09-24 in front of "proceed", "Merged #580", "Trigger a new
+# TestFlight build": one string, reminder first, so the turn opened with
+# "<" and both screens skipped it as harness noise — the person's own
+# words, gone from their own thread, whenever the CLI had a note to attach.
+_SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>\s*", re.S)
+
 _COMMAND_NAME = re.compile(r"<command-name>\s*(/?[\w:-]+)\s*</command-name>")
 _COMMAND_ARGS = re.compile(r"<command-args>(.*?)</command-args>", re.S)
 _TAGGED_OUT = re.compile(r"<local-command-(?:stdout|stderr)>(.*?)</local-command-(?:stdout|stderr)>", re.S)
@@ -567,7 +577,7 @@ def _message_parts(content):
     that read messages go through here, so an added part type is handled
     once."""
     if isinstance(content, str):
-        return content, None, []
+        return _SYSTEM_REMINDER.sub("", content), None, []
     text, tool, images = "", None, []
     if isinstance(content, list):
         for part in content:
@@ -575,7 +585,10 @@ def _message_parts(content):
                 continue
             kind = part.get("type")
             if kind == "text" and not text:
-                text = part.get("text", "")
+                # Without the harness's own note, so a part that is ONLY a
+                # reminder counts as empty and the person's text after it
+                # — same part or the next — is what both screens read.
+                text = _SYSTEM_REMINDER.sub("", part.get("text", ""))
             elif kind == "tool_use" and tool is None:
                 tool = part
             elif kind == "image":
@@ -1496,7 +1509,7 @@ def _thread_activity(path):
     return running, running_tool, state.get("github"), state.get("latest_ask")
 
 
-def resolve_session(prefix, projects_dir=None):
+def resolve_session(prefix, projects_dir=None, registry=None):
     """Full session id and working directory from a truncated id.
 
     The watch carries short ids; resuming a session needs the whole one.
@@ -1505,12 +1518,23 @@ def resolve_session(prefix, projects_dir=None):
     path = _find_transcript(prefix, projects_dir)
     if not path:
         return None, None
-    cwd, _, _ = session_meta(path, scan_lines=40)
-    return os.path.basename(path)[:-6], cwd
+    session_id = os.path.basename(path)[:-6]
+    began, _, _ = session_meta(path, scan_lines=40)
+    # Where the session is now wins: a desktop session can move, and a
+    # wrist run started in the folder it began in edits the wrong tree
+    # (found 2026-09-24: "HOV Testflight timeline" had moved from a
+    # worktree to the repository). `--resume` finds the transcript from
+    # any folder, so only the working directory is at stake. A worktree
+    # deleted after its merge falls back to the repository it was in.
+    now = (session_registry() if registry is None else registry).get(session_id, {}).get("cwd", "")
+    for cwd in (now, began, project_root(now), project_root(began)):
+        if cwd and os.path.isdir(cwd):
+            return session_id, cwd
+    return session_id, now or began
 
 
 def recent_sessions(limit=12, projects_dir=None, include_idle=False,
-                    light=False):
+                    light=False, waiting=()):
     """The user's ACTIVE Claude Code sessions, straight from local storage.
 
     ``include_idle`` lifts the liveness filter. The session LIST never wants
@@ -1543,8 +1567,13 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
         # lists exactly those, so the wrist does too. A watch whose owner
         # never turned Remote Control on still sees every live session.
         if any(entry["bridged"] for entry in registry.values()):
+            # ...except a session with a card waiting on the wrist: the
+            # card came from it, so the list must have somewhere to go.
+            # A terminal session without Remote Control otherwise sent
+            # cards to a watch that could not show where they came from.
             found = [f for f in found
-                     if f[3] not in registry or registry[f[3]]["bridged"]]
+                     if f[3] not in registry or registry[f[3]]["bridged"]
+                     or f[3] in waiting]
     found = found[:limit]
     sessions = []
     for mtime, path, project, session_id in found:
@@ -1575,6 +1604,12 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
             "repo": repo,
             "status": live.get(session_id, ""),
             "live": session_id in live,
+            # A process on this computer holds the session open, so a
+            # message from the wrist runs beside it — a side thread the
+            # open session does not read. Said per row, by the side that
+            # knows, so a route that does reach a live session can turn it
+            # off without a new watch build.
+            "side_thread": session_id in live,
             "path": cwd or "",
             "session_id": session_id[:12],
             "opening": opening or "",

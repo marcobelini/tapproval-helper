@@ -3267,6 +3267,47 @@ class TestGhostCards:
         assert queue.pending()
 
 
+class TestTheHumansWordsSurviveAReminder:
+    """Claude Code prepends a <system-reminder> block to the very text the
+    person typed. The wrist shows what the person said; the note is the
+    harness talking to Claude, not to anyone's wrist."""
+
+    REMINDER = ("<system-reminder>\nThe user has 3 notifications pending."
+                "\n</system-reminder>\n")
+
+    def test_an_ask_behind_a_reminder_reaches_thread_title_and_topic(self, tmp_path):
+        import watch_dashboard
+        path = _write_transcript(tmp_path, "-p", "reminder1.jsonl", [
+            {"cwd": "/x", "message": {"role": "user",
+                                       "content": self.REMINDER + "Merged #580"}},
+            {"message": {"role": "assistant",
+                         "content": [{"type": "text", "text": "Noted."}]}},
+            {"message": {"role": "user", "content": [
+                {"type": "text", "text": self.REMINDER.strip()},
+                {"type": "text", "text": "Trigger a new TestFlight build"}]}},
+        ])
+        turns = watch_dashboard.session_thread("reminder1", projects_dir=str(tmp_path))
+        asks = [t["text"] for t in turns if t["role"] == "user"]
+        assert asks == ["Merged #580", "Trigger a new TestFlight build"]
+        _, opening, _ = watch_dashboard.session_meta(str(path))
+        assert opening == "Merged #580"
+        assert watch_dashboard._THREAD_STATE[str(path)]["latest_ask"] == \
+            "Trigger a new TestFlight build"
+
+    def test_a_reminder_with_nothing_after_it_is_still_nothing(self, tmp_path):
+        """Only the note, no person: skipped as before — and so is an
+        unclosed one, which is all noise."""
+        import watch_dashboard
+        _write_transcript(tmp_path, "-p", "reminder2.jsonl", [
+            {"cwd": "/x", "message": {"role": "user",
+                                       "content": self.REMINDER.strip()}},
+            {"message": {"role": "user", "content": "<system-reminder>noise"}},
+            {"message": {"role": "user", "content": "the real ask"}},
+        ])
+        turns = watch_dashboard.session_thread("reminder2", projects_dir=str(tmp_path))
+        assert [t["text"] for t in turns] == ["the real ask"]
+
+
 class TestThreadForTheWatch:
     """The thread view is a live surface: tool runs are typed, markdown
     noise is stripped, and freshness says whether Claude is working."""
@@ -6080,7 +6121,7 @@ class TestTheWristAnswersAHeadlessSend:
 
     def test_a_send_carries_the_wrist_as_its_permission_surface(self, tmp_path, monkeypatch):
         seen = {}
-        monkeypatch.setattr(watch_relay, "resolve_session", lambda p, d=None: ("s1", str(tmp_path)))
+        monkeypatch.setattr(watch_relay, "resolve_session", lambda p, d=None, **k: ("s1", str(tmp_path)))
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/bin/claude")
         monkeypatch.setattr(watch_relay, "_spawn_detached",
                             lambda command, log, cwd=None: seen.update(command=command))
@@ -6097,7 +6138,7 @@ class TestTheWristAnswersAHeadlessSend:
         when it lands", and was killed the moment that reply was written.
         The run believed it had a background. It did not. Now it is told."""
         seen = {}
-        monkeypatch.setattr(watch_relay, "resolve_session", lambda p, d=None: ("s1", str(tmp_path)))
+        monkeypatch.setattr(watch_relay, "resolve_session", lambda p, d=None, **k: ("s1", str(tmp_path)))
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/bin/claude")
         monkeypatch.setattr(watch_relay, "_spawn_detached",
                             lambda command, log, cwd=None: seen.update(command=command))
@@ -6365,14 +6406,20 @@ class TestAWatchThatSpeaksDanish:
         """
         with open(watch_relay.__file__, encoding="utf-8") as handle:
             tree = ast.parse(handle.read())
-        func = next(node for node in ast.walk(tree)
-                    if isinstance(node, ast.FunctionDef)
-                    and node.name == "start_session")
-        dumps = [node for node in ast.walk(func)
+        def function(name):
+            return next(node for node in ast.walk(tree)
+                        if isinstance(node, ast.FunctionDef) and node.name == name)
+        # Every AppleScript literal goes through one helper, and the
+        # helpers that build scripts must use it.
+        for caller in ("start_session", "type_into_session"):
+            calls = {node.func.id for node in ast.walk(function(caller))
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+            assert "_applescript_literal" in calls, caller + " builds its own AppleScript literal"
+        dumps = [node for node in ast.walk(function("_applescript_literal"))
                  if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Attribute)
                  and node.func.attr == "dumps"]
-        assert dumps, "start_session no longer builds the AppleScript here"
+        assert dumps, "_applescript_literal no longer escapes with json.dumps"
         for call in dumps:
             kwargs = {kw.arg: kw.value for kw in call.keywords}
             assert "ensure_ascii" in kwargs, (
@@ -6662,7 +6709,7 @@ class TestRelayRoutes:
 
     def test_the_read_routes_answer_with_their_shapes(self, relay, monkeypatch):
         monkeypatch.setattr(watch_relay, "known_projects", lambda: [{"name": "x"}])
-        monkeypatch.setattr(watch_relay, "recent_sessions", lambda: [])
+        monkeypatch.setattr(watch_relay, "recent_sessions", lambda **k: [])
         monkeypatch.setattr(watch_relay, "activity_summary", lambda: {"total": 0})
         monkeypatch.setattr(watch_relay, "usage_summary", lambda: {"input": 0})
         base, _, _ = relay
@@ -6958,6 +7005,88 @@ class TestMergeToolRuns:
         assert wd._merge_tool_runs(turns) == turns
 
 
+class TestConnectingToAnExistingSession:
+    """2026-09-24: the watch listed only live sessions, and a message to a
+    live session forks it; a moved session was resumed in its old folder;
+    a terminal session without Remote Control sent cards but had no row."""
+
+    def _registry(self, tmp_path, monkeypatch, **entry):
+        import watch_dashboard
+        sessions = tmp_path / "sessions"
+        sessions.mkdir(exist_ok=True)
+        (sessions / "1.json").write_text(json.dumps(dict({"pid": os.getpid()}, **entry)), encoding="utf-8")
+        monkeypatch.setattr(watch_dashboard, "CLAUDE_SESSIONS", str(sessions))
+
+    def test_a_moved_session_is_resumed_where_it_is_now(self, tmp_path, monkeypatch):
+        began, now = tmp_path / "old-worktree", tmp_path / "repo"
+        began.mkdir()
+        now.mkdir()
+        self._registry(tmp_path, monkeypatch, sessionId="moved-1", entrypoint="claude-desktop", cwd=str(now))
+        _write_transcript(tmp_path, "-p", "moved-1.jsonl", [{"cwd": str(began), "message": {"role": "user", "content": "hi"}}])
+        assert watch_relay.resolve_session("moved-1", projects_dir=str(tmp_path)) == ("moved-1", str(now))
+
+    def test_a_deleted_worktree_falls_back_to_its_repository(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        gone = repo / ".claude" / "worktrees" / "merged-1"
+        self._registry(tmp_path, monkeypatch, sessionId="wt-1", entrypoint="claude-desktop", cwd=str(gone))
+        _write_transcript(tmp_path, "-p", "wt-1.jsonl", [{"cwd": str(gone), "message": {"role": "user", "content": "hi"}}])
+        assert watch_relay.resolve_session("wt-1", projects_dir=str(tmp_path)) == ("wt-1", str(repo))
+
+    def test_no_folder_left_is_never_the_home_folder(self, tmp_path, monkeypatch):
+        """Nothing exists any more: the run is asked for where the session
+        was, and fails there with its own reason — never in ~."""
+        self._registry(tmp_path, monkeypatch, sessionId="gone-1", entrypoint="claude-desktop", cwd="/nowhere/at/all")
+        _write_transcript(tmp_path, "-p", "gone-1.jsonl", [{"cwd": "/nowhere/at/all", "message": {"role": "user", "content": "hi"}}])
+        assert watch_relay.resolve_session("gone-1", projects_dir=str(tmp_path)) == ("gone-1", "/nowhere/at/all")
+
+    def test_a_session_with_a_waiting_card_is_listed_without_remote_control(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {"phone-1": "Desktop", "term-1": "Terminal"})
+        monkeypatch.setattr(watch_dashboard, "session_registry", lambda: {
+            "phone-1": {"status": "Desktop", "bridged": True, "name": ""},
+            "term-1": {"status": "Terminal", "bridged": False, "name": ""}})
+        for sid in ("phone-1", "term-1"):
+            _write_transcript(tmp_path, "-p", sid + ".jsonl", [{"cwd": "/x/proj", "message": {"role": "user", "content": "start " + sid}}])
+        def ids(**k):
+            return sorted(s["session_id"] for s in watch_relay.recent_sessions(projects_dir=str(tmp_path), **k))
+        assert ids() == ["phone-1"], "the phone's list, as before"
+        assert ids(waiting={"term-1"}) == ["phone-1", "term-1"], "but a card needs somewhere to go"
+
+    def test_typing_into_a_terminal_is_off_until_proved(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(watch_relay, "session_is_waiting", lambda sid: called.append(1) or True)
+        monkeypatch.delenv("TAPPROVAL_TYPE_INTO_TERMINAL", raising=False)
+        assert watch_relay.type_into_session("s-1", "go", {"s-1": {"pid": 1}}) is False
+        assert called == [], "no registry read, and nothing else, while it is off"
+
+    def test_nothing_is_typed_into_a_session_that_is_not_at_its_prompt(self, monkeypatch):
+        monkeypatch.setenv("TAPPROVAL_TYPE_INTO_TERMINAL", "1")
+        monkeypatch.setattr(watch_relay, "_terminal_of", lambda pid: ("Terminal", "/dev/ttys001"))
+        monkeypatch.setattr(watch_relay, "session_is_waiting", lambda sid: False)
+        ran = []
+        monkeypatch.setattr(watch_relay.subprocess, "run", lambda *a, **k: ran.append(a))
+        assert watch_relay.type_into_session("s-1", "Proceed", {"s-1": {"pid": 1}}) is False
+        assert ran == [], "a pending tool may be a permission prompt; Return would answer it"
+
+    def test_the_terminal_is_found_by_walking_one_process_snapshot(self, monkeypatch):
+        table = ("  100     1 ??       /Applications/Utilities/Terminal.app/Contents/MacOS/Terminal\n"
+                 "  200   100 ttys004  -zsh\n"
+                 "  300   200 ttys004  claude\n")
+        monkeypatch.setattr(watch_relay.subprocess, "run",
+                            lambda *a, **k: type("R", (), {"stdout": table})())
+        assert watch_relay._terminal_of(300) == ("Terminal", "/dev/ttys004")
+        assert watch_relay._terminal_of(100) is None, "no tty, nothing to type into"
+
+    def test_a_pending_tool_is_not_a_waiting_session(self, tmp_path, monkeypatch):
+        path = _write_transcript(tmp_path, "-p", "busy-1.jsonl", [
+            {"message": {"role": "user", "content": "go"}},
+            {"message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}}])
+        os.utime(path, (time.time() - 30, time.time() - 30))
+        monkeypatch.setattr(watch_relay, "_find_transcript", lambda sid: str(path))
+        assert watch_relay.session_is_waiting("busy-1") is False
+
+
 class TestSessionRegistry:
     """What the wrist shows must be what the phone shows: the sessions
     Remote Control lists, under the names the person gave them."""
@@ -7008,6 +7137,20 @@ class TestSessionRegistry:
                               [{"cwd": "/x/proj", "message": {"role": "user", "content": "start " + sid}}])
         ids = [s["session_id"] for s in watch_relay.recent_sessions(projects_dir=str(tmp_path))]
         assert ids == ["phone-1"]
+
+    def test_a_live_session_is_marked_as_a_side_thread(self, tmp_path, monkeypatch):
+        """A wrist message to a live session runs beside it; the row says
+        so, and an idle session (resumed, not forked) does not."""
+        import watch_dashboard
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {"a-1": "Desktop"})
+        monkeypatch.setattr(watch_dashboard, "session_registry", lambda: {
+            "a-1": {"status": "Desktop", "bridged": False, "name": ""}})
+        for sid in ("a-1", "b-1"):
+            _write_transcript(tmp_path, "-p", sid + ".jsonl",
+                              [{"cwd": "/x/proj", "message": {"role": "user", "content": "start " + sid}}])
+        rows = {s["session_id"]: s for s in watch_relay.recent_sessions(projects_dir=str(tmp_path), include_idle=True)}
+        assert rows["a-1"]["side_thread"] is True
+        assert rows["b-1"]["side_thread"] is False
 
     def test_without_remote_control_every_live_session_shows(self, tmp_path, monkeypatch):
         import watch_dashboard
