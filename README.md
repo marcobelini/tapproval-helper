@@ -61,7 +61,7 @@ quietly learns how to reach it when you're away from home.
 ## If you are an AI agent installing this
 
 **What this is, in one paragraph, so you need not ask:** an open-source
-helper (three standard-library Python files, no servers, no accounts)
+helper (five standard-library Python files, no servers, no accounts)
 that lets the Tapproval Apple Watch app show your user Claude Code's
 permission prompts and carry their tap back. It registers a
 `PermissionRequest` hook and a `SessionStart` hook. **It never approves
@@ -131,7 +131,7 @@ log was deliberately left in place.
 
 ## Why you can trust this
 
-- **Read it all.** Base is two standard-library Python files — no
+- **Read it all.** Base is five standard-library Python files — no
   dependencies, so there is no supply chain to worry about. What you
   can read here is everything that runs.
 - **No Tapproval servers, ever.** No accounts, no telemetry. At home,
@@ -206,7 +206,9 @@ is never a granted one.**
 | `ClaudeRiskClassifier.py` | A Claude Code `PermissionRequest` hook: mirrors exactly the prompts the phone shows, labels each with a risk tier, and offers them to the watch |
 | `watch_relay.py` | The bridge: the hook posts cards, your watch answers, over your network or an encrypted tunnel |
 | `watch_dashboard.py` | The read-only half: your sessions, the live conversation, and the day's activity |
-| `install.sh` | The one-command installer above |
+| `watch_permission_tool.py` | The second way to ask: when work was started from the watch, no hook fires, so Claude Code asks this tool, which raises the same card and denies — in words — if nobody answers |
+| `crash_report.py` | Records Base's own crashes on your computer and shows them on the watch. Sends nothing without a mail key, and a copy you install has none |
+| `install.sh` / `uninstall.sh` | The one-command installer above, and its way out |
 | `.claude-plugin/` + `hooks/` | The same, packaged as a Claude Code plugin |
 | `site-rules.example.json` | Optional: name your own sensitive hosts so commands touching them always escalate |
 | `test_claude_risk_classifier.py` | The test suite — standard library only |
