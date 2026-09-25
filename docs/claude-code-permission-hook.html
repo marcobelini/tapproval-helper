@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Code PermissionRequest hook: the decision shape</title>
+<meta name="description" content="The event a Claude Code PermissionRequest hook receives, the exact decision object it must print, and the string form that is silently ignored.">
+<link rel="canonical" href="https://tapproval.thoughtfulsteward.org/claude-code-permission-hook.html">
+<meta property="og:site_name" content="Tapproval">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Claude Code's PermissionRequest hook — the decision shape that works">
+<meta property="og:description" content="The event, the decision object Claude Code accepts, and the string form that fails validation and is quietly ignored.">
+<meta property="og:url" content="https://tapproval.thoughtfulsteward.org/claude-code-permission-hook.html">
+<meta property="og:image" content="https://tapproval.thoughtfulsteward.org/img/share.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="img/icon.png">
+<link rel="stylesheet" href="style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "TechArticle", "headline": "Claude Code's PermissionRequest hook — the decision shape that works", "description": "The event a PermissionRequest hook receives, the decision object Claude Code accepts, and the string form that fails validation and is silently ignored.", "datePublished": "2026-09-25", "dateModified": "2026-09-25", "proficiencyLevel": "Expert", "author": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "publisher": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "mainEntityOfPage": "https://tapproval.thoughtfulsteward.org/claude-code-permission-hook.html"}</script>
+</head>
+<body>
+<div class="wrap">
+<header class="top"><a href="./" style="display:flex;align-items:center;gap:12px;color:inherit"><img src="img/icon.png" alt=""><strong>Tapproval</strong></a>
+  <nav><a href="./">Home</a><a href="apple-watch-claude-code.html">Setup guide</a><a href="compare.html">Compare</a><a href="https://github.com/marcobelini/tapproval-helper">Source</a></nav></header>
+<main class="policy">
+<h1>Claude Code's PermissionRequest hook: the decision shape that works</h1>
+<p><em>Written from building <a href="./">Tapproval</a>, which answers these prompts from an Apple Watch. Checked against Claude Code 2.1.280, September 2026.</em></p>
+
+<p>When Claude Code is about to show a permission prompt ("May I run this command?", "May I edit this file?"), it first runs any <code>PermissionRequest</code> hooks you have configured. A hook can answer the prompt, deny it with a reason Claude reads, or say nothing and let the ordinary prompt appear. That makes it the one supported place to route approvals somewhere else: a phone, a chat, or a watch.</p>
+<p>It also has a trap that cost us every wrist approval for weeks, and nothing reported it.</p>
+
+<h2>Configuring the hook</h2>
+<p>In <code>~/.claude/settings.json</code> (or a plugin's <code>hooks/hooks.json</code>):</p>
+<pre>{
+  "hooks": {
+    "PermissionRequest": [
+      { "hooks": [ { "type": "command",
+                     "command": "python3 /path/to/your-hook.py",
+                     "timeout": 86460 } ] }
+    ]
+  }
+}</pre>
+<p>The <code>timeout</code> is in seconds. Claude Code stops a hook at its timeout, so a hook that waits for a person (a tap on a watch, say) needs a long one, or the question vanishes mid-glance.</p>
+
+<h2>What the hook receives</h2>
+<p>The event arrives as JSON on standard input. The fields that matter for a decision:</p>
+<ul>
+<li><code>tool_name</code>: <code>Bash</code>, <code>Edit</code>, <code>Write</code>, <code>AskUserQuestion</code>, <code>ExitPlanMode</code>, an <code>mcp__…</code> tool, and so on.</li>
+<li><code>tool_input</code>: the call's arguments: the command, the file path and new text, the question and its options, or the plan.</li>
+<li><code>cwd</code>: where the session is working.</li>
+<li><code>permission_suggestions</code>: present when the ordinary prompt would offer "don't ask again".</li>
+</ul>
+
+<h2>What the hook must print</h2>
+<p>Standard output carries the answer and nothing else: one JSON object. Diagnostics go to standard error.</p>
+<p><strong>Allow:</strong></p>
+<pre>{"hookSpecificOutput": {
+   "hookEventName": "PermissionRequest",
+   "decision": {"behavior": "allow"}}}</pre>
+<p><strong>Deny, with a reason Claude reads and acts on:</strong></p>
+<pre>{"hookSpecificOutput": {
+   "hookEventName": "PermissionRequest",
+   "decision": {"behavior": "deny",
+                "message": "Not on main. Push to a branch."}}}</pre>
+<p><strong>Leave it to the person:</strong> print the block with no <code>decision</code> at all. The ordinary prompt then appears exactly as if no hook were installed.</p>
+<pre>{"hookSpecificOutput": {"hookEventName": "PermissionRequest"}}</pre>
+<p><strong>Allow, and change the session's mode.</strong> An allow may also carry <code>updatedPermissions</code>. This is how "approve this plan and switch to auto mode" works:</p>
+<pre>{"hookSpecificOutput": {
+   "hookEventName": "PermissionRequest",
+   "decision": {"behavior": "allow",
+     "updatedPermissions": [{"type": "setMode", "mode": "auto",
+                             "destination": "session"}]}}}</pre>
+
+<h2>The trap: a string decision is silently ignored</h2>
+<p>Older examples show the decision as a string: <code>"decision": "allow"</code>. Claude Code validates the shape, and a string fails that check. A hook whose output fails validation is treated as <em>non-blocking</em>: the permission flow carries on as if the hook had not answered.</p>
+<p>Nothing looks wrong. There is no error in the session. The ordinary prompt appears, which is exactly what a hook that deliberately left the question to a person would produce. Your own log says "allowed". We shipped that for weeks: every approval tapped on a watch was discarded, on every install, until we read the CLI's own validator message:</p>
+<blockquote>PermissionRequest decision must be {"behavior": "allow"} or {"behavior": "deny", "message": "..."}</blockquote>
+<p>Two habits would have caught it:</p>
+<ul>
+<li><strong>Build the output in one function</strong>, and test the exact bytes it prints, not what you meant it to print.</li>
+<li><strong>Prove a real allow end to end once.</strong> Create a marker file, have a session delete it behind a prompt, allow it from the hook, and check the file is gone.</li>
+</ul>
+
+<h2>Other things worth knowing</h2>
+<ul>
+<li><strong>Fail closed.</strong> If the hook cannot parse the event or crashes, print the "leave it to the person" block. Never allow on a guess.</li>
+<li><strong>Questions and plans are prompts too.</strong> <code>AskUserQuestion</code> and <code>ExitPlanMode</code> reach the hook. A deny whose message carries the chosen option ("The user answered: …") is how an answer travels back from outside.</li>
+<li><strong>Headless runs.</strong> A <code>claude -p</code> run has no prompt to show, so it does not reach a <code>PermissionRequest</code> hook. Use <code>--permission-prompt-tool</code> with an MCP tool there instead.</li>
+<li><strong>A known display bug.</strong> When a hook answers, the Claude app on a phone can keep showing the prompt anyway (<a href="https://github.com/anthropics/claude-code/issues/32493">claude-code#32493</a>). The command did run; any message from the phone clears it.</li>
+</ul>
+
+<h2>A worked example</h2>
+<p><a href="https://github.com/marcobelini/tapproval-helper">Tapproval Base</a> is an open-source <code>PermissionRequest</code> hook, standard-library Python only. It sorts each call into five risk tiers, sends it to an Apple Watch, and prints the answer in the shape above. <code>_permission_output()</code> in <code>ClaudeRiskClassifier.py</code> is the one function that builds the decision, and its tests check the exact JSON.</p>
+<p style="margin-top:28px"><a class="cta" href="apple-watch-claude-code.html">Put these prompts on your Apple Watch</a></p>
+</main>
+<footer>
+  <p>Tapproval is an independent app and is not affiliated with, endorsed by or sponsored by Anthropic. Claude and Claude Code are trademarks of Anthropic, PBC. Apple Watch and App Store are trademarks of Apple Inc.</p>
+  <p>© 2026 Tapproval · <a href="./">Home</a> · <a href="privacy.html">Privacy policy</a> · <a href="mailto:tapproval@thoughtfulsteward.org">tapproval@thoughtfulsteward.org</a></p>
+</footer>
+</div>
+</body>
+</html>

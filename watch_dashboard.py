@@ -145,15 +145,32 @@ def _usage_entries(path):
         return state["entries"]
 
 
-def _usage_entry(line):
+def _json_object(line):
+    """One transcript or audit line as a dict, or None.
+
+    Every reader here parsed a line and then called .get on it; a line that
+    is JSON but not an object ([], a string, a number) raised
+    AttributeError inside functions documented never to raise (2026-09-25
+    review). One parse, one rule, for all of them."""
     try:
         entry = json.loads(line)
-    except ValueError:
+    except (ValueError, TypeError):
         return None
-    if not isinstance(entry, dict):
+    return entry if isinstance(entry, dict) else None
+
+
+def _message_of(entry):
+    """An entry's message, as a dict whatever the line held."""
+    message = entry.get("message")
+    return message if isinstance(message, dict) else {}
+
+
+def _usage_entry(line):
+    entry = _json_object(line)
+    if entry is None:
         return None
-    message = entry.get("message") or {}
-    usage = message.get("usage") or {} if isinstance(message, dict) else {}
+    message = _message_of(entry)
+    usage = message.get("usage") or {}
     if not usage:
         return None
     stamp = _parse_stamp(entry.get("timestamp"))
@@ -367,9 +384,8 @@ def transcript_origin(path, scan_lines=60):
                 for index, line in enumerate(handle):
                     if index >= scan_lines or (cwd and entry_point):
                         break
-                    try:
-                        entry = json.loads(line)
-                    except ValueError:
+                    entry = _json_object(line)
+                    if entry is None:
                         continue
                     cwd = cwd or str(entry.get("cwd") or "")
                     entry_point = entry_point or str(entry.get("entrypoint") or "")
@@ -686,13 +702,12 @@ def _session_meta(path, scan_lines=600):
             for index, line in enumerate(handle):
                 if index >= scan_lines and cwd and opening:
                     break
-                try:
-                    entry = json.loads(line)
-                except ValueError:
+                entry = _json_object(line)
+                if entry is None:
                     continue
                 if cwd is None and entry.get("cwd"):
                     cwd = entry["cwd"]
-                message = entry.get("message") or {}
+                message = _message_of(entry)
                 if message.get("role") != "user":
                     continue
                 turns += 1
@@ -816,9 +831,8 @@ def _activity_summary_locked(path, today):
     for line in lines:
         if today not in line[:32]:
             continue
-        try:
-            entry = json.loads(line)
-        except ValueError:
+        entry = _json_object(line)
+        if entry is None:
             continue
         tier = entry.get("tier", "?")
         state["tiers"][tier] = state["tiers"].get(tier, 0) + 1
@@ -891,9 +905,8 @@ def _recap_uncached(path, now=None):
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
-                try:
-                    entry = json.loads(line)
-                except ValueError:
+                entry = _json_object(line)
+                if entry is None:
                     continue          # a torn last line is not a reason to fail
                 _count_decision(stats, entry)
                 day = str(entry.get("ts", ""))[:10]
@@ -1026,6 +1039,29 @@ def blocks(markdown):
     return out
 
 
+def _flatten_line(line, keep_inline=False):
+    """One Markdown line reduced to what it says: the one list of rules
+    plain_text and _flatten_lines both apply. They were two copies of the
+    same thirteen substitutions, and a rule added to one would have made
+    the wrist show the same reply two ways. ``keep_inline`` leaves code,
+    emphasis and strike marks for a caller that styles them itself."""
+    line = _MD_HEADING.sub("", line)
+    line = _MD_QUOTE.sub("", line)
+    line = _MD_BULLET.sub(r"\1• ", line)
+    if line.lstrip().startswith("|"):
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        line = " · ".join(c for c in cells if c)
+    line = _MD_IMAGE.sub(r"\1", line)
+    line = _MD_LINK.sub(r"\1", line)
+    if not keep_inline:
+        line = _MD_CODE.sub(r"\1", line)
+        line = _MD_STRONG.sub(lambda m: m.group(1) or m.group(2), line)
+        line = _MD_EM.sub(lambda m: m.group(1) or m.group(2), line)
+        line = _MD_STRIKE.sub(r"\1", line)
+    line = _MD_HTML.sub("", line)
+    return _MD_ESCAPE.sub(r"\1", line)
+
+
 def _flatten_lines(lines, keep_inline=False):
     """``plain_text``'s line pass over lines already stripped of fences."""
     out = []
@@ -1034,22 +1070,7 @@ def _flatten_lines(lines, keep_inline=False):
             if not line.strip() and out and out[-1]:
                 out.append("")
             continue
-        line = _MD_HEADING.sub("", line)
-        line = _MD_QUOTE.sub("", line)
-        line = _MD_BULLET.sub(r"\1• ", line)
-        if line.lstrip().startswith("|"):
-            cells = [c.strip() for c in line.strip().strip("|").split("|")]
-            line = " · ".join(c for c in cells if c)
-        line = _MD_IMAGE.sub(r"\1", line)
-        line = _MD_LINK.sub(r"\1", line)
-        if not keep_inline:
-            line = _MD_CODE.sub(r"\1", line)
-            line = _MD_STRONG.sub(lambda m: m.group(1) or m.group(2), line)
-            line = _MD_EM.sub(lambda m: m.group(1) or m.group(2), line)
-            line = _MD_STRIKE.sub(r"\1", line)
-        line = _MD_HTML.sub("", line)
-        line = _MD_ESCAPE.sub(r"\1", line)
-        out.append(line.strip())
+        out.append(_flatten_line(line, keep_inline).strip())
     while out and not out[-1]:
         out.pop()
     return "\n".join(out)
@@ -1095,21 +1116,7 @@ def plain_text(markdown):
             if not line.strip() and out and out[-1]:
                 out.append("")
             continue
-        line = _MD_HEADING.sub("", line)
-        line = _MD_QUOTE.sub("", line)
-        line = _MD_BULLET.sub(r"\1• ", line)
-        if line.lstrip().startswith("|"):
-            cells = [c.strip() for c in line.strip().strip("|").split("|")]
-            line = " · ".join(c for c in cells if c)
-        line = _MD_IMAGE.sub(r"\1", line)
-        line = _MD_LINK.sub(r"\1", line)
-        line = _MD_CODE.sub(r"\1", line)
-        line = _MD_STRONG.sub(lambda m: m.group(1) or m.group(2), line)
-        line = _MD_EM.sub(lambda m: m.group(1) or m.group(2), line)
-        line = _MD_STRIKE.sub(r"\1", line)
-        line = _MD_HTML.sub("", line)
-        line = _MD_ESCAPE.sub(r"\1", line)
-        line = " ".join(line.split())
+        line = " ".join(_flatten_line(line).split())
         if line:
             out.append(line)
     while out and not out[-1]:
@@ -1456,11 +1463,10 @@ def _keep_what_was_said(turns, said, limit):
 
 def _thread_line(state, line, limit):
     """Fold one appended transcript line into the running thread state."""
-    try:
-        entry = json.loads(line)
-    except ValueError:
+    entry = _json_object(line)
+    if entry is None:
         return
-    message = entry.get("message") or {}
+    message = _message_of(entry)
     role = message.get("role")
     # Task launches and receipts arrive as user-role tool results and
     # notifications — never in Claude's own prose. An assistant message

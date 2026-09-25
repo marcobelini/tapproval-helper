@@ -102,7 +102,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.23"
+__version__ = "1.1.24"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -1620,9 +1620,13 @@ def read_audit(policy):
                 if not line:
                     continue
                 try:
-                    entries.append(json.loads(line))
+                    entry = json.loads(line)
                 except ValueError:
                     continue
+                # Callers .get() on every entry: a line that is JSON but
+                # not an object must not reach them.
+                if isinstance(entry, dict):
+                    entries.append(entry)
     except OSError:
         return []
     return entries
@@ -2286,17 +2290,14 @@ def _split_assignments(parts):
 def _manifest_hook(wiring):
     """Our PermissionRequest handler in a hooks manifest: (env, timeout)."""
     import shlex
-    for entry in wiring.get("hooks", {}).get("PermissionRequest", []):
-        for handler in entry.get("hooks", []):
-            if not _is_our_hook(handler):
-                continue
-            try:
-                parts = shlex.split(str(handler.get("command", "")),
-                                    posix=(os.name != "nt"))
-            except ValueError:
-                parts = []
-            env, _rest = _split_assignments(parts)
-            return env, handler.get("timeout")
+    for handler in _settings_handlers(wiring):
+        try:
+            parts = shlex.split(str(handler.get("command", "")),
+                                posix=(os.name != "nt"))
+        except ValueError:
+            parts = []
+        env, _rest = _split_assignments(parts)
+        return env, handler.get("timeout")
     return {}, None
 
 
@@ -2354,20 +2355,33 @@ def _plugin_install():
         if not isinstance(wiring, dict):
             continue
         env, timeout = _manifest_hook(wiring)
-        relay = any(
-            "watch_relay.py" in str(handler.get("command", ""))
-            for entry in wiring.get("hooks", {}).get("SessionStart", [])
-            for handler in entry.get("hooks", []))
+        relay = _relay_wired(wiring)
         return {"root": root, "env": env, "timeout": timeout, "relay": relay}
     return None
 
 
+def _handlers(data, event):
+    """Every handler under one hook event in a settings file or a hooks
+    manifest. The one walk of that shape: four copies of it used to live
+    here, and a guard added to one would not have reached the rest."""
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    entries = hooks.get(event, []) if isinstance(hooks, dict) else []
+    for entry in entries if isinstance(entries, list) else []:
+        for handler in (entry.get("hooks") or []) if isinstance(entry, dict) else []:
+            if isinstance(handler, dict):
+                yield handler
+
+
 def _settings_handlers(data):
     """Our PermissionRequest handlers in a parsed settings file."""
-    return [handler
-            for entry in data.get("hooks", {}).get("PermissionRequest", [])
-            for handler in entry.get("hooks", [])
+    return [handler for handler in _handlers(data, "PermissionRequest")
             if _is_our_hook(handler)]
+
+
+def _relay_wired(data):
+    """Does SessionStart start the relay, in this settings file or manifest?"""
+    return any("watch_relay.py" in str(handler.get("command", ""))
+               for handler in _handlers(data, "SessionStart"))
 
 
 def _plugin_only_install():
@@ -2670,10 +2684,8 @@ def _edit_settings_env(mutate):
 
 
 def _set_hook_timeout(data, timeout):
-    for entry in data.get("hooks", {}).get("PermissionRequest", []):
-        for handler in entry.get("hooks", []):
-            if _is_our_hook(handler):
-                handler["timeout"] = timeout
+    for handler in _settings_handlers(data):
+        handler["timeout"] = timeout
 
 
 def run_watch(enable=True):
@@ -2818,10 +2830,7 @@ def status_facts():
         # The hook's own command line is the truth for a plugin install;
         # this shell's environment says nothing about it.
         mode = str(plugin["env"].get("CLAUDE_RISK_MODE", mode)).lower()
-    relay_wired = any(
-        "watch_relay.py" in str(h.get("command", ""))
-        for entry in data.get("hooks", {}).get("SessionStart", [])
-        for h in entry.get("hooks", [])) or bool(plugin and plugin["relay"])
+    relay_wired = _relay_wired(data) or bool(plugin and plugin["relay"])
     return {
         "settings_path": path, "readable": readable, "handlers": handlers,
         "plugin": plugin, "plugin_only": plugin_only, "mode": mode,

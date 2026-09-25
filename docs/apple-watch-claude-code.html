@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Approve Claude Code from your Apple Watch: setup guide</title>
+<meta name="description" content="Get Claude Code's permission prompts on your Apple Watch and answer with one tap: install the free app, add the open-source helper, done in five minutes.">
+<link rel="canonical" href="https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html">
+<meta property="og:site_name" content="Tapproval">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Approve Claude Code prompts from your Apple Watch">
+<meta property="og:description" content="Setup guide: Claude Code's permission prompts on your wrist, each marked with its risk, one tap to answer.">
+<meta property="og:url" content="https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html">
+<meta property="og:image" content="https://tapproval.thoughtfulsteward.org/img/share.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="apple-itunes-app" content="app-id=6805869018">
+<link rel="icon" href="img/icon.png">
+<link rel="stylesheet" href="style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "HowTo", "name": "Approve Claude Code prompts from your Apple Watch", "description": "Get Claude Code's permission prompts on an Apple Watch and answer them with one tap.", "totalTime": "PT5M", "tool": [{"@type": "HowToTool", "name": "Apple Watch with watchOS 10 or later"}, {"@type": "HowToTool", "name": "Claude Code on a Mac or Linux computer"}], "step": [{"@type": "HowToStep", "name": "Install the watch app", "text": "Install Tapproval from the App Store on your Apple Watch. It is free and needs no account.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html#watch"}, {"@type": "HowToStep", "name": "Add the helper to Claude Code", "text": "In Claude Code, run /plugin marketplace add marcobelini/tapproval-helper and then /plugin install tapproval-helper@tapproval, or ask Claude Code to install the Tapproval plugin from marcobelini/tapproval-helper.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html#helper"}, {"@type": "HowToStep", "name": "Restart Claude Code", "text": "Quit Claude Code and run claude again, so the helper starts with the new session.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html#restart"}, {"@type": "HowToStep", "name": "Open Tapproval on the watch", "text": "Open the app once on the same Wi-Fi as the computer. It finds the computer and pairs by itself.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html#pair"}]}</script>
+</head>
+<body>
+<div class="wrap">
+<header class="top"><a href="./" style="display:flex;align-items:center;gap:12px;color:inherit"><img src="img/icon.png" alt=""><strong>Tapproval</strong></a>
+  <nav><a href="./">Home</a><a href="claude-code-permission-hook.html">How the hook works</a><a href="compare.html">Compare</a><a href="https://apps.apple.com/app/tapproval/id6805869018">App Store</a></nav></header>
+<main class="policy">
+<h1>Approve Claude Code prompts from your Apple Watch</h1>
+<p>Claude Code stops and asks before it runs a command, edits a file or answers a question for you. If you are away from the keyboard, the session waits. This guide puts those prompts on your Apple Watch, so one tap on the wrist answers them and the session carries on.</p>
+<p>It takes about five minutes. You need an Apple Watch on watchOS 10 or later, and Claude Code on a Mac or a Linux computer. Everything below is free, and there is no account to create.</p>
+
+<h2 id="watch">1. Install the watch app</h2>
+<p>Get <a href="https://apps.apple.com/app/tapproval/id6805869018">Tapproval on the App Store</a>. It is not yet available in the EU; the <a href="https://testflight.apple.com/join/dW1tYBQG">TestFlight beta</a> works everywhere.</p>
+
+<h2 id="helper">2. Add the helper to Claude Code</h2>
+<p>The watch needs a small bridge on the computer, called Tapproval Base. It is open source and uses only Python's standard library. Type these two lines into Claude Code itself:</p>
+<pre>/plugin marketplace add marcobelini/tapproval-helper
+/plugin install tapproval-helper@tapproval</pre>
+<p>Or just ask Claude Code in plain words:</p>
+<blockquote>Install the Tapproval plugin from marcobelini/tapproval-helper</blockquote>
+<p>The plugin registers a <code>PermissionRequest</code> hook, which is how Claude Code hands a prompt to the watch, and starts the relay with every session. <a href="claude-code-permission-hook.html">How that hook works</a> is explained on its own page.</p>
+
+<h2 id="restart">3. Restart Claude Code</h2>
+<p>Quit Claude Code and run <code>claude</code> again. The helper starts when a session begins, so the session you installed it from cannot start it.</p>
+
+<h2 id="pair">4. Open Tapproval on the watch</h2>
+<p>Open the app once while the watch and the computer are on the same Wi-Fi. It finds the computer by itself and pairs automatically. From then on it also knows how to reach the computer when you are away: through a private travel address, or through your own iCloud when nothing else answers.</p>
+
+<h2>What arrives on the wrist</h2>
+<ul>
+<li><strong>Permission prompts</strong>, each marked with one of five risk tiers worked out on your computer. A force-push to main arrives as CRITICAL. Tap Allow or Deny.</li>
+<li><strong>Questions</strong> Claude asks you, with the same options as on the desktop.</li>
+<li><strong>Plans</strong> waiting for approval, with Approve, Approve &amp; auto mode, Keep planning, or edits you dictate.</li>
+<li><strong>Your sessions</strong>: which one needs you, which is working, what it said. Reply, or start a new session from the wrist.</li>
+</ul>
+<p><strong>Nothing is approved for you.</strong> By default every prompt waits for a person. If you do not answer on the watch, the ordinary prompt is still there in Claude Code, exactly as it would be without Tapproval.</p>
+
+<h2>If the watch cannot find the computer</h2>
+<p>Almost every case is one of two things: the watch and the computer are on different networks, or a VPN on the iPhone is half connected. Open <strong>Settings → Connection</strong> on the watch; every route gets a tick or a reason. For a second watch, tell Claude Code <em>Open Tapproval pairing</em> and open the app within ten minutes.</p>
+
+<h2>Removing it</h2>
+<p>Tell Claude Code <em>Uninstall Tapproval Base</em>. It restores your settings, keeps a backup, and leaves nothing running. Delete the app from the watch like any other.</p>
+
+<p style="margin-top:36px"><a class="cta" href="https://apps.apple.com/app/tapproval/id6805869018">Get Tapproval on the App Store</a></p>
+</main>
+<footer>
+  <p>Tapproval is an independent app and is not affiliated with, endorsed by or sponsored by Anthropic. Claude and Claude Code are trademarks of Anthropic, PBC. Apple Watch and App Store are trademarks of Apple Inc.</p>
+  <p>© 2026 Tapproval · <a href="./">Home</a> · <a href="privacy.html">Privacy policy</a> · <a href="mailto:tapproval@thoughtfulsteward.org">tapproval@thoughtfulsteward.org</a></p>
+</footer>
+</div>
+</body>
+</html>

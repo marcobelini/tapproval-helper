@@ -8939,3 +8939,38 @@ class TestPollsReadOnlyWhatChanged:
         with open(path, "a") as handle:
             handle.write(json.dumps({"message": {"role": "assistant", "content": "more"}}) + "\n")
         assert watch_dashboard.session_meta(str(path), scan_lines=5) == first
+
+
+class TestALineThatIsNotAnObject:
+    """2026-09-25 review: every transcript reader parsed a line and called
+    .get on it, so a line that is JSON but not an object raised inside
+    functions documented never to raise."""
+
+    ODD = ["[]", '"a string"', "5", "null", '{"message": "not an object"}']
+
+    def _transcript(self, tmp_path):
+        good = json.dumps({"cwd": "/x/proj", "timestamp": "2026-09-25T06:00:00Z",
+                           "message": {"role": "user", "content": "Ship it"}})
+        reply = json.dumps({"timestamp": "2026-09-25T06:00:01Z", "message": {
+            "role": "assistant", "model": "m", "content": [{"type": "text", "text": "Done"}],
+            "usage": {"input_tokens": 1, "output_tokens": 2}}})
+        path = tmp_path / "-p" / "odd.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(self.ODD + [good] + self.ODD + [reply]) + "\n")
+        return path
+
+    def test_every_reader_skips_it(self, tmp_path):
+        path = str(self._transcript(tmp_path))
+        watch_dashboard._THREAD_STATE.pop(path, None)
+        turns, _, _ = watch_dashboard._parse_thread(path, 14)
+        assert [t["text"] for t in turns] == ["Ship it", "Done"]
+        assert watch_dashboard.session_meta(path)[:2] == ("/x/proj", "Ship it")
+        assert watch_dashboard.transcript_origin(path)[0] == "/x/proj"
+        watch_dashboard._USAGE_FILES.pop(path, None)
+        assert [e[2] for e in watch_dashboard._usage_entries(path)] == [2]
+
+    def test_the_audit_log_skips_it(self, tmp_path):
+        log = tmp_path / "audit.jsonl"
+        not_objects = [line for line in self.ODD if not line.startswith("{")]
+        log.write_text("\n".join(not_objects + [json.dumps({"tier": "LOW", "ts": "2026-09-25"})]) + "\n")
+        assert crc.read_audit({"audit_log": str(log)}) == [{"tier": "LOW", "ts": "2026-09-25"}]

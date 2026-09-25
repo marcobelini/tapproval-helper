@@ -966,7 +966,7 @@ class CardQueue:
 # imported; tests reach the rest through watch_dashboard.
 from watch_dashboard import (  # noqa: E402
     activity_summary, recap_summary, _find_transcript, image_bytes,
-    _parse_thread, prewarm_threads, _read_appended,
+    _json_object, _message_of, _parse_thread, prewarm_threads, _read_appended,
     project_root, recent_sessions, resolve_session, session_registry, shape,
     transcript_origin, transcripts_newest_first,
     THREAD_TURN_LIMIT, usage_summary)
@@ -1704,11 +1704,10 @@ class _PromptResolver:
                     pass
                 return False
             for line in lines:
-                try:
-                    entry = json.loads(line)
-                except ValueError:
+                entry = _json_object(line)
+                if entry is None:
                     continue
-                content = (entry.get("message") or {}).get("content")
+                content = _message_of(entry).get("content")
                 if not isinstance(content, list):
                     continue
                 for part in content:
