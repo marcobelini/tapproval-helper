@@ -26,7 +26,8 @@ rm -rf "$HOME/.tapproval"
 # pairing outlived the install it belonged to — a "clean exit" that kept
 # the key to the door.
 rm -f "$HOME/.tapproval-token" "$HOME/.tapproval-auth.json" \
-      "$HOME/.tapproval-relay.log" "$HOME/.tapproval-say.log" "$HOME/.tapproval-last-update"
+      "$HOME/.tapproval-relay.log" "$HOME/.tapproval-say.log" "$HOME/.tapproval-last-update" \
+      "$HOME/.tapproval-relay.pid"
 
 echo ""
 echo "TAPPROVAL_BASE_REMOVED"

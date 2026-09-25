@@ -1320,8 +1320,36 @@ def _running_task_count(state, session_id):
     return running
 
 
+# How much of a transcript's end is read the first time the watch asks
+# for its thread. The thread is its last turns; reading the whole file to
+# find them took 17-27 s and 1.26 GB for one 238 MB transcript on the
+# first /sessions after a relay start (2026-09-25 review). What a tail
+# cannot know: a background task launched before it (the running count
+# may miss it until it finishes) and a message of yours older than it
+# (the head of the thread then starts inside the tail).
+THREAD_TAIL_BYTES = 4 * 1024 * 1024
+
+
+def _tail_start(path, tail=None):
+    """The offset of the first whole line in the file's last ``tail``
+    bytes, or 0 when the file is no longer than that. Never raises."""
+    tail = THREAD_TAIL_BYTES if tail is None else tail
+    try:
+        size = os.path.getsize(path)
+        if size <= tail:
+            return 0
+        with open(path, "rb") as handle:
+            handle.seek(size - tail)
+            handle.readline()               # never start mid-line
+            return handle.tell()
+    except OSError:
+        return 0
+
+
 def _parse_thread_locked(path, limit):
     state = _thread_state_for(path)
+    if state["offset"] == 0 and not state["turns"]:
+        state["offset"] = _tail_start(path)
     lines, state["offset"], shrunk = _read_appended(path, state["offset"])
     if shrunk:
         # Rewritten transcript: the returned lines are the whole new file;
@@ -1540,7 +1568,12 @@ def resolve_session(prefix, projects_dir=None, registry=None):
 
     The watch carries short ids; resuming a session needs the whole one.
     Returns (session_id, cwd) or (None, None). Never raises.
+
+    An empty prefix names nobody: `""` matched every transcript, and the
+    first the directory listed was resumed (2026-09-25 review).
     """
+    if not str(prefix or "").strip():
+        return None, None
     path = _find_transcript(prefix, projects_dir)
     if not path:
         return None, None

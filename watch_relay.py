@@ -62,8 +62,11 @@ TUNNEL_PORT = 8978
 # Read once, to migrate a pre-per-device install into the auth file; never
 # written any more. The function that used to create it went with the
 # single-token design, and was the last write-then-chmod left in the tree.
-TOKEN_FILE = os.path.expanduser("~/.tapproval-token")
 AUTH_FILE = os.path.expanduser("~/.tapproval-auth.json")
+# The Mac bridge mirrors the key into the owner's private iCloud database,
+# where only the owner's Apple ID can read it. Where it is installed a watch
+# pairs through iCloud, and the network pairing door is never needed.
+BRIDGE_APP = os.path.expanduser("~/.tapproval-bridge/TapprovalBridge.app")
 # Bumped whenever the wire contract or the auth rules change, so a running
 # relay from before an update can be recognised — and replaced — instead of
 # quietly serving the old rules forever (see ensure_running).
@@ -87,7 +90,7 @@ except Exception:                                  # standalone deployment
 _PROVENANCE = None
 
 
-def install_crash_reporting(hooks=None):
+def install_crash_reporting():
     """Make the helper's own crashes visible instead of silent.
 
     A thread that dies takes its job with it — the advertiser stops
@@ -129,8 +132,15 @@ def install_crash_reporting(hooks=None):
                             source="process", helper=HELPER_VERSION)
         previous_process(kind, value, tb)
 
+    def on_request(kind, value, tb):
+        stack = "".join(traceback.format_exception(kind, value, tb))
+        crash_report.report("%s: %s" % (kind.__name__, value), stack,
+                            source="request", helper=HELPER_VERSION, note=_wrist)
+
+    global _ON_HANDLER_ERROR
     threading.excepthook = on_thread
     sys.excepthook = on_process
+    _ON_HANDLER_ERROR = on_request
     return True
 
 
@@ -393,6 +403,9 @@ def _spawn_detached(command, log_path, cwd=None):
     so a long-lived relay does not leak one file descriptor per spawn.
     Returns "" on success or a short error string. Never raises.
     """
+    # Every detached log is kept to size here, where it is opened: only the
+    # relay's own log was rotated, and the /say log grew by every reply.
+    _rotate_log(log_path)
     try:
         with open(log_path, "a") as log:
             subprocess.Popen(command, cwd=cwd, stdout=log, stderr=log,
@@ -1005,8 +1018,19 @@ def _permission_tool_flags(tool_path=None):
     path = tool_path or PERMISSION_TOOL
     if not os.path.isfile(path):
         return []
+    # The tool finds the wrist through CLAUDE_RISK_RELAY. A plugin install
+    # sets that on the PermissionRequest hook's own command line only, so
+    # neither this relay nor the run it starts had it, and every prompt in
+    # a wrist-sent run was denied "no relay address configured". The relay
+    # knows the address; it hands it down, unless the user set their own.
+    try:
+        from ClaudeRiskClassifier import WATCH_ENV
+    except Exception:
+        WATCH_ENV = {"CLAUDE_RISK_MODE": "enforce",
+                     "CLAUDE_RISK_RELAY": "http://127.0.0.1:%d" % DEFAULT_PORT}
+    env = {key: os.environ.get(key) or value for key, value in WATCH_ENV.items()}
     config = json.dumps({"mcpServers": {"tapproval": {
-        "command": sys.executable or "python3", "args": [path]}}})
+        "command": sys.executable or "python3", "args": [path], "env": env}}})
     return ["--mcp-config", config,
             "--permission-prompt-tool", "mcp__tapproval__approve"]
 
@@ -1014,7 +1038,12 @@ def _permission_tool_flags(tool_path=None):
 # How long a "is Claude Code signed in?" answer is trusted. The question
 # costs a subprocess, and the answer changes about twice a year.
 SIGNIN_CACHE_SECONDS = 120.0
-_SIGNIN = {"at": 0.0, "in": None}
+# An answer that could not be read is trusted for less, but trusted: left
+# uncached, every /health started `claude auth status` again, up to 15 s
+# each, several at once from the Connection screen (2026-09-25 review).
+SIGNIN_UNKNOWN_CACHE_SECONDS = 30.0
+_SIGNIN = {"at": 0.0, "in": None, "asked": False}
+_SIGNIN_LOCK = threading.Lock()
 
 
 def signed_in(runner=None, now=None):
@@ -1032,8 +1061,18 @@ def signed_in(runner=None, now=None):
     say it on the Connection screen where every other fault is reported.
     """
     stamp = time.time() if now is None else now
-    if _SIGNIN["in"] is not None and stamp - _SIGNIN["at"] < SIGNIN_CACHE_SECONDS:
-        return _SIGNIN["in"]
+    # One question at a time: callers that arrive meanwhile wait for its
+    # answer instead of each starting a subprocess of their own.
+    with _SIGNIN_LOCK:
+        if _SIGNIN.get("asked"):
+            trusted = (SIGNIN_CACHE_SECONDS if _SIGNIN["in"] is not None
+                       else SIGNIN_UNKNOWN_CACHE_SECONDS)
+            if stamp - _SIGNIN["at"] < trusted:
+                return _SIGNIN["in"]
+        return _ask_signed_in(runner, stamp)
+
+
+def _ask_signed_in(runner, stamp):
     answer = None
     try:
         run = runner or (lambda: subprocess.run(
@@ -1043,7 +1082,7 @@ def signed_in(runner=None, now=None):
             answer = bool(json.loads(done.stdout or "{}").get("loggedIn"))
     except Exception:
         answer = None
-    _SIGNIN.update(at=stamp, **{"in": answer})
+    _SIGNIN.update(at=stamp, asked=True, **{"in": answer})
     if answer is False:
         note_condition("signin", "Claude Code on your computer is signed out. "
                                  "Open a Terminal there and run: claude auth login")
@@ -1287,6 +1326,11 @@ def type_into_session(session_id, text, registry):
         return False
     # One line, no control characters: what a person could have typed.
     line = "".join(ch for ch in text if ch.isprintable())
+    # Typed first into Claude Code's prompt, `!` runs the rest as a shell
+    # command with no permission card, and `#` writes to memory. Such a
+    # message takes the ordinary route instead (2026-09-25 review).
+    if line.lstrip()[:1] in ("!", "#"):
+        return False
     find = TERMINAL_APPS[app] % {"tty": _applescript_literal(tty), "text": _applescript_literal(line)}
     ok, said = _run_osascript(TERMINAL_SCRIPT % {"app": app, "find": find})
     if not ok:
@@ -1823,6 +1867,94 @@ def authorize_request(client_ip, path, header_token,
     return _credential_ok(auth, header_token)
 
 
+# ---- signed requests -----------------------------------------------------
+#
+# A watch used to send its key itself, in an X-Tapproval-Token header, over
+# plain HTTP, to whichever host answered Bonjour first: anyone reading the
+# Wi-Fi saw it, and any device advertising the service could collect it
+# (2026-09-25 review, issue #271). A watch that signs sends a MAC instead:
+#
+#   X-Tapproval-Signature: v1 <unix time> <nonce> <hex HMAC-SHA256>
+#
+# keyed by its token, over the method, the path (percent-decoded, no
+# query), the time, the nonce and the SHA-256 of the body. The key never
+# travels, a signature is good for one request within two minutes, and
+# the relay answers with a proof over the same nonce, so the watch can
+# tell its own computer from something that merely answered.
+
+SIGNATURE_WINDOW_SECONDS = 120
+_SEEN_NONCES = OrderedDict()
+_NONCE_LOCK = threading.Lock()
+
+
+def _signature_message(method, path, stamp, nonce, body):
+    import hashlib
+    return "\n".join([str(method).upper(), str(path), str(stamp), str(nonce),
+                      hashlib.sha256(body or b"").hexdigest()]).encode("utf-8")
+
+
+def sign_request(token, method, path, stamp, nonce, body=b""):
+    import hashlib
+    return hmac.new(str(token).encode("utf-8"),
+                    _signature_message(method, path, stamp, nonce, body),
+                    hashlib.sha256).hexdigest()
+
+
+def relay_proof(token, nonce):
+    """What the relay answers a signed request with: only a holder of the
+    same key can produce it for this nonce."""
+    import hashlib
+    return hmac.new(str(token).encode("utf-8"),
+                    ("tapproval-proof\n%s" % nonce).encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def seal(token, nonce, secret):
+    """``secret`` (a 32-character hex key) encrypted for the holder of
+    ``token``: XOR with an HMAC-derived pad unique to this nonce. How a key
+    issued in answer to a signed request crosses plain HTTP."""
+    import hashlib
+    pad = hmac.new(str(token).encode("utf-8"),
+                   ("tapproval-seal\n%s" % nonce).encode("utf-8"),
+                   hashlib.sha256).digest()
+    raw = str(secret).encode("utf-8")[:32]
+    # By index, not zip(): zip(strict=) is 3.10, and the hook runs on 3.9.
+    return bytes(raw[i] ^ pad[i] for i in range(len(raw))).hex()
+
+
+def verify_signature(header, method, path, body, candidates, now=None):
+    """The token among ``candidates`` that signed this request, and its
+    nonce — or (None, None). A stale time, a malformed header or a nonce
+    already seen is (None, None): never an error, never a fallback."""
+    try:
+        version, stamp, nonce, mac = str(header or "").split()
+        stamp = int(stamp)
+    except ValueError:
+        return None, None
+    if version != "v1" or not (16 <= len(nonce) <= 64) or not mac:
+        return None, None
+    moment = time.time() if now is None else now
+    if abs(moment - stamp) > SIGNATURE_WINDOW_SECONDS:
+        return None, None
+    match = None
+    for token in candidates:
+        if token and hmac.compare_digest(
+                sign_request(token, method, path, stamp, nonce, body), mac):
+            match = token
+            break
+    if match is None:
+        return None, None
+    with _NONCE_LOCK:
+        for seen, at in list(_SEEN_NONCES.items()):
+            if moment - at <= 2 * SIGNATURE_WINDOW_SECONDS:
+                break
+            del _SEEN_NONCES[seen]
+        if nonce in _SEEN_NONCES:
+            return None, None              # a replay
+        _SEEN_NONCES[nonce] = moment
+    return match, nonce
+
+
 def _credential_ok(auth, token):
     """Does ``token`` match the credential store — an Auth, or the bare
     token string the older call sites still pass? False when there is no
@@ -1903,6 +2035,12 @@ def _socket_alive(sock):
 # loopback (it is cloudflared), which once made the pairing key reachable
 # from the whole internet.
 class RelayHandler(BaseHTTPRequestHandler):
+    # A socket that sends nothing for this long is closed. Without it a
+    # peer on the network could hold connections half-open, one thread
+    # each, until the relay ran out — and the hook's /card waits with it.
+    # It bounds reads and writes only: a /card waiting for a tap reads
+    # nothing meanwhile, so the wait itself is unaffected.
+    timeout = 30
     queue = None            # installed by serve()
     required_token = None   # when set, only /t/<token>/... paths are served
     auth = None             # the Auth object: device tokens and pairing
@@ -1936,11 +2074,18 @@ class RelayHandler(BaseHTTPRequestHandler):
         return site is not None and site != "none"
 
     def _authorized(self, path):
-        return authorize_request(
-            self.client_address[0], path,
-            self.headers.get("X-Tapproval-Token", ""),
+        token = self._presented()
+        allowed = authorize_request(
+            self.client_address[0], path, token,
             getattr(self, "tunnel_authed", False), self.auth,
             via_tunnel=self.required_token is not None)
+        # A watch presenting a real key from off this machine means the
+        # machine is paired, however the key reached it.
+        if (allowed and not self._is_local_process()
+                and hasattr(self.auth, "note_device_seen")
+                and _credential_ok(self.auth, token)):
+            self.auth.note_device_seen()
+        return allowed
 
     def _credentialed(self):
         """Did this caller prove anything at all? Decides how much /health
@@ -1948,7 +2093,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         right now" is a presence oracle, not liveness."""
         if self._is_local_process():
             return True
-        return _credential_ok(self.auth, self.headers.get("X-Tapproval-Token", ""))
+        return _credential_ok(self.auth, self._presented())
 
     def _proves_key(self):
         """A device token from anywhere; or, from a local process on the
@@ -1956,8 +2101,10 @@ class RelayHandler(BaseHTTPRequestHandler):
         the Mac bridge's credential. Loopback by itself proves nothing on
         the two routes that act: a command Claude runs is a local process
         too, and must not answer its own card. No store, no proof."""
-        token = self.headers.get("X-Tapproval-Token", "")
+        token = self._presented()
         if _credential_ok(self.auth, token):
+            if not self._is_local_process() and hasattr(self.auth, "note_device_seen"):
+                self.auth.note_device_seen()
             return True
         return (self._is_local_process()
                 and hasattr(self.auth, "is_bootstrap")
@@ -1991,25 +2138,58 @@ class RelayHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quiet: diagnostics only on stderr
         print("relay: %s" % (fmt % args), file=sys.stderr)
 
+    def _raw_body(self):
+        """The request body, read once. A signature covers it, so it is read
+        before the route decides anything; handlers read it from here."""
+        if not hasattr(self, "_body_bytes"):
+            self._body_bytes = b""
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                length = 0
+            if 0 < length <= MAX_BODY:
+                self._body_bytes = self.rfile.read(length)
+        return self._body_bytes
+
+    def _presented(self):
+        """The key this request proves: the one that signed it, or — from a
+        watch that predates signing — the key it sent. A signature that does
+        not verify proves nothing; it never falls back to a sent key."""
+        if not hasattr(self, "_presented_key"):
+            self._presented_key, self._signed_nonce = "", None
+            header = self.headers.get("X-Tapproval-Signature")
+            if header:
+                if self.auth is not None and hasattr(self.auth, "credentials"):
+                    from urllib.parse import unquote, urlsplit
+                    key, nonce = verify_signature(
+                        header, self.command, unquote(urlsplit(self.path).path),
+                        self._raw_body(), self.auth.credentials())
+                    self._presented_key, self._signed_nonce = key or "", nonce
+            else:
+                self._presented_key = self.headers.get("X-Tapproval-Token", "")
+        return self._presented_key
+
     def _send_json(self, payload, status=200, headers=None):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        # Proof that this answer comes from a holder of the key the request
+        # was signed with: the watch trusts an address only after it.
+        if getattr(self, "_signed_nonce", None):
+            self.send_header("X-Tapproval-Proof",
+                             relay_proof(self._presented_key, self._signed_nonce))
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
     def _read_json(self):
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except (TypeError, ValueError):
-            return None
-        if length <= 0 or length > MAX_BODY:
+        raw = self._raw_body()
+        if not raw:
             return None
         try:
-            data = json.loads(self.rfile.read(length).decode("utf-8"))
+            data = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return None
         return data if isinstance(data, dict) else None
@@ -2072,13 +2252,17 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "too many attempts"}, 429,
                             headers={"Retry-After": str(int(retry))})
             return
-        presented = self.headers.get("X-Tapproval-Token", "")
+        presented = self._presented()
         if not (auth.is_bootstrap(presented) or auth.matches(presented)):
             self._send_json({"error": "not paired"}, 403)
             return
         token = auth.issue_device(body.get("device_id"),
                                   body.get("label") or "Apple Watch",
                                   source=str(body.get("source") or "icloud"))
+        if getattr(self, "_signed_nonce", None):
+            # Signed: the new key crosses plain HTTP sealed for the signer.
+            self._send_json({"sealed": seal(presented, self._signed_nonce, token)})
+            return
         self._send_json({"token": token})
 
     # ---- routing -----------------------------------------------------------
@@ -2124,7 +2308,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             "/enroll": ("_post_enroll", dict(auth=False, lan_only=True)),
             "/card": ("_post_card", dict(local=True, lan_only=True)),
             "/heartbeat": ("_post_heartbeat", dict(local=True, lan_only=True)),
-            "/new": ("_post_new", {}),
+            # token, like /say: a command Claude runs is a local process,
+            # and it must not open sessions of its own on this machine.
+            "/new": ("_post_new", dict(token=True)),
             # token: a key from EVERY source. Loopback is a local process,
             # and a command Claude runs is a local process too — it must
             # not be able to answer its own card or speak into a session.
@@ -2337,7 +2523,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         same reasons — serialising them is correctness, not politeness.
         `act(body)` returns the status word; the reply says whether it
         was the good one."""
-        who = self.headers.get("X-Tapproval-Token", "") or self.client_address[0]
+        who = self._presented() or self.client_address[0]
         allowed, retry = LIMITS.allow("say", who, 6, 60)
         if not allowed:
             self._send_json({"error": "too many messages"}, 429,
@@ -2424,7 +2610,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                              "until": int(until)})
         elif path == "/admin/pair-reset":
             self.auth.revoke_all()
-            self.auth.open_window()
+            if not icloud_carries_the_key():
+                self.auth.open_window()
             self._send_json({"ok": True, "devices": 0,
                              "seconds": PAIR_WINDOW_SECONDS})
         elif path == "/admin/update-deferred":
@@ -2447,9 +2634,11 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
         elif path == "/admin/rotate":
             secret = self.auth.rotate()
-            type(self).required_token = None   # main listener unchanged
             _rotate_tunnel_prefix(secret)
-            self.auth.open_window()
+            # A rotation re-mirrors through iCloud; opening the network door
+            # as well handed the new key to whoever was still on the Wi-Fi.
+            if not icloud_carries_the_key():
+                self.auth.open_window()
             self._send_json({"ok": True, "rotated": True})
         else:
             # Fail closed by shape: an admin route added to ROUTES without
@@ -2493,9 +2682,31 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, queue=None, token=None,
     handler = type("BoundRelayHandler", (RelayHandler,),
                    {"queue": queue, "required_token": token,
                     "auth": auth})
-    server = ThreadingHTTPServer((host, port), handler)
-    server.daemon_threads = True
+    server = _RelayServer((host, port), handler)
     return server, queue
+
+
+# Set by install_crash_reporting: how a request handler's crash is reported.
+_ON_HANDLER_ERROR = None
+
+
+class _RelayServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer, with handler crashes reported like any other.
+
+    The stock server catches whatever a handler raises and prints it to
+    stderr, so threading.excepthook never sees it: every route could fail
+    with no record, no wrist condition and no mail (2026-09-25 review)."""
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        kind, value, tb = sys.exc_info()
+        super().handle_error(request, client_address)
+        # A caller that went away or stalled is the network, not a fault.
+        import socket
+        if isinstance(value, (ConnectionError, TimeoutError, socket.timeout)):
+            return
+        if _ON_HANDLER_ERROR is not None:
+            _ON_HANDLER_ERROR(kind, value, tb)
 
 
 _TAILSCALE_CACHE = {}
@@ -2571,7 +2782,7 @@ class Auth:
         # every relay start (here) and every --ensure (relight), not
         # forever: long enough to install the watch app, short enough that
         # a laptop left on café Wi-Fi is not handing out keys all afternoon.
-        if not self.paired_ever:
+        if not self.paired_ever and not icloud_carries_the_key():
             self._window_until = time.time() + PAIR_FIRST_WINDOW_SECONDS
 
     # ---- persistence -------------------------------------------------
@@ -2600,20 +2811,10 @@ class Auth:
         fresh identity rather than to an open door."""
         self.tunnel_secret = self.tunnel_secret or uuid.uuid4().hex
         self.bootstrap = self.bootstrap or uuid.uuid4().hex
-        # An install from before per-device tokens keeps working: its one
-        # token becomes a device entry, so the watch on the owner's wrist
-        # never notices the upgrade.
-        legacy = ""
-        try:
-            with open(TOKEN_FILE, encoding="utf-8") as handle:
-                legacy = handle.read().strip()
-        except OSError:
-            legacy = ""
-        if legacy and not self.devices:
-            self.devices = [{"id": "legacy", "token": legacy,
-                             "label": "Existing watch", "issued": int(time.time()),
-                             "last_seen": 0, "source": "migrated"}]
-            self.paired_ever = True
+        # The single-token file of 2026-08-22..27 is not migrated any more:
+        # every install has long since converted it, and reading it on a
+        # fresh identity re-admitted a key that rotate() and revoke_all()
+        # never deleted (2026-09-25 review).
         self.save()
 
     def _ensure_icloud_device(self):
@@ -2677,6 +2878,13 @@ class Auth:
     def matches(self, token):
         return self.device_for(token) is not None
 
+    def credentials(self):
+        """Every key a signature may be made with: the devices' and the
+        bootstrap (the iCloud copy, and what /enroll is signed with)."""
+        with self._lock:
+            keys = [d.get("token") for d in self.devices if d.get("token")]
+        return keys + ([self.bootstrap] if self.bootstrap else [])
+
     def is_bootstrap(self, token):
         return bool(self.bootstrap) and _token_matches(token, self.bootstrap)
 
@@ -2701,8 +2909,16 @@ class Auth:
         return token
 
     def revoke_all(self):
+        """--pair-reset: every key goes, the machine's own included.
+
+        Clearing the devices alone left the bootstrap valid, and a stranger
+        who had claimed it could enrol again the minute after a reset
+        (2026-09-25 review). The iCloud copy is re-mirrored by the bridge,
+        so the owner's watch comes back by itself."""
         with self._lock:
+            self.bootstrap = uuid.uuid4().hex
             self.devices = []
+            self._ensure_icloud_device()
             self.save()
 
     def rotate(self):
@@ -2740,7 +2956,7 @@ class Auth:
         PAIR_FIRST_WINDOW_SECONDS. A no-op once anything has paired, so a
         session start can never reopen a paired machine's door."""
         with self._lock:
-            if self.paired_ever:
+            if self.paired_ever or icloud_carries_the_key():
                 return self._window_until
             return self.open_window(PAIR_FIRST_WINDOW_SECONDS)
 
@@ -2761,11 +2977,16 @@ class Auth:
             return time.time() < self._window_until
 
     def claim_window(self, client_ip):
-        """Hand out the bootstrap, once per address and twice at most.
+        """Hand out a key of its own, once per address and twice at most.
 
         Returns the token, or None with the window left shut. A burst is an
         attack, not a retry, so the caller closes the window on a rate-limit
         rejection rather than letting it be ground down.
+
+        A device key, not the bootstrap: the bootstrap is the machine's own
+        secret — the one the bridge mirrors and --pair-reset could not take
+        back — and whoever claimed it held every future key too (2026-09-25
+        review). A device key can be seen, counted and revoked.
         """
         with self._lock:
             if time.time() >= self._window_until:
@@ -2776,7 +2997,28 @@ class Auth:
                 return None
             self._window_ips.add(client_ip)
             self._window_claims += 1
-            return self.bootstrap
+            return self.issue_device("lan-" + str(client_ip),
+                                     label="Watch paired on the network",
+                                     source="lan-window")
+
+    def note_device_seen(self):
+        """A watch just proved it holds a key: the machine is paired.
+
+        A watch that pairs through iCloud presents the mirrored key and
+        never enrols, so until now the first-run door never learned it was
+        no longer needed and reopened for half an hour at every Claude
+        Code session (2026-09-25 review)."""
+        with self._lock:
+            if self.paired_ever:
+                return
+            self.paired_ever = True
+            self._window_until = 0.0
+            self.save()
+
+
+def icloud_carries_the_key():
+    """Is the Mac bridge installed here, so a watch pairs through iCloud?"""
+    return os.path.isdir(BRIDGE_APP)
 
 
 def _token_matches(given, expected):

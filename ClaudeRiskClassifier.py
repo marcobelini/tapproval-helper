@@ -102,7 +102,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.20"
+__version__ = "1.1.21"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -165,7 +165,9 @@ SECRET_PATH = re.compile(
     # The credential stores this list did not name, each of which holds a
     # live token in plain text: `cat ~/.kube/config` read SAFE until now.
     r"\.kube[/\\]config|\.npmrc|\.pypirc|\.docker[/\\]config\.json|"
-    r"\.config[/\\]gh[/\\]hosts\.ya?ml|\.gitconfig\b|\.terraformrc)",
+    r"\.config[/\\]gh[/\\]hosts\.ya?ml|\.gitconfig\b|\.terraformrc|"
+    # Tapproval's own device keys: whoever reads them can answer a card.
+    r"\.tapproval-auth\.json|\.tapproval-token)",
     re.I,
 )
 
@@ -495,10 +497,10 @@ CONDITIONALLY_SAFE = {
 # unknown-command. This widens what the classifier *recognises*, never what
 # it forgives. Aliases share one set so they cannot drift apart.
 _PIP_READ_ONLY = frozenset("list show freeze --version".split())
-_FLY_READ_ONLY = frozenset("status logs list info version apps".split())
+_FLY_READ_ONLY = frozenset("status logs list info version".split())
 
 VERB_TOOLS_READ_ONLY = {
-    "gh": frozenset("auth browse search view list diff checks status".split()),
+    "gh": frozenset("browse search view list diff checks status".split()),
     "simctl": frozenset("list get_app_container getenv".split()),
     # cms and export are NOT here: `security cms -S` signs with a keychain
     # identity and `security export -t privKeys` dumps private keys — the
@@ -511,7 +513,7 @@ VERB_TOOLS_READ_ONLY = {
     "brew": frozenset("list info search deps outdated config --version".split()),
     "pip": _PIP_READ_ONLY,
     "pip3": _PIP_READ_ONLY,
-    "swift": frozenset("--version package".split()),
+    "swift": frozenset("--version".split()),
     "flyctl": _FLY_READ_ONLY,
     "fly": _FLY_READ_ONLY,
     "systemctl": frozenset("status list-units is-active show".split()),
@@ -519,7 +521,7 @@ VERB_TOOLS_READ_ONLY = {
     "ipconfig": frozenset("getifaddr getpacket getoption".split()),
     "networksetup": frozenset("-listallhardwareports -getinfo".split()),
     "tailscale": frozenset("status ip version netcheck".split()),
-    "gcloud": frozenset("info version config".split()),
+    "gcloud": frozenset("info version".split()),
     "aws": frozenset("--version help".split()),
 }
 
@@ -545,8 +547,19 @@ XCODEBUILD_ACTIONS = frozenset(
     "build clean test archive install installsrc analyze docbuild "
     "build-for-testing test-without-building".split())
 
-# Sub-subcommands that read despite living under a writing verb.
+# Sub-subcommands that read despite living under a writing verb — and the
+# groups that are not verbs at all. `gh auth`, `fly apps`, `swift package`
+# and `gcloud config` name a group; the verb is the next word. Listed as
+# first-level verbs they made the whole group read-only, and until
+# 2026-09-25 `gh auth logout`, `fly apps create`, `swift package update`
+# and `gcloud config set project prod` all read SAFE — and with gh among
+# the phone's silent leads, `gh auth logout` never reached the wrist.
 SUBCOMMAND_SECOND_LEVEL = {
+    ("gh", "auth"): frozenset("status".split()),
+    ("fly", "apps"): frozenset("list".split()),
+    ("flyctl", "apps"): frozenset("list".split()),
+    ("swift", "package"): frozenset("describe dump-package show-dependencies".split()),
+    ("gcloud", "config"): frozenset("list get get-value".split()),
     ("gh", "pr"): frozenset("view list diff checks status".split()),
     ("gh", "issue"): frozenset("view list status".split()),
     ("gh", "run"): frozenset("view list watch".split()),
@@ -770,6 +783,74 @@ def _git_risk(segment):
     return ("git-other", Risk.MEDIUM)
 
 
+# Commands that run the command after them. `env rm -rf ~` is `rm -rf ~`;
+# judged by its lead word it read HIGH instead of CRITICAL (2026-09-25).
+_PASS_THROUGH = frozenset("env command builtin nice nohup exec time timeout".split())
+_SHELLS = frozenset("sh bash zsh dash ksh fish".split())
+
+
+def _unwrapped(segment):
+    """The command a wrapper runs, or None when the segment is not a wrapper.
+
+    `sh -c "…"`, `eval "…"`, `env …`, `timeout 5 …`, `\\rm`, `( … )` and
+    `{ …; }` all run a command the lead word does not name; classify_bash
+    judges that inner command in its own right, so a wrapper can never
+    lower the tier of what it wraps."""
+    text = segment.strip()
+    if text.startswith("\\"):
+        return text[1:]
+    if (text.startswith("(") and text.endswith(")")) or (
+            text.startswith("{") and text.endswith("}")):
+        inner = text[1:-1].strip().rstrip(";").strip()
+        return inner or None
+    # `{ rm -rf ~; }` reaches here split at its `;`: the opening half.
+    if text.startswith("{ "):
+        return text[2:].strip() or None
+    words = _tokens(text)
+    if not words:
+        return None
+    lead = os.path.basename(words[0]).lower()
+    if lead == "eval":
+        return " ".join(words[1:]).strip("'\"") or None
+    if lead in _SHELLS:
+        import shlex
+        try:
+            args = shlex.split(" ".join(words[1:]))
+        except ValueError:
+            return None
+        for i, arg in enumerate(args):
+            if arg == "-c" or (arg.startswith("-") and not arg.startswith("--")
+                               and "c" in arg[1:]):
+                return args[i + 1] if i + 1 < len(args) else None
+        return None
+    if lead in _PASS_THROUGH:
+        rest = words[1:]
+        # Skip the wrapper's own options and arguments: `nice -n 5`,
+        # `timeout -s KILL 5`, `env -i A=b`.
+        while rest and (rest[0].startswith("-") or "=" in rest[0]
+                        or (lead in ("timeout", "nice") and rest[0][:1].isdigit())):
+            takes_value = rest[0] in ("-n", "-s", "-k", "-u", "--signal", "--kill-after")
+            rest = rest[2:] if takes_value else rest[1:]
+        return " ".join(rest) or None
+    return None
+
+
+# Read-only tools with a spelling that writes a file or runs a command.
+# Checked before the tool is waved through as a read: each of these read
+# SAFE until 2026-09-25, and --quiet would have allowed them.
+READ_TOOL_ESCAPES = {
+    "awk": re.compile(r"system\s*\(|\|\s*[\"']|\|&|>{1,2}\s*[\"']|getline\s*<"),
+    "rg": re.compile(r"(^|\s)--pre(=|\s)"),
+    "find": re.compile(r"(^|\s)-(fprint0?|fprintf|fls|execdir|ok|okdir)(\s|$)"),
+    "tree": re.compile(r"(^|\s)(-o|--output)(\s|=)"),
+    "sort": re.compile(r"(^|\s)(-o|--output)(\s|=)|(^|\s)-o\S"),
+    "yq": re.compile(r"(^|\s)(-i|--inplace)(\s|$)"),
+    "git": re.compile(r"(^|\s)--output(=|\s)"),
+}
+for _awk in ("gawk", "nawk", "mawk"):
+    READ_TOOL_ESCAPES[_awk] = READ_TOOL_ESCAPES["awk"]
+
+
 def classify_bash(command):
     """Classify a shell command. Returns ``(Risk, [rule_id, ...])``."""
     if not command or not command.strip():
@@ -803,7 +884,25 @@ def classify_bash(command):
                  else "?"), sub_risk)
 
     for segment in _segments(command):
+        if segment.strip() in ("}", ")"):
+            continue  # the closing half of a group split at its `;`
+        inner = _unwrapped(segment)
+        if inner is not None and inner.strip() != segment.strip():
+            sub_risk, sub_rules = classify_bash(inner)
+            bump("wrapped:" + (sub_rules[0] if sub_rules else "?"), sub_risk)
+            # Grouping and a leading backslash change nothing but aliases.
+            # A real wrapper can: `env LD_PRELOAD=x.so ls` runs x.so. It
+            # keeps the unknown-command floor it always had, so unwrapping
+            # can only ever raise a tier.
+            if segment.strip()[:1] not in "({\\":
+                bump("wrapper", Risk.MEDIUM)
+            continue
+
         token = os.path.basename(_first_token(segment)).lower()
+
+        escape = READ_TOOL_ESCAPES.get(token)
+        if escape is not None and escape.search(segment):
+            bump("read-tool-writes-or-runs", Risk.MEDIUM)
 
         # The effect the words name, before any table gets to recognise the
         # binary. bump() takes the maximum, so a recognition table below can
@@ -873,6 +972,13 @@ def classify_path(path, cwd=None):
         return Risk.MEDIUM, ["no-path"]
 
     normalised = str(path).replace("\\", "/")
+    # Resolve `..` before any pattern sees the path: `/tmp/../Users/me/.zshrc`
+    # matched the scratch rule and read LOW (2026-09-25).
+    if ".." in normalised.split("/"):
+        if cwd and not os.path.isabs(normalised):
+            normalised = os.path.join(str(cwd).replace("\\", "/"), normalised)
+        normalised = os.path.normpath(normalised).replace("\\", "/")
+        path = normalised
 
     if re.search(r"(^|/)\.git/", normalised):
         return Risk.CRITICAL, ["git-internals"]

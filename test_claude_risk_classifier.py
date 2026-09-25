@@ -33,6 +33,7 @@ import pytest
 import json as _json
 import threading
 import urllib.error
+import uuid
 import urllib.request
 
 import crash_report
@@ -129,12 +130,10 @@ def settings(tmp_path, monkeypatch):
 
 @pytest.fixture
 def fresh_auth(tmp_path, monkeypatch):
-    """A real Auth on a throwaway path, with the legacy-token migration
-    pointed at nothing. Two suites used to assemble one with Auth.__new__
+    """A real Auth on a throwaway path. Two suites used to assemble one with Auth.__new__
     and ten hand-set private fields — every new field on Auth then had to
     be added in both places, and a handler thread crashed when it was
     not. The real initialiser cannot get out of step with itself."""
-    monkeypatch.setattr(watch_relay, "TOKEN_FILE", str(tmp_path / "no-token"))
     auth = watch_relay.Auth(path=str(tmp_path / "auth.json"))
     auth.save = lambda: None
     return auth
@@ -201,7 +200,6 @@ def _no_real_home_files(tmp_path, monkeypatch):
     monkeypatch.setattr(crash_report, "KEY_FILE", str(home / "no-resend-key"))
     crash_report._reset_for_tests()
     monkeypatch.setattr(watch_relay, "AUTH_FILE", str(home / "auth.json"))
-    monkeypatch.setattr(watch_relay, "TOKEN_FILE", str(home / "no-token"))
     monkeypatch.setattr(watch_relay, "RELAY_LOG", str(home / "relay.log"))
     monkeypatch.setattr(watch_relay, "SAY_LOG", str(home / "say.log"))
     # And no test may read the owner's own Claude Code transcripts. Routes
@@ -221,6 +219,14 @@ def _no_real_home_files(tmp_path, monkeypatch):
     # about signing in put the real function back.
     monkeypatch.setattr(watch_relay, "_SIGNIN", {"at": 0.0, "in": None})
     monkeypatch.setattr(watch_relay, "signed_in", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_bridge(tmp_path, monkeypatch):
+    """Whether this Mac has the iCloud bridge installed decides whether the
+    network pairing door opens. Tests say which world they are in; the
+    default is a machine without it, where the door is the only way in."""
+    monkeypatch.setattr(watch_relay, "BRIDGE_APP", str(tmp_path / "no-bridge.app"))
 
 
 @pytest.fixture(autouse=True)
@@ -2073,6 +2079,99 @@ def _write_transcript(tmp_path, folder, name, lines):
     return path
 
 
+class TestSignedRequests:
+    """Issue #271: the watch sent its key itself, in clear, to whichever host
+    answered Bonjour. A signed request carries a MAC instead; the key never
+    travels, and the relay proves itself in its answer."""
+
+    @pytest.fixture
+    def relay(self, fresh_auth):
+        watch_relay.LIMITS.reset()
+        server, _ = watch_relay.serve(port=0, auth=fresh_auth)
+        _serve(server)
+        device = fresh_auth.issue_device("watch-1")
+        yield "http://127.0.0.1:%d" % server.server_address[1], fresh_auth, device
+        server.shutdown()
+        server.server_close()
+
+    def _post(self, base, path, body, headers):
+        data = json.dumps(body).encode()
+        request = urllib.request.Request(base + path, data=data, method="POST",
+                                         headers=dict({"Content-Type": "application/json"}, **headers))
+        try:
+            with urllib.request.urlopen(request, timeout=10) as reply:
+                return reply.status, json.loads(reply.read()), dict(reply.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), dict(error.headers)
+
+    def _signed(self, key, path, body, stamp=None, nonce=None):
+        stamp = int(time.time()) if stamp is None else stamp
+        nonce = nonce or uuid.uuid4().hex
+        raw = json.dumps(body).encode()
+        mac = watch_relay.sign_request(key, "POST", path, stamp, nonce, raw)
+        return {"X-Tapproval-Signature": "v1 %d %s %s" % (stamp, nonce, mac)}, nonce
+
+    def test_a_signed_request_is_a_key_and_the_relay_proves_itself(self, relay):
+        base, _, device = relay
+        body = {"id": "ghost", "decision": "allow"}
+        headers, nonce = self._signed(device, "/decision", body)
+        status, _, reply_headers = self._post(base, "/decision", body, headers)
+        assert status == 200
+        assert reply_headers.get("X-Tapproval-Proof") == watch_relay.relay_proof(device, nonce)
+
+    def test_a_signature_that_does_not_verify_proves_nothing(self, relay):
+        base, _, device = relay
+        body = {"id": "ghost", "decision": "allow"}
+        headers, _ = self._signed("not-the-key", "/decision", body)
+        # A real key sent beside a bad signature does not rescue it.
+        headers["X-Tapproval-Token"] = device
+        assert self._post(base, "/decision", body, headers)[0] == 403
+
+    def test_a_replay_a_stale_time_and_a_changed_body_are_refused(self, relay):
+        base, _, device = relay
+        body = {"id": "ghost", "decision": "allow"}
+        headers, _ = self._signed(device, "/decision", body)
+        assert self._post(base, "/decision", body, headers)[0] == 200
+        assert self._post(base, "/decision", body, headers)[0] == 403, "a replay"
+        stale, _ = self._signed(device, "/decision", body, stamp=int(time.time()) - 600)
+        assert self._post(base, "/decision", body, stale)[0] == 403, "a stale time"
+        signed_for, _ = self._signed(device, "/decision", body)
+        assert self._post(base, "/decision", {"id": "ghost", "decision": "deny"},
+                          signed_for)[0] == 403, "a body the signature does not cover"
+
+    def test_an_unsigned_key_still_works_for_one_release(self, relay):
+        base, _, device = relay
+        status, _, reply_headers = self._post(base, "/decision", {"id": "ghost", "decision": "allow"},
+                                              {"X-Tapproval-Token": device})
+        assert status == 200 and "X-Tapproval-Proof" not in reply_headers
+
+    def test_enrolment_signed_with_the_icloud_key_returns_the_new_key_sealed(self, fresh_auth):
+        watch_relay.LIMITS.reset()
+        server, _ = watch_relay.serve(port=0, auth=fresh_auth)
+        _serve(server)
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        try:
+            body = {"device_id": "watch-2", "label": "Test"}
+            headers, nonce = self._signed(fresh_auth.bootstrap, "/enroll", body)
+            status, reply, _ = self._post(base, "/enroll", body, headers)
+        finally:
+            server.shutdown()
+            server.server_close()
+        assert status == 200 and "token" not in reply, "the new key never crosses in clear"
+        opened = watch_relay.seal(fresh_auth.bootstrap, nonce, "0" * 32)
+        zeros, sealed = b"0" * 32, bytes.fromhex(reply["sealed"])
+        pad = bytes(zeros[i] ^ bytes.fromhex(opened)[i] for i in range(32))
+        issued = bytes(sealed[i] ^ pad[i] for i in range(32)).decode()
+        assert fresh_auth.matches(issued)
+
+    def test_the_signed_message_is_what_the_watch_signs(self):
+        """Pinned bytes: RelayModel.signature(...) in the watch computes the
+        same value for the same inputs (SignedRequestTests on the watch)."""
+        mac = watch_relay.sign_request("k" * 32, "POST", "/decision", 1790000000,
+                                       "0123456789abcdef", b'{"a":1}')
+        assert mac == "40a76bfa5eb884abf31631274d03a1b20118e1094116cc82836f47dc8e7a1d4a"
+
+
 class TestSessionNames:
     """Claude Code's folder names are lossy — familia-gateway and
     familia/gateway both become "-Users-...-familia-gateway". The transcript
@@ -2959,7 +3058,6 @@ class TestTheKeyCarriedThroughICloudWorks:
     quietly loses the session list."""
 
     def _auth(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(watch_relay, "TOKEN_FILE", str(tmp_path / "none"))
         return watch_relay.Auth(path=str(tmp_path / "auth.json"))
 
     def test_the_mirrored_key_opens_the_data_endpoints(self, tmp_path, monkeypatch):
@@ -3125,11 +3223,16 @@ class TestLanSourceIsNotTrusted:
         status, body = self._call(base + "/pair")
         assert status == 403 and body.get("error") == "already paired"
 
-    def test_an_open_window_hands_over_the_bootstrap_once_per_address(self, lan):
+    def test_an_open_window_hands_over_a_key_of_its_own_once_per_address(self, lan):
+        """A device key, never the bootstrap: the bootstrap is the machine's
+        own secret, and whoever claimed it held every future key too
+        (2026-09-25 review). A device key can be counted and revoked."""
         base, _, auth = lan
         auth.open_window(60)
         status, body = self._call(base + "/pair")
-        assert status == 200 and body["token"] == "bootstraptoken"
+        assert status == 200 and body["token"] and body["token"] != "bootstraptoken"
+        assert auth.matches(body["token"])
+        assert any(d.get("source") == "lan-window" for d in auth.devices)
         assert self._call(base + "/pair")[0] == 403   # same address, again
 
     def test_a_burst_shuts_the_window(self, lan):
@@ -3158,7 +3261,9 @@ class TestLanSourceIsNotTrusted:
         self._never_paired(auth)
         assert auth.window_open()
         status, body = self._call(base + "/pair")
-        assert status == 200 and body["token"] == "bootstraptoken"
+        assert status == 200 and auth.matches(body["token"])
+        assert body["token"] != "bootstraptoken", "a key of its own, never the machine's"
+        assert not auth.window_open(), "the first watch through shuts the door"
 
     def test_the_door_stays_open_long_enough_to_install_and_no_longer(self, lan):
         """The fuse: twenty minutes later still open, an hour later shut —
@@ -3169,7 +3274,6 @@ class TestLanSourceIsNotTrusted:
         try:
             watch_relay.time.time = lambda: real() + 1200.0
             assert auth.window_open()
-            assert self._call(base + "/pair")[0] == 200
             watch_relay.time.time = lambda: real() + 3600.0
             assert not auth.window_open()
             assert self._call(base + "/pair")[0] == 403
@@ -5139,6 +5243,17 @@ class TestASignedOutMacSaysSo:
         assert watch_relay.signed_in(runner=self._answer(code, out)) is None
         assert "signin" not in [c["key"] for c in watch_relay.conditions()]
 
+    def test_an_unreadable_answer_is_cached_too(self):
+        """Left uncached, every /health started `claude auth status` again."""
+        calls = []
+        def unreadable():
+            import subprocess as sp
+            calls.append(1)
+            return sp.CompletedProcess(["claude"], 1, "", "")
+        assert watch_relay.signed_in(runner=unreadable) is None
+        assert watch_relay.signed_in(runner=unreadable) is None
+        assert len(calls) == 1
+
     def test_the_answer_is_cached(self):
         calls = []
         def once():
@@ -6153,6 +6268,24 @@ class TestTheWristAnswersAHeadlessSend:
         # part of what the user said.
         assert command.index("--append-system-prompt") < command.index("-p")
 
+    def test_the_permission_tool_is_told_where_the_wrist_is(self, tmp_path, monkeypatch):
+        """A plugin install sets CLAUDE_RISK_RELAY on the PermissionRequest
+        hook's command line only, so the relay and the run it starts had
+        none, and every prompt in a wrist-sent run was denied "no relay
+        address configured" (2026-09-25 review). The relay hands it down,
+        and a user's own setting still wins."""
+        tool = tmp_path / "watch_permission_tool.py"
+        tool.write_text("")
+        monkeypatch.delenv("CLAUDE_RISK_RELAY", raising=False)
+        flags = watch_relay._permission_tool_flags(str(tool))
+        env = json.loads(flags[1])["mcpServers"]["tapproval"]["env"]
+        assert env["CLAUDE_RISK_RELAY"].startswith("http://127.0.0.1:")
+        assert env["CLAUDE_RISK_MODE"] == "enforce"
+        monkeypatch.setenv("CLAUDE_RISK_RELAY", "http://127.0.0.1:9999")
+        flags = watch_relay._permission_tool_flags(str(tool))
+        assert json.loads(flags[1])["mcpServers"]["tapproval"]["env"]["CLAUDE_RISK_RELAY"] \
+            == "http://127.0.0.1:9999"
+
     def test_a_relay_without_its_neighbour_still_sends(self, monkeypatch):
         """An install that updated the relay but not the file beside it
         must keep sending messages, not fail every send on a missing
@@ -6318,7 +6451,6 @@ class TestTwoRelaysOnePort:
                             lambda *a, **k: reported.append(a) or ("x", {}))
         monkeypatch.setattr(crash_report, "send",
                             lambda *a, **k: sent.append(a) or "sent")
-        monkeypatch.setattr(watch_relay, "TOKEN_FILE", str(tmp_path / "no-token"))
         monkeypatch.setattr(watch_relay, "Auth", lambda: _throwaway_auth(tmp_path))
         monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: None)
         monkeypatch.setattr(watch_relay, "helper_provenance", lambda: None)
@@ -6696,12 +6828,12 @@ class TestNewSessionFromTheWatch:
         words = shlex.split(shell_line)
         assert words[words.index("claude") + 1:] == ["--", text]
 
-    def test_projects_and_new_are_ordinary_data_routes(self, tmp_path, monkeypatch):
+    def test_projects_and_new_are_ordinary_data_routes(self, tmp_path, monkeypatch, fresh_auth):
         """/projects needs the same key as every other data route, and /new
         answers a refusal as JSON the watch can show — never a 500."""
         monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
         watch_relay.LIMITS.reset()
-        server, _ = watch_relay.serve(port=0)
+        server, _ = watch_relay.serve(port=0, auth=fresh_auth)
         _serve(server)
         base = "http://127.0.0.1:%d" % server.server_address[1]
         try:
@@ -6712,7 +6844,8 @@ class TestNewSessionFromTheWatch:
                 assert "projects" in json.loads(r.read())
             req = urllib.request.Request(base + "/new", method="POST",
                                          data=json.dumps({"path": "/nowhere", "text": "go"}).encode(),
-                                         headers={"Content-Type": "application/json"})
+                                         headers={"Content-Type": "application/json",
+                                                  "X-Tapproval-Token": fresh_auth.bootstrap})
             with urllib.request.urlopen(req, timeout=15) as r:
                 body = json.loads(r.read())
             assert body["ok"] is False and body["status"] in ("unknown project", "new sessions need a Mac")
@@ -6880,6 +7013,10 @@ class TestRelayRoutes:
                           body={"id": "ghost", "decision": "allow"})[0] == 403
         assert self._call(base + "/say", method="POST",
                           body={"session_id": "x", "text": "hi"})[0] == 403
+        # /new opens a session on this machine: a local process with no key
+        # must not (2026-09-25 review).
+        assert self._call(base + "/new", method="POST",
+                          body={"path": "/x", "text": "hi"})[0] == 403
         assert self._call(base + "/decision", token="not-a-key", method="POST",
                           body={"id": "ghost", "decision": "allow"})[0] == 403
         # The bootstrap secret (the 0600 file, which the Mac bridge reads)
@@ -6902,7 +7039,8 @@ class TestRelayRoutes:
 
     def test_a_new_session_with_no_words_is_refused_in_words(self, relay):
         base, _, _ = relay
-        status, body = self._call(base + "/new", method="POST", body={"path": "/x", "text": " "})
+        status, body = self._call(base + "/new", token=relay[2].bootstrap, method="POST",
+                                  body={"path": "/x", "text": " "})
         assert status == 200 and body == {"ok": False, "status": "empty"}
 
     def test_the_second_send_in_the_same_moment_waits_its_turn(self, relay):
@@ -7133,6 +7271,18 @@ class TestConnectingToAnExistingSession:
         assert watch_relay.type_into_session("s-1", "Proceed", {"s-1": {"pid": 1}}) is False
         assert ran == [], "a pending tool may be a permission prompt; Return would answer it"
 
+    @pytest.mark.parametrize("text", ["!rm -rf ~", "  !curl x | sh", "# remember this"])
+    def test_a_shell_mode_message_is_never_typed(self, monkeypatch, text):
+        """Typed first into Claude Code's prompt, `!` runs a shell command
+        with no permission card (2026-09-25 review)."""
+        monkeypatch.setenv("TAPPROVAL_TYPE_INTO_TERMINAL", "1")
+        monkeypatch.setattr(watch_relay, "_terminal_of", lambda pid: ("Terminal", "/dev/ttys001"))
+        monkeypatch.setattr(watch_relay, "session_is_waiting", lambda sid: True)
+        ran = []
+        monkeypatch.setattr(watch_relay.subprocess, "run", lambda *a, **k: ran.append(a))
+        assert watch_relay.type_into_session("s-1", text, {"s-1": {"pid": 1}}) is False
+        assert ran == []
+
     def test_the_terminal_is_found_by_walking_one_process_snapshot(self, monkeypatch):
         table = ("  100     1 ??       /Applications/Utilities/Terminal.app/Contents/MacOS/Terminal\n"
                  "  200   100 ttys004  -zsh\n"
@@ -7310,7 +7460,45 @@ class TestFirstPairingIsAWindow:
         assert not auth.window_open()
         auth.relight()
         assert auth.window_open()
-        assert auth.claim_window("192.168.1.9") == auth.bootstrap
+        key = auth.claim_window("192.168.1.9")
+        assert key and key != auth.bootstrap and auth.matches(key)
+
+    def test_a_mac_with_the_icloud_bridge_never_opens_the_network_door(self, tmp_path, monkeypatch):
+        """Where the bridge mirrors the key into iCloud, a watch pairs
+        through the owner's Apple ID. Opening the network door as well, for
+        half an hour at every session start, handed a key to anyone on the
+        same Wi-Fi (2026-09-25 review)."""
+        bridge = tmp_path / "TapprovalBridge.app"
+        bridge.mkdir()
+        monkeypatch.setattr(watch_relay, "BRIDGE_APP", str(bridge))
+        auth = watch_relay.Auth(path=str(tmp_path / "auth.json"))
+        auth.save = lambda: None
+        assert not auth.paired_ever
+        assert not auth.window_open()
+        auth.relight()
+        assert not auth.window_open(), "a session start does not open it either"
+        assert auth.claim_window("192.168.1.9") is None
+
+    def test_a_watch_that_pairs_through_icloud_shuts_the_door(self, fresh_auth):
+        """It presents the mirrored key and never enrols; the relay learns
+        it is paired the first time that key arrives from off the machine."""
+        auth = fresh_auth
+        assert auth.window_open()
+        auth.note_device_seen()
+        assert auth.paired_ever and not auth.window_open()
+        auth.relight()
+        assert not auth.window_open()
+
+    def test_a_reset_takes_the_machines_own_key_too(self, fresh_auth):
+        """--pair-reset left the bootstrap valid: whoever had claimed it
+        could enrol again the minute after (2026-09-25 review)."""
+        auth = fresh_auth
+        old = auth.bootstrap
+        auth.issue_device("stranger")
+        auth.revoke_all()
+        assert auth.bootstrap != old
+        assert not auth.matches(old) and not auth.is_bootstrap(old)
+        assert auth.matches(auth.bootstrap), "the iCloud copy is a key again at once"
 
     def test_the_first_watch_shuts_the_door_and_a_session_start_no_longer_opens_it(self, fresh_auth):
         auth = fresh_auth
@@ -8224,6 +8412,64 @@ class TestTheEffectOntology:
             shipped, _ = crc.classify_bash(command)
             assert shipped >= (named[1] if named else crc.Risk.SAFE), command
 
+    @pytest.mark.parametrize("command", [
+        'sh -c "rm -rf /"', "bash -c 'rm -rf ~'", 'eval "rm -rf ~"',
+        "\\rm -rf ~", "env rm -rf ~", "env -i HOME=/x rm -rf ~",
+        "command rm -rf ~", "nice -n 5 rm -rf ~", "nohup rm -rf ~",
+        "timeout 5 rm -rf ~", "time rm -rf ~", "exec rm -rf ~", "(rm -rf ~)",
+        "{ rm -rf ~; }",
+    ])
+    def test_a_wrapper_never_lowers_what_it_wraps(self, command):
+        """`env`, `sh -c`, `eval`, a subshell or a backslash run the command
+        after them; judged by the lead word they read MEDIUM or HIGH while
+        bare `rm -rf ~` is CRITICAL (2026-09-25 review)."""
+        risk, rules = crc.classify_bash(command)
+        assert risk == crc.Risk.CRITICAL, "%s -> %s %s" % (command, risk.name, rules)
+
+    @pytest.mark.parametrize("command", [
+        "env FOO=1 ls", "env LD_PRELOAD=x.so ls", "time pytest", "nice make",
+    ])
+    def test_a_wrapper_keeps_the_floor_it_always_had(self, command):
+        """Unwrapping may only raise: `env LD_PRELOAD=x.so ls` runs x.so, so a
+        wrapper round a read is not itself a read."""
+        assert crc.classify_bash(command)[0] >= crc.Risk.MEDIUM, command
+
+    @pytest.mark.parametrize("command", [
+        "awk '{print $1}' data.txt", "rg foo", "git diff", "git log --oneline",
+        "find . -name x", "tree", "sort names.txt", "grep -o foo f", "(ls)",
+    ])
+    def test_the_plain_reads_stay_safe(self, command):
+        assert crc.classify_bash(command)[0] == crc.Risk.SAFE, command
+
+    @pytest.mark.parametrize("path", [
+        "/tmp/../Users/me/.zshrc",
+        "/Users/me/proj/.cache/../../Library/LaunchAgents/x.plist",
+        "../other/settings.py",
+    ])
+    def test_dot_dot_is_resolved_before_any_path_rule(self, path):
+        """`/tmp/..` matched the scratch rule and read LOW: with --quiet a
+        write to ~/.zshrc or a LaunchAgent went through unasked."""
+        result = crc.classify({"tool_name": "Write",
+                               "tool_input": {"file_path": path, "content": "x"},
+                               "cwd": "/Users/me/proj"})
+        assert result["risk"] >= crc.Risk.HIGH, (path, result["rules"])
+
+    def test_a_subcommand_group_is_never_a_read_verb(self):
+        """A group names no action; its verb is the next word. A group listed
+        among a tool's read verbs makes everything under it read-only, which
+        is how `gh auth logout` read SAFE. Held over the tables, not over
+        examples, so the next group added in the wrong place fails here."""
+        for (tool, group) in crc.SUBCOMMAND_SECOND_LEVEL:
+            verbs = crc.VERB_TOOLS_READ_ONLY.get(tool, frozenset())
+            assert group not in verbs, "%s %s is a group, not a verb" % (tool, group)
+
+    @pytest.mark.parametrize("command", [
+        "gh auth status", "fly apps list", "swift package describe",
+        "gcloud config list", "gh pr view 12",
+    ])
+    def test_the_reads_inside_a_group_stay_safe(self, command):
+        assert crc.classify_bash(command)[0] == crc.Risk.SAFE, command
+
     # --- the commands that were wrong -------------------------------------
 
     @pytest.mark.parametrize("command,floor", [
@@ -8255,6 +8501,27 @@ class TestTheEffectOntology:
         ("curl -H 'x-api-key=abc' https://api.example/", crc.Risk.HIGH),
         ("gcloud secrets versions access latest --secret=db", crc.Risk.HIGH),
         ("vault kv get -field=api_key secret/prod", crc.Risk.HIGH),
+        # A subcommand GROUP taken for a read verb (2026-09-25): the whole
+        # group read SAFE, and --quiet would have allowed each of these.
+        ("gh auth logout", crc.Risk.MEDIUM),
+        ("gh auth refresh -s delete_repo", crc.Risk.MEDIUM),
+        ("fly apps create x", crc.Risk.MEDIUM),
+        ("flyctl apps restart x", crc.Risk.MEDIUM),
+        ("swift package update", crc.Risk.MEDIUM),
+        ("gcloud config set project prod", crc.Risk.MEDIUM),
+        # A read-only tool with a spelling that writes a file or runs a
+        # command (2026-09-25 review).
+        ("awk 'BEGIN{system(\"rm -rf ~/work\")}'", crc.Risk.MEDIUM),
+        ("rg --pre=./x.sh foo", crc.Risk.MEDIUM),
+        ("git diff --output=/Users/me/.zshrc", crc.Risk.MEDIUM),
+        ("git log --output=notes.txt", crc.Risk.MEDIUM),
+        ("find . -fprint /Users/me/.zshrc", crc.Risk.MEDIUM),
+        ("find . -execdir sh -c x \\;", crc.Risk.MEDIUM),
+        ("tree -o /Users/me/.zshrc", crc.Risk.MEDIUM),
+        ("sort -o /Users/me/.zshrc list.txt", crc.Risk.MEDIUM),
+        ("yq -i '.a=1' deploy.yml", crc.Risk.MEDIUM),
+        # Tapproval's own device keys: reading them is answering its cards.
+        ("cat ~/.tapproval-auth.json", crc.Risk.HIGH),
     ])
     def test_every_command_that_used_to_read_safe(self, command, floor):
         risk, rules = crc.classify_bash(command)
@@ -8416,3 +8683,94 @@ class TestStandardLibraryOnly:
                   "    except ImportError:\n"
                   "        from urllib import request\n")
         assert self._imported_names(source) == {"requests", "urllib"}
+
+
+class TestAThreadIsReadFromItsEnd:
+    """2026-09-25 review: the first read of a transcript processed the whole
+    file to keep fourteen turns — 17-27 s and 1.26 GB for a 238 MB file on
+    the first /sessions after a relay start."""
+
+    def _write(self, tmp_path, count):
+        path = tmp_path / "-p" / "long.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            for n in range(count):
+                handle.write(json.dumps({"timestamp": "2026-09-25T00:00:%02dZ" % (n % 60),
+                                         "message": {"role": "assistant",
+                                                     "content": [{"type": "text",
+                                                                  "text": "reply %d" % n}]}}) + "\n")
+        return path
+
+    def test_the_first_read_starts_near_the_end_on_a_whole_line(self, tmp_path, monkeypatch):
+        path = self._write(tmp_path, 2000)
+        monkeypatch.setattr(watch_dashboard, "THREAD_TAIL_BYTES", 5000)
+        watch_dashboard._THREAD_STATE.pop(str(path), None)
+        read = []
+        real = watch_dashboard._read_appended
+        monkeypatch.setattr(watch_dashboard, "_read_appended",
+                            lambda p, offset: read.append(offset) or real(p, offset))
+        turns, _, _ = watch_dashboard._parse_thread(str(path), 14)
+        size = os.path.getsize(path)
+        assert read and size - read[0] <= 5000, "only the tail is read"
+        texts = [t["text"] for t in turns]
+        assert texts[-1] == "reply 1999" and len(texts) == 14
+        assert all(t.startswith("reply ") for t in texts), "no half line became a turn"
+
+    def test_a_short_transcript_is_read_whole(self, tmp_path, monkeypatch):
+        path = self._write(tmp_path, 5)
+        watch_dashboard._THREAD_STATE.pop(str(path), None)
+        assert watch_dashboard._tail_start(str(path)) == 0
+        turns, _, _ = watch_dashboard._parse_thread(str(path), 14)
+        assert [t["text"] for t in turns] == ["reply %d" % n for n in range(5)]
+
+    def test_after_the_first_read_only_the_new_lines_are_read(self, tmp_path, monkeypatch):
+        path = self._write(tmp_path, 2000)
+        monkeypatch.setattr(watch_dashboard, "THREAD_TAIL_BYTES", 5000)
+        watch_dashboard._THREAD_STATE.pop(str(path), None)
+        watch_dashboard._parse_thread(str(path), 14)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": {"role": "assistant",
+                                                 "content": [{"type": "text", "text": "new"}]}}) + "\n")
+        turns, _, _ = watch_dashboard._parse_thread(str(path), 14)
+        assert turns[-1]["text"] == "new" and turns[-2]["text"] == "reply 1999"
+
+
+class TestTheRelayServerItself:
+    """2026-09-25 review: the stock ThreadingHTTPServer swallowed every
+    handler crash into stderr, and nothing bounded a silent socket."""
+
+    def test_a_handler_crash_is_reported(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(watch_relay, "_ON_HANDLER_ERROR",
+                            lambda kind, value, tb: seen.append(kind))
+        server = watch_relay._RelayServer.__new__(watch_relay._RelayServer)
+        import contextlib
+        import io
+        try:
+            raise KeyError("boom")
+        except KeyError:
+            with contextlib.redirect_stderr(io.StringIO()):
+                watch_relay._RelayServer.handle_error(server, None, ("127.0.0.1", 1))
+        assert seen == [KeyError]
+
+    def test_a_caller_that_went_away_is_not_a_crash(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(watch_relay, "_ON_HANDLER_ERROR",
+                            lambda kind, value, tb: seen.append(kind))
+        server = watch_relay._RelayServer.__new__(watch_relay._RelayServer)
+        import contextlib
+        import io
+        for error in (ConnectionResetError(), BrokenPipeError(), TimeoutError()):
+            try:
+                raise error
+            except OSError:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    watch_relay._RelayServer.handle_error(server, None, ("127.0.0.1", 1))
+        assert seen == []
+
+    def test_a_silent_socket_is_closed(self):
+        assert 0 < watch_relay.RelayHandler.timeout <= 60
+
+    def test_an_empty_session_id_names_nobody(self, tmp_path):
+        assert watch_relay.resolve_session("", projects_dir=str(tmp_path)) == (None, None)
+        assert watch_relay.resolve_session("   ", projects_dir=str(tmp_path)) == (None, None)
