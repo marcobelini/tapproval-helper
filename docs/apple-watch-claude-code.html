@@ -56,6 +56,9 @@
 <h2>If the watch cannot find the computer</h2>
 <p>Almost every case is one of two things: the watch and the computer are on different networks, or a VPN on the iPhone is half connected. Open <strong>Settings → Connection</strong> on the watch; every route gets a tick or a reason. For a second watch, tell Claude Code <em>Open Tapproval pairing</em> and open the app within ten minutes.</p>
 
+<h2>Two buzzes for one prompt</h2>
+<p>If you also use Claude's Remote Control, the Claude app on your iPhone sends its own "permission needed" notification, and the watch shows that one too. Since Claude Code 2.1.278 it does so even for a prompt that has already been answered (<a href="https://github.com/anthropics/claude-code/issues/96126">claude-code#96126</a>). To keep only Tapproval's card, type <code>/config</code> in Claude Code and turn off <strong>Push when actions required</strong>. The cost: if the watch cannot be reached, the phone no longer tells you a prompt is waiting.</p>
+
 <h2>Removing it</h2>
 <p>Tell Claude Code <em>Uninstall Tapproval Base</em>. It restores your settings, keeps a backup, and leaves nothing running. Delete the app from the watch like any other.</p>
 
