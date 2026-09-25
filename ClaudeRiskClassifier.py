@@ -102,7 +102,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.22"
+__version__ = "1.1.23"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -1335,10 +1335,102 @@ def _facts_detail(facts, limit):
                 limit)
 
 
+# ExitPlanMode on the wrist: a question with the phone's answers. A watch
+# from before plan cards shows it as any question, with these three
+# buttons; a newer one also shows the plan itself and can dictate edits.
+PLAN_APPROVE = "Approve"
+PLAN_APPROVE_AUTO = "Approve & auto mode"
+PLAN_KEEP = "Keep planning"
+PLAN_OPTIONS = [PLAN_APPROVE, PLAN_APPROVE_AUTO, PLAN_KEEP]
+PLAN_EDITS = "Suggest edits:"     # a newer watch prefixes dictated edits
+PLAN_CHARS = 2400
+# The modes Claude Code's validator accepts for setMode (2.1.280).
+PERMISSION_MODES = frozenset(
+    "acceptEdits auto bypassPermissions default dontAsk plan".split())
+
+
+def _plan_plain(plan):
+    """A plan's Markdown as lines a wrist can read: markers and emphasis
+    gone, the line structure kept. Headings, bullets and numbers stay as
+    words; code keeps its text without the fences."""
+    lines = []
+    for raw in str(plan or "").splitlines():
+        line = raw.strip()
+        if line.startswith("```"):
+            continue
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"^[-*+]\s+", "• ", line)
+        line = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", lambda m: m.group(1) or m.group(2), line)
+        line = re.sub(r"`([^`]*)`", r"\1", line)
+        line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
+        if line or (lines and lines[-1]):
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _plan_card(tool_input, risk, headline_chars, detail_chars):
+    plan = str(tool_input.get("plan") or "")
+    title = ""
+    for raw in plan.splitlines():
+        if raw.strip():
+            title = _plan_plain(raw).lstrip("• ").strip()
+            break
+    return {
+        "kind": "question",
+        "plan_card": True,
+        "tier": risk.name,
+        "headline": _fit("Plan: %s" % title if title else "Claude has a plan",
+                         headline_chars * 2),
+        "detail": _fit(" · ".join(PLAN_OPTIONS), detail_chars),
+        "options": list(PLAN_OPTIONS),
+        "plan": _plan_fit(_plan_body(_plan_plain(plan), title,
+                                     headline_chars * 2 - len("Plan: "))),
+    }
+
+
+def _plan_body(text, title, room):
+    """The plan without its title, which is already the card's headline:
+    shown twice, one under the other, it read as a fault. A first line too
+    long for the headline stays, or its end would be lost."""
+    lines = text.splitlines()
+    if (lines and title and len(title) <= room
+            and lines[0].lstrip("• ").strip() == title):
+        lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
+def _plan_fit(text, limit=PLAN_CHARS):
+    """Cap a plan for the wrist without flattening it: its line breaks are
+    its structure, which _fit (one line, whitespace collapsed) would lose."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    return cut[:max(cut.rfind("\n"), cut.rfind(" "), limit // 2)].rstrip() + " …"
+
+
+def plan_decision(chosen):
+    """What a wrist answer to a plan card means for the hook:
+    (behavior, message, mode)."""
+    said = " ".join(str(chosen or "").split())
+    if said == PLAN_APPROVE:
+        return "allow", "", None
+    if said == PLAN_APPROVE_AUTO:
+        return "allow", "", "auto"
+    if said == PLAN_KEEP:
+        return ("deny", "The user wants to keep planning before you start. "
+                "Ask them what to change.", None)
+    edits = said[len(PLAN_EDITS):].strip() if said.startswith(PLAN_EDITS) else said
+    return ("deny", "The user asks for changes to the plan, from their "
+            "watch: %s. Revise the plan and present it again." % edits, None)
+
+
 def wrist_card(tool, tool_input, risk,
                headline_chars=HEADLINE_CHARS, detail_chars=DETAIL_CHARS):
     """Build the compact card a watch face can render in one glance."""
     tool_input = tool_input if isinstance(tool_input, dict) else {}
+
+    if tool == "ExitPlanMode":
+        return _plan_card(tool_input, risk, headline_chars, detail_chars)
 
     if tool == "AskUserQuestion":
         questions = tool_input.get("questions")
@@ -1682,11 +1774,11 @@ def ask_watch(card, policy, project=None):
         return "none", None
     decision = answer.get("decision")
     if decision == "answer" and answer.get("answer"):
-        return "answer", str(answer["answer"])[:200]
+        return "answer", str(answer["answer"])[:600]
     return (decision if decision in ("allow", "deny") else "none"), None
 
 
-def _permission_output(behavior, message=""):
+def _permission_output(behavior, message="", mode=None):
     """The hookSpecificOutput block Claude Code will actually accept.
 
     The shape is checked, and the CLI's own validator spells it out:
@@ -1706,6 +1798,14 @@ def _permission_output(behavior, message=""):
     output = {"hookEventName": "PermissionRequest"}
     if behavior == "allow":
         output["decision"] = {"behavior": "allow"}
+        # An allow may also move the session to another permission mode —
+        # how "Approve & auto mode" on a plan works. The CLI's validator
+        # (2.1.280) accepts updatedPermissions entries of type setMode with
+        # a known mode and a destination; "session" touches no settings
+        # file. Only modes the validator knows are ever sent.
+        if mode in PERMISSION_MODES:
+            output["decision"]["updatedPermissions"] = [
+                {"type": "setMode", "mode": mode, "destination": "session"}]
     elif behavior == "deny":
         output["decision"] = {"behavior": "deny", "message": message}
     return output
@@ -1831,7 +1931,16 @@ def run_hook(stdin=None, stdout=None):
             verdict, chosen = ask_watch(card, policy,
                                         project=audit.get("project"))
             audit["watch"] = verdict
-            if verdict == "answer" and chosen:
+            if verdict == "answer" and chosen and card.get("plan_card"):
+                # A plan answered on the wrist: approve (optionally moving
+                # the session to auto mode, as the phone's button does),
+                # or keep planning with the user's words.
+                behavior, message, mode = plan_decision(chosen)
+                audit["effective"] = behavior
+                audit["answer"] = chosen
+                response["hookSpecificOutput"] = _permission_output(
+                    behavior, message, mode=mode)
+            elif verdict == "answer" and chosen:
                 # A question card answered on the wrist: deny-with-reason is
                 # the one hook channel that can carry the user's words back
                 # to Claude, which then proceeds on the chosen option.

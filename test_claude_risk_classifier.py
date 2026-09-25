@@ -3880,6 +3880,78 @@ class TestQuestionCards:
         assert "answered from their watch" in _decision_message(result)
 
 
+class TestThePlanCard:
+    """2026-09-25, on the owner's wrist: ExitPlanMode arrived as a generic
+    card, "ExitPlanMode" over two fields cut to a few characters each,
+    while the phone showed the plan and "Approve & auto mode" / "Suggest
+    edits". A plan card is a question with the phone's answers: a watch
+    from before plan cards shows the buttons, a newer one the plan too."""
+
+    PLAN = ("# Roll out shared working principles\n\n## Steps\n"
+            "- **Sync** `CLAUDE.md` into every repo\n- Add the CI check\n\n"
+            "```bash\nsync.sh fleet\n```\n## Verification\n1. bats passes")
+
+    def test_the_card_is_the_plan_not_the_tool(self):
+        card = crc.wrist_card("ExitPlanMode", {"plan": self.PLAN, "planFilePath": "/p.md"},
+                              Risk.MEDIUM)
+        assert card["kind"] == "question" and card["plan_card"] is True
+        assert card["headline"] == "Plan: Roll out shared working principles"
+        assert card["options"] == ["Approve", "Approve & auto mode", "Keep planning"]
+        assert "ExitPlanMode" not in card["headline"]
+        lines = card["plan"].splitlines()
+        assert "• Sync CLAUDE.md into every repo" in lines, "markers gone, lines kept"
+        assert "**" not in card["plan"] and "```" not in card["plan"] and "#" not in card["plan"]
+        assert not card["plan"].startswith("Roll out"), "the title is the headline, not said twice"
+
+    def test_a_long_plan_is_capped_on_a_word(self):
+        card = crc.wrist_card("ExitPlanMode", {"plan": "word " * 2000}, Risk.MEDIUM)
+        assert len(card["plan"]) <= crc.PLAN_CHARS + 2
+        assert card["plan"].endswith(" …")
+
+    def test_an_empty_plan_still_asks(self):
+        card = crc.wrist_card("ExitPlanMode", {}, Risk.MEDIUM)
+        assert card["headline"] == "Claude has a plan" and card["options"]
+
+    @pytest.mark.parametrize("said,behavior,mode,words", [
+        ("Approve", "allow", None, ""),
+        ("Approve & auto mode", "allow", "auto", ""),
+        ("Keep planning", "deny", None, "keep planning"),
+        ("Suggest edits: drop step two", "deny", None, "drop step two"),
+    ])
+    def test_each_answer_means_what_the_phone_means(self, said, behavior, mode, words):
+        got = crc.plan_decision(said)
+        assert got[0] == behavior and got[2] == mode
+        assert words in got[1]
+
+    def test_approve_and_auto_mode_travels_as_a_mode_the_cli_accepts(self, live_relay,
+                                                                     tmp_path, monkeypatch):
+        import io
+        import time as _time
+        port, queue = live_relay
+
+        def answer_first_card():
+            for _ in range(60):
+                cards = queue.pending()
+                if cards:
+                    queue.decide(cards[0]["id"], "answer", answer="Approve & auto mode")
+                    return
+                _time.sleep(0.05)
+
+        threading.Thread(target=answer_first_card, daemon=True).start()
+        monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
+        monkeypatch.setenv("CLAUDE_RISK_RELAY", "http://127.0.0.1:%d" % port)
+        monkeypatch.setenv("CLAUDE_RISK_RELAY_WAIT", "10")
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "a.jsonl"))
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "user-settings.json"))
+        monkeypatch.delenv("CLAUDE_RISK_CONFIG", raising=False)
+        monkeypatch.delenv("CLAUDE_RISK_AUTO_ALLOW", raising=False)
+        out = io.StringIO()
+        crc.run_hook(stdin=io.StringIO(json.dumps(
+            {"tool_name": "ExitPlanMode", "tool_input": {"plan": self.PLAN}})), stdout=out)
+        result = json.loads(out.getvalue())["hookSpecificOutput"]
+        assert result["decision"] == {"behavior": "allow", "updatedPermissions": [
+            {"type": "setMode", "mode": "auto", "destination": "session"}]}
+
 class TestPhoneVocabulary:
     """The watch thread speaks the phone app's language: tool bursts
     become one phrase, and running background tasks are counted."""
@@ -5043,6 +5115,17 @@ class TestPermissionDecisionShape:
     def test_deny_carries_its_message(self):
         out = crc._permission_output("deny", "because")
         assert out["decision"] == {"behavior": "deny", "message": "because"}
+
+    def test_an_allow_may_carry_a_known_mode_and_nothing_else(self):
+        """updatedPermissions/setMode, as the CLI's validator (2.1.280) spells
+        it; an unknown mode is never sent, because a failed shape is a
+        silently discarded answer."""
+        assert crc._permission_output("allow", mode="auto")["decision"] == {
+            "behavior": "allow", "updatedPermissions": [
+                {"type": "setMode", "mode": "auto", "destination": "session"}]}
+        assert crc._permission_output("allow", mode="warp")["decision"] == {"behavior": "allow"}
+        assert "updatedPermissions" not in crc._permission_output(
+            "deny", "no", mode="auto")["decision"]
 
     def test_escalation_sends_no_decision_at_all(self):
         """Saying nothing is what leaves the question with the human."""
