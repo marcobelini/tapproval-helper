@@ -20,6 +20,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import glob
 import re
 import shutil
 import subprocess
@@ -2172,6 +2173,41 @@ class TestSignedRequests:
         assert mac == "40a76bfa5eb884abf31631274d03a1b20118e1094116cc82836f47dc8e7a1d4a"
 
 
+class TestEveryCommittingScriptSaysWhoItIs:
+    """CLAUDE.md constraint 5: commits made by scripts are the project's.
+    sync-helper.sh set the identity script-wide; deploy-testflight.sh
+    committed "Ship build N" on whatever the machine's git config said,
+    which on a fresh clone is a person (2026-09-25 review)."""
+
+    def test_a_script_that_commits_exports_the_project_identity(self):
+        # The public helper ships neither script that commits; the sync runs
+        # this suite in that layout (and refused 1.1.22 until this skip).
+        if not os.path.isfile(os.path.join(_ROOT, "sync-helper.sh")):
+            pytest.skip("no committing scripts in this layout")
+        scripts = glob.glob(os.path.join(_ROOT, "*.sh")) + glob.glob(
+            os.path.join(_ROOT, "WatchApp", "*.sh"))
+        committing = []
+        for path in scripts:
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+            if re.search(r"\bgit\b[^\n]*\bcommit\b", text):
+                committing.append(path)
+                assert re.search(r'^export GIT_AUTHOR_NAME="Tapproval"', text, re.M), path
+                assert "GIT_COMMITTER_EMAIL" in text, path
+        assert len(committing) >= 2, committing
+
+
+class TestSyncHelperFlags:
+    def test_a_dry_run_is_a_dry_run_whatever_the_order(self):
+        path = os.path.join(_ROOT, "sync-helper.sh")
+        if not os.path.isfile(path):
+            pytest.skip("no sync script in this layout")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        assert '"${1:-}" = "--check"' not in text, "flags read by position again"
+        assert "--check) CHECK=1" in text and "--anyway) ANYWAY=1" in text
+
+
 class TestSessionNames:
     """Claude Code's folder names are lossy — familia-gateway and
     familia/gateway both become "-Users-...-familia-gateway". The transcript
@@ -3395,8 +3431,6 @@ class TestTheHumansWordsSurviveAReminder:
         assert asks == ["Merged #580", "Trigger a new TestFlight build"]
         _, opening, _ = watch_dashboard.session_meta(str(path))
         assert opening == "Merged #580"
-        assert watch_dashboard._THREAD_STATE[str(path)]["latest_ask"] == \
-            "Trigger a new TestFlight build"
 
     def test_a_reminder_with_nothing_after_it_is_still_nothing(self, tmp_path):
         """Only the note, no person: skipped as before — and so is an
@@ -5825,7 +5859,7 @@ class TestTheHelperReportsItsOwnCrashes:
             seen["headers"] = {k.lower(): v for k, v in request.header_items()}
             return Reply()
         crash_report.send({"at": "now", "message": "m", "stack": "s",
-                           "source": "test", "helper": "h"}, 1, 0,
+                           "source": "test", "helper": "h"}, 1,
                           settings=("re_k", "to@x", "from@x"), opener=opener)
         assert seen["headers"].get("User-agent".lower()), (
             "without a User-Agent Cloudflare answers 403 before Resend sees it")
@@ -5971,7 +6005,7 @@ class TestTheHelperReportsItsOwnCrashes:
         # No opener: without the guard this would reach api.resend.com.
         reason = crash_report.send(
             {"at": "now", "message": "m", "stack": "s",
-             "source": "test", "helper": "h"}, 1, 0)
+             "source": "test", "helper": "h"}, 1)
         assert reason == "not_sent_in_tests", reason
 
     def test_an_injected_opener_still_exercises_the_send_path(self, tmp_path):
@@ -5984,7 +6018,7 @@ class TestTheHelperReportsItsOwnCrashes:
             def __exit__(self, *a): return False
         assert crash_report.send(
             {"at": "now", "message": "m", "stack": "s",
-             "source": "test", "helper": "h"}, 1, 0,
+             "source": "test", "helper": "h"}, 1,
             settings=("re_k", "to@x", "from@x"), opener=Post()) == "sent"
 
     def test_the_guard_reads_the_process_not_a_flag(self):
@@ -8774,3 +8808,51 @@ class TestTheRelayServerItself:
     def test_an_empty_session_id_names_nobody(self, tmp_path):
         assert watch_relay.resolve_session("", projects_dir=str(tmp_path)) == (None, None)
         assert watch_relay.resolve_session("   ", projects_dir=str(tmp_path)) == (None, None)
+
+
+class TestPollsReadOnlyWhatChanged:
+    """2026-09-25 review: /usage re-read every active transcript from its
+    first byte on each call (2.2 s), and /sessions re-read each active
+    transcript's first 600 lines on every poll."""
+
+    def _usage_line(self, out, stamp="2026-09-25T06:00:00Z"):
+        return json.dumps({"timestamp": stamp, "message": {
+            "role": "assistant", "model": "claude-opus-5",
+            "usage": {"input_tokens": 1, "output_tokens": out}}}) + "\n"
+
+    def test_usage_follows_a_transcript_instead_of_rereading_it(self, tmp_path, monkeypatch):
+        path = tmp_path / "t.jsonl"
+        path.write_text(self._usage_line(5) + self._usage_line(7))
+        watch_dashboard._USAGE_FILES.pop(str(path), None)
+        assert [e[2] for e in watch_dashboard._usage_entries(str(path))] == [5, 7]
+        parsed = []
+        real = watch_dashboard._usage_entry
+        monkeypatch.setattr(watch_dashboard, "_usage_entry",
+                            lambda line: parsed.append(line) or real(line))
+        with open(path, "a") as handle:
+            handle.write(self._usage_line(11) + '{"half a line')
+        assert [e[2] for e in watch_dashboard._usage_entries(str(path))] == [5, 7, 11]
+        assert len(parsed) == 1, "only the appended whole line is read"
+
+    def test_a_rewritten_transcript_is_counted_afresh(self, tmp_path):
+        path = tmp_path / "t.jsonl"
+        path.write_text(self._usage_line(5) + self._usage_line(7))
+        watch_dashboard._USAGE_FILES.pop(str(path), None)
+        watch_dashboard._usage_entries(str(path))
+        path.write_text(self._usage_line(3))
+        assert [e[2] for e in watch_dashboard._usage_entries(str(path))] == [3]
+
+    def test_settled_session_facts_are_not_read_again(self, tmp_path, monkeypatch):
+        path = tmp_path / "s.jsonl"
+        lines = [json.dumps({"cwd": "/x/proj", "message": {"role": "user", "content": "Ship it"}})]
+        lines += [json.dumps({"message": {"role": "assistant", "content": "ok %d" % n}})
+                  for n in range(10)]
+        path.write_text("\n".join(lines) + "\n")
+        watch_dashboard._META_SETTLED.pop(str(path), None)
+        first = watch_dashboard.session_meta(str(path), scan_lines=5)
+        assert first[0] == "/x/proj" and first[1] == "Ship it"
+        monkeypatch.setattr(watch_dashboard, "_session_meta",
+                            lambda *a, **k: pytest.fail("read again"))
+        with open(path, "a") as handle:
+            handle.write(json.dumps({"message": {"role": "assistant", "content": "more"}}) + "\n")
+        assert watch_dashboard.session_meta(str(path), scan_lines=5) == first

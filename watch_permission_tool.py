@@ -84,7 +84,7 @@ def decide(tool_name, tool_input, crc=None, cwd=None):
         if verdict == "deny":
             return deny(reason or "Blocked by your Tapproval policy.")
         card = crc.wrist_card(tool_name, tool_input, result["risk"])
-        verdict, _answer = crc.ask_watch(card, policy, project=result.get("project"))
+        verdict, _answer = crc.ask_watch(card, policy)
     except Exception as error:                          # never a stack trace
         return deny("Tapproval could not ask your watch (%s). Answer this at "
                     "the keyboard." % error)

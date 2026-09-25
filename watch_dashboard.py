@@ -93,7 +93,7 @@ def _stat_cached(cache, path, compute, extra=None, limit=64):
 
 # Parsed usage entries per transcript — a transcript that has not changed
 # is never read twice.
-_USAGE_FILES = {}   # path -> (stat_key, [(stamp, inp, out, cache_read, model)])
+_USAGE_FILES = {}   # path -> {"offset": bytes read, "entries": [(stamp, inp, out, cache_read, model)]}
 
 
 def _parse_stamp(text):
@@ -108,38 +108,62 @@ def _parse_stamp(text):
         return None
 
 
+_USAGE_LOCK = threading.Lock()
+
+
 def _usage_entries(path):
-    """All usage records in one transcript, cached until the file changes."""
-    return _stat_cached(_USAGE_FILES, path,
-                        lambda: _usage_entries_uncached(path))
+    """All usage records in one transcript, read once and then followed.
+
+    An active transcript changes every few seconds, and a cache keyed on
+    (mtime, size) re-read it from the first byte each time: 2.2 s per
+    /usage over ten minutes' worth of files (2026-09-25 review). Only what
+    was appended is read now, line by line so a big file never sits in
+    memory whole; a file that shrank is read again from the start."""
+    with _USAGE_LOCK:
+        state = _USAGE_FILES.get(path) or {"offset": 0, "entries": []}
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return state["entries"]
+        if size < state["offset"]:
+            state = {"offset": 0, "entries": []}
+        if size > state["offset"]:
+            try:
+                with open(path, "rb") as handle:
+                    handle.seek(state["offset"])
+                    for raw in handle:
+                        if not raw.endswith(b"\n"):
+                            break              # a line still being written
+                        state["offset"] += len(raw)
+                        if b'"usage"' in raw:
+                            entry = _usage_entry(raw.decode("utf-8", "replace"))
+                            if entry is not None:
+                                state["entries"].append(entry)
+            except OSError:
+                pass
+        _USAGE_FILES[path] = state
+        return state["entries"]
 
 
-def _usage_entries_uncached(path):
-    entries = []
+def _usage_entry(line):
     try:
-        with open(path, encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                if '"usage"' not in line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                message = entry.get("message") or {}
-                usage = message.get("usage") or {}
-                if not usage:
-                    continue
-                stamp = _parse_stamp(entry.get("timestamp"))
-                if stamp is None:
-                    continue
-                entries.append((stamp,
-                                int(usage.get("input_tokens") or 0),
-                                int(usage.get("output_tokens") or 0),
-                                int(usage.get("cache_read_input_tokens") or 0),
-                                message.get("model") or "unknown"))
-    except OSError:
-        return []
-    return entries
+        entry = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(entry, dict):
+        return None
+    message = entry.get("message") or {}
+    usage = message.get("usage") or {} if isinstance(message, dict) else {}
+    if not usage:
+        return None
+    stamp = _parse_stamp(entry.get("timestamp"))
+    if stamp is None:
+        return None
+    return (stamp,
+            int(usage.get("input_tokens") or 0),
+            int(usage.get("output_tokens") or 0),
+            int(usage.get("cache_read_input_tokens") or 0),
+            message.get("model") or "unknown")
 
 
 def usage_summary(projects_dir=None, now=None):
@@ -180,8 +204,9 @@ def usage_summary(projects_dir=None, now=None):
     except OSError:
         return totals
 
-    for stale in set(_USAGE_FILES) - set(paths):
-        _USAGE_FILES.pop(stale, None)   # fell out of the 24h window
+    with _USAGE_LOCK:
+        for stale in set(_USAGE_FILES) - set(paths):
+            _USAGE_FILES.pop(stale, None)   # fell out of the 24h window
 
     for path in paths:
         for stamp, inp, out, cached_read, model in _usage_entries(path):
@@ -602,12 +627,48 @@ def _message_parts(content):
                     images.append(ref)
     return text, tool, images
 
+# Answers that can no longer change: path -> (size when settled, scan_lines,
+# result). A transcript only grows, and once its first scan_lines lines
+# hold both the working directory and the opening ask, nothing appended
+# can alter either — yet an active session's (mtime, size) changes on
+# every poll, and the stat cache re-read its first 600 lines each time.
+_META_SETTLED = OrderedDict()
+
+
 def session_meta(path, scan_lines=600):
     """Cached front for :func:`_session_meta` —
     /sessions re-reads a dozen transcripts per watch visit otherwise."""
-    return _stat_cached(_META_CACHE, path,
-                        lambda: _session_meta(path, scan_lines),
-                        extra=scan_lines)
+    settled = _META_SETTLED.get(path)
+    if settled is not None and settled[1] == scan_lines:
+        try:
+            if os.path.getsize(path) >= settled[0]:
+                return settled[2]
+        except OSError:
+            pass
+        _META_SETTLED.pop(path, None)       # shrank: a rewrite
+    result = _stat_cached(_META_CACHE, path,
+                          lambda: _session_meta(path, scan_lines),
+                          extra=scan_lines)
+    if result[0] and result[1] and _has_lines(path, scan_lines):
+        try:
+            _META_SETTLED[path] = (os.path.getsize(path), scan_lines, result)
+            while len(_META_SETTLED) > 256:
+                _META_SETTLED.popitem(last=False)
+        except OSError:
+            pass
+    return result
+
+
+def _has_lines(path, count):
+    """Does the file already hold at least ``count`` whole lines?"""
+    try:
+        with open(path, "rb") as handle:
+            for index, _ in enumerate(handle, 1):
+                if index >= count:
+                    return True
+    except OSError:
+        pass
+    return False
 
 
 def _session_meta(path, scan_lines=600):
@@ -1226,7 +1287,7 @@ def prewarm_threads(session_ids):
 def _fresh_thread_state():
     return {"offset": 0, "turns": [], "launched": set(),
             "finished": set(), "running_tool": None, "github": None,
-            "latest_ask": None, "last_said": None,
+            "last_said": None,
             "result": None, "result_at": 0.0, "limit": None}
 
 
@@ -1492,15 +1553,6 @@ def _thread_line(state, line, limit):
         fact = _last_github_fact(text)
         if fact:
             state["github"] = fact
-    # The phone re-titles a session as its topic moves on; mirror that by
-    # remembering the latest user ask with enough substance to BE a topic.
-    # Not topics: short acks ("ok"/"det virker"), slash-command/skill
-    # invocations, and the harness's own compaction hand-off message.
-    lead_ask = text.strip()
-    if (role == "user" and kind == "text" and len(lead_ask) >= 24
-            and not lead_ask.startswith("/")
-            and not lead_ask.startswith("This session is being continued")):
-        state["latest_ask"] = lead_ask[:200]
     turn = {
         "role": role,
         "kind": kind,
@@ -1556,11 +1608,13 @@ def _last_github_fact(text):
 
 def _thread_activity(path):
     """The list row's share of the thread state: (running_tasks,
-    running_tool, github, latest_ask). Same limit as /thread, so the list
-    and the detail screen share one incremental parse per transcript."""
+    running_tool, github). Same limit as /thread, so the list and the
+    detail screen share one incremental parse per transcript. (A topic
+    from your latest message was computed here too, and dropped by the
+    only caller since titles come from the opening ask.)"""
     _, running, running_tool = _parse_thread(path, THREAD_TURN_LIMIT)
     state = _THREAD_STATE.get(path) or {}
-    return running, running_tool, state.get("github"), state.get("latest_ask")
+    return running, running_tool, state.get("github")
 
 
 def resolve_session(prefix, projects_dir=None, registry=None):
@@ -1593,19 +1647,13 @@ def resolve_session(prefix, projects_dir=None, registry=None):
 
 
 def recent_sessions(limit=12, projects_dir=None, include_idle=False,
-                    light=False, waiting=()):
+                    waiting=()):
     """The user's ACTIVE Claude Code sessions, straight from local storage.
 
     ``include_idle`` lifts the liveness filter. The session LIST never wants
     that — it mirrors the phone, which shows active sessions — but the
     "start a new session where?" list does: a project you worked in
     yesterday is exactly where you might start one today.
-
-    ``light`` skips the per-session work only the list screen shows — the
-    thread parse behind running_tasks/running_tool/github, and the git
-    remote behind repo. The projects picker wants a path and an age per
-    row and used to pay a full transcript parse for each of fifty rows:
-    six seconds, on a blocked handler thread, to answer "where?".
 
     Claude Code keeps transcripts at ~/.claude/projects/<munged-path>/<id>.jsonl
     — the only sanctioned way to enumerate sessions today (no remote API).
@@ -1645,11 +1693,8 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
         name = os.path.basename(where.rstrip("/")) if where else ""
         if not name:
             name = project.rstrip("-").rsplit("-", 1)[-1] or project
-        if light:
-            running_tasks, running_tool, github, repo = 0, None, None, ""
-        else:
-            running_tasks, running_tool, github, _ = _thread_activity(path)
-            repo = repo_slug(cwd)
+        running_tasks, running_tool, github = _thread_activity(path)
+        repo = repo_slug(cwd)
         # The app's own title wins outright — a /rename, or the title the
         # desktop app gave it, which is what the phone shows too. Otherwise
         # the opening ask: the phone titles a session once, from how it

@@ -86,7 +86,7 @@ KEY_ENV = "TAPPROVAL_RESEND_API_KEY"
 TO_ENV = "TAPPROVAL_CRASH_REPORT_TO"
 FROM_ENV = "TAPPROVAL_CRASH_REPORT_FROM"
 
-_seen = {}                       # fingerprint -> {count, first, notified}
+_seen = {}                       # fingerprint -> {count, notified}
 _window_start = 0.0
 _sent_in_window = 0
 
@@ -178,8 +178,9 @@ def subject_for(entry, repeats):
                _clip(entry.get("message"), 80))).replace("\n", " ")
 
 
-def body_for(entry, count, first):
+def body_for(entry, count):
     where = {"thread": "in a background thread — the relay kept running",
+             "request": "answering a request — the relay kept running",
              "process": "on the main path — the process stopped",
              "hook": "inside the Claude Code hook"}.get(
                  entry.get("source"), entry.get("source") or "unknown")
@@ -220,7 +221,7 @@ def running_under_test(env=None, modules=None):
     return bool(env.get("PYTEST_CURRENT_TEST")) or "pytest" in modules
 
 
-def send(entry, count, first, settings=None, opener=None):
+def send(entry, count, settings=None, opener=None):
     """POST one report to Resend. Returns a reason string, never raises."""
     key, to, sender = settings or mail_settings()
     if not (key and to and sender):
@@ -233,7 +234,7 @@ def send(entry, count, first, settings=None, opener=None):
     payload = json.dumps({
         "from": sender, "to": [to],
         "subject": subject_for(entry, count),
-        "text": body_for(entry, count, first),
+        "text": body_for(entry, count),
     }).encode("utf-8")
     request = urllib.request.Request(
         "https://api.resend.com/emails", data=payload,
@@ -307,16 +308,14 @@ def report(message, stack, source="process", helper=None, now=None,
             _window_start, _sent_in_window = stamp, 0
             _seen.clear()
         key = fingerprint(entry["message"], entry["stack"])
-        seen = _seen.setdefault(key, {"count": 0, "first": stamp,
-                                      "notified": False})
+        seen = _seen.setdefault(key, {"count": 0, "notified": False})
         seen["count"] += 1
         if seen["notified"]:
             return "duplicate", entry
         if _sent_in_window >= MAX_SENDS_PER_WINDOW:
             return "rate_limited", entry
 
-        reason = send(entry, seen["count"], seen["first"],
-                      settings=settings, opener=opener)
+        reason = send(entry, seen["count"], settings=settings, opener=opener)
         if reason == "sent":
             seen["notified"] = True
             _sent_in_window += 1
