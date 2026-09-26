@@ -794,6 +794,25 @@ def ensure_running(updated=False):
     return 1
 
 
+def alert_bucket(card):
+    """What a notification for this card may offer a closed watch.
+
+    A double tap runs a notification's first action, so this is what
+    stands between a reflex and an approval. Decided here, once: the
+    bridge copies it into iCloud and the watch picks its buttons by it.
+
+    - "go"      SAFE, LOW: Allow first; the headline is on the screen.
+    - "careful" MEDIUM: Deny first, Allow second — never a reflex yes.
+    - "stop"    HIGH, CRITICAL: Deny only; approving means opening it.
+    - "ask"     a question or a plan: open only, the answer is a choice.
+    Anything unrecognised is "stop": fail closed.
+    """
+    if card.get("kind") == "question":
+        return "ask"
+    return {"SAFE": "go", "LOW": "go", "MEDIUM": "careful"}.get(
+        card.get("tier") if isinstance(card.get("tier"), str) else None, "stop")
+
+
 class CardQueue:
     """Pending wrist cards and the decisions made about them."""
 
@@ -809,11 +828,15 @@ class CardQueue:
         self._session_allows = set()
         self._decisions = {}            # id -> "allow" | "deny"
         self.last_poll = None           # monotonic time of last /pending fetch
+        self.last_bridge_poll = None    # the same, for the Mac bridge
 
     # A watch that has not polled within this many seconds is not on a
     # wrist right now. Diagnostics only — cards queue regardless, because
     # a wrist raised late must still find its card.
     WATCH_PRESENT_SECONDS = 90
+    # The bridge polls every 2 s while it runs; three missed polls and
+    # nothing will mirror a card into iCloud, so nothing will buzz.
+    BRIDGE_ALIVE_SECONDS = 30
 
     def submit(self, card, wait, caller_alive=None, resolved_elsewhere=None):
         """Queue a card and block until it is decided or ``wait`` expires.
@@ -850,6 +873,14 @@ class CardQueue:
         card_id = uuid.uuid4().hex[:12]
         entry = dict(card)
         entry["id"] = card_id
+        # Always recomputed: the bucket is the relay's to decide, never the
+        # poster's, so a card cannot ask for a looser notification.
+        entry["alert"] = alert_bucket(entry)
+        # T0 of the buzz-when-closed latency measurement (with the bridge's
+        # "mirrored" line and the watch's "alert delivered" line).
+        print("relay: queued %s %s at %d" % (card_id, entry["alert"],
+                                             int(time.time() * 1000)),
+              file=sys.stderr)
         deadline = time.monotonic() + wait
         with self._lock:
             self._pending[card_id] = entry
@@ -894,11 +925,27 @@ class CardQueue:
                 decision = "allow"
         return card_id, decision, answer
 
-    def pending(self, from_watch=False):
+    def pending(self, from_watch=False, from_bridge=False):
         with self._lock:
             if from_watch:
                 self.last_poll = time.monotonic()
+            if from_bridge:
+                self.last_bridge_poll = time.monotonic()
             return list(self._pending.values())
+
+    def alert_route(self):
+        """What will make a closed watch buzz, or None.
+
+        "bridge" while the Mac bridge is polling: it mirrors each card into
+        iCloud, whose subscription alerts the watch. A watch's own poll is
+        not a route — it only happens while the app is open.
+        """
+        with self._lock:
+            if (self.last_bridge_poll is not None
+                    and time.monotonic() - self.last_bridge_poll
+                    <= self.BRIDGE_ALIVE_SECONDS):
+                return "bridge"
+            return None
 
     def note_watch_indirect(self, seconds_ago):
         """A watch seen through the cloud counts as present.
@@ -1542,8 +1589,13 @@ def start_session(path, text, projects_dir=None, platform=None):
     # The unset is for a Terminal that is already carrying some session's
     # markers (see HOST_SESSION_MARKERS): scrubbing this process cannot
     # reach a Terminal launched before it, and its windows inherit.
-    script = 'unset %s; cd %s && claude -- %s' % (
-        " ".join(HOST_SESSION_MARKERS), shlex.quote(path), shlex.quote(text))
+    # The session is born on the wrist, so it speaks the wrist's style from
+    # its first answer, as a reply sent into a session already does. It
+    # stays Concise if the person later sits down at it; `/output-style`
+    # changes that there.
+    script = 'unset %s; cd %s && claude --settings %s -- %s' % (
+        " ".join(HOST_SESSION_MARKERS), shlex.quote(path),
+        shlex.quote(BRIEF_REPLY_SETTINGS), shlex.quote(text))
     # json.dumps is the right escaper for the quotes and backslashes an
     # AppleScript string literal understands — but only with
     # ensure_ascii=False. Left at its default it writes \u00e5 for "å",
@@ -2382,8 +2434,9 @@ class RelayHandler(BaseHTTPRequestHandler):
     def _get_pending(self, path, query):
         # The bridge identifies itself so its polls never masquerade as
         # a watch in the "watch seen" diagnostics.
-        from_watch = query.get("source", [""])[0] != "bridge"
-        self._send_json({"cards": self.queue.pending(from_watch=from_watch)})
+        from_bridge = query.get("source", [""])[0] == "bridge"
+        self._send_json({"cards": self.queue.pending(
+            from_watch=not from_bridge, from_bridge=from_bridge)})
 
     def _get_image(self, path, query):
         """One picture a transcript carried, by the reference /thread gave.
@@ -2418,6 +2471,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                              "pending": len(self.queue.pending()),
                              "watch_seen_seconds_ago":
                                  self.queue.watch_seen_seconds_ago(),
+                             "alert_route": self.queue.alert_route(),
                              "version": RELAY_VERSION,
                              "helper": HELPER_VERSION,
                              "helper_commit": (_PROVENANCE or (None, None))[0],

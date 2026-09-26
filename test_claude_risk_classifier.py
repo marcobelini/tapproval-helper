@@ -2208,6 +2208,79 @@ class TestSyncHelperFlags:
         assert "--check) CHECK=1" in text and "--anyway) ANYWAY=1" in text
 
 
+class TestAlertBuckets:
+    """What a notification on a closed watch may offer is decided here, once,
+    and travels with the card: the watch and the bridge only copy it. A
+    double tap runs a notification's first action, so the bucket is what
+    stands between a reflex and an approval."""
+
+    @pytest.mark.parametrize("card,bucket", [
+        ({"tier": "SAFE"}, "go"),
+        ({"tier": "LOW"}, "go"),
+        ({"tier": "MEDIUM"}, "careful"),
+        ({"tier": "HIGH"}, "stop"),
+        ({"tier": "CRITICAL"}, "stop"),
+        ({"tier": "SAFE", "kind": "question"}, "ask"),
+        ({"tier": "CRITICAL", "kind": "question", "plan": "x"}, "ask"),
+    ])
+    def test_every_tier_and_kind_has_its_bucket(self, card, bucket):
+        assert watch_relay.alert_bucket(card) == bucket
+
+    @pytest.mark.parametrize("card", [{}, {"tier": "WEIRD"}, {"tier": None}, {"tier": 3}])
+    def test_anything_unrecognised_gets_the_strictest_bucket(self, card):
+        assert watch_relay.alert_bucket(card) == "stop"
+
+    def test_a_queued_card_carries_its_bucket(self):
+        import time as _time
+        queue = watch_relay.CardQueue()
+        thread = threading.Thread(target=lambda: queue.submit(
+            {"tier": "MEDIUM", "headline": "x", "detail": "x"}, wait=5), daemon=True)
+        thread.start()
+        for _ in range(200):
+            if queue.pending():
+                break
+            _time.sleep(0.01)
+        card = queue.pending()[0]
+        assert card["alert"] == "careful"
+        queue.decide(card["id"], "deny")
+        thread.join(timeout=5)
+
+    def test_a_bucket_sent_by_the_hook_is_not_trusted(self):
+        import time as _time
+        queue = watch_relay.CardQueue()
+        thread = threading.Thread(target=lambda: queue.submit(
+            {"tier": "CRITICAL", "alert": "go", "headline": "x", "detail": "x"},
+            wait=5), daemon=True)
+        thread.start()
+        for _ in range(200):
+            if queue.pending():
+                break
+            _time.sleep(0.01)
+        card = queue.pending()[0]
+        assert card["alert"] == "stop"
+        queue.decide(card["id"], "deny")
+        thread.join(timeout=5)
+
+    def test_the_route_is_the_bridge_only_while_it_polls(self, monkeypatch):
+        queue = watch_relay.CardQueue()
+        assert queue.alert_route() is None, "no bridge has ever polled"
+        queue.pending(from_bridge=True)
+        assert queue.alert_route() == "bridge"
+        # a watch's own poll is not a delivery route for a closed app
+        fresh = watch_relay.CardQueue()
+        fresh.pending(from_watch=True)
+        assert fresh.alert_route() is None
+        now = watch_relay.time.monotonic()
+        monkeypatch.setattr(watch_relay.time, "monotonic",
+                            lambda: now + watch_relay.CardQueue.BRIDGE_ALIVE_SECONDS + 1)
+        assert queue.alert_route() is None, "a bridge that stopped polling is no route"
+
+    def test_a_bridge_poll_does_not_count_as_a_watch(self):
+        queue = watch_relay.CardQueue()
+        queue.pending(from_bridge=True)
+        assert queue.watch_seen_seconds_ago() is None
+
+
 class TestSessionNames:
     """Claude Code's folder names are lossy — familia-gateway and
     familia/gateway both become "-Users-...-familia-gateway". The transcript
@@ -6859,9 +6932,24 @@ class TestNewSessionFromTheWatch:
 
     def _expected_line(self, tmp_path, text="Fix CI; it's red"):
         import shlex
-        return "unset %s; cd %s && claude -- %s" % (
+        return "unset %s; cd %s && claude --settings %s -- %s" % (
             " ".join(watch_relay.HOST_SESSION_MARKERS),
-            shlex.quote(str(tmp_path / "acme")), shlex.quote(text))
+            shlex.quote(str(tmp_path / "acme")),
+            shlex.quote(watch_relay.BRIEF_REPLY_SETTINGS), shlex.quote(text))
+
+    def test_a_session_started_from_the_wrist_answers_in_the_concise_style(
+            self, tmp_path, monkeypatch):
+        """A reply sent into a session was already asked for in Claude
+        Code's Concise style; a session started from the wrist was not, so
+        its first answer arrived at desktop length on a 14 pt thread. The
+        session is born on the wrist, so the style goes with it."""
+        import shlex
+        status, _calls, shell_line, _lines = self._start(tmp_path, monkeypatch)
+        assert status == "started"
+        words = shlex.split(shell_line.split("&& ", 1)[1])
+        assert words[:3] == ["claude", "--settings", watch_relay.BRIEF_REPLY_SETTINGS]
+        assert json.loads(words[2]) == {"outputStyle": "Concise"}
+        assert words[3] == "--", "the message must still come after the end of options"
 
     def test_a_command_file_goes_first_and_needs_no_consent(self, tmp_path, monkeypatch):
         """Measured on the release Mac, 2026-09-08: osascript hung until
@@ -6943,7 +7031,9 @@ class TestNewSessionFromTheWatch:
         status, _, shell_line, _ = self._start(tmp_path, monkeypatch, text=text)
         assert status == "started"
         words = shlex.split(shell_line)
-        assert words[words.index("claude") + 1:] == ["--", text]
+        after_claude = words[words.index("claude") + 1:]
+        assert after_claude[-2:] == ["--", text]
+        assert text not in after_claude[:-1], "only our own flags come before --"
 
     def test_projects_and_new_are_ordinary_data_routes(self, tmp_path, monkeypatch, fresh_auth):
         """/projects needs the same key as every other data route, and /new
@@ -7020,6 +7110,14 @@ class TestRelayRoutes:
         assert status == 200 and body["ok"] is True
         # loopback is credentialed: the details come with it
         assert "version" in body and "pending" in body
+
+    def test_health_names_the_alert_route_once_the_bridge_polls(self, relay):
+        """The watch can only promise a buzz when something will deliver
+        one: /health says so, and a bridge poll is what makes it true."""
+        base, _, _ = relay
+        assert self._call(base + "/health")[1]["alert_route"] is None
+        assert self._call(base + "/pending?source=bridge")[0] == 200
+        assert self._call(base + "/health")[1]["alert_route"] == "bridge"
 
     def test_the_read_routes_answer_with_their_shapes(self, relay, monkeypatch):
         monkeypatch.setattr(watch_relay, "known_projects", lambda: [{"name": "x"}])

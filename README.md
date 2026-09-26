@@ -136,9 +136,8 @@ log was deliberately left in place.
   can read here is everything that runs.
 - **No Tapproval servers, ever.** No accounts, no telemetry. At home,
   prompts travel directly between your computer and your watch. Away
-  from home they ride either your own iCloud (private to your Apple
-  ID) or an encrypted tunnel (Cloudflare) hidden behind a secret path —
-  in transit only, stored nowhere.
+  from home they ride your tailnet or an encrypted tunnel (Cloudflare)
+  hidden behind a secret path — in transit only, stored nowhere.
 - **`127.0.0.1` is not a computer of ours.** You will see that address in
   the code and in the hook it installs. It is called *loopback*, and it is
   the one address every computer reserves for itself: it means "this
