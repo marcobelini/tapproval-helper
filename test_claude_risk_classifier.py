@@ -2281,6 +2281,233 @@ class TestAlertBuckets:
         assert queue.watch_seen_seconds_ago() is None
 
 
+class TestEachRequestOnAConnectionStandsAlone:
+    """HTTP/1.1 keeps a connection open, and the relay answers every request
+    on it with the same handler object. The body and the key a request
+    proved were cached on that object and never cleared, so the second
+    request on a connection reused the first one's. Found 2026-09-27 in the
+    relay log: a card's answer arriving after a poll read the poll's empty
+    body (400), its own body was left unread and corrupted the next request
+    — and a request with no key rode the key the previous one proved.
+    Cloudflare pools connections to the relay across callers, so on the
+    travel address that last part was a way in."""
+
+    @pytest.fixture
+    def relay(self, fresh_auth):
+        watch_relay.LIMITS.reset()
+        server, queue = watch_relay.serve(port=0, auth=_known_watch(fresh_auth))
+        real = server.get_request
+
+        def from_the_lan():
+            # Not loopback: every request must prove a key of its own.
+            sock, addr = real()
+            return sock, ("192.168.1.77", addr[1])
+        server.get_request = from_the_lan
+        _serve(server)
+        yield server.server_address[1], queue
+        server.shutdown()
+        server.server_close()
+
+    def _connection(self, port):
+        import http.client
+        return http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+
+    def _ask(self, conn, method, path, token=None, body=None):
+        """One request on `conn`, signed with `token` the way the watch
+        signs every request (the key itself never travels)."""
+        import time as _time
+        import uuid as _uuid
+        raw = json.dumps(body).encode() if body is not None else b""
+        headers = {"Content-Type": "application/json"}
+        if token:
+            stamp, nonce = int(_time.time()), _uuid.uuid4().hex
+            mac = watch_relay.sign_request(token, method, path.split("?")[0],
+                                           stamp, nonce, raw)
+            headers["X-Tapproval-Signature"] = "v1 %d %s %s" % (stamp, nonce, mac)
+        conn.request(method, path, body=raw if body is not None else None,
+                     headers=headers)
+        reply = conn.getresponse()
+        data = reply.read()
+        try:
+            return reply.status, json.loads(data or b"{}")
+        except ValueError:
+            return reply.status, {"raw": data[:80]}
+
+    def test_an_answer_after_a_poll_reads_its_own_body(self, relay):
+        port, _queue = relay
+        conn = self._connection(port)
+        assert self._ask(conn, "GET", "/pending", token="devicetoken")[0] == 200
+        status, body = self._ask(conn, "POST", "/decision", token="devicetoken",
+                                 body={"id": "gone", "decision": "deny"})
+        assert status == 200 and body == {"ok": False}, \
+            "the answer read the poll's empty body: %s %s" % (status, body)
+        # ...and nothing was left behind to corrupt the next request.
+        assert self._ask(conn, "GET", "/pending", token="devicetoken")[0] == 200
+        conn.close()
+
+    def test_an_answer_really_reaches_its_card_on_a_reused_connection(self, relay):
+        import time as _time
+        port, queue = relay
+        result = {}
+        waiter = threading.Thread(target=lambda: result.update(
+            decision=queue.submit({"tier": "MEDIUM", "headline": "x", "detail": "x"},
+                                  wait=10)[1]), daemon=True)
+        waiter.start()
+        for _ in range(200):
+            if queue.pending():
+                break
+            _time.sleep(0.01)
+        card = queue.pending()[0]["id"]
+        conn = self._connection(port)
+        self._ask(conn, "GET", "/pending", token="devicetoken")
+        status, body = self._ask(conn, "POST", "/decision", token="devicetoken",
+                                 body={"id": card, "decision": "allow"})
+        waiter.join(timeout=5)
+        assert (status, body) == (200, {"ok": True})
+        assert result["decision"] == "allow"
+        conn.close()
+
+    def test_a_request_without_a_key_does_not_ride_the_one_before(self, relay):
+        port, _queue = relay
+        conn = self._connection(port)
+        assert self._ask(conn, "GET", "/pending", token="devicetoken")[0] == 200
+        status, _ = self._ask(conn, "GET", "/pending")
+        assert status in (401, 403), \
+            "a keyless request was let in on the previous request's key (%s)" % status
+        conn.close()
+class TestTheTravelAddressSurvivesARestart:
+    """With the iPhone off, a watch can reach its computer only over the
+    internet (Apple, TN3135): the travel address, or iCloud. Every relay
+    restart used to kill cloudflared and open a new random address, which a
+    phone-less watch has no way to learn — so a daily helper update was
+    enough to strand it. The running tunnel is now adopted instead."""
+
+    URL = "https://calm-river-words.trycloudflare.com"
+
+    @pytest.fixture(autouse=True)
+    def _state(self, tmp_path, monkeypatch):
+        self.state = tmp_path / "tunnel.json"
+        monkeypatch.setattr(watch_relay, "TUNNEL_STATE", str(self.state))
+        monkeypatch.setattr(watch_relay, "TUNNEL_URL", None)
+        watch_relay.clear_condition("tunnel")
+
+    def _remember(self, pid=4242, port=8978, url=URL):
+        self.state.write_text(json.dumps({"pid": pid, "url": url, "port": port}))
+
+    def _process(self, monkeypatch, alive=True, command=None):
+        import subprocess as sp
+        monkeypatch.setattr(watch_relay, "_pid_alive", lambda pid: alive)
+        command = command or ("/opt/homebrew/bin/cloudflared tunnel --no-autoupdate "
+                              "--url http://127.0.0.1:8978")
+        monkeypatch.setattr(watch_relay.subprocess, "run",
+                            lambda cmd, **k: sp.CompletedProcess(cmd, 0, command + "\n", ""))
+
+    def test_a_live_tunnel_for_this_port_is_adoptable(self, monkeypatch):
+        self._remember()
+        self._process(monkeypatch)
+        assert watch_relay._adoptable_tunnel(8978) == {
+            "pid": 4242, "url": self.URL, "port": 8978}
+
+    @pytest.mark.parametrize("why", ["dead", "other-port", "not-cloudflared",
+                                     "no-file", "corrupt", "wrong-port-in-file"])
+    def test_anything_doubtful_is_not_adopted(self, monkeypatch, why):
+        self._remember(port=9999 if why == "wrong-port-in-file" else 8978)
+        if why == "no-file":
+            self.state.unlink()
+        if why == "corrupt":
+            self.state.write_text("{not json")
+        self._process(monkeypatch, alive=why != "dead", command={
+            "other-port": "cloudflared tunnel --url http://127.0.0.1:9999",
+            "not-cloudflared": "python3 -m http.server 8978",
+        }.get(why))
+        assert watch_relay._adoptable_tunnel(8978) is None
+
+    def test_a_restart_keeps_the_address(self, monkeypatch):
+        self._remember()
+        monkeypatch.setattr(watch_relay, "_cloudflared", lambda: "/usr/bin/true")
+        monkeypatch.setattr(watch_relay, "_adoptable_tunnel",
+                            lambda port: {"pid": 4242, "url": self.URL, "port": port})
+        monkeypatch.setattr(watch_relay, "_tunnel_answers", lambda url, token: True)
+        reaped = []
+        monkeypatch.setattr(watch_relay, "_reap_stale_tunnels",
+                            lambda port, keep=None: reaped.append(keep))
+
+        def no_new_tunnel(*a, **k):
+            raise AssertionError("an answering tunnel must be adopted, not replaced")
+        monkeypatch.setattr(watch_relay.subprocess, "Popen", no_new_tunnel)
+        handle = watch_relay.start_tunnel(8978, "tok")
+        assert handle is not None and handle.pid == 4242
+        assert watch_relay.TUNNEL_URL == self.URL + "/t/tok"
+        assert reaped == [4242], "orphans go, the adopted one stays"
+
+    def test_a_tunnel_that_does_not_answer_is_replaced_and_remembered(self, monkeypatch):
+        import io
+        import time as _time
+        monkeypatch.setattr(watch_relay, "_cloudflared", lambda: "/usr/bin/true")
+        monkeypatch.setattr(watch_relay, "_adoptable_tunnel",
+                            lambda port: {"pid": 4242, "url": self.URL, "port": port})
+        monkeypatch.setattr(watch_relay, "_tunnel_answers", lambda url, token: False)
+        reaped = []
+        monkeypatch.setattr(watch_relay, "_reap_stale_tunnels",
+                            lambda port, keep=None: reaped.append(keep))
+        fresh = "https://new-words-here.trycloudflare.com"
+
+        class Proc:
+            pid = 5151
+            stderr = io.StringIO("INF starting\nINF |  %s  |\n" % fresh)
+        monkeypatch.setattr(watch_relay.subprocess, "Popen", lambda *a, **k: Proc())
+        handle = watch_relay.start_tunnel(8978, "tok")
+        assert handle.pid == 5151
+        for _ in range(200):
+            if watch_relay.TUNNEL_URL:
+                break
+            _time.sleep(0.01)
+        assert watch_relay.TUNNEL_URL == fresh + "/t/tok"
+        assert reaped == [None], "nothing is kept when nothing is adopted"
+        saved = json.loads(self.state.read_text())
+        assert saved == {"pid": 5151, "url": fresh, "port": 8978}
+        assert oct(os.stat(self.state).st_mode & 0o777) == "0o600"
+
+    @pytest.mark.parametrize("status,ctype,expected", [
+        (401, "application/json", True),     # our listener, no key: alive
+        (200, "application/json", True),
+        (502, "text/html", False),           # cloudflare: nothing behind it
+        (530, "text/html", False),           # cloudflare: tunnel gone
+    ])
+    def test_answering_means_this_relay_answered(self, monkeypatch, status, ctype, expected):
+        import urllib.error
+
+        class Reply:
+            def __init__(self):
+                self.status = status
+                self.headers = {"Content-Type": ctype}
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def opener(request, timeout=None):
+            assert request.full_url == self.URL + "/t/tok/health"
+            if status >= 400:
+                raise urllib.error.HTTPError(request.full_url, status, "x",
+                                             {"Content-Type": ctype}, None)
+            return Reply()
+        monkeypatch.setattr(watch_relay.urllib.request, "urlopen", opener)
+        assert watch_relay._tunnel_answers(self.URL, "tok") is expected
+
+    def test_an_unreachable_tunnel_does_not_answer(self, monkeypatch):
+        def opener(request, timeout=None):
+            raise OSError("no route")
+        monkeypatch.setattr(watch_relay.urllib.request, "urlopen", opener)
+        assert watch_relay._tunnel_answers(self.URL, "tok") is False
+
+    def test_nothing_reaches_stdout(self, monkeypatch, capsys):
+        self._remember()
+        self._process(monkeypatch)
+        watch_relay._adoptable_tunnel(8978)
+        assert capsys.readouterr().out == ""
+
+
 class TestSessionNames:
     """Claude Code's folder names are lossy — familia-gateway and
     familia/gateway both become "-Users-...-familia-gateway". The transcript

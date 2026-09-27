@@ -21,13 +21,16 @@ else
   echo "(~/.tapproval not found — nothing registered to remove)"
 fi
 pkill -f "watch_relay.py" 2>/dev/null || true
+# The travel tunnel outlives a relay on purpose, so a restart keeps its
+# address; an uninstall must stop it, or a public URL would outlive Tapproval.
+pkill -f "cloudflared tunnel.*127.0.0.1:8978" 2>/dev/null || true
 rm -rf "$HOME/.tapproval"
 # Everything else the relay writes beside its directory. Left behind, the
 # pairing outlived the install it belonged to — a "clean exit" that kept
 # the key to the door.
 rm -f "$HOME/.tapproval-token" "$HOME/.tapproval-auth.json" \
       "$HOME/.tapproval-relay.log" "$HOME/.tapproval-say.log" "$HOME/.tapproval-last-update" \
-      "$HOME/.tapproval-relay.pid"
+      "$HOME/.tapproval-relay.pid" "$HOME/.tapproval-tunnel.json"
 
 echo ""
 echo "TAPPROVAL_BASE_REMOVED"

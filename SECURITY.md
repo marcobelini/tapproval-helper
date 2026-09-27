@@ -32,6 +32,12 @@ and a fix.
   redacted) and stays on your computer.
 - **Cards travel through your own private iCloud or an encrypted tunnel**
   when you are away from home, in transit only.
+- **On the iCloud route, your Apple ID is the key.** With the optional Mac
+  bridge, the watch learns its first key from your private iCloud, and
+  answers can travel back the same way. Anyone who controls your Apple ID
+  could therefore answer a prompt. Protect it with two-factor
+  authentication. A second key stored beside the first would add nothing,
+  and a key kept anywhere else would end automatic pairing.
 
 ## Design rules we will not trade away
 

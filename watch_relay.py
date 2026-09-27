@@ -52,6 +52,8 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 import uuid
 from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -2097,6 +2099,33 @@ class RelayHandler(BaseHTTPRequestHandler):
     auth = None             # the Auth object: device tokens and pairing
     protocol_version = "HTTP/1.1"
 
+    # What one request proved about itself. HTTP/1.1 keeps a connection
+    # open and this handler object answers every request on it, so these
+    # must be forgotten before each one: kept, the body of a poll was read
+    # as the body of the answer after it (400, and the unread answer then
+    # corrupted the next request), and a request with no key rode the key
+    # the one before it proved — on the travel address, where Cloudflare
+    # pools connections across callers, a way in (2026-09-27).
+    _PER_REQUEST = ("_body_bytes", "_presented_key", "_signed_nonce")
+
+    def parse_request(self):
+        for name in self._PER_REQUEST:
+            self.__dict__.pop(name, None)
+        if not super().parse_request():
+            return False
+        # Read the body now, whatever the route: a request answered without
+        # reading its body leaves it in the connection, where it becomes the
+        # start of the next request. One too large to read ends the
+        # connection instead.
+        self._raw_body()
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length > MAX_BODY or self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+        return True
+
     def _host_ok(self):
         """Reject a request whose Host header does not name this machine —
         the defence against DNS rebinding. Only the main listener needs it:
@@ -3091,19 +3120,112 @@ def _token_matches(given, expected):
 TUNNEL_URL = None
 
 
-def _reap_stale_tunnels(port):
-    """Kill cloudflared processes left over from earlier relay runs.
+# The running tunnel, remembered so the next relay can adopt it: with the
+# iPhone off, a watch reaches its computer only over the internet (Apple,
+# TN3135), so the travel address is the one route it has — and a new random
+# address at every relay restart stranded it until it next met the Mac.
+TUNNEL_STATE = (os.environ.get("TAPPROVAL_TUNNEL_STATE")
+                or os.path.expanduser("~/.tapproval-tunnel.json"))
 
-    cloudflared is spawned as our child but survives a killed relay; each
-    orphan holds a public URL forwarding to whoever owns the port now.
-    Anything targeting our tunnel port is ours by definition. Never raises.
+
+def _tunnel_pids(port):
+    """Every cloudflared process that forwards to our tunnel port."""
+    try:
+        found = subprocess.run(["pgrep", "-f", "cloudflared tunnel.*127.0.0.1:%d" % port],
+                               capture_output=True, text=True, timeout=5)
+        return [int(pid) for pid in found.stdout.split() if pid.isdigit()]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
+
+def _reap_stale_tunnels(port, keep=None):
+    """Kill cloudflared processes left over from earlier relay runs, except
+    the one being adopted.
+
+    cloudflared outlives the relay on purpose (so the next one can adopt
+    it); every OTHER one forwarding to our port is an orphan holding a
+    public URL, and goes. Anything targeting our tunnel port is ours by
+    definition. Never raises.
+    """
+    for pid in _tunnel_pids(port):
+        if pid == keep:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _remember_tunnel(pid, url, port):
+    """Write the running tunnel down (0600), for the next relay. Never raises."""
+    try:
+        fd = os.open(TUNNEL_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"pid": int(pid), "url": url, "port": int(port)}, handle)
+        os.chmod(TUNNEL_STATE, 0o600)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _adoptable_tunnel(port):
+    """The remembered tunnel, if it is alive and still ours; else None.
+
+    Ours means: the pid is alive and its command line is cloudflared
+    forwarding to this port — a recycled pid belongs to something else.
+    Whether it still reaches this relay is `_tunnel_answers`' question.
     """
     try:
-        subprocess.run(["pkill", "-f",
-                        "cloudflared tunnel.*127.0.0.1:%d" % port],
-                       capture_output=True, timeout=5)
+        with open(TUNNEL_STATE, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        pid, url, saved_port = int(saved["pid"]), str(saved["url"]), int(saved["port"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if saved_port != port or not url.startswith("https://") or not _pid_alive(pid):
+        return None
+    try:
+        command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
-        pass
+        return None
+    if "cloudflared" not in command or "127.0.0.1:%d" % port not in command:
+        return None
+    return {"pid": pid, "url": url, "port": port}
+
+
+def _tunnel_answers(url, token):
+    """True when a request through the public URL reaches THIS relay.
+
+    Our tunnel listener answers any request under its secret path in JSON
+    — 401 without a key is still an answer. Cloudflare answers a tunnel
+    with nothing behind it (or no tunnel at all) in HTML: 502, 530. Never
+    raises.
+    """
+    request = urllib.request.Request("%s/t/%s/health" % (url, token),
+                                     headers={"User-Agent": "Tapproval-helper"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as reply:
+            status, ctype = reply.status, reply.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as error:
+        status = error.code
+        ctype = (error.headers or {}).get("Content-Type", "") if error.headers else ""
+    except Exception:
+        return False
+    return status in (200, 401, 403) and "json" in (ctype or "")
+
+
+class _AdoptedTunnel:
+    """A cloudflared this relay did not start: known by its pid alone."""
+
+    def __init__(self, pid):
+        self.pid = pid
 
 
 # launchd hands a process a bare PATH — no /opt/homebrew/bin, no
@@ -3136,6 +3258,7 @@ def start_tunnel(port, token):
     The process is registered for cleanup at exit so a relay restart never
     leaves an orphan tunnel running.
     """
+    global TUNNEL_URL
     binary = _cloudflared()
     if not binary:
         note_condition(
@@ -3143,6 +3266,16 @@ def start_tunnel(port, token):
             "Answering from away is off: cloudflared is not installed on "
             "this computer. Install it with: brew install cloudflared")
         return None
+    adopted = _adoptable_tunnel(port)
+    if adopted and _tunnel_answers(adopted["url"], token):
+        TUNNEL_URL = "%s/t/%s" % (adopted["url"], token)
+        clear_condition("tunnel")
+        _reap_stale_tunnels(port, keep=adopted["pid"])
+        print("relay: tunnel adopted %s — the travel address is unchanged"
+              % adopted["url"], file=sys.stderr)
+        return _AdoptedTunnel(adopted["pid"])
+    reason = ("the last one no longer answered" if adopted
+              else "none to adopt")
     _reap_stale_tunnels(port)
     proc = subprocess.Popen(
         [binary, "tunnel", "--no-autoupdate",
@@ -3154,7 +3287,12 @@ def start_tunnel(port, token):
         for line in proc.stderr:
             match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
             if match:
+                # Remembered before announced: whoever reads the address
+                # next (the next relay, a test) finds it already written.
+                _remember_tunnel(proc.pid, match.group(0), port)
                 TUNNEL_URL = "%s/t/%s" % (match.group(0), token)
+                print("relay: tunnel new %s (%s)" % (match.group(0), reason),
+                      file=sys.stderr)
                 clear_condition("tunnel")
                 print("relay: off-Wi-Fi tunnel up — the watch learns this "
                       "address automatically while on the same Wi-Fi.\n"
@@ -3492,7 +3630,9 @@ def main(argv=None):
         return _port_taken(args.port)
     print("relay: listening on http://%s:%d" % (args.host, args.port),
           file=sys.stderr)
-    tunnel_proc = _start_tunnel(queue, auth) if args.tunnel else None
+    if args.tunnel:
+        # Not kept: the tunnel outlives this relay on purpose (see the finally).
+        _start_tunnel(queue, auth)
     advertiser = None
     if not args.no_bonjour:
         advertiser = _Advertiser(args.port)
@@ -3521,8 +3661,10 @@ def main(argv=None):
     finally:
         if advertiser is not None:
             advertiser.terminate()
-        if tunnel_proc is not None:
-            tunnel_proc.terminate()
+        # The tunnel is left running on purpose: the next relay adopts it,
+        # so the travel address — the one route a watch without its iPhone
+        # has — survives restarts and updates. start_tunnel() reaps it if
+        # it no longer answers; uninstall.sh stops it for good.
         server.server_close()
         try:
             os.remove(PID_FILE)
