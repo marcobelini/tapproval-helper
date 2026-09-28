@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tapproval security: what it can see, and what was fixed</title>
+<meta name="description" content="What Tapproval can see and where it goes, the rules it will not trade away, what it does not protect against, and every security fix, disclosed.">
+<link rel="canonical" href="https://tapproval.thoughtfulsteward.org/security.html">
+<meta property="og:site_name" content="Tapproval">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Tapproval security — what it can see, and what was fixed">
+<meta property="og:description" content="The threat model in plain words, what it leaves out, and every security fix with what was wrong and who could have used it.">
+<meta property="og:url" content="https://tapproval.thoughtfulsteward.org/security.html">
+<meta property="og:image" content="https://tapproval.thoughtfulsteward.org/img/share.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="img/icon.png">
+<link rel="stylesheet" href="style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "TechArticle", "headline": "Tapproval security — what it can see, and what was fixed", "description": "The threat model in plain words, what it leaves out, and every security fix with what was wrong and who could have used it.", "datePublished": "2026-09-28", "dateModified": "2026-09-28", "author": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "publisher": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "mainEntityOfPage": "https://tapproval.thoughtfulsteward.org/security.html"}</script>
+</head>
+<body>
+<div class="wrap">
+<header class="top"><a href="./" style="display:flex;align-items:center;gap:12px;color:inherit"><img src="img/icon.png" alt=""><strong>Tapproval</strong></a>
+  <nav><a href="./">Home</a><a href="apple-watch-claude-code.html">Setup guide</a><a href="changelog.html">Changelog</a><a href="https://github.com/marcobelini/tapproval-helper">Source</a></nav></header>
+<main class="policy">
+<h1>Security: what Tapproval can see, and what was fixed</h1>
+<p><em>Tapproval answers permission prompts, so a bug in it is a bug in somebody's permission boundary. This page says what it can see, what it promises, what it does not protect against, and every security fix so far. The computer half is open source, so each claim here can be checked in <a href="https://github.com/marcobelini/tapproval-helper">the code</a>.</em></p>
+
+<h2>What Tapproval can see, and where it goes</h2>
+<p>A small helper on your computer, Tapproval Base, sees what Claude Code asks permission for: the command, or the file and what would be written to it. For the session list it also reads Claude Code's transcripts on that computer. It sends a short card to your watch and prints your answer back to Claude Code. There is no server of ours, no account and no telemetry. Cards take one of three routes:</p>
+<ul>
+<li><strong>Your own network.</strong> Watch and computer talk directly.</li>
+<li><strong>Your own iCloud, if you install the Mac bridge.</strong> Cards pass through CloudKit's private database, which belongs to your Apple ID. We cannot read it.</li>
+<li><strong>An encrypted tunnel, if you turn on the travel connection.</strong> Traffic passes through Cloudflare and is not stored there. The address is secret, but it is only an address: every request must still prove a device key.</li>
+</ul>
+<p>The <a href="privacy.html">privacy policy</a> has the same routes, with what each part stores.</p>
+
+<h2>The rules it will not trade away</h2>
+<ul>
+<li><strong>It approves nothing on its own by default.</strong> Allowing the harmless tiers automatically is something you switch on. A CRITICAL call is never auto-allowed, whatever the setting.</li>
+<li><strong>It fails closed.</strong> Anything it cannot parse, reach or judge ends with the ordinary prompt in your terminal, exactly as if Tapproval were not installed.</li>
+<li><strong>Only a process on your own computer is let in without a key</strong>, and even that process can post a card but never answer one, so a command Claude runs cannot approve its own prompt. Being on the same Wi-Fi counts for nothing: on a café network, that is a room full of strangers.</li>
+<li><strong>A watch never sends its key.</strong> It signs each request. Each signature can be used once. The helper proves itself in its answer, and the watch keeps an address only from an answer carrying that proof.</li>
+<li><strong>Standard-library Python only.</strong> The helper installs no third-party packages, so there is no dependency tree to trust.</li>
+</ul>
+
+<h2>What it does not protect against</h2>
+<ul>
+<li><strong>A compromised computer.</strong> A process running as you can talk to the helper. Letting local processes in is what lets Claude Code hand it a prompt in the first place.</li>
+<li><strong>Your Apple ID, on the iCloud route.</strong> With the Mac bridge, the watch learns its first key from your private iCloud. Anyone who controls your Apple ID could answer a prompt, so protect it with two-factor authentication.</li>
+<li><strong>What the audit log holds.</strong> The helper logs command text on your computer, with credential-shaped fragments removed. It never leaves the machine, but it is there.</li>
+</ul>
+
+<h2>Fixes, disclosed</h2>
+<p>Newest first. Each entry says what was wrong, when, who could have used it, and the fix. Starting Claude Code once updates the helper.</p>
+
+<h3>1.1.27, 27 September 2026: a request could borrow the key of the one before it</h3>
+<p><strong>What was wrong.</strong> Several requests can share one network connection. The helper kept what it had learned about a request, including whether its key had been proved, on the connection instead of on the request. A request without a key, sent on a connection just after a request that did prove a key, was treated as proved.</p>
+<p><strong>Since when.</strong> From 1.1.21 (25 September 2026), when signed requests arrived, until 1.1.27.</p>
+<p><strong>Who could have used it.</strong> Only someone who knew your secret travel address. Cloudflare's tunnel shares connections between callers, so such a person's request could land on a connection your watch had just used, and read sessions or answer a prompt. Without the travel connection turned on, there was no way in.</p>
+<p><strong>The fix.</strong> Every request now starts from nothing and proves its own key. A test sends a keyless request after a signed one on the same connection and expects a refusal. <a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.27">Release notes</a>.</p>
+
+<h3>1.1.21, 25 September 2026: the key stopped crossing the network</h3>
+<p><strong>What was wrong.</strong> Before this, a watch proved itself by sending its key with each request, and it trusted any helper that answered on the right address.</p>
+<p><strong>Who could have used it.</strong> Someone able to read the traffic, or to answer in the helper's place on your network, could have learned the key.</p>
+<p><strong>The fix.</strong> Requests are signed and good once, and the helper proves itself in every answer. A Mac with the iCloud bridge never offers a key on the network. The network pairing door hands out a revocable device key rather than the main one. The old way was accepted for one release, for watches that predate it. <a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.21">Release notes</a>.</p>
+
+<h3>Before the first public release, August–September 2026</h3>
+<ul>
+<li><strong>The Wi-Fi was a credential.</strong> Anyone on the same network could read transcripts, answer a prompt, or type into a live session. Every caller except a local process now presents a device key.</li>
+<li><strong>The travel address was the key.</strong> The tunnel's secret path and the device key became separate secrets, so seeing the address grants nothing.</li>
+<li><strong>Pairing was reachable through the tunnel.</strong> On that route the caller looked local. The pairing door is now closed there.</li>
+<li><strong>A local command could answer its own prompt.</strong> Local processes may still post cards, but answering one now needs a device key.</li>
+</ul>
+
+<h2>Reporting a problem</h2>
+<p>Open a <a href="https://github.com/marcobelini/tapproval-helper/security/advisories/new">private security advisory</a>, or write to <a href="mailto:tapproval@thoughtfulsteward.org">tapproval@thoughtfulsteward.org</a>. You will hear back within a few days. There is no bounty, only credit if you want it, and a fix. What counts, and what is accepted, is in <a href="https://github.com/marcobelini/tapproval-helper/blob/main/SECURITY.md">SECURITY.md</a>.</p>
+<p style="margin-top:28px"><a class="cta" href="changelog.html">Every release, in order</a></p>
+</main>
+<footer>
+  <p>Tapproval is an independent app and is not affiliated with, endorsed by or sponsored by Anthropic. Claude and Claude Code are trademarks of Anthropic, PBC. Apple Watch and App Store are trademarks of Apple Inc.</p>
+  <p>© 2026 Tapproval · <a href="./">Home</a> · <a href="security.html">Security</a> · <a href="privacy.html">Privacy policy</a> · <a href="mailto:tapproval@thoughtfulsteward.org">tapproval@thoughtfulsteward.org</a></p>
+</footer>
+</div>
+</body>
+</html>

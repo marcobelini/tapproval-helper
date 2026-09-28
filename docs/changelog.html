@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tapproval changelog: every helper release</title>
+<meta name="description" content="Every release of Tapproval Base, the open-source helper that puts Claude Code's permission prompts on an Apple Watch, newest first.">
+<link rel="canonical" href="https://tapproval.thoughtfulsteward.org/changelog.html">
+<meta property="og:site_name" content="Tapproval">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Tapproval changelog — every helper release">
+<meta property="og:description" content="What changed in each release of the open-source helper, newest first.">
+<meta property="og:url" content="https://tapproval.thoughtfulsteward.org/changelog.html">
+<meta property="og:image" content="https://tapproval.thoughtfulsteward.org/img/share.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="img/icon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header class="top"><a href="./" style="display:flex;align-items:center;gap:12px;color:inherit"><img src="img/icon.png" alt=""><strong>Tapproval</strong></a>
+  <nav><a href="./">Home</a><a href="apple-watch-claude-code.html">Setup guide</a><a href="security.html">Security</a><a href="https://github.com/marcobelini/tapproval-helper">Source</a></nav></header>
+<main class="policy">
+<h1>Changelog</h1>
+<p><em>Every release of Tapproval Base, the helper on your computer, newest first. Starting Claude Code once updates it. Generated from <a href="https://github.com/marcobelini/tapproval-helper/releases">the releases on GitHub</a>, which may already hold a newer one. Security fixes are also explained on <a href="security.html">the security page</a>.</em></p>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.27">Tapproval Base 1.1.27</a></h2>
+<p><em>2026-09-27</em></p>
+<p><strong>Tapproval Base</strong> is the computer half of Tapproval: it puts Claude Code's permission prompts on your Apple Watch, each marked with its risk, and one tap answers. Nothing is approved for you unless you ask it to be, and a CRITICAL never is.</p>
+<p>Already installed? Starting Claude Code once updates it. <strong>Please update: this release fixes a security issue.</strong></p>
+<h3>Since 1.1.25</h3>
+<ul>
+<li><strong>Security: every request now proves its own key.</strong> Several requests on one connection were answered with state the first one left behind. A request without a key could ride the key the request before it had proved. On the travel address, Cloudflare shares connections between callers, so that was a way in without a key. It came in with signed requests in 1.1.21, and this release fixes it.</li>
+<li><strong>Answers from the wrist register again.</strong> The same flaw made an answer that followed a check for new cards read that check's empty body. It was refused, and the answer was lost.</li>
+<li><strong>Works with your iPhone off.</strong> Without its iPhone, a watch can reach your computer only over the internet. The travel address now stays the same across helper updates and restarts, and only a restart of the Mac itself changes it. A matching watch update (TestFlight build 141 and later) tries every route at once.</li>
+<li><strong>Uninstall stops the travel tunnel too</strong>, now that it outlives the helper on purpose.</li>
+</ul>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.25">Tapproval Base 1.1.25</a></h2>
+<p><em>2026-09-26</em></p>
+<p><strong>Tapproval Base</strong> is the computer half of Tapproval: it puts Claude Code's permission prompts on your Apple Watch, each marked with its risk, and one tap answers. Nothing is approved for you unless you ask it to be, and a CRITICAL never is.</p>
+<p>Already installed? Starting Claude Code once updates it.</p>
+<h3>Since 1.1.24</h3>
+<ul>
+<li><strong>A session started from the wrist answers briefly.</strong> It uses Claude Code's own Concise style from its first reply, just as a message sent into a session already did. If you later sit down at it, <code>/output-style</code> changes that.</li>
+<li><strong>Groundwork for notifications on a closed watch.</strong> Each card now carries what a notification for it may offer: Allow first only for SAFE and LOW, Deny first for MEDIUM, Deny only for HIGH and CRITICAL, and open only for questions. The watch app that uses this is in testing.</li>
+<li><strong>The site says only what is true today.</strong> The iCloud route needs an extra program on the Mac that is not part of the standard install yet, so it is no longer promised to everyone.</li>
+</ul>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.24">Tapproval Base 1.1.24</a></h2>
+<p><em>2026-09-25</em></p>
+<p><strong>Tapproval Base</strong> is the computer half of Tapproval: it puts Claude Code's permission prompts on your Apple Watch, each marked with its risk, and one tap answers. Nothing is approved for you unless you ask it to be, and a CRITICAL never is.</p>
+<p>Already installed? Starting Claude Code once updates it.</p>
+<h3>Since 1.1.23</h3>
+<ul>
+<li><strong>Nothing changes on the wrist.</strong> Reading Claude Code's transcript now goes through one JSON reader per line and one Markdown pass for every text the watch shows, instead of several near-copies. Behaviour is the same, and tests hold it.</li>
+<li><strong>The website has three new pages:</strong> a <a href="https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html">setup guide</a>, <a href="https://tapproval.thoughtfulsteward.org/claude-code-permission-hook.html">how the PermissionRequest hook works</a> (including the string decision that is silently ignored), and an <a href="https://tapproval.thoughtfulsteward.org/compare.html">honest comparison</a> with Remote Control, Happy, Omnara and claude-watch.</li>
+</ul>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.23">Tapproval Base 1.1.23</a></h2>
+<p><em>2026-09-25</em></p>
+<p><strong>Tapproval Base</strong> is the computer half of Tapproval: it puts Claude Code's permission prompts on your Apple Watch, each marked with its risk, and one tap answers. Nothing is approved for you unless you ask it to be, and a CRITICAL never is.</p>
+<p>Already installed? Starting Claude Code once updates it.</p>
+<h3>Since 1.1.22</h3>
+<ul>
+<li><strong>A plan waiting for approval reaches the wrist as a plan.</strong> When Claude asks to leave plan mode, the watch gets the plan's title and the phone's answers: <strong>Approve</strong>, <strong>Approve &amp; auto mode</strong> (which also moves the session to auto mode, as the phone's button does), and <strong>Keep planning</strong>. A watch app from TestFlight build 139 on also shows the whole plan and takes dictated edits; earlier builds show the three answers.</li>
+</ul>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.22">Tapproval Base 1.1.22</a></h2>
+<p><em>2026-09-25</em></p>
+<p><strong>Tapproval Base</strong> is the computer half of Tapproval: it puts Claude Code's permission prompts on your Apple Watch, each marked with its risk, and one tap answers. Nothing is approved for you unless you ask it to be, and a CRITICAL never is.</p>
+<p>Already installed? Starting Claude Code once updates it.</p>
+<h3>Since 1.1.21</h3>
+<ul>
+<li><strong>Lighter on your Mac while the watch is open.</strong> Usage figures follow each transcript instead of re-reading it (a warm /usage: 1.3 s → 0.02 s), and the session list no longer re-reads the start of every active session on each poll.</li>
+<li>A helper crash while answering a request is named as such in the report.</li>
+<li>Housekeeping: code the review proved unused is gone; no change in behaviour.</li>
+</ul>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.21">Tapproval Base 1.1.21</a></h2>
+<p><em>2026-09-25</em></p>
+<p><strong>Tapproval Base</strong> is the computer half of Tapproval: it puts Claude Code's permission prompts on your Apple Watch, each marked with its risk, and one tap answers. Nothing is approved for you unless you ask it to be, and a CRITICAL never is.</p>
+<p>Already installed? Starting Claude Code once updates it. New: tell Claude Code <code>Install the Tapproval plugin from marcobelini/tapproval-helper</code>, then get the free watch app: https://apps.apple.com/app/tapproval/id6805869018</p>
+<h3>Since 1.1.20 — a security release</h3>
+<ul>
+<li><strong>Your key no longer crosses the network.</strong> A watch signs each request instead of sending its key, each signature is good once, and the helper proves itself in its answer; the watch learns an address only from such an answer. The old way is still accepted for one release, for watches that predate it.</li>
+<li><strong>No pairing door where iCloud carries the key.</strong> A Mac with the iCloud bridge never offers a key on the network, the network door hands out a revocable device key rather than the main one, and a reset replaces the main key.</li>
+<li><strong>Commands that change things are no longer read as reads.</strong> <code>gh auth logout</code>, <code>fly apps create</code>, <code>swift package update</code>, <code>gcloud config set</code>; <code>awk system(…)</code>, <code>rg --pre</code>, <code>git diff --output</code>, <code>find -fprint</code>; and wrappers such as <code>sh -c "rm -rf /"</code>, <code>env rm -rf ~</code> or <code>( rm -rf ~ )</code> are now judged by what they do. A write to a path through <code>..</code> is judged where it lands.</li>
+<li><strong>Messages from the watch reach their session's permission prompts</strong> on plugin installs, a new session needs the watch's key even from this machine, and a crash in the helper's request handling is reported instead of lost.</li>
+<li><strong>Faster and lighter</strong>: a session's thread is read from the end of its transcript (one 227 MB transcript: 1.6 GB and 1.6 s → 45 MB and 0.02 s).</li>
+</ul>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.20">Tapproval Base 1.1.20</a></h2>
+<p><em>2026-09-24</em></p>
+<p><strong>Tapproval Base</strong> is the computer half of Tapproval: it puts Claude Code's permission prompts on your Apple Watch. When Claude stops to ask before doing something that needs your say-so, the question lands on your wrist, marked with its risk, and one tap answers it.</p>
+<p>Nothing is approved for you unless you ask it to be, and a CRITICAL never is. Answer on the wrist, or the usual terminal prompt appears exactly as it would without this installed.</p>
+<h3>Install</h3>
+<p>Tell Claude Code on your computer:</p>
+<pre><code>Install the Tapproval plugin from marcobelini/tapproval-helper
+</code></pre>
+<p>Already installed? Starting Claude Code once updates it.</p>
+<p>Then get the watch app, free: <strong>https://apps.apple.com/app/tapproval/id6805869018</strong> (outside the EU for now — the beta works everywhere: https://testflight.apple.com/join/dW1tYBQG).</p>
+<p>You need an Apple Watch and Claude Code on a Mac or Linux machine.</p>
+<h3>Since 1.1.16</h3>
+<ul>
+<li><strong>Sessions started from the watch reach the watch.</strong> A Terminal opened from inside a Claude Code session handed that session's markers to every window, and a session that thinks it is another's child saves no transcript — so New session started a session the phone could see and the watch never did. The helper now sheds those markers, and the window it opens unsets them too.</li>
+<li><strong>New session answers in under a second.</strong> The helper tried to script Terminal first and waited four seconds for a permission it cannot ask for; the watch gave up and said the computer did not answer, about a session that had started. It now opens the window the way that needs no permission, first.</li>
+<li><strong>An update reaches a busy helper.</strong> An outdated helper that answered slowly was left running beside its installed update; it is now asked again, patiently, and replaced.</li>
+<li><strong>What you said stays in the thread.</strong> Your latest message stays at the head of a session's thread on the watch, and Claude Code's own notes no longer pass as yours or hide what you wrote.</li>
+<li><strong>The watch knows which sessions are open on your computer</strong>, so it can say, where you type, that a message from the wrist runs beside that open session rather than inside it.</li>
+<li>An end-to-end check (<code>e2e_new_session.py</code>, in the product repository) now starts a real session the way the watch does before a change to how sessions start is published.</li>
+</ul>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.16">Tapproval Base 1.1.16</a></h2>
+<p><em>2026-09-23</em></p>
+<p><strong>Tapproval Base</strong> is the computer half of Tapproval: it puts Claude Code's permission prompts on your Apple Watch. When Claude stops to ask before doing something that needs your say-so, the question lands on your wrist, marked with its risk, and one tap answers it.</p>
+<p>Nothing is approved for you unless you ask it to be, and a CRITICAL never is. Answer on the wrist, or the usual terminal prompt appears exactly as it would without this installed.</p>
+<h3>Install</h3>
+<p>Tell Claude Code on your computer:</p>
+<pre><code>Install the Tapproval plugin from marcobelini/tapproval-helper
+</code></pre>
+<p>Then get the watch app, free: <strong>https://apps.apple.com/app/tapproval/id6805869018</strong> (outside the EU for now — the beta works everywhere: https://testflight.apple.com/join/dW1tYBQG).</p>
+<p>You need an Apple Watch and Claude Code on a Mac or Linux machine.</p>
+<h3>What it is</h3>
+<p>Python, standard library only: no dependencies to audit and none to install. No server, no account, no analytics. A tool that reads your sessions and carries your approvals should be one you can read, so all of it is here.</p>
+<p>Loopback is the only free pass: every other caller, on your Wi-Fi or not, must present a token issued to one device.</p>
+<h3>Since 1.1.4</h3>
+<ul>
+<li><strong>Sessions carry the names the Claude app gives them</strong>, and name the repository rather than a session's worktree. Starting a new session offers your real projects — no worktrees, no folders only scheduled runs use.</li>
+<li><strong>Messages from the watch work after a restart.</strong> Started at login with a bare search path, the helper could not find Claude Code; it now looks where the installers put it, and says so on the watch if Claude Code is truly missing.</li>
+<li><strong>A second copy of the helper no longer crashes.</strong> A slow start-up check could launch a second helper beside a busy first one; it now sees the port is taken and leaves it.</li>
+<li><strong>An update put off for a waiting card is tried again</strong> on every start, never while a card is waiting.</li>
+<li>The helper knows which code it runs however it was started, and the watch's Connection screen shows where that code is from.</li>
+</ul>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.4">Tapproval Base 1.1.4</a></h2>
+<p><em>2026-09-10</em></p>
+<p><strong>Tapproval Base</strong> is the computer half of Tapproval: it puts Claude Code's permission prompts on your Apple Watch. When Claude stops to ask before doing something that needs your say-so, the question lands on your wrist and one tap answers it.</p>
+<p>Nothing is ever approved automatically. You tap Allow or Deny, or the usual terminal prompt appears exactly as it would without this installed.</p>
+<h3>Install</h3>
+<p>Tell Claude Code on your Mac:</p>
+<pre><code>Install github.com/marcobelini/tapproval-helper
+</code></pre>
+<p>Then get the watch app: <strong>https://testflight.apple.com/join/dW1tYBQG</strong> — free while it is in beta.</p>
+<p>You need an Apple Watch and Claude Code on a Mac.</p>
+<h3>What it is</h3>
+<p>Five Python files, standard library only, no dependencies to audit and none to install. No server, no account, no analytics. A tool that reads your sessions and carries your approvals should be one you can read, so all of it is here.</p>
+<p>Loopback is the only free pass: every other caller, on your Wi-Fi or not, must present a token issued to one device.</p>
+<h3>In this version</h3>
+<ul>
+<li>A message sent from the watch can raise a permission card on the same wrist.</li>
+<li>The helper and the watch each report their own faults, on the wrist and on disk.</li>
+<li><code>/health</code> says which day the helper's code is from, so an out-of-date computer cannot go unnoticed.</li>
+</ul>
+<p>Full history: <a href="https://github.com/marcobelini/tapproval-helper/blob/main/CHANGELOG.md">CHANGELOG.md</a> · Website: https://tapproval.thoughtfulsteward.org</p>
+</main>
+<footer>
+  <p>Tapproval is an independent app and is not affiliated with, endorsed by or sponsored by Anthropic. Claude and Claude Code are trademarks of Anthropic, PBC. Apple Watch and App Store are trademarks of Apple Inc.</p>
+  <p>© 2026 Tapproval · <a href="./">Home</a> · <a href="security.html">Security</a> · <a href="privacy.html">Privacy policy</a> · <a href="mailto:tapproval@thoughtfulsteward.org">tapproval@thoughtfulsteward.org</a></p>
+</footer>
+</div>
+</body>
+</html>

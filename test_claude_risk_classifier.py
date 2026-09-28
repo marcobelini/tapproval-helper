@@ -7994,6 +7994,77 @@ class TestTheUpdateLeavesTheBlockingPath:
         assert ensured == [True]
 
 
+class TestTheSiteMapMatchesTheSite:
+    """The website is hand-written pages, and nothing else checks them. A
+    page missing from sitemap.xml is a page search engines are not told
+    about; an entry with no page is a 404 we submitted ourselves. The
+    security page is linked from every page because it is the one a
+    careful stranger looks for first."""
+
+    DOCS = os.path.join(HELPER_DIR, "docs")
+    SITE = "https://tapproval.thoughtfulsteward.org/"
+
+    def _pages(self):
+        return sorted(os.path.basename(p)
+                      for p in glob.glob(os.path.join(self.DOCS, "*.html")))
+
+    def _sitemap(self):
+        with open(os.path.join(self.DOCS, "sitemap.xml"),
+                  encoding="utf-8") as handle:
+            locs = re.findall(r"<loc>([^<]+)</loc>", handle.read())
+        return sorted("index.html" if loc == self.SITE
+                      else loc[len(self.SITE):] for loc in locs)
+
+    def test_every_page_is_in_the_sitemap_and_every_entry_is_a_page(self):
+        assert self._pages() == self._sitemap()
+
+    def test_every_page_links_the_security_page(self):
+        missing = []
+        for page in self._pages():
+            with open(os.path.join(self.DOCS, page), encoding="utf-8") as h:
+                if 'href="security.html"' not in h.read():
+                    missing.append(page)
+        assert missing == []
+
+
+class TestTheChangelogPageNeverGoesBlank:
+    """render-changelog.py fetches the releases with gh. When that fails —
+    offline, logged out, rate-limited — the page it already has must stay:
+    an empty changelog tells a stranger the project stopped."""
+
+    SCRIPT = os.path.join(_ROOT, "render-changelog.py")
+
+    def _run(self, tmp_path, gh_body):
+        if not os.path.exists(self.SCRIPT):
+            pytest.skip("render-changelog.py lives in the product repo only")
+        fake = tmp_path / "bin"
+        fake.mkdir()
+        gh = fake / "gh"
+        gh.write_text("#!/bin/sh\n" + gh_body)
+        gh.chmod(0o755)
+        root = tmp_path / "repo"
+        (root / "helper" / "docs").mkdir(parents=True)
+        shutil.copy(self.SCRIPT, root / "render-changelog.py")
+        page = root / "helper" / "docs" / "changelog.html"
+        page.write_text("the page we had")
+        env = dict(os.environ, PATH="%s:%s" % (fake, os.environ["PATH"]))
+        result = subprocess.run(
+            [sys.executable, str(root / "render-changelog.py")],
+            capture_output=True, text=True, env=env)
+        return result, page.read_text()
+
+    def test_a_failing_gh_leaves_the_page_and_says_so(self, tmp_path):
+        result, page = self._run(tmp_path, "echo 'HTTP 401' >&2; exit 1\n")
+        assert result.returncode == 0
+        assert page == "the page we had"
+        assert "NOT re-rendered" in result.stderr
+
+    def test_no_releases_leaves_the_page_and_says_so(self, tmp_path):
+        result, page = self._run(tmp_path, "echo '[]'\n")
+        assert page == "the page we had"
+        assert "NOT re-rendered" in result.stderr
+
+
 class TestNoPersonalIdentityInTrackedFiles:
     """CLAUDE.md rules 5 and 6 are a promise, and this is the check.
 
