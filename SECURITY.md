@@ -14,6 +14,15 @@ You will get an acknowledgement within a few days. This is a small project
 with one maintainer, so there is no bounty — only credit, if you want it,
 and a fix.
 
+## Disclosure
+
+A fix comes first, then the account of it. Once a fixed release is out,
+what was wrong, since when, who could have used it and the fix are written
+up on the [security page](https://tapproval.thoughtfulsteward.org/security.html)
+and in the release notes. If you reported it, we agree the date with you,
+and it is no later than 90 days after your report unless you ask for
+longer. A problem that is not yet fixed is not described in public.
+
 ## What counts
 
 - Anything that makes the classifier auto-allow a call it should escalate.

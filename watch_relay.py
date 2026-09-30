@@ -3314,6 +3314,63 @@ def start_tunnel(port, token):
     return proc
 
 
+# How often the relay looks at its own tunnel. start_tunnel() checked once,
+# at start; on 2026-09-30 the adopted cloudflared exited some time later and
+# the relay went on handing out a dead travel address — every row on the
+# watch's Connection screen red, in a car, and nothing said why.
+TUNNEL_CHECK_EVERY = 60                 # seconds: is the process alive?
+TUNNEL_PROBE_EVERY = 5                  # every 5th check, ask through Cloudflare
+TUNNEL_BACKOFF = (120, 300, 600)        # after failures, wait longer — no spin
+
+
+def _tunnel_alive(handle):
+    """Our own child by poll(); an adopted one only by its pid."""
+    if handle is None:
+        return False
+    poll = getattr(handle, "poll", None)
+    if poll is not None:
+        return poll() is None
+    return _pid_alive(handle.pid)
+
+
+def watch_tunnel(handle, port, token, sleep=time.sleep, checks=None):
+    """Keep the travel address alive for as long as the relay runs.
+
+    Every minute: is cloudflared still running? Every fifth minute: does
+    the public address still reach this relay? When either answer is no,
+    stop handing the dead address out, say so on the Connection screen,
+    and open a new tunnel — the bridge mirrors the new address through
+    iCloud, which is how a watch away from home learns it. `checks` bounds
+    the loop for tests; the relay passes None.
+    """
+    global TUNNEL_URL
+    failures = 0
+    done = 0
+    while checks is None or done < checks:
+        sleep(TUNNEL_CHECK_EVERY if not failures
+              else TUNNEL_BACKOFF[min(failures, len(TUNNEL_BACKOFF)) - 1])
+        done += 1
+        url = TUNNEL_URL
+        if _tunnel_alive(handle):
+            if not url or done % TUNNEL_PROBE_EVERY:
+                failures = 0            # alive, or still announcing itself
+                continue
+            if _tunnel_answers(url.split("/t/")[0], token):
+                failures = 0
+                continue
+            why = "no longer answers"
+        else:
+            why = "has exited"
+        failures += 1
+        TUNNEL_URL = None
+        note_condition(
+            "tunnel",
+            "Answering from away stopped. Reopening it — your watch learns "
+            "the new address through iCloud.")
+        print("relay: tunnel %s — reopening" % why, file=sys.stderr)
+        handle = start_tunnel(port, token)
+
+
 # --------------------------------------------------------------------------
 # Demo / manual injection
 # --------------------------------------------------------------------------
@@ -3413,7 +3470,11 @@ def _start_tunnel(queue, auth):
         return None
     _TUNNEL_HANDLER = tunnel_server.RequestHandlerClass
     threading.Thread(target=tunnel_server.serve_forever, daemon=True).start()
-    return start_tunnel(TUNNEL_PORT, auth.tunnel_secret)
+    handle = start_tunnel(TUNNEL_PORT, auth.tunnel_secret)
+    if handle is not None:
+        threading.Thread(target=watch_tunnel, daemon=True,
+                         args=(handle, TUNNEL_PORT, auth.tunnel_secret)).start()
+    return handle
 
 
 class _Advertiser:

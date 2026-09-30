@@ -1,0 +1,53 @@
+# Provenance for each release: an archive of the tagged source, a signed
+# statement from GitHub that this workflow built it from that commit, and
+# both attached to the release. It proves where a release came from, not
+# that the code in it is safe — the security page says so in those words.
+#
+# Verify a download with:
+#   gh attestation verify tapproval-helper-v1.1.27.tar.gz -R marcobelini/tapproval-helper
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attest, e.g. v1.1.27
+        required: true
+
+# Read-only unless a job says otherwise, as in tests.yml.
+permissions:
+  contents: read
+
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # upload the archive and its proof to the release
+      id-token: write      # sign the statement with this workflow's identity
+      attestations: write  # record it where `gh attestation verify` looks
+    env:
+      # Through env, never pasted into a script: a tag name is input.
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+      - name: Archive the tagged source
+        run: |
+          git archive --format=tar.gz --prefix="tapproval-helper-${TAG}/" \
+            -o "tapproval-helper-${TAG}.tar.gz" HEAD
+      - id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: tapproval-helper-${{ env.TAG }}.tar.gz
+      - name: Attach the archive and its proof to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE" "tapproval-helper-${TAG}.tar.gz.sigstore.json"
+          gh release upload "$TAG" --clobber \
+            "tapproval-helper-${TAG}.tar.gz" \
+            "tapproval-helper-${TAG}.tar.gz.sigstore.json"

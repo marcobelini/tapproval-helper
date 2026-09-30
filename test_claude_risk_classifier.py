@@ -2375,6 +2375,94 @@ class TestEachRequestOnAConnectionStandsAlone:
         assert status in (401, 403), \
             "a keyless request was let in on the previous request's key (%s)" % status
         conn.close()
+class TestTheAwayAddressIsWatched:
+    """2026-09-30, 08:51, in a car: every row on the Connection screen red.
+    The relay was up and still handing out its travel address, but the
+    cloudflared behind it had exited some time after the relay adopted it,
+    and nothing looked again — start_tunnel() checked once, at start. A
+    watch with no Wi-Fi had no way in, and no row said why. The relay now
+    watches its tunnel and reopens it."""
+
+    URL = "https://calm-river-words.trycloudflare.com"
+
+    @pytest.fixture(autouse=True)
+    def _state(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "TUNNEL_URL", self.URL + "/t/tok")
+        watch_relay.clear_condition("tunnel")
+        self.restarts = []
+        self.fresh = watch_relay._AdoptedTunnel(7777)
+
+        def restart(port, token):
+            self.restarts.append((port, token))
+            # What start_tunnel does on the way up: the condition waits for
+            # the new address to be announced, and is cleared then.
+            return self.fresh
+        monkeypatch.setattr(watch_relay, "start_tunnel", restart)
+        self.slept = []
+        yield
+        watch_relay.clear_condition("tunnel")
+
+    def _watch(self, handle, checks):
+        watch_relay.watch_tunnel(handle, 8978, "tok",
+                                 sleep=self.slept.append, checks=checks)
+
+    def _said(self):
+        return [c["detail"] for c in watch_relay.conditions() if c["key"] == "tunnel"]
+
+    def test_a_tunnel_that_exits_is_reopened_and_says_so(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "_pid_alive", lambda pid: pid == 7777)
+        self._watch(watch_relay._AdoptedTunnel(4242), checks=1)
+        assert self.restarts == [(8978, "tok")]
+        assert watch_relay.TUNNEL_URL is None, "a dead address is not handed out"
+        said = self._said()
+        assert said and "away" in said[0].lower() and "icloud" in said[0].lower(), said
+
+    def test_a_tunnel_that_stops_answering_is_reopened(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "_pid_alive", lambda pid: True)
+        asked = []
+        monkeypatch.setattr(watch_relay, "_tunnel_answers",
+                            lambda url, token: asked.append(url) or False)
+        self._watch(watch_relay._AdoptedTunnel(4242),
+                    checks=watch_relay.TUNNEL_PROBE_EVERY)
+        assert asked == [self.URL], "asked through the public address, once"
+        assert self.restarts == [(8978, "tok")]
+        assert self._said()
+
+    def test_a_healthy_tunnel_is_left_alone(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "_pid_alive", lambda pid: True)
+        monkeypatch.setattr(watch_relay, "_tunnel_answers", lambda url, token: True)
+        self._watch(watch_relay._AdoptedTunnel(4242),
+                    checks=3 * watch_relay.TUNNEL_PROBE_EVERY)
+        assert self.restarts == []
+        assert self._said() == []
+        assert watch_relay.TUNNEL_URL == self.URL + "/t/tok"
+        assert set(self.slept) == {watch_relay.TUNNEL_CHECK_EVERY}
+
+    def test_our_own_child_is_judged_by_poll(self, monkeypatch):
+        class Child:
+            pid = 5151
+
+            def poll(self):
+                return 1                      # exited
+        monkeypatch.setattr(watch_relay, "_pid_alive", lambda pid: True)
+        self._watch(Child(), checks=1)
+        assert self.restarts, "an exited child is dead even if its pid is reused"
+
+    def test_repeated_failures_back_off(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "_pid_alive", lambda pid: False)
+        self._watch(watch_relay._AdoptedTunnel(4242), checks=6)
+        assert len(self.restarts) == 6
+        assert self.slept[0] == watch_relay.TUNNEL_CHECK_EVERY
+        assert self.slept[1:] == sorted(self.slept[1:]), "waits only grow"
+        assert self.slept[-1] == watch_relay.TUNNEL_BACKOFF[-1]
+        assert max(self.slept) <= watch_relay.TUNNEL_BACKOFF[-1]
+
+    def test_the_relay_starts_the_watch(self):
+        import inspect
+        source = inspect.getsource(watch_relay._start_tunnel)
+        assert "watch_tunnel" in source, "start it where the tunnel starts"
+
+
 class TestTheTravelAddressSurvivesARestart:
     """With the iPhone off, a watch can reach its computer only over the
     internet (Apple, TN3135): the travel address, or iCloud. Every relay
@@ -5116,6 +5204,24 @@ HELPER_DIR = (os.path.join(_ROOT, "helper")
 def _helper_manifest(*parts):
     with open(os.path.join(HELPER_DIR, *parts), encoding="utf-8") as handle:
         return json.load(handle)
+
+
+class TestEveryPublicWorkflowIsPublished:
+    """sync-helper.sh copies workflows by name, one line each. A workflow
+    added under helper/.github/workflows without its line is tested here,
+    reviewed here, and never runs anywhere — the release attestation would
+    have been exactly that."""
+
+    def test_the_sync_copies_every_workflow_under_helper(self):
+        script = os.path.join(_ROOT, "sync-helper.sh")
+        if not os.path.exists(script):
+            pytest.skip("sync-helper.sh lives in the product repo only")
+        with open(script, encoding="utf-8") as handle:
+            text = handle.read()
+        folder = os.path.join(_ROOT, "helper", ".github", "workflows")
+        missing = [name for name in sorted(os.listdir(folder))
+                   if "helper/.github/workflows/%s" % name not in text]
+        assert missing == []
 
 
 class TestTheSyncScriptSaysWhatItDidAndDidNot:
@@ -8229,8 +8335,19 @@ class TestTheLocalFallbackRunsWhatCiRuns:
     def test_ruff_is_run_with_the_same_rules(self):
         workflow, local = self._files()
         def flags(text):
-            return re.search(r'ruff check ([^\n]+)', text).group(1).strip()
+            found = re.search(r'ruff(?:==|@)([\d.]+) check ([^\n]+)', text)
+            assert found, "ruff must be pinned to a version"
+            return found.group(1), found.group(2).strip()
         assert flags(local) == flags(workflow)
+
+    def test_pytest_is_pinned_to_the_same_version(self):
+        """Pinned, because an unpinned tool can turn main red with no code
+        change — and pinned alike, because the local fallback exists to
+        say what CI would say."""
+        workflow, local = self._files()
+        def version(text):
+            return re.findall(r'pytest==([\d.]+)', text)
+        assert version(workflow) and set(version(workflow)) == set(version(local))
 
     @pytest.mark.parametrize("fragment", [
         "-destination 'generic/platform=watchOS'",      # the device compile
@@ -8321,6 +8438,50 @@ class TestCiCanBeMovedToThisMacAndBack:
         mini = switch.split("\n  mini)", 1)[1].split(";;", 1)[0]
         assert "runner_state" in mini, (
             "switching to a runner nobody registered queues every job forever")
+
+
+class TestTheDocumentsDoNotRestateTheReviewState:
+    """APP_STORE.md → "What is still outstanding" is the one place that
+    says which version is live and which is in review. On 2026-09-28 four
+    documents said so, and three were stale: CLAUDE.md, read first by every
+    session, still had 1.3 under review two days after it went live, and
+    ROADMAP's "Now" named a helper seven releases old. The same rule as the
+    build number: history may say what happened; only one file says what
+    is. CHANGELOG.md is history by definition, and a struck-through roadmap
+    row (~~) is a record, not a claim."""
+
+    OWNER = {"APP_STORE.md", "CHANGELOG.md"}
+    STATES = re.compile(
+        r"\b1\.\d+\b[^\n.]{0,40}\b(is live|is in (?:App )?review"
+        r"|is `?WAITING_FOR_REVIEW|is on the App Store)", re.I)
+
+    def test_only_app_store_md_says_what_is_live_or_in_review(self):
+        offenders = []
+        for rel in _tracked_files(_ROOT):
+            if (not rel.endswith(".md") or rel in self.OWNER
+                    or rel.startswith("design/")):
+                continue
+            with open(os.path.join(_ROOT, rel), encoding="utf-8") as handle:
+                for number, line in enumerate(handle, 1):
+                    if "~~" not in line and self.STATES.search(line):
+                        offenders.append("%s:%d: %s" % (rel, number, line.strip()[:80]))
+        assert not offenders, ("say it in APP_STORE.md, not here:\n"
+                               + "\n".join(offenders))
+
+    @pytest.mark.parametrize("sentence", [
+        "**Now — 1.2 is live; 1.3 is in App Review.** Updated 2026-09-24, night.",
+        "**1.3 is live** (released 2026-09-26, build 137) with the listing fixes",
+        "and 1.3 is `WAITING_FOR_REVIEW` again, at the back of the queue",
+    ])
+    def test_the_guard_catches_the_sentences_that_went_stale(self, sentence):
+        assert self.STATES.search(sentence), sentence
+
+    @pytest.mark.parametrize("sentence", [
+        "- **Do not touch a version while it is in review.** A build swap puts it",
+        "**Use when:** a version is `WAITING_FOR_REVIEW` and a newer build has",
+    ])
+    def test_rules_about_review_are_not_status(self, sentence):
+        assert not self.STATES.search(sentence), sentence
 
 
 class TestTheDocumentsDoNotRestateTheBuildNumber:
