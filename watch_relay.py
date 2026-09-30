@@ -3126,6 +3126,10 @@ TUNNEL_URL = None
 # address at every relay restart stranded it until it next met the Mac.
 TUNNEL_STATE = (os.environ.get("TAPPROVAL_TUNNEL_STATE")
                 or os.path.expanduser("~/.tapproval-tunnel.json"))
+# cloudflared's own log: where the new address is read from, and the first
+# place to look when the away address will not open.
+TUNNEL_LOG = os.path.expanduser("~/.tapproval-tunnel.log")
+TUNNEL_ANNOUNCE_WAIT = 60      # seconds for cloudflared to name its address
 
 
 def _tunnel_pids(port):
@@ -3221,6 +3225,26 @@ def _tunnel_answers(url, token):
     return status in (200, 401, 403) and "json" in (ctype or "")
 
 
+# The edge needs a moment after a relay handover: cloudflared has been
+# pointing at a dead origin while one relay stopped and the next started, and
+# its first reply can be a 502. One probe at that instant replaced a healthy
+# tunnel on 2026-09-30 and stranded the watch. Give it a few tries.
+TUNNEL_PROBE_GAP = 3            # seconds between tries
+TUNNEL_ADOPT_TRIES = 5          # at relay start: about 15 s of grace
+TUNNEL_WATCH_TRIES = 3          # the watchdog's five-minute check
+
+
+def _tunnel_answers_soon(url, token, tries=1):
+    """`_tunnel_answers`, allowing a few tries for the edge to catch up.
+    True at the first real answer; False only when every try failed."""
+    for attempt in range(max(1, tries)):
+        if attempt:
+            time.sleep(TUNNEL_PROBE_GAP)
+        if _tunnel_answers(url, token):
+            return True
+    return False
+
+
 class _AdoptedTunnel:
     """A cloudflared this relay did not start: known by its pid alone."""
 
@@ -3267,7 +3291,8 @@ def start_tunnel(port, token):
             "this computer. Install it with: brew install cloudflared")
         return None
     adopted = _adoptable_tunnel(port)
-    if adopted and _tunnel_answers(adopted["url"], token):
+    if adopted and _tunnel_answers_soon(adopted["url"], token,
+                                        tries=TUNNEL_ADOPT_TRIES):
         TUNNEL_URL = "%s/t/%s" % (adopted["url"], token)
         clear_condition("tunnel")
         _reap_stale_tunnels(port, keep=adopted["pid"])
@@ -3277,41 +3302,105 @@ def start_tunnel(port, token):
     reason = ("the last one no longer answered" if adopted
               else "none to adopt")
     _reap_stale_tunnels(port)
+    # cloudflared writes to a file of its own, in a session of its own. Its
+    # stderr used to be a pipe into this relay, so the moment the relay
+    # exited — every update, every restart — cloudflared's next log line hit
+    # a closed pipe and killed it (measured 2026-09-30: dead within a
+    # second). No travel address had ever survived a relay restart.
+    try:
+        log_fd = os.open(TUNNEL_LOG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    except OSError:
+        log_fd = subprocess.DEVNULL
     proc = subprocess.Popen(
         [binary, "tunnel", "--no-autoupdate",
          "--url", "http://127.0.0.1:%d" % port],
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log_fd,
+        start_new_session=True)
+    if log_fd is not subprocess.DEVNULL:
+        os.close(log_fd)                # the child has its own copy
 
     def announce():
         global TUNNEL_URL
-        for line in proc.stderr:
-            match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+        deadline = time.monotonic() + TUNNEL_ANNOUNCE_WAIT
+        while time.monotonic() < deadline:
+            try:
+                with open(TUNNEL_LOG, encoding="utf-8", errors="replace") as handle:
+                    text = handle.read()
+            except OSError:
+                text = ""
+            match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", text)
             if match:
                 # Remembered before announced: whoever reads the address
                 # next (the next relay, a test) finds it already written.
                 _remember_tunnel(proc.pid, match.group(0), port)
+                if adopted:
+                    # The address the watch knew is gone. Said until the
+                    # watchdog's next healthy check: a watch away from home
+                    # is out of reach until iCloud carries the new one.
+                    note_condition(
+                        "tunnel",
+                        "The away address changed. Your watch learns the new "
+                        "one through iCloud within a minute or two.")
+                else:
+                    clear_condition("tunnel")
                 TUNNEL_URL = "%s/t/%s" % (match.group(0), token)
                 print("relay: tunnel new %s (%s)" % (match.group(0), reason),
                       file=sys.stderr)
-                clear_condition("tunnel")
                 print("relay: off-Wi-Fi tunnel up — the watch learns this "
                       "address automatically while on the same Wi-Fi.\n"
                       "       (manual fallback: %s)" % TUNNEL_URL,
                       file=sys.stderr)
+                return
+            if proc.poll() is not None:
                 break
-        else:
-            # cloudflared's output ended without ever naming a URL, so the
-            # tunnel died on the way up. Nothing said so before: the thread
-            # simply finished and the away address never appeared.
-            note_condition(
-                "tunnel",
-                "Answering from away is not working: the connection closed "
-                "before it opened. Answers still work on your own Wi-Fi.")
-        for _ in proc.stderr:   # drain quietly
-            pass
+            time.sleep(0.2)
+        # cloudflared exited, or never named a URL: the tunnel died on the
+        # way up. Nothing said so before: the away address never appeared.
+        note_condition(
+            "tunnel",
+            "Answering from away is not working: the connection closed "
+            "before it opened. Answers still work on your own Wi-Fi.")
+        print("relay: tunnel did not open — see %s" % TUNNEL_LOG, file=sys.stderr)
 
     threading.Thread(target=announce, daemon=True).start()
     return proc
+
+
+# The Mac bridge polls /pending?source=bridge every two seconds; it is the
+# iCloud route, the only one a watch away from home with its iPhone off has
+# for cards. Silence longer than this is a stopped bridge, and is said.
+BRIDGE_SILENT_SECONDS = 120
+
+
+def check_bridge(queue, started, now=None):
+    """One look at the bridge: note or clear the `bridge` condition.
+    True when all is well (or no bridge is installed here)."""
+    now = time.monotonic() if now is None else now
+    last = queue.last_bridge_poll
+    if not icloud_carries_the_key():
+        clear_condition("bridge")
+        return True
+    if last is None and now - started < BRIDGE_SILENT_SECONDS:
+        return True                     # just started: give it a moment
+    if last is not None and now - last <= BRIDGE_SILENT_SECONDS:
+        clear_condition("bridge")
+        return True
+    note_condition(
+        "bridge",
+        "The iCloud route is off: Tapproval's bridge on this computer is not "
+        "running, so away from home cards cannot reach your watch. "
+        "Restarting the computer starts it again.")
+    return False
+
+
+def watch_bridge(queue, sleep=time.sleep, checks=None):
+    """Look at the bridge once a minute for as long as the relay runs."""
+    started = time.monotonic()
+    done = 0
+    while checks is None or done < checks:
+        sleep(60)
+        done += 1
+        check_bridge(queue, started)
 
 
 # How often the relay looks at its own tunnel. start_tunnel() checked once,
@@ -3355,8 +3444,10 @@ def watch_tunnel(handle, port, token, sleep=time.sleep, checks=None):
             if not url or done % TUNNEL_PROBE_EVERY:
                 failures = 0            # alive, or still announcing itself
                 continue
-            if _tunnel_answers(url.split("/t/")[0], token):
+            if _tunnel_answers_soon(url.split("/t/")[0], token,
+                                    tries=TUNNEL_WATCH_TRIES):
                 failures = 0
+                clear_condition("tunnel")   # a changed-address notice ends here
                 continue
             why = "no longer answers"
         else:
@@ -3694,6 +3785,7 @@ def main(argv=None):
     if args.tunnel:
         # Not kept: the tunnel outlives this relay on purpose (see the finally).
         _start_tunnel(queue, auth)
+    threading.Thread(target=watch_bridge, args=(queue,), daemon=True).start()
     advertiser = None
     if not args.no_bonjour:
         advertiser = _Advertiser(args.port)

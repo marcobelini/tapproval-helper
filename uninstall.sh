@@ -30,7 +30,8 @@ rm -rf "$HOME/.tapproval"
 # the key to the door.
 rm -f "$HOME/.tapproval-token" "$HOME/.tapproval-auth.json" \
       "$HOME/.tapproval-relay.log" "$HOME/.tapproval-say.log" "$HOME/.tapproval-last-update" \
-      "$HOME/.tapproval-relay.pid" "$HOME/.tapproval-tunnel.json"
+      "$HOME/.tapproval-relay.pid" "$HOME/.tapproval-tunnel.json" \
+      "$HOME/.tapproval-tunnel.log"
 
 echo ""
 echo "TAPPROVAL_BASE_REMOVED"

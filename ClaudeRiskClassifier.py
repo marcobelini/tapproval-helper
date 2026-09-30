@@ -102,7 +102,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.28"
+__version__ = "1.1.29"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -2851,6 +2851,87 @@ def _relay_health():
         return None
 
 
+def _relay_json(path, timeout=1):
+    """GET a path on the local relay as JSON, or None when nothing answers."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen(RELAY_URL + path, timeout=timeout) as reply:
+            return json.loads(reply.read())
+    except Exception:
+        return None
+
+
+def _away_answers(url):
+    """Does the away address reach this relay from the internet? The relay
+    answers under its secret path in JSON — a 401/403 without a key is an
+    answer; Cloudflare's own error pages are HTML. None when unknown."""
+    if not url:
+        return None
+    try:
+        import urllib.error
+        import urllib.request
+        request = urllib.request.Request(url.rstrip("/") + "/health",
+                                         headers={"User-Agent": "Tapproval-status"})
+        try:
+            with urllib.request.urlopen(request, timeout=8) as reply:
+                status, ctype = reply.status, reply.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as error:
+            status = error.code
+            ctype = error.headers.get("Content-Type", "") if error.headers else ""
+        return status in (200, 401, 403) and "json" in (ctype or "")
+    except Exception:
+        return False
+
+
+RELAY_LOG_PATH = "~/.tapproval-relay.log"
+
+
+def connection_lines(health, tunnel, away_ok):
+    """The Connection block of --status, as lines, and the one next step.
+
+    `health` is the relay's /health (None: not running), `tunnel` its
+    /tunnel, `away_ok` whether the away address answered from outside
+    (None: not asked). Pure, so a test can hold every case."""
+    lines = ["", "Connection"]
+    if health is None:
+        lines.append("Relay         : not running")
+        lines.append("Next step     : start it: python3 ~/.tapproval/watch_relay.py --ensure")
+        lines.append("Relay log     : %s" % RELAY_LOG_PATH)
+        return lines
+    lines.append("Relay         : running, helper %s" % health.get("helper", "?"))
+    icloud = health.get("alert_route") == "bridge"
+    lines.append("iCloud route  : %s" % ("on (the Mac bridge is polling)" if icloud
+                                         else "off (no Mac bridge is polling)"))
+    url = (tunnel or {}).get("url")
+    if not url:
+        lines.append("Away address  : none yet")
+    elif away_ok:
+        lines.append("Away address  : answers from the internet")
+    elif away_ok is False:
+        lines.append("Away address  : does not answer from the internet")
+    else:
+        lines.append("Away address  : %s" % url.split("/t/")[0])
+    lines.append("Tailscale     : %s" % ((tunnel or {}).get("tailscale") or "not on Tailscale"))
+    seen = health.get("watch_seen_seconds_ago")
+    lines.append("Watch         : %s" % ("seen %ds ago" % seen if seen is not None
+                                         else "not seen recently"))
+    problems = [c.get("detail") for c in health.get("conditions") or [] if c.get("detail")]
+    for detail in problems:
+        lines.append("Problem       : %s" % detail)
+    if problems:
+        step = problems[0]
+    elif url and away_ok is False:
+        step = ("the away address is not answering; the relay reopens it "
+                "within a few minutes, or restart it with --ensure")
+    elif not health.get("paired_ever", True):
+        step = "pair a watch: tell Claude Code 'Open Tapproval pairing'"
+    else:
+        step = "none"
+    lines.append("Next step     : %s" % step)
+    lines.append("Relay log     : %s" % RELAY_LOG_PATH)
+    return lines
+
+
 def run_status():
     """Plain-English answer to 'is this thing on?'"""
     f = status_facts()
@@ -2896,14 +2977,11 @@ def run_status():
         print("Reboot        : no login wake-up \u2014 the relay waits for"
               " the first session; re-run --install to add it")
     health = f["relay_health"]
-    if health is not None:
-        seen = health.get("watch_seen_seconds_ago")
-        watch = ("watch seen %ds ago" % seen) if seen is not None \
-            else "no watch yet"
-        print("Relay         : running (%s)" % watch)
-    else:
-        print("Relay         : not running right now (starts with the next")
-        print("                Claude Code session)")
+    tunnel = _relay_json("/tunnel") if health is not None else None
+    away = _away_answers((tunnel or {}).get("url")) if tunnel else None
+    for line in connection_lines(health, tunnel, away):
+        print(line)
+    print("")
 
     entries = f["entries"]
     print("Audit log     : %s" % f["audit_path"])

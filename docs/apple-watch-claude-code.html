@@ -54,10 +54,24 @@
 <p><strong>Nothing is approved for you.</strong> By default every prompt waits for a person. If you do not answer on the watch, the ordinary prompt is still there in Claude Code, exactly as it would be without Tapproval.</p>
 
 <h2>If the watch cannot find the computer</h2>
-<p>Almost every case is one of two things: the watch and the computer are on different networks, or a VPN on the iPhone is half connected. Open <strong>Settings → Connection</strong> on the watch; every route gets a tick or a reason. For a second watch, tell Claude Code <em>Open Tapproval pairing</em> and open the app within ten minutes.</p>
+<p>Open <strong>Settings → Connection</strong> on the watch: every route gets a tick or a reason. On the computer, one command says what the helper sees and the one next step:</p>
+<pre>python3 ~/.tapproval/ClaudeRiskClassifier.py --status</pre>
+<p>Its <em>Connection</em> block names the relay, the iCloud route, whether the away address answers from the internet, anything the helper has noticed, and where its log is (<code>~/.tapproval-relay.log</code>). The same notices appear on the watch's Connection screen.</p>
+<div class="scroll"><table>
+<thead><tr><th>What you see</th><th>Why</th><th>What to do</th></tr></thead>
+<tbody>
+<tr><td><strong>Computer: Not seen on this Wi-Fi</strong>, away from home</td><td>Expected. The watch looks for your computer on the network it is on.</td><td>Nothing. Away from home, cards travel by the away address or your iCloud.</td></tr>
+<tr><td><strong>Computer</strong> red at home, or <strong>Found it, no answer</strong></td><td>Watch and computer on different networks, or a VPN on the iPhone that is half connected.</td><td>Join the same Wi-Fi, or turn the iPhone's VPN off or fully on.</td></tr>
+<tr><td><strong>Tailscale: No answer</strong></td><td>A watch app usually cannot use the iPhone's Tailscale connection.</td><td>Nothing; the other routes carry the cards.</td></tr>
+<tr><td><strong>Away address: No answer</strong> or <strong>Old address</strong></td><td>The address changed (the computer restarted) or its connection dropped. The helper notices within five minutes and opens a new one.</td><td>Wait a minute or two: the new address reaches the watch through your iCloud. If it stays red, run <code>--status</code>.</td></tr>
+<tr><td><strong>Approvals only</strong></td><td>Cards arrive through iCloud, but sessions need a direct link.</td><td>Join the computer's Wi-Fi, or turn off the iPhone's VPN.</td></tr>
+<tr><td><strong>Helper: older than the version this app expects</strong></td><td>The helper on the computer has not updated yet.</td><td>Start Claude Code once; it updates itself.</td></tr>
+<tr><td>A red notice from <strong>Your computer</strong>, such as <em>The iCloud route is off</em></td><td>The helper found something wrong and says what, in its own words.</td><td>Follow the sentence; <code>--status</code> repeats it as the next step.</td></tr>
+</tbody></table></div>
+<p>For a second watch, tell Claude Code <em>Open Tapproval pairing</em> and open the app within ten minutes.</p>
 
 <h2>With your iPhone off</h2>
-<p>Tapproval keeps working. Without its iPhone, Apple lets a watch reach the internet but not your home network, so the watch uses its private travel address, on Wi-Fi or cellular. That address survives updates and restarts of the helper. After your Mac itself restarts, the watch learns the new address the next time your iPhone is nearby.</p>
+<p>Tapproval keeps working. Without its iPhone, Apple lets a watch reach the internet but not your home network, so the watch uses its private travel address, on Wi-Fi or cellular. From helper 1.1.29 that address survives updates and restarts of the helper, and if its connection drops the helper opens a new one by itself. After your Mac itself restarts, the address changes, and the watch learns the new one through your iCloud.</p>
 
 <h2>Two buzzes for one prompt</h2>
 <p>If you also use Claude's Remote Control, the Claude app on your iPhone sends its own "permission needed" notification, and the watch shows that one too. Since Claude Code 2.1.278 it does so even for a prompt that has already been answered (<a href="https://github.com/anthropics/claude-code/issues/96126">claude-code#96126</a>). To keep only Tapproval's card, type <code>/config</code> in Claude Code and turn off <strong>Push when actions required</strong>. The cost: if the watch cannot be reached, the phone no longer tells you a prompt is waiting.</p>

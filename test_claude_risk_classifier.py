@@ -2375,6 +2375,223 @@ class TestEachRequestOnAConnectionStandsAlone:
         assert status in (401, 403), \
             "a keyless request was let in on the previous request's key (%s)" % status
         conn.close()
+def _fake_cloudflared(monkeypatch, url, calls=None):
+    """Stand-in for starting cloudflared: it writes its address banner into
+    the file descriptor the relay handed it as stderr, as the real one does,
+    and records how it was started."""
+    import tempfile
+    log = os.path.join(tempfile.mkdtemp(), "tunnel.log")
+    monkeypatch.setattr(watch_relay, "TUNNEL_LOG", log)
+
+    class Proc:
+        pid = 5151
+
+        def poll(self):
+            return None
+
+    def popen(args, **kwargs):
+        if calls is not None:
+            calls.append(kwargs)
+        fd = kwargs.get("stderr")
+        if isinstance(fd, int) and fd >= 0:
+            os.write(fd, ("INF starting\nINF |  %s  |\n" % url).encode())
+        return Proc()
+    monkeypatch.setattr(watch_relay.subprocess, "Popen", popen)
+
+
+class TestAnUpdateKeepsTheAwayAddress:
+    """2026-09-30, 09:26: helper 1.1.28 went in and the relay minted a new
+    away address although the old one was healthy — the watch had been
+    using it a second earlier. One probe, fired the instant the new relay
+    bound its tunnel port, met the edge still reconnecting to a dead
+    origin. The probe now allows the edge a few seconds, and a changed
+    address is said out loud."""
+
+    URL = "https://calm-river-words.trycloudflare.com"
+
+    @pytest.fixture(autouse=True)
+    def _state(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "TUNNEL_URL", None)
+        monkeypatch.setattr(watch_relay, "TUNNEL_PROBE_GAP", 0)
+        watch_relay.clear_condition("tunnel")
+        yield
+        watch_relay.clear_condition("tunnel")
+
+    def test_the_probe_waits_out_a_bad_edge(self, monkeypatch):
+        replies = iter([False, False, True])
+        calls = []
+        monkeypatch.setattr(watch_relay, "_tunnel_answers",
+                            lambda url, token: calls.append(url) or next(replies))
+        assert watch_relay._tunnel_answers_soon(self.URL, "tok", tries=5)
+        assert len(calls) == 3, "stops at the first real answer"
+
+    def test_the_probe_gives_up_after_its_tries(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(watch_relay, "_tunnel_answers",
+                            lambda url, token: calls.append(url) or False)
+        assert not watch_relay._tunnel_answers_soon(self.URL, "tok", tries=4)
+        assert len(calls) == 4
+
+    def test_adoption_survives_one_bad_reply(self, monkeypatch):
+        replies = iter([False, True])
+        monkeypatch.setattr(watch_relay, "_cloudflared", lambda: "/usr/bin/true")
+        monkeypatch.setattr(watch_relay, "_adoptable_tunnel",
+                            lambda port: {"pid": 4242, "url": self.URL, "port": port})
+        monkeypatch.setattr(watch_relay, "_tunnel_answers",
+                            lambda url, token: next(replies))
+        monkeypatch.setattr(watch_relay, "_reap_stale_tunnels",
+                            lambda port, keep=None: None)
+
+        def no_new_tunnel(*a, **k):
+            raise AssertionError("a tunnel that answers on the second try is kept")
+        monkeypatch.setattr(watch_relay.subprocess, "Popen", no_new_tunnel)
+        handle = watch_relay.start_tunnel(8978, "tok")
+        assert handle.pid == 4242
+        assert watch_relay.TUNNEL_URL == self.URL + "/t/tok"
+
+    def test_a_changed_address_is_said_not_silent(self, monkeypatch):
+        import time as _time
+        monkeypatch.setattr(watch_relay, "_cloudflared", lambda: "/usr/bin/true")
+        monkeypatch.setattr(watch_relay, "_adoptable_tunnel",
+                            lambda port: {"pid": 4242, "url": self.URL, "port": port})
+        monkeypatch.setattr(watch_relay, "_tunnel_answers", lambda url, token: False)
+        monkeypatch.setattr(watch_relay, "_reap_stale_tunnels",
+                            lambda port, keep=None: None)
+        monkeypatch.setattr(watch_relay, "_remember_tunnel", lambda *a: None)
+        fresh = "https://new-words-here.trycloudflare.com"
+
+        _fake_cloudflared(monkeypatch, fresh)
+        watch_relay.start_tunnel(8978, "tok")
+        for _ in range(200):
+            if watch_relay.TUNNEL_URL:
+                break
+            _time.sleep(0.01)
+        assert watch_relay.TUNNEL_URL == fresh + "/t/tok"
+        said = [c["detail"] for c in watch_relay.conditions() if c["key"] == "tunnel"]
+        assert said and "changed" in said[0] and "icloud" in said[0].lower(), said
+
+    def test_cloudflared_does_not_die_with_the_relay(self, monkeypatch):
+        """Its stderr was a pipe into the relay: when the relay exited,
+        cloudflared's next log line killed it. It now writes to its own
+        file, in its own session, so the next relay can adopt it."""
+        monkeypatch.setattr(watch_relay, "_cloudflared", lambda: "/usr/bin/true")
+        monkeypatch.setattr(watch_relay, "_adoptable_tunnel", lambda port: None)
+        monkeypatch.setattr(watch_relay, "_reap_stale_tunnels",
+                            lambda port, keep=None: None)
+        monkeypatch.setattr(watch_relay, "_remember_tunnel", lambda *a: None)
+        calls = []
+        _fake_cloudflared(monkeypatch, "https://own-file.trycloudflare.com", calls)
+        watch_relay.start_tunnel(8978, "tok")
+        started = calls[0]
+        assert started.get("start_new_session") is True
+        assert started.get("stderr") is not watch_relay.subprocess.PIPE
+        assert started.get("stdout") is not watch_relay.subprocess.PIPE
+        assert oct(os.stat(watch_relay.TUNNEL_LOG).st_mode & 0o777) == "0o600"
+
+    def test_a_healthy_check_clears_the_notice(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "TUNNEL_URL", self.URL + "/t/tok")
+        watch_relay.note_condition("tunnel", "The away address changed.")
+        monkeypatch.setattr(watch_relay, "_pid_alive", lambda pid: True)
+        monkeypatch.setattr(watch_relay, "_tunnel_answers", lambda url, token: True)
+        watch_relay.watch_tunnel(watch_relay._AdoptedTunnel(4242), 8978, "tok",
+                                 sleep=lambda s: None,
+                                 checks=watch_relay.TUNNEL_PROBE_EVERY)
+        assert not [c for c in watch_relay.conditions() if c["key"] == "tunnel"]
+
+
+class TestTheBridgeIsWatched:
+    """The iCloud route — the only way cards reach a watch away from home
+    with the phone off — rode on the Mac bridge, and the relay said nothing
+    when it stopped: /health carried a bare `alert_route: null`. Now it is a
+    sentence on the Connection screen."""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "icloud_carries_the_key", lambda: True)
+        watch_relay.clear_condition("bridge")
+        self.queue = watch_relay.CardQueue()
+        yield
+        watch_relay.clear_condition("bridge")
+
+    def _said(self):
+        return [c["detail"] for c in watch_relay.conditions() if c["key"] == "bridge"]
+
+    def test_a_silent_bridge_is_named(self):
+        self.queue.last_bridge_poll = 1000.0
+        ok = watch_relay.check_bridge(self.queue, started=0.0,
+                                      now=1000.0 + watch_relay.BRIDGE_SILENT_SECONDS + 1)
+        assert ok is False
+        said = self._said()
+        assert said and "icloud" in said[0].lower() and "bridge" in said[0].lower(), said
+
+    def test_a_polling_bridge_clears_it(self):
+        watch_relay.note_condition("bridge", "stale")
+        self.queue.last_bridge_poll = 1000.0
+        assert watch_relay.check_bridge(self.queue, started=0.0, now=1010.0)
+        assert self._said() == []
+
+    def test_a_bridge_that_never_polled_gets_a_grace(self):
+        self.queue.last_bridge_poll = None
+        assert watch_relay.check_bridge(self.queue, started=1000.0, now=1030.0)
+        assert self._said() == []
+        assert not watch_relay.check_bridge(
+            self.queue, started=1000.0,
+            now=1000.0 + watch_relay.BRIDGE_SILENT_SECONDS + 1)
+
+    def test_no_bridge_installed_is_not_a_fault(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "icloud_carries_the_key", lambda: False)
+        watch_relay.note_condition("bridge", "stale")
+        assert watch_relay.check_bridge(self.queue, started=0.0, now=10_000.0)
+        assert self._said() == []
+
+    def test_the_relay_starts_the_watch(self):
+        import inspect
+        assert "watch_bridge" in inspect.getsource(watch_relay.main)
+
+
+class TestStatusTroubleshoots:
+    """--status used to stop at "relay running". It now reads the relay's
+    own conditions and says the one next step."""
+
+    HEALTH = {"ok": True, "pending": 0, "watch_seen_seconds_ago": 40,
+              "alert_route": "bridge", "helper": "1.1.29",
+              "conditions": [], "paired_ever": True}
+
+    def _lines(self, health, tunnel=None, answers=None):
+        return crc.connection_lines(health, tunnel or {}, answers)
+
+    def test_all_well_says_so(self):
+        lines = self._lines(self.HEALTH, {"url": "https://a.trycloudflare.com/t/x",
+                                          "tailscale": "http://100.1.2.3:8977"}, True)
+        text = "\n".join(lines)
+        assert "iCloud route  : on" in text
+        assert "answers" in text and "Next step     : none" in text
+        assert "tapproval-relay.log" in text
+
+    def test_a_condition_is_printed_and_becomes_the_next_step(self):
+        health = dict(self.HEALTH, alert_route=None, conditions=[
+            {"key": "bridge", "detail": "The iCloud route is off: the bridge is not running."}])
+        text = "\n".join(self._lines(health, {"url": None}, None))
+        assert "The iCloud route is off" in text
+        assert "iCloud route  : off" in text
+        assert "Next step     : The iCloud route is off" in text
+
+    def test_a_dead_away_address_is_the_next_step(self):
+        text = "\n".join(self._lines(self.HEALTH,
+                                     {"url": "https://a.trycloudflare.com/t/x"}, False))
+        assert "does not answer" in text
+        assert "Next step     :" in text and "--ensure" not in text.split("Next step")[0]
+
+    def test_no_relay_says_how_to_start_it(self):
+        text = "\n".join(self._lines(None))
+        assert "not running" in text and "--ensure" in text
+
+    def test_a_watch_never_seen_says_pair(self):
+        health = dict(self.HEALTH, watch_seen_seconds_ago=None, paired_ever=False)
+        text = "\n".join(self._lines(health, {"url": None}, None))
+        assert "pair" in text.lower()
+
+
 class TestTheAwayAddressIsWatched:
     """2026-09-30, 08:51, in a car: every row on the Connection screen red.
     The relay was up and still handing out its travel address, but the
@@ -2387,6 +2604,7 @@ class TestTheAwayAddressIsWatched:
 
     @pytest.fixture(autouse=True)
     def _state(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "TUNNEL_PROBE_GAP", 0)
         monkeypatch.setattr(watch_relay, "TUNNEL_URL", self.URL + "/t/tok")
         watch_relay.clear_condition("tunnel")
         self.restarts = []
@@ -2424,7 +2642,8 @@ class TestTheAwayAddressIsWatched:
                             lambda url, token: asked.append(url) or False)
         self._watch(watch_relay._AdoptedTunnel(4242),
                     checks=watch_relay.TUNNEL_PROBE_EVERY)
-        assert asked == [self.URL], "asked through the public address, once"
+        assert asked == [self.URL] * watch_relay.TUNNEL_WATCH_TRIES, \
+            "asked through the public address, a few times before giving up"
         assert self.restarts == [(8978, "tok")]
         assert self._said()
 
@@ -2477,6 +2696,7 @@ class TestTheTravelAddressSurvivesARestart:
         self.state = tmp_path / "tunnel.json"
         monkeypatch.setattr(watch_relay, "TUNNEL_STATE", str(self.state))
         monkeypatch.setattr(watch_relay, "TUNNEL_URL", None)
+        monkeypatch.setattr(watch_relay, "TUNNEL_PROBE_GAP", 0)
         watch_relay.clear_condition("tunnel")
 
     def _remember(self, pid=4242, port=8978, url=URL):
@@ -2529,7 +2749,6 @@ class TestTheTravelAddressSurvivesARestart:
         assert reaped == [4242], "orphans go, the adopted one stays"
 
     def test_a_tunnel_that_does_not_answer_is_replaced_and_remembered(self, monkeypatch):
-        import io
         import time as _time
         monkeypatch.setattr(watch_relay, "_cloudflared", lambda: "/usr/bin/true")
         monkeypatch.setattr(watch_relay, "_adoptable_tunnel",
@@ -2540,10 +2759,7 @@ class TestTheTravelAddressSurvivesARestart:
                             lambda port, keep=None: reaped.append(keep))
         fresh = "https://new-words-here.trycloudflare.com"
 
-        class Proc:
-            pid = 5151
-            stderr = io.StringIO("INF starting\nINF |  %s  |\n" % fresh)
-        monkeypatch.setattr(watch_relay.subprocess, "Popen", lambda *a, **k: Proc())
+        _fake_cloudflared(monkeypatch, fresh)
         handle = watch_relay.start_tunnel(8978, "tok")
         assert handle.pid == 5151
         for _ in range(200):
@@ -8597,7 +8813,7 @@ class TestTheReportingItselfIsChecked:
     # a key that is not here fails the first test below, which is the
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
-    VOCABULARY = {"bonjour", "claude", "crash", "helper", "port", "signin", "tunnel", "update"}
+    VOCABULARY = {"bonjour", "bridge", "claude", "crash", "helper", "port", "signin", "tunnel", "update"}
 
     @staticmethod
     def _module_source(name):
