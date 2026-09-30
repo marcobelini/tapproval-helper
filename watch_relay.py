@@ -1387,6 +1387,37 @@ def type_into_session(session_id, text, registry):
     return ok and said == "typed"
 
 
+class _StampedStream:
+    """The relay's stderr with the time at the head of every line.
+
+    The relay log had no times at all, so a slow send could not be timed
+    from tap to transcript, nor a failure placed next to anything else
+    (2026-09-30). Wraps the stream; never raises past it."""
+
+    def __init__(self, stream, clock=None):
+        self._stream = stream
+        self._clock = clock or (lambda: time.strftime("%H:%M:%S"))
+        self._at_start = True
+        self._lock = threading.Lock()
+
+    def write(self, text):
+        with self._lock:
+            out = []
+            for piece in str(text).splitlines(keepends=True):
+                if self._at_start:
+                    out.append(self._clock() + " ")
+                out.append(piece)
+                self._at_start = piece.endswith("\n")
+            self._stream.write("".join(out))
+        return len(text)
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
     """Send an instruction to a session, the way the terminal would.
 
@@ -1406,7 +1437,10 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
         return "unknown session"
     # Open in a terminal and waiting for input: type it there. The words
     # land in the live session itself — the one route that does not fork.
+    started = time.monotonic()
     if type_into_session(session_id, text, registry):
+        print("relay: say %s typed (%d ms)" % (session_id[:8],
+              (time.monotonic() - started) * 1000), file=sys.stderr)
         return "sent"
     stop = say_guard(session_id, force=force, live=registry)
     if stop:
@@ -1426,6 +1460,9 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
     # "--dangerously-skip-permissions" is parsed as that flag, not sent.
     command += ["-p", "--", text]
     error = _spawn_detached(command, SAY_LOG, cwd=cwd)
+    print("relay: say %s headless (%d ms)%s" % (
+        session_id[:8], (time.monotonic() - started) * 1000,
+        " — could not start: %s" % error if error else ""), file=sys.stderr)
     return "could not start: %s" % error if error else "sent"
 
 
@@ -3743,6 +3780,8 @@ def _port_taken(port):
 
 def main(argv=None):
     args = _build_parser().parse_args(argv)
+    if not isinstance(sys.stderr, _StampedStream):
+        sys.stderr = _StampedStream(sys.stderr)
     forget_host_session()
     if args.ensure:
         return ensure_running()

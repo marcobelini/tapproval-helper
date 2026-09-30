@@ -23,6 +23,17 @@
 <main class="policy">
 <h1>Changelog</h1>
 <p><em>Every release of Tapproval Base, the helper on your computer, newest first. Starting Claude Code once updates it. Generated from <a href="https://github.com/marcobelini/tapproval-helper/releases">the releases on GitHub</a>, which may already hold a newer one. Security fixes are also explained on <a href="security.html">the security page</a>.</em></p>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.29">Tapproval Base 1.1.29</a></h2>
+<p><em>2026-09-30</em></p>
+<p><strong>Tapproval Base</strong> is the computer half of Tapproval: it puts Claude Code's permission prompts on your Apple Watch, each marked with its risk, and one tap answers. Nothing is approved for you unless you ask it to be, and a CRITICAL never is.</p>
+<p>Already installed? Starting Claude Code once updates it.</p>
+<h3>Since 1.1.28</h3>
+<ul>
+<li><strong>The away address really survives a restart.</strong> The program that holds the tunnel open wrote its messages into a pipe only the helper read, so when the helper stopped — every update, every restart — the tunnel died within a second and the address was lost. It writes to its own log now, in its own session, and the next helper takes it over. After this update, the address changes one last time.</li>
+<li><strong>A bad moment no longer replaces a good tunnel.</strong> The check that decides whether to keep a tunnel allows a few tries, and when the address does change the watch's Connection screen says so until the watch has it.</li>
+<li><strong>A stopped Mac bridge is named</strong>: "The iCloud route is off", instead of nothing.</li>
+<li><strong><code>--status</code> troubleshoots.</strong> <code>python3 ~/.tapproval/ClaudeRiskClassifier.py --status</code> shows the relay, the iCloud route, whether the away address answers from the internet, Tailscale, the watch, every problem the helper has noticed, the one next step, and where the log is. What each row on the watch means: https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html</li>
+</ul>
 <h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.28">Tapproval Base 1.1.28</a></h2>
 <p><em>2026-09-30</em></p>
 <p><strong>Tapproval Base</strong> is the computer half of Tapproval: it puts Claude Code's permission prompts on your Apple Watch, each marked with its risk, and one tap answers. Nothing is approved for you unless you ask it to be, and a CRITICAL never is.</p>

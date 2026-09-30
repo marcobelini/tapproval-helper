@@ -2592,6 +2592,36 @@ class TestStatusTroubleshoots:
         assert "pair" in text.lower()
 
 
+class TestTheRelayLogCarriesTheTime:
+    """2026-09-30: a quick send took long to show and the relay log could
+    not say how long — it had no times. Every line now starts with one, and
+    each send says which way it went and how long starting it took."""
+
+    def test_every_line_starts_with_the_time(self):
+        import io
+        sink = io.StringIO()
+        stamped = watch_relay._StampedStream(sink, clock=lambda: "10:20:30")
+        stamped.write("relay: one\nrelay: tw")
+        stamped.write("o\n")
+        assert sink.getvalue() == "10:20:30 relay: one\n10:20:30 relay: two\n"
+
+    def test_the_relay_stamps_its_stderr(self):
+        import inspect
+        assert "_StampedStream" in inspect.getsource(watch_relay.main)
+
+    def test_a_send_logs_its_path(self, monkeypatch, capsys):
+        monkeypatch.setattr(watch_relay, "session_registry", lambda: {})
+        monkeypatch.setattr(watch_relay, "resolve_session",
+                            lambda prefix, projects, registry=None: ("abcdef1234", "/tmp"))
+        monkeypatch.setattr(watch_relay, "type_into_session", lambda *a: False)
+        monkeypatch.setattr(watch_relay, "say_guard", lambda *a, **k: None)
+        monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
+        monkeypatch.setattr(watch_relay, "signed_in", lambda: True)
+        monkeypatch.setattr(watch_relay, "_spawn_detached", lambda *a, **k: None)
+        assert watch_relay.say_to_session("abcdef", "What's left?") == "sent"
+        assert "say abcdef12 headless" in capsys.readouterr().err
+
+
 class TestTheAwayAddressIsWatched:
     """2026-09-30, 08:51, in a car: every row on the Connection screen red.
     The relay was up and still handing out its travel address, but the
