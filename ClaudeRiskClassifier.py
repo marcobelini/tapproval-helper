@@ -102,7 +102,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.30"
+__version__ = "1.1.31"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -167,7 +167,17 @@ SECRET_PATH = re.compile(
     r"\.kube[/\\]config|\.npmrc|\.pypirc|\.docker[/\\]config\.json|"
     r"\.config[/\\]gh[/\\]hosts\.ya?ml|\.gitconfig\b|\.terraformrc|"
     # Tapproval's own device keys: whoever reads them can answer a card.
-    r"\.tapproval-auth\.json|\.tapproval-token)",
+    r"\.tapproval-auth\.json|\.tapproval-token|\.tapproval-devices\.json|"
+    # Each read SAFE until the 2026-09-30 review: App Store Connect and
+    # other private keys, database and vault passwords, a direnv file,
+    # GnuPG and macOS keychains, shell history, a process's environment,
+    # Terraform state (which stores secrets in plain text).
+    r"\.p8\b|[\w-]\.key\b|\.appstoreconnect[/\\]|\.vault-token|\.pgpass|"
+    r"\.my\.cnf|\.envrc\b|\.gnupg[/\\]|Keychains[/\\]|_history\b|"
+    r"/proc/[^/\s]+/environ|\.tfstate\b|"
+    # Claude Code's own account file, the browsers' saved cookies and
+    # logins, the Messages database, and a search for a private key.
+    r"\.claude\.json\b|[/\\]Cookies\b|[/\\]Login\\? Data\b|Messages[/\\]chat\.db|PRIVATE KEY)",
     re.I,
 )
 
@@ -207,10 +217,33 @@ SQL_MUTATION = re.compile(
 )
 
 # Shell operators we split on to classify each segment independently.
-SEGMENT_SPLIT = re.compile(r"\s*(?:\|\||&&|;|\||\n)\s*")
+# A lone `&` between words runs the next command too: `echo hi & rm -rf ~`
+# was one segment led by echo (2026-09-30). `2>&1`, `&>` and `|&` are not it.
+SEGMENT_SPLIT = re.compile(r"\s*(?:\|\||&&|;|\||\n|(?<=\s)&(?![&>])(?=\s|$))\s*")
 
 # Leading VAR=value assignments before the real command.
 ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
+_ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=\S*\s+")
+# Variables that change how a command formats or reports, never which
+# program runs. Any other prefix can: PATH, DYLD_INSERT_LIBRARIES,
+# BASH_ENV, GIT_PAGER and GIT_SSH_COMMAND each ran a program of the
+# caller's choosing behind a SAFE lead word (2026-09-30).
+HARMLESS_ENV = frozenset(
+    "LANG LANGUAGE TZ NO_COLOR FORCE_COLOR CLICOLOR CLICOLOR_FORCE TERM "
+    "COLUMNS LINES CI PYTHONUNBUFFERED PYTHONDONTWRITEBYTECODE PYTHONHASHSEED "
+    "NODE_ENV RUST_BACKTRACE RUST_LOG DEBUG VERBOSE GIT_TERMINAL_PROMPT "
+    "HOMEBREW_NO_AUTO_UPDATE HOMEBREW_NO_ENV_HINTS".split())
+
+
+def _assigned_names(segment):
+    """The names a segment assigns before its command: `A=1 B=2 ls`."""
+    names, text = [], segment.strip()
+    while True:
+        match = _ASSIGNMENT.match(text)
+        if not match:
+            return names
+        names.append(match.group(1))
+        text = text[match.end():]
 
 
 # --------------------------------------------------------------------------
@@ -381,7 +414,9 @@ def _words_name_a_secret(parts):
 
 
 def _names_a_secret(word):
-    bare = word.strip("-'\"")
+    # `${GITHUB_TOKEN}` is `$GITHUB_TOKEN`: the braces kept `token}` from
+    # matching, and the braced spelling read SAFE (2026-09-30).
+    bare = word.strip("-'\"").replace("${", "$").rstrip("}")
     if bare.lower() in SECRET_WORDS:
         return True
     if not (word.startswith("-") or "=" in word or bare.isupper()):
@@ -632,10 +667,21 @@ GIT_MEDIUM = frozenset(
 # (rule_id, pattern, risk) applied to the whole command line.
 WHOLE_LINE_RULES = [
     ("pipe-to-shell", re.compile(r"\|\s*(sudo\s+)?(ba|z|k|fi|da)?sh\b"), Risk.CRITICAL),
+    # The same thing through another interpreter, or through a
+    # substitution a shell then runs: `curl … | python3`,
+    # `sh -c "$(curl …)"`, `bash <(curl …)` all read MEDIUM (2026-09-30).
+    ("fetch-and-run",
+     re.compile(r"\b(curl|wget)\b[^;&]*\|\s*(sudo\s+)?"
+                r"(python[\d.]*|node|perl|ruby|php|osascript)\b"
+                r"|(\b((ba|z|k|da)?sh|eval|source)|(^|\s)\.)\s[^;|]*"
+                r"(\$\(|<\(|`)\s*(curl|wget)\b"), Risk.CRITICAL),
     ("fork-bomb", re.compile(r":\s*\(\s*\)\s*\{.*\}\s*;\s*:"), Risk.CRITICAL),
     ("history-rewrite", re.compile(r"\bgit\s+filter-(branch|repo)\b"), Risk.CRITICAL),
     ("cmd-substitution", re.compile(r"\$\(|`"), Risk.MEDIUM),  # inner cmd classified in classify_bash()
-    ("redirect-write", re.compile(r"(?<![0-9<>])>>?(?!\s*/dev/null)"), Risk.MEDIUM),
+    # Any `>` that is not a descriptor copy (`2>&1`, `>&2`) or /dev/null.
+    # The lookbehind used to skip every `>` after a digit, which took
+    # `1> ~/.zshrc` and `2> f` for `2>&1` and left them SAFE (2026-09-30).
+    ("redirect-write", re.compile(r"(?<![<>])>>?(?!\s*(&[\d-]|/dev/null\b))"), Risk.MEDIUM),
 ]
 
 # (rule_id, pattern, risk) applied per segment.
@@ -694,7 +740,7 @@ GIT_RE = re.compile(
 
 # Targets that mean "wipe the machine" or "wipe my home directory".
 CATASTROPHIC_TARGETS = re.compile(
-    r"^(/|//|/\*|~|~/|~/\*|\$HOME|\$HOME/\*|\.|\.\.|\*|"
+    r"^(/|//|/\*|~|~/|~/\*|\$\{?HOME\}?/?|\$\{?HOME\}?/\*|\.|\.\.|\*|"
     r"/(bin|boot|dev|etc|home|lib|opt|root|sbin|srv|usr|var|Users|Windows)/?\*?)$"
 )
 
@@ -754,8 +800,18 @@ def _git_risk(segment):
         return None
     sub, rest = match.group(1).lower(), match.group(2) or ""
     forced = bool(re.search(r"(--force(?!-with-lease)|(^|\s)-f\b|\s\+)", rest))
+    # Options that choose a program git will run: a pager, a diff tool, an
+    # ssh command, a remote's upload-pack. Each ran behind a SAFE "git log"
+    # (2026-09-30). -C only changes the directory and stays a read.
+    opening = segment[match.start():match.start(1)]
+    runs = bool(re.search(r"(^|\s)(-c\s*\S|--exec-path|--git-dir|--work-tree)", opening)
+                or re.search(r"(^|\s)(--upload-pack|--receive-pack|--exec|--ext-diff)\b"
+                             r"|(^|\s)-u\s", rest))
 
     if sub == "push":
+        # Deleting a remote branch loses it as surely as overwriting it.
+        if re.search(r"(^|\s)(--delete|-d)\b|(^|\s):\S", rest):
+            forced = True
         if forced and re.search(r"\b(main|master|prod|production|release)\b", rest):
             return ("git-force-push-protected", Risk.CRITICAL)
         if forced:
@@ -765,6 +821,8 @@ def _git_risk(segment):
         return ("git-reset-hard", Risk.HIGH)
     if sub == "clean" and re.search(r"-[a-z]*f", rest):
         return ("git-clean-force", Risk.HIGH)
+    if sub in GIT_READ_ONLY and runs:
+        return ("git-runs-a-program", Risk.MEDIUM)
     if sub == "config":
         # `config` sat in GIT_READ_ONLY, so `git config --global alias.x
         # '!rm -rf ~'` read SAFE: it is a read only when it is reading.
@@ -776,6 +834,17 @@ def _git_risk(segment):
         if len([w for w in rest.split() if not w.startswith("-")]) >= 2:
             return ("git-config-write", Risk.MEDIUM)
         return ("git-read", Risk.SAFE)
+    words = [w for w in rest.split() if not w.startswith("-")]
+    if sub == "remote" and words and words[0] in (
+            "add", "set-url", "remove", "rm", "rename", "set-head", "prune",
+            "update", "set-branches"):
+        return ("git-write", Risk.MEDIUM)
+    if sub == "branch" and (
+            re.search(r"(^|\s)(-[fmMcCdDu]\b|--(force|move|copy|delete|set-upstream-to|"
+                      r"unset-upstream|edit-description)\b)", rest)
+            or (words and not re.search(r"(^|\s)(-l|--list|--contains|--no-contains|"
+                                        r"--merged|--no-merged|--points-at)\b", rest))):
+        return ("git-write", Risk.MEDIUM)
     if sub in GIT_READ_ONLY:
         return ("git-read", Risk.SAFE)
     if sub in GIT_MEDIUM:
@@ -785,7 +854,9 @@ def _git_risk(segment):
 
 # Commands that run the command after them. `env rm -rf ~` is `rm -rf ~`;
 # judged by its lead word it read HIGH instead of CRITICAL (2026-09-25).
-_PASS_THROUGH = frozenset("env command builtin nice nohup exec time timeout".split())
+_PASS_THROUGH = frozenset("env command builtin nice nohup exec time timeout sudo".split())
+# `if true; then rm -rf ~; fi` splits into segments led by these words.
+_SHELL_KEYWORDS = frozenset("if then else elif do while until !".split())
 _SHELLS = frozenset("sh bash zsh dash ksh fish".split())
 
 
@@ -812,6 +883,8 @@ def _unwrapped(segment):
     lead = os.path.basename(words[0]).lower()
     if lead == "eval":
         return " ".join(words[1:]).strip("'\"") or None
+    if lead in _SHELL_KEYWORDS:
+        return " ".join(words[1:]) or None
     if lead in _SHELLS:
         import shlex
         try:
@@ -829,7 +902,8 @@ def _unwrapped(segment):
         # `timeout -s KILL 5`, `env -i A=b`.
         while rest and (rest[0].startswith("-") or "=" in rest[0]
                         or (lead in ("timeout", "nice") and rest[0][:1].isdigit())):
-            takes_value = rest[0] in ("-n", "-s", "-k", "-u", "--signal", "--kill-after")
+            takes_value = rest[0] in ("-n", "-s", "-k", "-u", "--signal", "--kill-after") or (
+                lead == "sudo" and rest[0] in ("-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U"))
             rest = rest[2:] if takes_value else rest[1:]
         return " ".join(rest) or None
     return None
@@ -839,16 +913,36 @@ def _unwrapped(segment):
 # Checked before the tool is waved through as a read: each of these read
 # SAFE until 2026-09-25, and --quiet would have allowed them.
 READ_TOOL_ESCAPES = {
-    "awk": re.compile(r"system\s*\(|\|\s*[\"']|\|&|>{1,2}\s*[\"']|getline\s*<"),
+    "awk": re.compile(r"system\s*\(|\|\s*[\"']|\|&|>{1,2}\s*[\"']|getline\s*<"
+                      r"|(^|\s)(-f\s*\S|--file\b)"),
     "rg": re.compile(r"(^|\s)--pre(=|\s)"),
     "find": re.compile(r"(^|\s)-(fprint0?|fprintf|fls|execdir|ok|okdir)(\s|$)"),
     "tree": re.compile(r"(^|\s)(-o|--output)(\s|=)"),
-    "sort": re.compile(r"(^|\s)(-o|--output)(\s|=)|(^|\s)-o\S"),
+    "sort": re.compile(r"(^|\s)(-o|--output)(\s|=)|(^|\s)-o\S|--compress-program"),
+    # sed's own commands write (`w file`, `s/a/b/w file`) and run (`e`).
+    "sed": re.compile(r"(^|\s)--in-place\b|(^|[\s;{}'\"/\d$])[wW]\s+\S"
+                      r"|(^|[\s;{}'\"/\d$])e(\s|['\";]|$)"),
+    # Setting the clock or the machine's name, not reading them.
+    "date": re.compile(r"(^|\s)(-s|--set)\b|(^|\s)\d{6,}(\s|$)"),
+    "hostname": lambda segment: any(not w.startswith("-") for w in _tokens(segment)[1:]),
+    "uniq": lambda segment: len([w for w in _tokens(segment)[1:]
+                                 if not w.startswith("-") and not w.isdigit()]) >= 2,
+    "security": re.compile(r"\b(list|default|login)-keychains?\b[^|;&]*\s-[sd]\b"),
     "yq": re.compile(r"(^|\s)(-i|--inplace)(\s|$)"),
     "git": re.compile(r"(^|\s)--output(=|\s)"),
 }
 for _awk in ("gawk", "nawk", "mawk"):
     READ_TOOL_ESCAPES[_awk] = READ_TOOL_ESCAPES["awk"]
+
+
+# Reads that put a live credential into the transcript, by a spelling the
+# ontology cannot see: a one-letter flag, a BSD ps option, a keychain dump.
+CREDENTIAL_READS = re.compile(
+    r"\bgh\s+auth\s+status\b[^|;&]*(\s-t\b|--show-token)"
+    r"|\bsecurity\s+(find-(generic|internet)-password\b[^|;&]*\s-[a-z]*[wg]\b"
+    r"|dump-keychain\b|export\b)"
+    r"|\bps\b(\s+-\S+)*(\s+-[a-zA-Z]*E[a-zA-Z]*|\s+[acehjlmrSTuvwxX]*e[acehjlmrSTuvwxX]*)(?=\s|$)"
+    r"|\bjq\b[^|;&]*\$ENV\b")
 
 
 def classify_bash(command):
@@ -896,13 +990,23 @@ def classify_bash(command):
             # can only ever raise a tier.
             if segment.strip()[:1] not in "({\\":
                 bump("wrapper", Risk.MEDIUM)
+            if os.path.basename(_first_token(segment)).lower() == "sudo":
+                bump("sudo", Risk.HIGH)
             continue
 
         token = os.path.basename(_first_token(segment)).lower()
 
         escape = READ_TOOL_ESCAPES.get(token)
-        if escape is not None and escape.search(segment):
+        if escape is not None and (escape.search(segment) if hasattr(escape, "search")
+                                   else escape(segment)):
             bump("read-tool-writes-or-runs", Risk.MEDIUM)
+
+        if any(name not in HARMLESS_ENV and not name.startswith("LC_")
+               for name in _assigned_names(segment)):
+            bump("env-prefix", Risk.MEDIUM)
+
+        if CREDENTIAL_READS.search(segment):
+            bump("credential-read", Risk.HIGH)
 
         # The effect the words name, before any table gets to recognise the
         # binary. bump() takes the maximum, so a recognition table below can
@@ -964,6 +1068,12 @@ INFRA_PATH = re.compile(
     re.I,
 )
 SCRATCH_PATH = re.compile(r"([/\\](tmp|scratchpad|\.cache)[/\\])", re.I)
+# What every later session reads as its instructions, or runs as a command,
+# agent or skill: not documentation, whatever the extension (2026-09-30).
+INSTRUCTION_PATH = re.compile(
+    r"(^|[/\\])(CLAUDE(\.local)?\.md|AGENTS\.md)$"
+    r"|(^|[/\\])\.claude[/\\](commands|agents|skills|hooks)[/\\]", re.I)
+TEST_CODE_PATH = re.compile(r"(^|[/\\])(test_[^/\\]*|[^/\\]*_test)\.py$", re.I)
 
 
 def classify_path(path, cwd=None):
@@ -1005,7 +1115,12 @@ def classify_path(path, cwd=None):
         except (ValueError, OSError):
             return Risk.HIGH, ["unresolvable-path"]
 
+    if INSTRUCTION_PATH.search(normalised):
+        return Risk.MEDIUM, ["agent-instructions"]
     if LOW_RISK_PATH.search(normalised):
+        # Tagged, so the hook can tell a test it may later be asked to run.
+        if TEST_CODE_PATH.search(normalised):
+            return Risk.LOW, ["docs-or-test", "test-code"]
         return Risk.LOW, ["docs-or-test"]
 
     return Risk.MEDIUM, ["project-file"]
@@ -1690,6 +1805,41 @@ def _input_digests(tool, tool_input):
     return digests
 
 
+# Commands that run the project's tests — which is to say, run code.
+TEST_RUNNER = re.compile(
+    r"(^|[\s/;&|])(pytest|py\.test|tox|nox)\b|\b(npm|yarn|pnpm|bun)\s+(run\s+)?test\b"
+    r"|\bpython[\d.]*\s+-m\s+(pytest|unittest)\b")
+
+
+def _session_auto_wrote_tests(session_id, policy, tail=256 * 1024):
+    """Did this session have a test file written with nobody looking?
+
+    A test file is a LOW write and pytest a SAFE run, so under --quiet a
+    session could write test_x.py and run it without a human: any code at
+    all (2026-09-30 review). The audit log already records both halves;
+    this reads its tail. Never raises; unknown is no.
+    """
+    if not session_id:
+        return False
+    try:
+        with open(_audit_path(policy), "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - tail))
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(entry, dict) and entry.get("session_id") == session_id
+                and entry.get("effective") == "allow"
+                and "test-code" in (entry.get("rules") or [])):
+            return True
+    return False
+
+
 def build_response(event, policy):
     """Classify one event; returns ``(response_dict, audit_entry, card)``.
 
@@ -1698,6 +1848,12 @@ def build_response(event, policy):
     """
     result = classify(event)
     risk = result["risk"]
+    if (result["tool"] == "Bash" and risk < Risk.MEDIUM
+            and TEST_RUNNER.search(str((result["tool_input"] or {}).get("command", "")))
+            and decide(risk, policy)[0] == "allow"
+            and _session_auto_wrote_tests((event or {}).get("session_id"), policy)):
+        risk = result["risk"] = Risk.MEDIUM
+        result["rules"] = list(result["rules"]) + ["tests-after-auto-written-test"]
     card = wrist_card(
         result["tool"],
         result["tool_input"],
@@ -2606,13 +2762,15 @@ def run_uninstall():
         return 1
 
     hooks = data.get("hooks")
-    if not isinstance(hooks, dict):
-        print("Not installed — nothing to remove.")
-        return 0
-
-    removed = _remove_our_hooks(hooks)
+    removed = _remove_our_hooks(hooks) if isinstance(hooks, dict) else False
     if not removed:
-        print("Not installed — nothing to remove.")
+        # The login job is ours whatever settings say: a hand edit or an
+        # earlier --uninstall took the hooks and left it pointing at a
+        # script the uninstaller then deletes (2026-09-30 review).
+        if remove_launch_agent():
+            print("Not in settings; the login job was removed.")
+        else:
+            print("Not installed — nothing to remove.")
         return 0
 
     if not hooks:

@@ -16,7 +16,10 @@ echo "  Your audit log stays, so your own history remains yours."
 echo ""
 
 if [ -f "$HOME/.tapproval/ClaudeRiskClassifier.py" ]; then
-  python3 "$HOME/.tapproval/ClaudeRiskClassifier.py" --uninstall
+  # Not fatal: "installed as a plugin" is an answer, and stopping here left
+  # the relay running and the pairing key on disk (2026-09-30 review).
+  python3 "$HOME/.tapproval/ClaudeRiskClassifier.py" --uninstall \
+    || echo "(continuing: the rest is removed either way)"
 else
   echo "(~/.tapproval not found — nothing registered to remove)"
 fi
@@ -31,7 +34,9 @@ rm -rf "$HOME/.tapproval"
 rm -f "$HOME/.tapproval-token" "$HOME/.tapproval-auth.json" \
       "$HOME/.tapproval-relay.log" "$HOME/.tapproval-say.log" "$HOME/.tapproval-last-update" \
       "$HOME/.tapproval-relay.pid" "$HOME/.tapproval-tunnel.json" \
-      "$HOME/.tapproval-tunnel.log"
+      "$HOME/.tapproval-tunnel.log" "$HOME/.tapproval-crashes.jsonl"
+# The copies install.sh set aside when it replaced an older checkout.
+rm -rf "$HOME"/.tapproval.superseded-*
 
 echo ""
 echo "TAPPROVAL_BASE_REMOVED"

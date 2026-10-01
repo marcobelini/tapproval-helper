@@ -1977,16 +1977,22 @@ _SEEN_NONCES = OrderedDict()
 _NONCE_LOCK = threading.Lock()
 
 
-def _signature_message(method, path, stamp, nonce, body):
+def _signature_message(method, path, stamp, nonce, body, query=None):
+    """v1 covers method, path, time, nonce and body; v2 (``query`` given,
+    even empty) adds the raw query string, which v1 left open: a signed
+    request for `?id=A` could be sent on as `?id=B` (2026-09-30 review)."""
     import hashlib
-    return "\n".join([str(method).upper(), str(path), str(stamp), str(nonce),
-                      hashlib.sha256(body or b"").hexdigest()]).encode("utf-8")
+    parts = [str(method).upper(), str(path)]
+    if query is not None:
+        parts.append(str(query))
+    parts += [str(stamp), str(nonce), hashlib.sha256(body or b"").hexdigest()]
+    return "\n".join(parts).encode("utf-8")
 
 
-def sign_request(token, method, path, stamp, nonce, body=b""):
+def sign_request(token, method, path, stamp, nonce, body=b"", query=None):
     import hashlib
     return hmac.new(str(token).encode("utf-8"),
-                    _signature_message(method, path, stamp, nonce, body),
+                    _signature_message(method, path, stamp, nonce, body, query),
                     hashlib.sha256).hexdigest()
 
 
@@ -1996,6 +2002,18 @@ def relay_proof(token, nonce):
     import hashlib
     return hmac.new(str(token).encode("utf-8"),
                     ("tapproval-proof\n%s" % nonce).encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def relay_proof2(token, nonce, status, body):
+    """The proof over the answer itself: the nonce, the status and the
+    SHA-256 of the body. relay_proof names only the nonce, so a proof
+    could be kept while the body under it was rewritten (2026-09-30
+    review). A watch that has seen this header requires it from then on."""
+    import hashlib
+    message = "tapproval-proof2\n%s\n%d\n%s" % (
+        nonce, int(status), hashlib.sha256(body or b"").hexdigest())
+    return hmac.new(str(token).encode("utf-8"), message.encode("utf-8"),
                     hashlib.sha256).hexdigest()
 
 
@@ -2012,7 +2030,7 @@ def seal(token, nonce, secret):
     return bytes(raw[i] ^ pad[i] for i in range(len(raw))).hex()
 
 
-def verify_signature(header, method, path, body, candidates, now=None):
+def verify_signature(header, method, path, body, candidates, now=None, query=""):
     """The token among ``candidates`` that signed this request, and its
     nonce — or (None, None). A stale time, a malformed header or a nonce
     already seen is (None, None): never an error, never a fallback."""
@@ -2021,15 +2039,16 @@ def verify_signature(header, method, path, body, candidates, now=None):
         stamp = int(stamp)
     except ValueError:
         return None, None
-    if version != "v1" or not (16 <= len(nonce) <= 64) or not mac:
+    if version not in ("v1", "v2") or not (16 <= len(nonce) <= 64) or not mac:
         return None, None
+    signed_query = query if version == "v2" else None
     moment = time.time() if now is None else now
     if abs(moment - stamp) > SIGNATURE_WINDOW_SECONDS:
         return None, None
     match = None
     for token in candidates:
         if token and hmac.compare_digest(
-                sign_request(token, method, path, stamp, nonce, body), mac):
+                sign_request(token, method, path, stamp, nonce, body, signed_query), mac):
             match = token
             break
     if match is None:
@@ -2278,9 +2297,10 @@ class RelayHandler(BaseHTTPRequestHandler):
             if header:
                 if self.auth is not None and hasattr(self.auth, "credentials"):
                     from urllib.parse import unquote, urlsplit
+                    split = urlsplit(self.path)
                     key, nonce = verify_signature(
-                        header, self.command, unquote(urlsplit(self.path).path),
-                        self._raw_body(), self.auth.credentials())
+                        header, self.command, unquote(split.path),
+                        self._raw_body(), self.auth.credentials(), query=split.query)
                     self._presented_key, self._signed_nonce = key or "", nonce
             else:
                 self._presented_key = self.headers.get("X-Tapproval-Token", "")
@@ -2293,13 +2313,21 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         # Proof that this answer comes from a holder of the key the request
         # was signed with: the watch trusts an address only after it.
-        if getattr(self, "_signed_nonce", None):
-            self.send_header("X-Tapproval-Proof",
-                             relay_proof(self._presented_key, self._signed_nonce))
+        self._send_proofs(status, body)
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_proofs(self, status, body):
+        """Both proofs, when the request was signed: the nonce-only one for
+        watches that predate the second, and the one over this answer."""
+        if getattr(self, "_signed_nonce", None):
+            self.send_header("X-Tapproval-Proof",
+                             relay_proof(self._presented_key, self._signed_nonce))
+            self.send_header("X-Tapproval-Proof2",
+                             relay_proof2(self._presented_key, self._signed_nonce,
+                                          status, body))
 
     def _read_json(self):
         raw = self._raw_body()
@@ -2330,6 +2358,13 @@ class RelayHandler(BaseHTTPRequestHandler):
         auth = self.auth
         if auth is None or not hasattr(auth, "claim_window"):
             self._send_json({"error": "pairing closed"}, 403)
+            return
+        if self._is_local_process():
+            # No watch pairs from this Mac. A process here that could open
+            # the window (`--pair`) and claim it from 127.0.0.1 held a key
+            # of its own — enough for a prompt-injected session to answer
+            # its own CRITICAL card (2026-09-30 review).
+            self._send_json({"error": "pair from the watch, not from this computer"}, 403)
             return
         client = self.client_address[0]
         allowed, retry = LIMITS.allow("pair", client, 5, 600)
@@ -2373,9 +2408,17 @@ class RelayHandler(BaseHTTPRequestHandler):
         if not (auth.is_bootstrap(presented) or auth.matches(presented)):
             self._send_json({"error": "not paired"}, 403)
             return
-        token = auth.issue_device(body.get("device_id"),
+        # The watch names itself, inside its own namespace: `icloud` and
+        # `lan-*` are rows the relay keeps, and an enrolment claiming
+        # `icloud` replaced the iCloud key's row for good (2026-09-30).
+        raw = str(body.get("device_id") or uuid.uuid4().hex)[:56]
+        token = auth.issue_device("watch-" + raw,
                                   body.get("label") or "Apple Watch",
-                                  source=str(body.get("source") or "icloud"))
+                                  source=str(body.get("source") or "icloud"),
+                                  replaces=raw)
+        if not auth.is_bootstrap(presented):
+            # A key from the pairing window is traded in, not multiplied.
+            auth.revoke_token(presented)
         if getattr(self, "_signed_nonce", None):
             # Signed: the new key crosses plain HTTP sealed for the signer.
             self._send_json({"sealed": seal(presented, self._signed_nonce, token)})
@@ -2520,6 +2563,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", media)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "private, max-age=3600")
+        self._send_proofs(200, data)
         self.end_headers()
         self.wfile.write(data)
 
@@ -2778,6 +2822,12 @@ class RelayHandler(BaseHTTPRequestHandler):
 _TUNNEL_HANDLER = None
 
 
+def _live_tunnel_secret(fallback):
+    """The secret path the tunnel listener answers now. A rotation changes
+    it in place, so a copy taken at start goes stale (2026-09-30 review)."""
+    return getattr(_TUNNEL_HANDLER, "required_token", None) or fallback
+
+
 def _rotate_tunnel_prefix(secret):
     """Point the live tunnel listener at the new secret path."""
     global TUNNEL_URL
@@ -2964,17 +3014,29 @@ class Auth:
             "paired_ever": self.paired_ever,
         }
         body = json.dumps(payload, indent=2)
-        # 0600 from the moment it exists: writing first and chmod-ing after
-        # leaves a readable window, however brief.
+        # Written beside the file and renamed over it: the bridge reads this
+        # file too, and a truncated read is read as no key at all — which
+        # the bridge would mirror to iCloud (2026-09-30 review). 0600 from
+        # the moment the new file exists, whatever the old one's mode was.
+        temp = "%s.%d.tmp" % (self.path, os.getpid())
         try:
-            fd = os.open(self.path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-        except OSError:
+            fd = os.open(temp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        except OSError as error:
+            print("relay: could not save %s: %s" % (self.path, error), file=sys.stderr)
             return
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(body + "\n")
-        except OSError:
-            pass
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temp, 0o600)
+            os.replace(temp, self.path)
+        except OSError as error:
+            print("relay: could not save %s: %s" % (self.path, error), file=sys.stderr)
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
 
     # ---- credentials -------------------------------------------------
 
@@ -3007,14 +3069,23 @@ class Auth:
     def is_bootstrap(self, token):
         return bool(self.bootstrap) and _token_matches(token, self.bootstrap)
 
-    def issue_device(self, device_id=None, label="Apple Watch", source="icloud"):
+    RESERVED_IDS = ("icloud",)
+
+    def issue_device(self, device_id=None, label="Apple Watch", source="icloud",
+                     replaces=None):
         """Mint a token for one device. Re-enrolling the same device id
-        replaces its token rather than growing the list forever."""
+        replaces its token rather than growing the list forever.
+        ``replaces`` names a row from before device ids had a namespace,
+        dropped too unless it is one the relay keeps."""
         token = uuid.uuid4().hex
         device_id = str(device_id or uuid.uuid4().hex)[:64]
+        gone = {device_id}
+        if replaces and replaces not in self.RESERVED_IDS \
+                and not str(replaces).startswith("lan-"):
+            gone.add(str(replaces))
         with self._lock:
             self.devices = [d for d in self.devices
-                            if d.get("id") != device_id]
+                            if d.get("id") not in gone]
             self.devices.append({"id": device_id, "token": token,
                                  "label": str(label or "Apple Watch")[:40],
                                  "issued": int(time.time()), "last_seen": 0,
@@ -3026,6 +3097,17 @@ class Auth:
             self.paired_ever = True
             self.save()
         return token
+
+    def revoke_token(self, token):
+        """Drop the one device row holding ``token``; the iCloud row is the
+        bootstrap's and is never dropped this way."""
+        with self._lock:
+            kept = [d for d in self.devices
+                    if d.get("id") in self.RESERVED_IDS
+                    or not _token_matches(token, d.get("token") or "")]
+            if len(kept) != len(self.devices):
+                self.devices = kept
+                self.save()
 
     def revoke_all(self):
         """--pair-reset: every key goes, the machine's own included.
@@ -3385,7 +3467,7 @@ def start_tunnel(port, token):
                       file=sys.stderr)
                 print("relay: off-Wi-Fi tunnel up — the watch learns this "
                       "address automatically while on the same Wi-Fi.\n"
-                      "       (manual fallback: %s)" % TUNNEL_URL,
+                      "       (manual fallback: %s/t/…)" % match.group(0),
                       file=sys.stderr)
                 return
             if proc.poll() is not None:
@@ -3481,7 +3563,7 @@ def watch_tunnel(handle, port, token, sleep=time.sleep, checks=None):
             if not url or done % TUNNEL_PROBE_EVERY:
                 failures = 0            # alive, or still announcing itself
                 continue
-            if _tunnel_answers_soon(url.split("/t/")[0], token,
+            if _tunnel_answers_soon(url.split("/t/")[0], _live_tunnel_secret(token),
                                     tries=TUNNEL_WATCH_TRIES):
                 failures = 0
                 clear_condition("tunnel")   # a changed-address notice ends here
@@ -3496,7 +3578,7 @@ def watch_tunnel(handle, port, token, sleep=time.sleep, checks=None):
             "Answering from away stopped. Reopening it — your watch learns "
             "the new address through iCloud.")
         print("relay: tunnel %s — reopening" % why, file=sys.stderr)
-        handle = start_tunnel(port, token)
+        handle = start_tunnel(port, _live_tunnel_secret(token))
 
 
 # --------------------------------------------------------------------------

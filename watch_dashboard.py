@@ -166,6 +166,16 @@ def _message_of(entry):
 
 
 def _usage_entry(line):
+    """One usage record, or None — for a line of any shape at all. A usage
+    block that was not numbers raised here and broke /usage until the file
+    aged out of the window (2026-09-30 review)."""
+    try:
+        return _usage_entry_of(line)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _usage_entry_of(line):
     entry = _json_object(line)
     if entry is None:
         return None
@@ -285,7 +295,7 @@ def session_registry(sessions_dir=None):
             continue
         registry[session_id] = {
             "status": ENTRYPOINTS.get(data.get("entrypoint", ""), "Connected"),
-            "bridged": bool(data.get("bridgeSessionId")),
+            "bridged": bool(data.get(shape("registry.bridged"))),
             # The title the phone and the desktop app show. A name the CLI
             # derived from the folder ("acme-3f") is not a title, so that
             # one is left out; a /rename and the desktop app's own title
@@ -294,7 +304,8 @@ def session_registry(sessions_dir=None):
             # sessions until 2026-09-23 — it showed "Base directory for this
             # skill…", the first line a skill injected.
             "name": (str(data.get("name") or "").strip()
-                     if data.get("nameSource") != "derived" else ""),
+                     if data.get(shape("registry.name_source"))
+                     != shape("registry.name_derived") else ""),
             "cwd": str(data.get("cwd") or ""),
             "pid": int(pid),
         }
@@ -465,6 +476,37 @@ UPSTREAM_SHAPES = {
          "as a user turn when a headless run resumes a session mid-answer. "
          "Nobody said it; the wrist showed it as the owner's own message, "
          "each time answered by the filler above.", "2026-09-24"),
+    "registry.bridged":
+        ("bridgeSessionId", "The session registry's mark of a session "
+         "Remote Control carries to the phone.", "2026-09-03"),
+    "registry.name_source":
+        ("nameSource", "How the registry says a session's name came about.",
+         "2026-09-03"),
+    "registry.name_derived":
+        ("derived", "The nameSource of a name the CLI made from the folder "
+         "(\"acme-3f\"): not a title anybody chose.", "2026-09-03"),
+    "text.caveat_opener":
+        ("Caveat:", "How a slash command's local-command note opens, as a "
+         "user turn nobody typed.", "2026-08-27"),
+    "text.request_opener":
+        ("[Request", "How an interruption notice opens (\"[Request "
+         "interrupted by user]\"), as a user turn.", "2026-08-27"),
+    "tag.system_reminder":
+        ("system-reminder", "The tag of the notes Claude Code prepends to "
+         "the very text a person typed.", "2026-09-24"),
+    "task.exited":
+        ("[exited", "The last words of a background task's output file "
+         "when it has finished.", "2026-08-27"),
+    "task.killed":
+        ("[killed]", "…and when it was stopped.", "2026-08-27"),
+    "task.launched":
+        ("background with ID", "The tool result that says a background "
+         "command started.", "2026-08-27"),
+    "task.agent_id":
+        ("agentId", "The same, for a background agent.", "2026-08-27"),
+    "tag.task_id":
+        ("<task-id>", "The notification that a background task finished.",
+         "2026-08-27"),
     "part.tool_result":
         ('"tool_result"', "A tool has answered, so nothing is running now.",
          "2026-09-04"),
@@ -506,7 +548,7 @@ def note_unknown_subtype(subtype):
 # the session list (its title) and the thread (its first turn) skip them;
 # they used to each carry this tuple, and a prefix Claude Code adds
 # tomorrow would have been skipped on one screen and shown on the other.
-_SYSTEM_OPENERS = ("<", "Caveat:", "[Request")
+_SYSTEM_OPENERS = ("<", shape("text.caveat_opener"), shape("text.request_opener"))
 
 
 # Claude Code rides its own notes INTO the person's message: memory recall,
@@ -516,7 +558,8 @@ _SYSTEM_OPENERS = ("<", "Caveat:", "[Request")
 # TestFlight build": one string, reminder first, so the turn opened with
 # "<" and both screens skipped it as harness noise — the person's own
 # words, gone from their own thread, whenever the CLI had a note to attach.
-_SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>\s*", re.S)
+_SYSTEM_REMINDER = re.compile(r"<{0}>.*?</{0}>\s*".format(
+    re.escape(shape("tag.system_reminder"))), re.S)
 
 _COMMAND_NAME = re.compile(r"<command-name>\s*(/?[\w:-]+)\s*</command-name>")
 _COMMAND_ARGS = re.compile(r"<command-args>(.*?)</command-args>", re.S)
@@ -700,7 +743,10 @@ def _session_meta(path, scan_lines=600):
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             for index, line in enumerate(handle):
-                if index >= scan_lines and cwd and opening:
+                # Stop where the caller said, found or not: a session of
+                # slash commands never has an opening, and waiting for one
+                # read the whole transcript on every /sessions (2026-09-30).
+                if index >= scan_lines:
                     break
                 entry = _json_object(line)
                 if entry is None:
@@ -788,6 +834,20 @@ _ACTIVITY_STATE = {}    # path -> {"day", "offset", ...running stats}
 _ACTIVITY_LOCK = threading.Lock()
 
 
+def _local_time(stamp):
+    """("YYYY-MM-DD", "HH:MM") of an ISO timestamp in this machine's zone,
+    or None when it does not parse."""
+    from datetime import datetime
+    try:
+        moment = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        return None
+    local = moment.astimezone()
+    return local.strftime("%Y-%m-%d"), local.strftime("%H:%M")
+
+
 def activity_summary(audit_log=None, now=None):
     """What the triage actually did today, and the last few decisions.
 
@@ -795,8 +855,9 @@ def activity_summary(audit_log=None, now=None):
     handled without a human, and how few needed one. Never raises.
     """
     now = now or time.time()
-    from datetime import datetime, timezone
-    today = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+    # The wearer's day, not UTC's: the log is written in UTC, and Today
+    # turned over at 02:00 in Copenhagen and clocked 09:30 as 07:30.
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
     path = audit_log or _audit_log_path()
     # Requests run on their own threads, and this reads a file offset,
     # advances it, and adds to counters. Two overlapping calls — the watch
@@ -816,7 +877,12 @@ def _activity_summary_locked(path, today):
 
     state = _ACTIVITY_STATE.get(path)
     if state is None or state["day"] != today:
+        # A new day starts where the old one stopped reading: everything
+        # before that offset was read before midnight, so none of it is
+        # today's. Starting from byte zero read the lifetime log each night.
+        carried = state["offset"] if state is not None else 0
         state = fresh_state()
+        state["offset"] = carried
         _ACTIVITY_STATE[path] = state
 
     lines, state["offset"], shrunk = _read_appended(path, state["offset"])
@@ -829,10 +895,11 @@ def _activity_summary_locked(path, today):
         state["offset"] = offset
         _ACTIVITY_STATE[path] = state
     for line in lines:
-        if today not in line[:32]:
-            continue
         entry = _json_object(line)
         if entry is None:
+            continue
+        local = _local_time(entry.get("ts"))
+        if local is None or local[0] != today:
             continue
         tier = entry.get("tier", "?")
         state["tiers"][tier] = state["tiers"].get(tier, 0) + 1
@@ -842,7 +909,7 @@ def _activity_summary_locked(path, today):
                 "tier": tier,
                 "headline": entry.get("headline", ""),
                 "project": entry.get("project") or "",
-                "at": str(entry.get("ts", ""))[11:16],
+                "at": local[1],
             })
             state["recent"] = state["recent"][-12:]
 
@@ -1225,7 +1292,7 @@ def _judge_task_files(found):
                 size = os.path.getsize(path)
                 handle.seek(max(0, size - 300))
                 tail = handle.read().decode("utf-8", "replace")
-            if "[exited" in tail or "[killed]" in tail:
+            if shape("task.exited") in tail or shape("task.killed") in tail:
                 return "done"
             if time.time() - os.path.getmtime(path) <= 1800:
                 return "running"
@@ -1428,7 +1495,16 @@ def _parse_thread_locked(path, limit):
         _THREAD_STATE[path] = state
     if lines:
         for line in lines:
-            _thread_line(state, line, limit)
+            try:
+                _thread_line(state, line, limit)
+            except (AttributeError, TypeError, ValueError, KeyError, IndexError) as error:
+                # One line of a shape nobody expected used to end the batch
+                # — and the offset had moved past it, so the rest was lost
+                # for good (2026-09-30 review). Skip it, and say so once.
+                if not state.get("skipped"):
+                    print("dashboard: skipped a transcript line in %s (%s)"
+                          % (os.path.basename(path), error), file=sys.stderr)
+                state["skipped"] = state.get("skipped", 0) + 1
         state["result"] = None
     # Recompute on new lines, a new limit, or a 30s clock: the task
     # verdicts depend on files OUTSIDE this transcript, so a cached
@@ -1472,10 +1548,10 @@ def _thread_line(state, line, limit):
     # notifications — never in Claude's own prose. An assistant message
     # QUOTING an id (writing tests, discussing a task) must not count.
     if role != "assistant":
-        if "background with ID" in line or "agentId" in line:
+        if shape("task.launched") in line or shape("task.agent_id") in line:
             for a, b in _TASK_LAUNCH.findall(line):
                 state["launched"].add(a or b)
-        if "<task-id>" in line:
+        if shape("tag.task_id") in line:
             state["finished"].update(_TASK_DONE.findall(line))
     if shape("part.tool_result") in line:
         state["running_tool"] = None

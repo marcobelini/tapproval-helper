@@ -79,15 +79,30 @@ def decide(tool_name, tool_input, crc=None, cwd=None):
         # — which is the honest default, not the quiet one. CRITICAL is
         # never auto-allowed here either; `decide` holds that.
         verdict, reason = crc.decide(result["risk"], policy)
+        # Shadow mode allows nothing, as in the hook: the threshold was
+        # applied here whatever the mode said (2026-09-30 review).
+        if verdict == "allow" and str(policy.get("mode", "shadow")).lower() != "enforce":
+            verdict = "escalate"
         if verdict == "allow":
             return {"behavior": "allow", "updatedInput": tool_input}
         if verdict == "deny":
             return deny(reason or "Blocked by your Tapproval policy.")
         card = crc.wrist_card(tool_name, tool_input, result["risk"])
-        verdict, _answer = crc.ask_watch(card, policy)
+        verdict, answer = crc.ask_watch(card, policy)
     except Exception as error:                          # never a stack trace
         return deny("Tapproval could not ask your watch (%s). Answer this at "
                     "the keyboard." % error)
+    if verdict == "answer" and answer:
+        # The wrist answered a question or a plan. This was thrown away and
+        # the run told the watch had not answered (2026-09-30 review).
+        if card.get("plan_card"):
+            behavior, message, _mode = crc.plan_decision(answer)
+            if behavior == "allow":
+                return {"behavior": "allow", "updatedInput": tool_input}
+            return deny(message)
+        # The hook's channel for words: a deny whose reason is the answer,
+        # on which Claude proceeds.
+        return deny("The user answered from their watch: %s" % answer)
     if verdict == "allow":
         return {"behavior": "allow", "updatedInput": tool_input}
     if verdict == "deny":
@@ -103,6 +118,11 @@ def _result(request_id, payload):
 def handle(message, crc=None):
     """One JSON-RPC message in, one reply out — or None for a notification,
     which by the protocol is answered with silence, not with an error."""
+    if not isinstance(message, dict):
+        # Valid JSON that is not a request used to raise here and end the
+        # server, leaving the rest of the run with no permission tool.
+        return {"jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600, "message": "not a request"}}
     method = message.get("method")
     request_id = message.get("id")
     if request_id is None:
@@ -125,12 +145,17 @@ def handle(message, crc=None):
                     "tool_use_id": {"type": "string"}},
                 "required": ["tool_name", "input"]}}]})
     if method == "tools/call":
-        params = message.get("params") or {}
+        params = message.get("params")
+        params = params if isinstance(params, dict) else {}
         if params.get("name") != TOOL:
             return {"jsonrpc": "2.0", "id": request_id,
                     "error": {"code": -32601,
                               "message": "no tool named %r" % params.get("name")}}
-        arguments = params.get("arguments") or {}
+        arguments = params.get("arguments")
+        if not isinstance(arguments, dict):
+            return _result(request_id, {"content": [{"type": "text", "text": json.dumps(
+                deny("Tapproval could not read this permission request. Answer it "
+                     "at the keyboard."))}]})
         decision = decide(arguments.get("tool_name") or arguments.get("toolName") or "",
                           arguments.get("input") or arguments.get("toolInput") or {},
                           crc=crc, cwd=arguments.get("cwd"))
