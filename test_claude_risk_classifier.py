@@ -5091,6 +5091,86 @@ class TestMonitorsAreTasks:
         assert path
 
 
+class TestAScheduledSessionSaysWhenItComesBack:
+    """A session that set a wake-up (a /loop, a check for later) is not
+    idle: something will happen without anyone. ScheduleWakeup's result
+    says when ("Next wakeup scheduled for 07:42:00 (in 257s)"), and
+    "Loop stopped" cancels it (shapes seen 2026-09-23 and 2026-09-26)."""
+
+    def test_the_state_ladder(self):
+        import watch_dashboard as wd
+        soon = time.time() + 600
+        assert wd.session_state(300, None, 0, False, False, wake_at=soon) == ("scheduled", "wakeup")
+        assert wd.session_state(300, None, 0, False, False, wake_at=time.time() - 5) == ("idle", "")
+        assert wd.session_state(300, None, 2, False, False, wake_at=soon) == ("running", "tasks")
+        assert wd.session_state(300, None, 0, True, False, wake_at=soon) == ("asking", "card")
+        assert wd.session_state(3, None, 0, False, False, wake_at=soon) == ("running", "writing")
+
+    @staticmethod
+    def _wakeup(stamp, seconds=257, tool_id="toolu_w1"):
+        return [
+            {"timestamp": stamp, "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": tool_id, "name": "ScheduleWakeup",
+                 "input": {"delaySeconds": seconds, "prompt": "/loop check"}}]}},
+            {"timestamp": stamp, "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content":
+                 "Next wakeup scheduled for 07:42:00 (in %ds). Nothing more to "
+                 "do this turn." % seconds}]}},
+        ]
+
+    @staticmethod
+    def _iso(epoch):
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    def _parse(self, tmp_path, lines):
+        import watch_dashboard as wd
+        path = _write_transcript(tmp_path, "-p", "wake01.jsonl", lines)
+        wd._THREAD_STATE.pop(str(path), None)
+        wd._parse_thread(str(path), 14)
+        return wd._THREAD_STATE[str(path)].get("wake_at"), str(path)
+
+    def test_the_wake_time_comes_from_the_result(self, tmp_path):
+        stamp = 1790000000
+        wake_at, _ = self._parse(tmp_path, self._wakeup(self._iso(stamp)))
+        assert wake_at == stamp + 257
+
+    def test_a_stopped_loop_wakes_nobody(self, tmp_path):
+        lines = self._wakeup(self._iso(time.time())) + [
+            {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_w2", "name": "ScheduleWakeup",
+                 "input": {"stop": True}}]}},
+            {"message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_w2",
+                 "content": "Loop stopped — cancelled the pending wakeup."}]}}]
+        wake_at, _ = self._parse(tmp_path, lines)
+        assert wake_at is None
+
+    def test_a_refused_wakeup_is_no_wakeup(self, tmp_path):
+        lines = [
+            {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_w3", "name": "ScheduleWakeup",
+                 "input": {"delaySeconds": 120}}]}},
+            {"message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_w3", "is_error": True,
+                 "content": "`prompt` is required when `stop` is not true."}]}}]
+        wake_at, _ = self._parse(tmp_path, lines)
+        assert wake_at is None
+
+    def test_the_list_row_says_scheduled_and_when(self, tmp_path):
+        import watch_dashboard as wd
+        now = time.time()
+        path = _write_transcript(tmp_path, "-p", "wake02.jsonl",
+                                 [{"cwd": "/x", "message": {"role": "user", "content": "go"}}]
+                                 + self._wakeup(self._iso(now - 60), seconds=1800))
+        os.utime(path, (now - 60, now - 60))
+        wd._THREAD_STATE.pop(str(path), None)
+        rows = wd.recent_sessions(limit=5, projects_dir=str(tmp_path), include_idle=True)
+        row = next(r for r in rows if r["session_id"].startswith("wake02"))
+        assert (row["state"], row["state_reason"]) == ("scheduled", "wakeup")
+        assert abs(row["wake_at"] - (now - 60 + 1800)) <= 2
+
+
 class TestEveryPress:
     """Every press the watch can make, mock-verified end to end through
     the hook: allow, deny, an option answer, and the phone's third
@@ -8302,7 +8382,7 @@ class TestRelayRoutes:
         assert status == 200
         assert body == {"turns": [], "running_tasks": 0, "running_tool": None,
                         "modified_seconds_ago": None, "state": "idle",
-                        "state_reason": ""}
+                        "state_reason": "", "wake_at": None}
 
     def test_a_thread_says_its_state(self, relay, monkeypatch, tmp_path):
         """The thread's header shows the same state as the list's row."""

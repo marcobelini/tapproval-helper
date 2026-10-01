@@ -507,6 +507,13 @@ UPSTREAM_SHAPES = {
     "task.monitor_started":
         ("Monitor started (task", "The tool result that says a Monitor "
          "started; it is a background task like a command.", "2026-10-01"),
+    "wakeup.scheduled":
+        ("Next wakeup scheduled for", "ScheduleWakeup's result when it took: "
+         "\"Next wakeup scheduled for 07:42:00 (in 257s)\". The session "
+         "comes back by itself then.", "2026-10-01"),
+    "wakeup.stopped":
+        ("Loop stopped", "ScheduleWakeup's result for stop: the pending "
+         "wake-up is cancelled.", "2026-10-01"),
     "tag.task_id":
         ("<task-id>", "The id inside a task notification. A Monitor sends "
          "one with every event, so on its own it does not mean finished.",
@@ -1245,6 +1252,7 @@ _TASK_LAUNCH = re.compile(
     r"running in background with ID: ([\w-]+)|agentId: ([a-f0-9]+)"
     r"|Monitor started \(task ([\w-]+)")
 _TASK_DONE = re.compile(r"<task-id>([\w-]+)</task-id>")
+_WAKEUP_IN = re.compile(r"Next wakeup scheduled for [^(]*\(in (\d+)s\)")
 # How many tool descriptions to remember, to name a task by what it is for.
 _DESCRIPTIONS_KEPT = 64
 
@@ -1385,6 +1393,7 @@ def _fresh_thread_state():
     return {"offset": 0, "turns": [], "launched": set(),
             "finished": set(), "running_tool": None, "running_tool_id": None,
             "descriptions": OrderedDict(), "task_labels": {}, "running_label": None,
+            "wake_at": None,
             "github": None,
             "last_said": None,
             "result": None, "result_at": 0.0, "limit": None}
@@ -1594,6 +1603,14 @@ def _thread_line(state, line, limit):
                     state.setdefault("task_labels", {})[tid] = description
         if shape("tag.task_id") in line:
             state["finished"].update(_tasks_ended(line))
+        # A wake-up the session set for itself: when it comes back.
+        if shape("wakeup.scheduled") in line:
+            found = _WAKEUP_IN.search(line)
+            if found:
+                said = _parse_stamp(entry.get("timestamp")) or time.time()
+                state["wake_at"] = said + int(found.group(1))
+        elif shape("wakeup.stopped") in line:
+            state["wake_at"] = None
     if shape("part.tool_result") in line:
         state["running_tool"] = None
         state["running_tool_id"] = None
@@ -1785,13 +1802,15 @@ STATE_TOOL_SECONDS = 1800
 
 
 def session_state(active_seconds_ago, running_tool, running_tasks,
-                  card_waiting, waiting_at_mac):
+                  card_waiting, waiting_at_mac, wake_at=None):
     """The one state a session is in, and why: ``(state, reason)``.
 
     ``running`` — Claude writing (``writing``), a tool call in flight
     (``tool``), or tasks still running behind a quiet transcript
     (``tasks``). ``asking`` — a card on the wrist (``card``) or a prompt
-    waiting at the Mac (``terminal``). ``idle`` otherwise.
+    waiting at the Mac (``terminal``). ``scheduled`` — nothing running,
+    but the session set a wake-up that is still ahead (``wakeup``), so it
+    comes back by itself. ``idle`` otherwise.
 
     Decided here, once, by the side that can see the transcript, the task
     files and the audit log. The watch used to decide "working" alone from
@@ -1811,6 +1830,8 @@ def session_state(active_seconds_ago, running_tool, running_tasks,
         return "running", "tool"
     if running_tasks:
         return "running", "tasks"
+    if wake_at and wake_at > time.time():
+        return "scheduled", "wakeup"
     return "idle", ""
 
 
@@ -1850,6 +1871,12 @@ def prompts_at_the_mac(audit_log=None, tail=128 * 1024):
     _AT_MAC_CACHE.clear()
     _AT_MAC_CACHE[path] = (key, found)
     return found
+
+
+def thread_wake_at(path):
+    """When this transcript's session comes back by itself (a wake-up it
+    set), epoch seconds, or None. Read from the parse state, never raises."""
+    return (_THREAD_STATE.get(path) or {}).get("wake_at") if path else None
 
 
 def thread_tool_id(path):
@@ -1907,10 +1934,12 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
         if not name:
             name = project.rstrip("-").rsplit("-", 1)[-1] or project
         running_tasks, running_tool, github = _thread_activity(path)
+        wake_at = (_THREAD_STATE.get(path) or {}).get("wake_at")
         state, reason = session_state(
             max(0, int(time.time() - mtime)), running_tool, running_tasks,
             card_waiting=session_id in waiting,
-            waiting_at_mac=thread_tool_id(path) in at_mac)
+            waiting_at_mac=thread_tool_id(path) in at_mac,
+            wake_at=wake_at)
         repo = repo_slug(cwd)
         # The app's own title wins outright — a /rename, or the title the
         # desktop app gave it, which is what the phone shows too. Otherwise
@@ -1950,5 +1979,7 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
             # older than this field keeps its own 20-second rule.
             "state": state,
             "state_reason": reason,
+            # When a scheduled session comes back, epoch seconds.
+            "wake_at": int(wake_at) if state == "scheduled" else None,
         })
     return sessions

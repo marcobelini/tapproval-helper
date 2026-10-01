@@ -1020,7 +1020,7 @@ from watch_dashboard import (  # noqa: E402
     activity_summary, recap_summary, _find_transcript, image_bytes,
     _json_object, _message_of, _parse_thread, prewarm_threads, _read_appended,
     project_root, prompts_at_the_mac, recent_sessions, resolve_session,
-    session_registry, session_state, shape, thread_tool_id,
+    session_registry, session_state, shape, thread_tool_id, thread_wake_at,
     transcript_origin, transcripts_newest_first,
     THREAD_TURN_LIMIT, usage_summary)
 
@@ -2648,15 +2648,18 @@ class RelayHandler(BaseHTTPRequestHandler):
         card_waiting = bool(session_id) and any(
             str(card.get("session_id") or "").startswith(session_id)
             for card in self.queue.pending())
+        wake_at = thread_wake_at(path_on_disk)
         state, reason = session_state(
             active, tool_now, running, card_waiting,
-            bool(path_on_disk) and thread_tool_id(path_on_disk) in prompts_at_the_mac())
+            bool(path_on_disk) and thread_tool_id(path_on_disk) in prompts_at_the_mac(),
+            wake_at=wake_at)
         self._send_json({"turns": turns,
                          "running_tasks": running,
                          "running_tool": tool_now,
                          "modified_seconds_ago": active,
                          "state": state,
-                         "state_reason": reason})
+                         "state_reason": reason,
+                         "wake_at": int(wake_at) if state == "scheduled" else None})
 
     def _get_tunnel(self, path, query):
         # LAN only: hand the watch its away-addresses while it's home.
