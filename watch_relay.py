@@ -593,7 +593,7 @@ def _rotate_log(path=None, limit=RELAY_LOG_MAX):
         return False
 
 
-# At most once a day, and never in the way. A stale helper is not a
+# At most once an hour, and never in the way. A stale helper is not a
 # cosmetic problem: the version before 1.1.1 discarded every wrist
 # approval in silence, so "an update that never arrives" is the failure
 # mode this guards against.
@@ -602,11 +602,14 @@ def _rotate_log(path=None, limit=RELAY_LOG_MAX):
 # monkeypatch cannot reach — never pulls the working tree it is testing.
 _UPDATE_STAMP = os.environ.get("TAPPROVAL_UPDATE_STAMP") or os.path.expanduser(
     "~/.tapproval-last-update")
-_UPDATE_EVERY = 86400.0
+# An hour, not a day: a helper published in the afternoon sat unread until
+# the next morning (2026-10-01) while the watch said "start Claude Code
+# once to update it". A fetch is cheap, and it never blocks a session.
+_UPDATE_EVERY = 3600.0
 
 
 def _self_update():
-    """Kick off a fast-forward of a git-installed helper, once a day.
+    """Kick off a fast-forward of a git-installed helper, once an hour.
 
     Runs on the blocking path of the SessionStart hook, so it never pulls
     here: it spawns ``--update`` detached and returns at once. The

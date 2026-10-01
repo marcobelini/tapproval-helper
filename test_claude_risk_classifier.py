@@ -4982,7 +4982,8 @@ class TestPhoneVocabulary:
             {"message": {"role": "user", "content":
              "Command running in background with ID: stillgoing1."}},
             {"message": {"role": "user", "content":
-             "<task-notification><task-id>abc123</task-id>done"}},
+             "<task-notification><task-id>abc123</task-id>"
+             "<status>completed</status>done"}},
         ]
         _write_transcript(tmp_path, "-p", "tasks01.jsonl", lines)
         path = watch_relay._find_transcript("tasks01",
@@ -4996,6 +4997,98 @@ class TestPhoneVocabulary:
         watch_dashboard._THREAD_STATE.pop(path, None)
         _, running, _ = watch_relay._parse_thread(path, 14)
         assert running == 1     # abc123 receipted; stillgoing1 found on disk
+
+
+class TestMonitorsAreTasks:
+    """A Monitor is a background task like a background command, and the
+    phone counts it. The wrist did not: its launch reads "Monitor started
+    (task …)", which nothing recognised, and every EVENT it sends carries a
+    <task-id> — which was read as "finished". Only a notification with a
+    <status> ends a task (2026-10-01, a familia-gateway session the phone
+    showed with one running task and the wrist showed idle)."""
+
+    def _session(self, tmp_path, monkeypatch, lines, live=("bmon1",)):
+        import watch_dashboard
+        path = _write_transcript(tmp_path, "-p", "mon01.jsonl", lines)
+        tasks = tmp_path / "tmp" / "claude-1" / "proj" / "mon01" / "tasks"
+        tasks.mkdir(parents=True, exist_ok=True)
+        for task in live:
+            (tasks / ("%s.output" % task)).write_text("event\n", encoding="utf-8")
+        monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+        watch_dashboard._THREAD_STATE.pop(str(path), None)
+        return str(path)
+
+    @staticmethod
+    def _monitor_launch(task="bmon1", description="TestFlight build 2 milestones"):
+        return [
+            {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_m1", "name": "Monitor",
+                 "input": {"description": description, "command": "tail -f x"}}]}},
+            {"message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_m1", "content":
+                 "Monitor started (task %s, expires in 30m unless the source "
+                 "ends first)." % task}]}},
+        ]
+
+    @staticmethod
+    def _event(task="bmon1"):
+        return {"message": {"role": "user", "content":
+                "<task-notification>\n<task-id>%s</task-id>\n<summary>Monitor "
+                "event: \"TestFlight\"</summary>\n<event>==> Uploading</event>\n"
+                "</task-notification>" % task}}
+
+    def test_a_monitor_with_events_is_still_running(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        path = self._session(tmp_path, monkeypatch,
+                             self._monitor_launch() + [self._event(), self._event()])
+        _, running, _ = watch_dashboard._parse_thread(path, 14)
+        assert running == 1, "an event is news from a monitor, not its end"
+        assert watch_dashboard._THREAD_STATE[path]["running_label"] == \
+            "TestFlight build 2 milestones"
+
+    def test_a_monitor_ends_with_its_status(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        path = self._session(tmp_path, monkeypatch, self._monitor_launch() + [
+            self._event(),
+            {"message": {"role": "user", "content":
+             "<task-notification>\n<task-id>bmon1</task-id>\n<status>completed"
+             "</status>\n<summary>Monitor \"TestFlight\" stream ended</summary>"
+             "\n</task-notification>"}}])
+        _, running, _ = watch_dashboard._parse_thread(path, 14)
+        assert running == 0
+        assert watch_dashboard._THREAD_STATE[path]["running_label"] is None
+
+    def test_a_background_command_is_named_by_its_description(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        path = self._session(tmp_path, monkeypatch, [
+            {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_b1", "name": "Bash",
+                 "input": {"command": "until …; do sleep 60; done",
+                           "description": "Wait for build 95 to finish processing",
+                           "run_in_background": True}}]}},
+            {"message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_b1", "content":
+                 "Command running in background with ID: bb95. Output is "
+                 "being written to: /tmp/x/tasks/bb95.output"}]}},
+        ], live=("bb95",))
+        _, running, _ = watch_dashboard._parse_thread(path, 14)
+        assert running == 1
+        assert watch_dashboard._THREAD_STATE[path]["running_label"] == \
+            "Wait for build 95 to finish processing"
+
+    def test_the_list_row_carries_the_label(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        path = self._session(tmp_path, monkeypatch,
+                             [{"cwd": "/x", "message": {"role": "user", "content": "go"}}]
+                             + self._monitor_launch())
+        quiet = time.time() - 300        # Claude stopped writing five minutes ago
+        os.utime(path, (quiet, quiet))
+        rows = watch_dashboard.recent_sessions(limit=5, projects_dir=str(tmp_path), include_idle=True)
+        row = next(r for r in rows if r["session_id"].startswith("mon01"))
+        assert row["running_tasks"] == 1
+        assert row["running_label"] == "TestFlight build 2 milestones"
+        assert row["state"] == "running" and row["state_reason"] == "tasks"
+        assert path
 
 
 class TestEveryPress:
@@ -6575,7 +6668,23 @@ class TestHelperKeepsItselfCurrent:
         wr._self_update()                      # no .git beside it
         assert spawned == []
 
-    def test_it_asks_at_most_once_a_day(self, tmp_path, monkeypatch):
+    def test_a_stamp_two_hours_old_asks_again(self, tmp_path, monkeypatch):
+        """Once a day left a helper published at 15:02 unread until the next
+        morning (2026-10-01), while the watch said "start Claude Code once
+        to update it". An hour keeps that sentence true."""
+        wr = watch_relay
+        spawned = self._spawns(monkeypatch)
+        (tmp_path / ".git").mkdir()
+        stamp = tmp_path / "stamp"
+        stamp.write_text("earlier", encoding="utf-8")
+        two_hours_ago = time.time() - 2 * 3600
+        os.utime(stamp, (two_hours_ago, two_hours_ago))
+        monkeypatch.setattr(wr, "__file__", str(tmp_path / "watch_relay.py"))
+        monkeypatch.setattr(wr, "_UPDATE_STAMP", str(stamp))
+        wr._self_update()
+        assert len(spawned) == 1, "an update two hours stale must be asked for"
+
+    def test_it_asks_at_most_once_an_hour(self, tmp_path, monkeypatch):
         wr = watch_relay
         spawned = self._spawns(monkeypatch)
         (tmp_path / ".git").mkdir()

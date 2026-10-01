@@ -504,9 +504,16 @@ UPSTREAM_SHAPES = {
          "command started.", "2026-08-27"),
     "task.agent_id":
         ("agentId", "The same, for a background agent.", "2026-08-27"),
+    "task.monitor_started":
+        ("Monitor started (task", "The tool result that says a Monitor "
+         "started; it is a background task like a command.", "2026-10-01"),
     "tag.task_id":
-        ("<task-id>", "The notification that a background task finished.",
-         "2026-08-27"),
+        ("<task-id>", "The id inside a task notification. A Monitor sends "
+         "one with every event, so on its own it does not mean finished.",
+         "2026-10-01"),
+    "tag.task_status":
+        ("<status>", "What makes a task notification an ending: completed, "
+         "failed, killed. A Monitor's events carry none.", "2026-10-01"),
     "part.tool_result":
         ('"tool_result"', "A tool has answered, so nothing is running now.",
          "2026-09-04"),
@@ -1235,8 +1242,24 @@ def _tool_phrase(name, count=1):
 # Background tasks announce themselves when launched and are receipted by
 # a task-notification when they end; the difference is what is running.
 _TASK_LAUNCH = re.compile(
-    r"running in background with ID: ([\w-]+)|agentId: ([a-f0-9]+)")
+    r"running in background with ID: ([\w-]+)|agentId: ([a-f0-9]+)"
+    r"|Monitor started \(task ([\w-]+)")
 _TASK_DONE = re.compile(r"<task-id>([\w-]+)</task-id>")
+# How many tool descriptions to remember, to name a task by what it is for.
+_DESCRIPTIONS_KEPT = 64
+
+
+def _tasks_ended(line):
+    """The task ids a line says have ENDED: those whose notification carries
+    a <status>. A Monitor sends a notification per event with the same
+    <task-id> and no status, and reading every <task-id> as an ending
+    retired a live monitor at its first event (2026-10-01)."""
+    ended = set()
+    for block in line.split("<task-notification>")[1:]:
+        block = block.split("</task-notification>")[0]
+        if shape("tag.task_status") in block:
+            ended.update(_TASK_DONE.findall(block))
+    return ended
 
 
 def _task_state(session_id, task_id):
@@ -1361,6 +1384,7 @@ def prewarm_threads(session_ids):
 def _fresh_thread_state():
     return {"offset": 0, "turns": [], "launched": set(),
             "finished": set(), "running_tool": None, "running_tool_id": None,
+            "descriptions": OrderedDict(), "task_labels": {}, "running_label": None,
             "github": None,
             "last_said": None,
             "result": None, "result_at": 0.0, "limit": None}
@@ -1447,12 +1471,19 @@ def _running_task_count(state, session_id):
     running = 0
     outstanding = state["launched"] - state["finished"]
     files = _task_output_files(session_id) if outstanding else {}
-    for tid in list(outstanding):
+    labels = state.setdefault("task_labels", {})
+    label = None
+    # Launch order, so the label is the newest running task's.
+    for tid in [t for t in labels if t in outstanding] + sorted(outstanding - set(labels)):
         verdict = _judge_task_files(files.get(tid, ()))
         if verdict == "done":
             state["finished"].add(tid)
         elif verdict == "running":
             running += 1
+            label = labels.get(tid) or label
+    # What the wrist can say instead of "1 task": the description Claude
+    # gave the command, monitor or agent ("Wait for build 95 to finish").
+    state["running_label"] = label if running else None
     return running
 
 
@@ -1549,11 +1580,20 @@ def _thread_line(state, line, limit):
     # notifications — never in Claude's own prose. An assistant message
     # QUOTING an id (writing tests, discussing a task) must not count.
     if role != "assistant":
-        if shape("task.launched") in line or shape("task.agent_id") in line:
-            for a, b in _TASK_LAUNCH.findall(line):
-                state["launched"].add(a or b)
+        if (shape("task.launched") in line or shape("task.agent_id") in line
+                or shape("task.monitor_started") in line):
+            asked = [part.get("tool_use_id") for part in
+                     (message.get("content") if isinstance(message.get("content"), list) else [])
+                     if isinstance(part, dict) and part.get("type") == "tool_result"]
+            description = next((state.get("descriptions", {}).get(i) for i in asked
+                                if state.get("descriptions", {}).get(i)), None)
+            for groups in _TASK_LAUNCH.findall(line):
+                tid = next(g for g in groups if g)
+                state["launched"].add(tid)
+                if description:
+                    state.setdefault("task_labels", {})[tid] = description
         if shape("tag.task_id") in line:
-            state["finished"].update(_TASK_DONE.findall(line))
+            state["finished"].update(_tasks_ended(line))
     if shape("part.tool_result") in line:
         state["running_tool"] = None
         state["running_tool_id"] = None
@@ -1584,6 +1624,11 @@ def _thread_line(state, line, limit):
         phrase = _tool_phrase(tool)
         # Which call: a prompt for it at the terminal is "needs you".
         state["running_tool_id"] = part.get("id")
+        if part.get("id") and tool_description:
+            kept = state.setdefault("descriptions", OrderedDict())
+            kept[part["id"]] = " ".join(str(tool_description).split())[:80]
+            while len(kept) > _DESCRIPTIONS_KEPT:
+                kept.popitem(last=False)
         state["running_tool"] = (
             " ".join(str(tool_description or "").split())
             or phrase[:1].upper() + phrase[1:])
@@ -1897,6 +1942,9 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
             "active_seconds_ago": max(0, int(time.time() - mtime)),
             "running_tool": running_tool,
             "running_tasks": running_tasks,
+            # What is running, in Claude's own words, when anything is.
+            "running_label": ((_THREAD_STATE.get(path) or {}).get("running_label")
+                              if running_tasks else None),
             "github": github,
             # The state itself, decided here (session_state). A watch
             # older than this field keeps its own 20-second rule.
