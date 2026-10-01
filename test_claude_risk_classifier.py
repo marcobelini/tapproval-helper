@@ -8779,6 +8779,7 @@ class TestTheReleaseToolsSayWhenAStepFailed:
         assert ".tapproval-crashes.jsonl" in script
         assert ".tapproval.superseded-" in script
 
+    @pytest.mark.skipif(sys.platform != "darwin", reason="launchd is macOS")
     def test_uninstall_removes_the_login_job_when_the_hooks_are_already_gone(self, settings):
         settings.write_text(json.dumps({"hooks": {}}))
         agent = Path(crc._launch_agent_path())
