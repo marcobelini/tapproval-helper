@@ -1360,7 +1360,8 @@ def prewarm_threads(session_ids):
 
 def _fresh_thread_state():
     return {"offset": 0, "turns": [], "launched": set(),
-            "finished": set(), "running_tool": None, "github": None,
+            "finished": set(), "running_tool": None, "running_tool_id": None,
+            "github": None,
             "last_said": None,
             "result": None, "result_at": 0.0, "limit": None}
 
@@ -1555,6 +1556,7 @@ def _thread_line(state, line, limit):
             state["finished"].update(_TASK_DONE.findall(line))
     if shape("part.tool_result") in line:
         state["running_tool"] = None
+        state["running_tool_id"] = None
     if entry.get("type") == "system":
         # A slash command the CLI answered itself — /recap, /cost, an
         # unknown command — writes its output here, not as an assistant
@@ -1580,6 +1582,8 @@ def _thread_line(state, line, limit):
         inp = part.get("input") or {}
         tool_description = inp.get("description")
         phrase = _tool_phrase(tool)
+        # Which call: a prompt for it at the terminal is "needs you".
+        state["running_tool_id"] = part.get("id")
         state["running_tool"] = (
             " ".join(str(tool_description or "").split())
             or phrase[:1].upper() + phrase[1:])
@@ -1728,6 +1732,87 @@ def resolve_session(prefix, projects_dir=None, registry=None):
     return session_id, now or began
 
 
+# A transcript written this recently means Claude is writing now.
+STATE_WRITING_SECONDS = 20
+# A tool call unanswered this long after the transcript last moved is a
+# leftover of an interrupted turn, not work in flight.
+STATE_TOOL_SECONDS = 1800
+
+
+def session_state(active_seconds_ago, running_tool, running_tasks,
+                  card_waiting, waiting_at_mac):
+    """The one state a session is in, and why: ``(state, reason)``.
+
+    ``running`` — Claude writing (``writing``), a tool call in flight
+    (``tool``), or tasks still running behind a quiet transcript
+    (``tasks``). ``asking`` — a card on the wrist (``card``) or a prompt
+    waiting at the Mac (``terminal``). ``idle`` otherwise.
+
+    Decided here, once, by the side that can see the transcript, the task
+    files and the audit log. The watch used to decide "working" alone from
+    20 seconds of transcript silence: a session with background tasks
+    still running read as idle, and so did a prompt that went to the
+    terminal (2026-10-01).
+    """
+    if card_waiting:
+        return "asking", "card"
+    quiet = active_seconds_ago if active_seconds_ago is not None else float("inf")
+    tool_live = bool(running_tool) and quiet <= STATE_TOOL_SECONDS
+    if tool_live and waiting_at_mac:
+        return "asking", "terminal"
+    if quiet < STATE_WRITING_SECONDS:
+        return "running", "writing"
+    if tool_live:
+        return "running", "tool"
+    if running_tasks:
+        return "running", "tasks"
+    return "idle", ""
+
+
+_AT_MAC_CACHE = {}
+
+
+def prompts_at_the_mac(audit_log=None, tail=128 * 1024):
+    """The tool calls the hook left with the person at the terminal.
+
+    The audit log records every PermissionRequest with its tool_use_id and
+    what was done with it; "escalate" means the prompt is on the screen at
+    the Mac (a SAFE call Claude Code answers itself is "skipped-parity",
+    not a prompt). Whether it is still waiting is the transcript's to say:
+    its tool_result has not arrived. Reads the log's tail, cached on its
+    size and time. Never raises."""
+    path = audit_log or _audit_log_path()
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return set()
+    key = (stat.st_size, stat.st_mtime)
+    cached = _AT_MAC_CACHE.get(path)
+    if cached and cached[0] == key:
+        return cached[1]
+    found = set()
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(max(0, stat.st_size - tail))
+            for raw in handle.read().decode("utf-8", "replace").splitlines():
+                entry = _json_object(raw)
+                if (entry and entry.get("effective") == "escalate"
+                        and entry.get("watch") != "skipped-parity"
+                        and entry.get("tool_use_id")):
+                    found.add(str(entry["tool_use_id"]))
+    except OSError:
+        return set()
+    _AT_MAC_CACHE.clear()
+    _AT_MAC_CACHE[path] = (key, found)
+    return found
+
+
+def thread_tool_id(path):
+    """The id of the tool call this transcript is waiting on, or None —
+    after _parse_thread or _thread_activity has read it."""
+    return (_THREAD_STATE.get(path) or {}).get("running_tool_id")
+
+
 def recent_sessions(limit=12, projects_dir=None, include_idle=False,
                     waiting=()):
     """The user's ACTIVE Claude Code sessions, straight from local storage.
@@ -1764,6 +1849,7 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
                      if f[3] not in registry or registry[f[3]]["bridged"]
                      or f[3] in waiting]
     found = found[:limit]
+    at_mac = prompts_at_the_mac()
     sessions = []
     for mtime, path, project, session_id in found:
         # Only the ones we actually return are worth opening.
@@ -1776,6 +1862,10 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
         if not name:
             name = project.rstrip("-").rsplit("-", 1)[-1] or project
         running_tasks, running_tool, github = _thread_activity(path)
+        state, reason = session_state(
+            max(0, int(time.time() - mtime)), running_tool, running_tasks,
+            card_waiting=session_id in waiting,
+            waiting_at_mac=thread_tool_id(path) in at_mac)
         repo = repo_slug(cwd)
         # The app's own title wins outright — a /rename, or the title the
         # desktop app gave it, which is what the phone shows too. Otherwise
@@ -1808,5 +1898,9 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
             "running_tool": running_tool,
             "running_tasks": running_tasks,
             "github": github,
+            # The state itself, decided here (session_state). A watch
+            # older than this field keeps its own 20-second rule.
+            "state": state,
+            "state_reason": reason,
         })
     return sessions

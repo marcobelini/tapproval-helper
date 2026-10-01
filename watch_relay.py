@@ -1016,7 +1016,8 @@ class CardQueue:
 from watch_dashboard import (  # noqa: E402
     activity_summary, recap_summary, _find_transcript, image_bytes,
     _json_object, _message_of, _parse_thread, prewarm_threads, _read_appended,
-    project_root, recent_sessions, resolve_session, session_registry, shape,
+    project_root, prompts_at_the_mac, recent_sessions, resolve_session,
+    session_registry, session_state, shape, thread_tool_id,
     transcript_origin, transcripts_newest_first,
     THREAD_TURN_LIMIT, usage_summary)
 
@@ -2271,8 +2272,15 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     # -- plumbing ----------------------------------------------------------
 
+    # The segment after /t/ is the tunnel's rendezvous secret: not a
+    # credential, but no business in a log file. Redacted on the formatted
+    # line, so an error message quoting a malformed request line is covered
+    # too; the route after it stays readable (/t/…/health).
+    _TUNNEL_SECRET_IN_LOG = re.compile(r"/t/[^/\s\"'?#]+")
+
     def log_message(self, fmt, *args):  # quiet: diagnostics only on stderr
-        print("relay: %s" % (fmt % args), file=sys.stderr)
+        line = self._TUNNEL_SECRET_IN_LOG.sub("/t/…", fmt % args)
+        print("relay: %s" % line, file=sys.stderr)
 
     def _raw_body(self):
         """The request body, read once. A signature covers it, so it is read
@@ -2633,10 +2641,19 @@ class RelayHandler(BaseHTTPRequestHandler):
                 pass
             turns, running, tool_now = _parse_thread(
                 path_on_disk, THREAD_TURN_LIMIT)
+        # The same state the session list shows, for the thread's header.
+        card_waiting = bool(session_id) and any(
+            str(card.get("session_id") or "").startswith(session_id)
+            for card in self.queue.pending())
+        state, reason = session_state(
+            active, tool_now, running, card_waiting,
+            bool(path_on_disk) and thread_tool_id(path_on_disk) in prompts_at_the_mac())
         self._send_json({"turns": turns,
                          "running_tasks": running,
                          "running_tool": tool_now,
-                         "modified_seconds_ago": active})
+                         "modified_seconds_ago": active,
+                         "state": state,
+                         "state_reason": reason})
 
     def _get_tunnel(self, path, query):
         # LAN only: hand the watch its away-addresses while it's home.

@@ -1667,6 +1667,96 @@ class TestRelayBonjour:
         assert watch_relay.advertise(8977) is None
 
 
+class TestASessionHasOneState:
+    """Three states, decided once, by the side that can see them: running
+    (Claude writing, a tool in flight, or tasks still running behind a
+    quiet transcript), asking (a card waiting, or a prompt waiting at the
+    Mac), idle. The watch used to decide "working" alone, from 20 seconds
+    of transcript silence — so a session with background tasks still
+    running read as idle, and so did a prompt that went to the terminal
+    (2026-10-01)."""
+
+    @pytest.mark.parametrize("args,expected", [
+        (dict(active=3), ("running", "writing")),
+        (dict(active=300, tool="Running tests"), ("running", "tool")),
+        (dict(active=300, tasks=2), ("running", "tasks")),
+        (dict(active=300, card=True), ("asking", "card")),
+        (dict(active=300, tool="Bash", at_mac=True), ("asking", "terminal")),
+        (dict(active=3, card=True), ("asking", "card")),
+        (dict(active=300), ("idle", "")),
+        (dict(active=4000, tool="Bash"), ("idle", "")),
+    ])
+    def test_the_rule(self, args, expected):
+        import watch_dashboard as wd
+        assert wd.session_state(
+            active_seconds_ago=args.get("active"), running_tool=args.get("tool"),
+            running_tasks=args.get("tasks", 0), card_waiting=args.get("card", False),
+            waiting_at_mac=args.get("at_mac", False)) == expected
+
+    def _session(self, tmp_path, monkeypatch, lines, quiet_for=120):
+        import watch_dashboard as wd
+        monkeypatch.setattr(wd, "live_sessions", lambda: {"cccc3333": "Terminal"})
+        monkeypatch.setattr(wd, "_task_output_files", lambda *a, **k: {})
+        proj = tmp_path / "projects" / "-Users-x-Developer-Acme"
+        proj.mkdir(parents=True)
+        path = proj / "cccc3333.jsonl"
+        path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+        past = time.time() - quiet_for
+        os.utime(path, (past, past))
+        wd._THREAD_STATE.clear()
+        return str(tmp_path / "projects")
+
+    TOOL = [{"cwd": "/x", "message": {"role": "user", "content": "Deploy"}},
+            {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_ABC", "name": "Bash",
+                 "input": {"command": "npm run deploy", "description": "Deploying"}}]}}]
+
+    def test_a_prompt_waiting_at_the_mac_is_asking(self, tmp_path, monkeypatch):
+        import watch_dashboard as wd
+        projects = self._session(tmp_path, monkeypatch, self.TOOL)
+        audit = tmp_path / "audit.jsonl"
+        audit.write_text(json.dumps({"session_id": "cccc3333", "tool_use_id": "toolu_ABC",
+                                     "effective": "escalate", "watch": "timeout"}) + "\n")
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(audit))
+        row = wd.recent_sessions(projects_dir=projects)[0]
+        assert (row["state"], row["state_reason"]) == ("asking", "terminal")
+
+    def test_a_tool_the_hook_waved_through_is_running(self, tmp_path, monkeypatch):
+        import watch_dashboard as wd
+        projects = self._session(tmp_path, monkeypatch, self.TOOL)
+        audit = tmp_path / "audit.jsonl"
+        audit.write_text(json.dumps({"session_id": "cccc3333", "tool_use_id": "toolu_ABC",
+                                     "effective": "allow"}) + "\n")
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(audit))
+        row = wd.recent_sessions(projects_dir=projects)[0]
+        assert (row["state"], row["state_reason"]) == ("running", "tool")
+
+    def test_a_card_on_the_wrist_is_asking(self, tmp_path, monkeypatch):
+        import watch_dashboard as wd
+        projects = self._session(tmp_path, monkeypatch, self.TOOL[:1])
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "none.jsonl"))
+        row = wd.recent_sessions(projects_dir=projects, waiting={"cccc3333"})[0]
+        assert (row["state"], row["state_reason"]) == ("asking", "card")
+
+    def test_background_tasks_behind_a_quiet_transcript_are_running(self, tmp_path, monkeypatch):
+        import watch_dashboard as wd
+        lines = self.TOOL[:1] + [{"message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_ABC",
+             "content": "Command running in background with ID: bg123"}]}}]
+        projects = self._session(tmp_path, monkeypatch, lines)
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "none.jsonl"))
+        monkeypatch.setattr(wd, "_running_task_count", lambda state, path: 1)
+        row = wd.recent_sessions(projects_dir=projects)[0]
+        assert (row["state"], row["state_reason"]) == ("running", "tasks")
+
+    def test_quiet_with_nothing_running_is_idle(self, tmp_path, monkeypatch):
+        import watch_dashboard as wd
+        projects = self._session(tmp_path, monkeypatch, self.TOOL[:1])
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "none.jsonl"))
+        row = wd.recent_sessions(projects_dir=projects)[0]
+        assert (row["state"], row["state_reason"]) == ("idle", "")
+
+
 class TestRelaySessions:
     def test_lists_sessions_newest_first(self, tmp_path, monkeypatch):
         import time as _time
@@ -1746,6 +1836,19 @@ class TestRelayTunnelToken:
         # /health stays anonymous-friendly for liveness, but only under the
         # correct prefix.
         assert self._get(base + "/t/s3cret/health") == 403
+
+    def test_the_logged_request_line_never_carries_the_secret(self, tokened, capsys):
+        """The prefix is a rendezvous address, and ~/.tapproval-relay.log
+        is no place for it: every request line used to read
+        ``"GET /t/<secret>/pending HTTP/1.1"``. The route after it stays,
+        so the log still says what was asked for."""
+        base, _ = tokened
+        self._get(base + "/t/s3cret/pending")
+        self._get(base + "/t/s3cret/health")
+        logged = capsys.readouterr().err
+        assert "/t/\u2026/pending" in logged
+        assert "/t/\u2026/health" in logged
+        assert "s3cret" not in logged
 
     def test_card_injection_refused_through_tunnel(self, tokened):
         base, queue = tokened
@@ -8089,7 +8192,29 @@ class TestRelayRoutes:
         status, body = self._call(base + "/thread?id=nope")
         assert status == 200
         assert body == {"turns": [], "running_tasks": 0, "running_tool": None,
-                        "modified_seconds_ago": None}
+                        "modified_seconds_ago": None, "state": "idle",
+                        "state_reason": ""}
+
+    def test_a_thread_says_its_state(self, relay, monkeypatch, tmp_path):
+        """The thread's header shows the same state as the list's row."""
+        base, queue, _ = relay
+        transcript = tmp_path / "dddd4444.jsonl"
+        transcript.write_text(json.dumps({"message": {"role": "user", "content": "Hi"}}) + "\n")
+        past = time.time() - 120
+        os.utime(transcript, (past, past))
+        monkeypatch.setattr(watch_relay, "_find_transcript", lambda sid: str(transcript))
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "none.jsonl"))
+        assert self._call(base + "/thread?id=dddd4444")[1]["state"] == "idle"
+        waiter = threading.Thread(target=lambda: queue.submit(
+            {"tier": "HIGH", "headline": "x", "detail": "x",
+             "session_id": "dddd4444-full-id"}, 3.0), daemon=True)
+        waiter.start()
+        for _ in range(50):
+            if queue.pending():
+                break
+            time.sleep(0.02)
+        status, body = self._call(base + "/thread?id=dddd4444")
+        assert (body["state"], body["state_reason"]) == ("asking", "card")
 
     def test_the_tunnel_route_hands_over_the_away_addresses(self, relay, monkeypatch):
         monkeypatch.setattr(watch_relay, "TUNNEL_URL", "https://t.example")
@@ -8760,6 +8885,15 @@ class TestTheReleaseToolsSayWhenAStepFailed:
         block = script[script.index('EXPORT/UPLOAD FAILED for build'):]
         assert block.index("exit 1") < block.index("\nfi"), \
             "a failed export went on to commit, print Done and distribute"
+
+    def test_the_deploy_signs_with_the_certificate_its_profiles_name(self):
+        """A second "Apple Distribution" certificate on the keychain search
+        list (another project's EAS build, 2026-10-01) won the name, and
+        the archive failed against both profiles."""
+        script = self._read(os.path.join("WatchApp", "deploy-testflight.sh"))
+        assert 'CODE_SIGN_IDENTITY="$SIGNING_SHA"' in script
+        assert "<string>${SIGNING_SHA}</string>" in script
+        assert "<string>Apple Distribution</string>" not in script
 
     def test_an_unrecorded_build_number_is_said(self):
         script = self._read(os.path.join("WatchApp", "deploy-testflight.sh"))
