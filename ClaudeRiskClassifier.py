@@ -102,7 +102,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.34"
+__version__ = "1.1.35"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -1149,6 +1149,14 @@ MCP_EXECUTE_WORDS = frozenset("run execute start stop kill cancel".split())
 MCP_EFFECT = dict({w: Effect.EXECUTE for w in MCP_EXECUTE_WORDS},
                   **{w: Effect.MUTATE for w in MCP_MUTATE_WORDS})
 MCP_EFFECT.update(EFFECT_WORDS)
+# Verbs that only read, for integration calls alone (never the words that
+# judge a shell command): the owner's change C of 2026-10-02. They never
+# replace a meaning a word already has, a secret in the name still makes a
+# credential read (G4), and a verb outside every list stays MEDIUM.
+MCP_READ_WORDS = ("get", "list", "search", "read", "fetch", "find", "query",
+                  "view", "describe", "status", "lookup", "count", "inspect")
+for _verb in MCP_READ_WORDS:
+    MCP_EFFECT.setdefault(_verb, Effect.OBSERVE)
 # Longest first, so `setup` meets `set` only after nothing longer matched.
 _MCP_VERB_PREFIXES = sorted((v for v in MCP_EFFECT if len(v) >= 3),
                             key=len, reverse=True)
@@ -1198,9 +1206,11 @@ def _mcp_risk(tool):
     risk = derive_risk(effect, TOOL_REACH.get(server, Reach.SHARED), secret=secret)
     if not known and not secret:
         risk = min(risk, Risk.HIGH)
-    # A connector's read is still a network call by an agent; the floor an
-    # unknown MCP tool has always had applies to a recognised read too.
-    return max(risk, Risk.MEDIUM), ["mcp:%s" % effect.name.lower()]
+    # A recognised read is LOW (the owner's decision, 2026-10-02: "Check PR
+    # status" at MEDIUM only because the tool was an MCP one). Everything
+    # else keeps the floor an unknown MCP tool has always had.
+    floor = Risk.LOW if effect is Effect.OBSERVE and not secret else Risk.MEDIUM
+    return max(risk, floor), ["mcp:%s" % effect.name.lower()]
 
 CONTENT_KEYS = ("content", "new_string", "file_text", "new_source")
 
@@ -1539,6 +1549,53 @@ def plan_decision(chosen):
             "watch: %s. Revise the plan and present it again." % edits, None)
 
 
+# Integration calls that recur on the wrist, in words (the Wrist cards
+# design, 2026-10-02): (server or "*", tool, action or "*") → headline.
+# Servers match case-insensitively and by suffix, so a renamed or prefixed
+# server ("Claude_Code_iOS_Simulator") still finds its phrase.
+MCP_PHRASES = {
+    ("ccd_pr", "get_status", "*"): "Check PR status",
+    ("github", "push_files", "*"): "Push files to GitHub",
+    ("github", "create_pull_request", "*"): "Open a pull request on GitHub",
+    ("ios_simulator", "control", "launch"): "Launch the app in Simulator",
+    ("ios_simulator", "control", "open_url"): "Open a link in Simulator",
+    ("ios_simulator", "control", "screenshot"): "Take a Simulator screenshot",
+    ("ios_simulator", "control", "tap"): "Tap in Simulator",
+    ("ios_simulator", "control", "swipe"): "Swipe in Simulator",
+    ("ios_simulator", "control", "text"): "Type in Simulator",
+    ("ios_simulator", "control", "attach"): "Show Simulator",
+    ("*", "search_threads", "*"): "Search mail",
+}
+_SERVER_IS_AN_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _mcp_headline(tool, action):
+    """What an ``mcp__<server>__<tool>`` call does, in words: a phrase for
+    the calls that recur, else the tool's own words in sentence case with a
+    readable server after them ("Merge pull request · github"). A server
+    named by an id is left out — it would only be noise on a wrist."""
+    server, sep, name = tool[len("mcp__"):].rpartition("__")
+    if not sep:
+        server, name = "", tool[len("mcp__"):]
+    words = " ".join(name.replace("_", " ").split())
+    action_raw = "_".join(str(action or "").split())
+    low = server.lower()
+    for (srv, verb, act), phrase in MCP_PHRASES.items():
+        if verb != name.lower():
+            continue
+        if srv != "*" and not low.endswith(srv):
+            continue
+        if act not in ("*", action_raw.lower()):
+            continue
+        return phrase
+    pieces = [words[:1].upper() + words[1:]] if words else ["Integration call"]
+    if action:
+        pieces.append(action)
+    if server and not _SERVER_IS_AN_ID.match(server):
+        pieces.append(" ".join(server.replace("_", " ").replace("-", " ").split()))
+    return " · ".join(pieces)
+
+
 def wrist_card(tool, tool_input, risk,
                headline_chars=HEADLINE_CHARS, detail_chars=DETAIL_CHARS):
     """Build the compact card a watch face can render in one glance."""
@@ -1595,15 +1652,12 @@ def wrist_card(tool, tool_input, risk,
         # the verb; the target fields become two or three facts. The
         # detail is those same facts as one line, for the audit log and
         # a wrist app older than this field.
-        if tool.startswith("mcp__"):
-            parts = tool.split("__")
-            who = parts[1] if len(parts) > 1 else "mcp"
-            named = parts[2].replace("_", " ") if len(parts) > 2 else ""
-        else:
-            who, named = (tool or "Unknown tool"), ""
         action_key, action = _action_from_input(tool_input)
-        pieces = [who] + [p for p in (named, action) if p]
-        headline = _fit(" · ".join(pieces), headline_chars)
+        if tool.startswith("mcp__"):
+            headline = _fit(_mcp_headline(tool, action), headline_chars)
+        else:
+            pieces = [tool or "Unknown tool"] + [p for p in (action,) if p]
+            headline = _fit(" · ".join(pieces), headline_chars)
         facts = card_facts(tool_input, skip=(action_key,) if action_key else ())
         detail = _facts_detail(facts, detail_chars)
         return {"tier": risk.name, "headline": headline, "detail": detail,
@@ -1752,16 +1806,56 @@ def read_audit(policy):
 # --------------------------------------------------------------------------
 
 
-def _project_name(cwd):
-    """Folder name of the session's working directory.
+def repository_name(cwd):
+    """The name of the repository a working directory belongs to.
 
-    Deliberately the basename, not the full path: enough to break a report
-    down per project, without writing directory structure into a log that
-    gets read aloud.
+    The folder Claude works in is often a worktree with a name nobody chose
+    ("cranky-shannon-3187c0", "wt-push") or a subfolder ("ios"); on 74% of
+    287 prompts the wrist named that while the phone named the repository
+    (2026-10-02). Walks up to the nearest `.git`: a folder is the repository
+    itself, a worktree's file points into `<repo>/.git/worktrees/`. The home
+    folder is never taken for a repository (a dotfiles checkout would name
+    every project after the user), and with no repository the folder's own
+    name stands. Only names are returned, never a path; a few stat calls,
+    no subprocess, never raises.
     """
     if not cwd:
         return None
-    return os.path.basename(str(cwd).replace("\\", "/").rstrip("/")) or None
+    path = str(cwd).replace("\\", "/").rstrip("/")
+    folder = os.path.basename(path) or None
+    try:
+        home = os.path.realpath(os.path.expanduser("~"))
+        here = path
+        for _ in range(12):
+            if not here or here == "/" or os.path.realpath(here) == home:
+                break
+            marker = os.path.join(here, ".git")
+            if os.path.isdir(marker):
+                return os.path.basename(here) or folder
+            if os.path.isfile(marker):
+                with open(marker, encoding="utf-8", errors="replace") as handle:
+                    line = handle.readline().strip()
+                gitdir = line[len("gitdir:"):].strip() if line.startswith("gitdir:") else ""
+                if "/.git/worktrees/" in gitdir:
+                    return os.path.basename(gitdir.split("/.git/worktrees/", 1)[0]) or folder
+                return os.path.basename(here) or folder
+            parent = os.path.dirname(here)
+            if parent == here:
+                break
+            here = parent
+    except (OSError, ValueError):
+        pass
+    return folder
+
+
+def _project_name(cwd):
+    """The repository the session works in, by name (repository_name).
+
+    Deliberately a name, not the full path: enough to break a report down
+    per project, without writing directory structure into a log that gets
+    read aloud.
+    """
+    return repository_name(cwd)
 
 
 def _card_fingerprint(tool, tool_input):

@@ -1017,12 +1017,25 @@ class CardQueue:
 # transcripts is large and harmless. Only what the relay itself calls is
 # imported; tests reach the rest through watch_dashboard.
 from watch_dashboard import (  # noqa: E402
-    activity_summary, recap_summary, _find_transcript, image_bytes,
+    activity_summary, card_session_title, recap_summary, _find_transcript, image_bytes,
     _json_object, _message_of, _parse_thread, prewarm_threads, _read_appended,
     project_root, prompts_at_the_mac, recent_sessions, resolve_session,
     session_registry, session_state, shape, thread_tool_id, thread_wake_at,
     transcript_origin, transcripts_newest_first,
     THREAD_TURN_LIMIT, usage_summary)
+
+
+def with_session_title(card):
+    """The card with the session's title beside its repository, for the
+    wrist's place line ("familia-gateway · Show multi-day appointment…",
+    the Wrist cards design, 2026-10-02). Added here rather than in the hook,
+    which stays fast; a card without a session, or a title nobody knows,
+    goes out as it came."""
+    session_id = card.get("session_id")
+    if not session_id or card.get("session_title"):
+        return card
+    title = card_session_title(session_id)
+    return dict(card, session_title=title) if title else card
 
 
 # What a wrist-sent message asks Claude to sound like. Each message spawns
@@ -2693,7 +2706,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             return
         try:
             card_id, decision, answer = self.queue.submit(
-                body["card"], wait,
+                with_session_title(body["card"]), wait,
                 caller_alive=functools.partial(_socket_alive, self.connection),
                 resolved_elsewhere=_prompt_resolver(body["card"]))
         finally:
@@ -3310,13 +3323,14 @@ def _pid_alive(pid):
         return False
 
 
-def _remember_tunnel(pid, url, port):
+def _remember_tunnel(pid, url, port, path=None):
     """Write the running tunnel down (0600), for the next relay. Never raises."""
+    path = path or TUNNEL_STATE
     try:
-        fd = os.open(TUNNEL_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump({"pid": int(pid), "url": url, "port": int(port)}, handle)
-        os.chmod(TUNNEL_STATE, 0o600)
+        os.chmod(path, 0o600)
     except (OSError, ValueError, TypeError):
         pass
 
@@ -3444,13 +3458,20 @@ def start_tunnel(port, token):
     reason = ("the last one no longer answered" if adopted
               else "none to adopt")
     _reap_stale_tunnels(port)
+    # The files this tunnel uses, fixed now: the thread below outlives this
+    # call, and reading the module's names later found whatever they were
+    # by then. On 2026-10-01 that was a test's fake tunnel (pid 5151,
+    # own-file.trycloudflare.com) written into the real record after the
+    # test had put the names back — on every suite run on that Mac, CI's
+    # included — so each relay restart found nothing to adopt.
+    log_path, state_path = TUNNEL_LOG, TUNNEL_STATE
     # cloudflared writes to a file of its own, in a session of its own. Its
     # stderr used to be a pipe into this relay, so the moment the relay
     # exited — every update, every restart — cloudflared's next log line hit
     # a closed pipe and killed it (measured 2026-09-30: dead within a
     # second). No travel address had ever survived a relay restart.
     try:
-        log_fd = os.open(TUNNEL_LOG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     except OSError:
         log_fd = subprocess.DEVNULL
     proc = subprocess.Popen(
@@ -3466,7 +3487,7 @@ def start_tunnel(port, token):
         deadline = time.monotonic() + TUNNEL_ANNOUNCE_WAIT
         while time.monotonic() < deadline:
             try:
-                with open(TUNNEL_LOG, encoding="utf-8", errors="replace") as handle:
+                with open(log_path, encoding="utf-8", errors="replace") as handle:
                     text = handle.read()
             except OSError:
                 text = ""
@@ -3474,7 +3495,7 @@ def start_tunnel(port, token):
             if match:
                 # Remembered before announced: whoever reads the address
                 # next (the next relay, a test) finds it already written.
-                _remember_tunnel(proc.pid, match.group(0), port)
+                _remember_tunnel(proc.pid, match.group(0), port, state_path)
                 if adopted:
                     # The address the watch knew is gone. Said until the
                     # watchdog's next healthy check: a watch away from home
@@ -3502,7 +3523,7 @@ def start_tunnel(port, token):
             "tunnel",
             "Answering from away is not working: the connection closed "
             "before it opened. Answers still work on your own Wi-Fi.")
-        print("relay: tunnel did not open — see %s" % TUNNEL_LOG, file=sys.stderr)
+        print("relay: tunnel did not open — see %s" % log_path, file=sys.stderr)
 
     threading.Thread(target=announce, daemon=True).start()
     return proc

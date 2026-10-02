@@ -117,6 +117,21 @@ def _no_real_self_update(tmp_path, monkeypatch):
     monkeypatch.setattr(watch_relay, "_UPDATE_STAMP", str(stamp))
 
 
+@pytest.fixture(autouse=True)
+def _no_real_tunnel_record(tmp_path, monkeypatch):
+    """No test may write the real relay's tunnel record or log.
+
+    The record is how the next relay adopts the running tunnel and keeps
+    the travel address. On 2026-10-01 it held a test's fake (pid 5151) on
+    the owner's Mac, where CI runs too, and three restarts in a row minted
+    new addresses. Tests that mean to use these files point them
+    somewhere of their own on top of this.
+    """
+    monkeypatch.setenv("TAPPROVAL_TUNNEL_STATE", str(tmp_path / "tunnel.json"))
+    monkeypatch.setattr(watch_relay, "TUNNEL_STATE", str(tmp_path / "tunnel.json"))
+    monkeypatch.setattr(watch_relay, "TUNNEL_LOG", str(tmp_path / "tunnel.log"))
+
+
 @pytest.fixture
 def settings(tmp_path, monkeypatch):
     """The throwaway settings.json every test already has, as a Path.
@@ -539,10 +554,13 @@ class TestClassifyDispatch:
                                "tool_input": {}})
         assert result["risk"] == Risk.HIGH
 
-    def test_mcp_read_tool_is_medium(self):
+    def test_mcp_read_tool_is_low(self):
+        """MEDIUM until 2026-10-02, when the owner chose LOW for calls that
+        only read (the Wrist cards design, change C). Nothing is auto-allowed
+        by this unless the owner turns auto-allow on."""
         result = crc.classify({"tool_name": "mcp__github__get_file_contents",
                                "tool_input": {}})
-        assert result["risk"] == Risk.MEDIUM
+        assert result["risk"] == Risk.LOW
 
     @pytest.mark.parametrize("tool,tier", [
         # The old regex used [^_]+ for the server, so a server whose name
@@ -556,13 +574,19 @@ class TestClassifyDispatch:
         # prefix. Neither may read lower than it did.
         ("mcp__gh__createIssue", Risk.HIGH),
         ("mcp__gh__deleteFile", Risk.HIGH),
-        ("mcp__gh__getFileContents", Risk.MEDIUM),
+        # A recognised read is LOW: the owner's decision of 2026-10-02 (the
+        # Wrist cards design, change C). Writes, secrets and unknown verbs
+        # keep their tiers.
+        ("mcp__gh__getFileContents", Risk.LOW),
         ("mcp__x__setup_webhook", Risk.HIGH),
         ("mcp__x__runtime_info", Risk.HIGH),
         # The verb is the first word. Judging every word made get_label a
         # write, because "label" is a verb somewhere else.
-        ("mcp__github__get_label", Risk.MEDIUM),
-        ("mcp__x__list_things", Risk.MEDIUM),
+        ("mcp__github__get_label", Risk.LOW),
+        ("mcp__x__list_things", Risk.LOW),
+        ("mcp__ccd_pr__get_status", Risk.LOW),
+        # A verb the vocabulary does not know is still asked about at MEDIUM.
+        ("mcp__x__frobnicate_widget", Risk.MEDIUM),
         # Verbs the hand-picked list did not have, that the vocabulary does.
         ("mcp__x__destroy_cluster", Risk.HIGH),
         ("mcp__x__revoke_key", Risk.HIGH),
@@ -739,7 +763,7 @@ class TestCardFacts:
                               {"owner": "acme", "repo": "platform",
                                "pull_number": 142, "merge_method": "squash"},
                               Risk.HIGH)
-        assert card["headline"] == "github · merge pull request"
+        assert card["headline"] == "Merge pull request · github"
         assert card["facts"][:3] == [["owner", "acme"], ["repo", "platform"],
                                      ["pull number", "142"]]
 
@@ -747,7 +771,7 @@ class TestCardFacts:
         card = crc.wrist_card("mcp__wordpress__content_authoring",
                               {"action": "posts.create", "site_id": 7,
                                "title": "Launch"}, Risk.HIGH)
-        assert card["headline"] == "wordpress · content authoring · posts.create"
+        assert card["headline"] == "Content authoring · posts.create · wordpress"
         assert ["title", "Launch"] in card["facts"]
 
     def test_nested_input_collapses_to_counts(self):
@@ -3061,6 +3085,49 @@ class TestTheTravelAddressSurvivesARestart:
         assert saved == {"pid": 5151, "url": fresh, "port": 8978}
         assert oct(os.stat(self.state).st_mode & 0o777) == "0o600"
 
+    def test_the_record_goes_where_the_tunnel_was_started(self, monkeypatch, tmp_path):
+        """2026-10-01: three relay restarts, three new addresses, each
+        "none to adopt". The record on the owner's Mac held pid 5151 and
+        own-file.trycloudflare.com — a test's fake tunnel. The thread that
+        waits for cloudflared's address outlived its test, read the module's
+        paths after the test had put them back, and wrote the fake into the
+        real record; every suite run on that Mac (CI included) did it again,
+        and the next relay found nothing of its own to adopt. The thread now
+        uses the files that were in force when the tunnel started."""
+        import time as _time
+        # What the paths are put back to: here, stand-ins for the real ones.
+        home_log = tmp_path / "home.log"
+        home_log.write_text("INF |  https://home-words.trycloudflare.com  |\n")
+        monkeypatch.setattr(watch_relay, "TUNNEL_LOG", str(home_log))
+        monkeypatch.setattr(watch_relay, "_cloudflared", lambda: "/usr/bin/true")
+        monkeypatch.setattr(watch_relay, "_adoptable_tunnel", lambda port: None)
+        monkeypatch.setattr(watch_relay, "_reap_stale_tunnels",
+                            lambda port, keep=None: None)
+        run_state, run_log = tmp_path / "run.json", tmp_path / "run.log"
+
+        class Proc:
+            pid = 5151
+
+            def poll(self):
+                return None
+
+        with monkeypatch.context() as during:
+            during.setattr(watch_relay, "TUNNEL_STATE", str(run_state))
+            during.setattr(watch_relay, "TUNNEL_LOG", str(run_log))
+            during.setattr(watch_relay.subprocess, "Popen", lambda *a, **k: Proc())
+            watch_relay.start_tunnel(8978, "tok")
+        # The patches are gone, as at a test's teardown; the address comes now.
+        with open(run_log, "a", encoding="utf-8") as handle:
+            handle.write("INF |  https://run-words.trycloudflare.com  |\n")
+        for _ in range(200):
+            if watch_relay.TUNNEL_URL:
+                break
+            _time.sleep(0.01)
+        assert watch_relay.TUNNEL_URL == "https://run-words.trycloudflare.com/t/tok"
+        assert not self.state.exists(), "the record in force afterwards is untouched"
+        assert json.loads(run_state.read_text())["url"] == \
+            "https://run-words.trycloudflare.com"
+
     @pytest.mark.parametrize("status,ctype,expected", [
         (401, "application/json", True),     # our listener, no key: alive
         (200, "application/json", True),
@@ -5169,6 +5236,103 @@ class TestAScheduledSessionSaysWhenItComesBack:
         row = next(r for r in rows if r["session_id"].startswith("wake02"))
         assert (row["state"], row["state_reason"]) == ("scheduled", "wakeup")
         assert abs(row["wake_at"] - (now - 60 + 1800)) <= 2
+
+
+class TestTheCardSaysWhereAndWhat:
+    """The Wrist cards design, 2026-10-02. On 74% of 287 prompts the card
+    named a worktree or a subfolder ("cranky-shannon-3187c0", "ios") where
+    the phone named the repository, and an integration call read as its
+    internal name ("ccd_pr · get status")."""
+
+    @staticmethod
+    def _repo(root, name):
+        repo = root / name
+        (repo / ".git" / "worktrees").mkdir(parents=True)
+        return repo
+
+    @staticmethod
+    def _worktree(repo, folder):
+        folder.mkdir(parents=True)
+        (folder / ".git").write_text("gitdir: %s/.git/worktrees/%s\n" % (repo, folder.name),
+                                     encoding="utf-8")
+        return folder
+
+    def test_a_scratch_worktree_names_its_repository(self, tmp_path):
+        repo = self._repo(tmp_path, "acme")
+        wt = self._worktree(repo, tmp_path / "scratch" / "wt-fix")
+        assert crc.repository_name(str(wt)) == "acme"
+        (wt / "src").mkdir()
+        assert crc.repository_name(str(wt / "src")) == "acme"
+
+    def test_a_desktop_worktree_names_its_repository(self, tmp_path):
+        repo = self._repo(tmp_path, "familia-gateway")
+        wt = self._worktree(repo, repo / ".claude" / "worktrees" / "cranky-shannon-3187c0")
+        assert crc.repository_name(str(wt)) == "familia-gateway"
+
+    def test_a_subfolder_names_its_repository(self, tmp_path):
+        repo = self._repo(tmp_path, "Spyglass")
+        (repo / "ios").mkdir()
+        assert crc.repository_name(str(repo / "ios")) == "Spyglass"
+
+    def test_no_repository_keeps_the_folder(self, tmp_path):
+        (tmp_path / "plain").mkdir()
+        assert crc.repository_name(str(tmp_path / "plain")) == "plain"
+        assert crc.repository_name("/Users/x/Developer/some-repo") == "some-repo"
+
+    def test_a_home_folder_under_git_is_never_the_repository(self, tmp_path, monkeypatch):
+        home = self._repo(tmp_path, "home")
+        monkeypatch.setenv("HOME", str(home))
+        (home / "projects" / "x").mkdir(parents=True)
+        assert crc.repository_name(str(home / "projects" / "x")) == "x"
+
+    def test_the_audit_and_the_card_name_the_repository(self, tmp_path):
+        repo = self._repo(tmp_path, "acme")
+        wt = self._worktree(repo, tmp_path / "wt-push")
+        policy = dict(crc.DEFAULT_POLICY, audit_log=str(tmp_path / "a.jsonl"))
+        _, audit, _ = crc.build_response(
+            {"tool_name": "Read", "tool_input": {}, "cwd": str(wt)}, policy)
+        assert audit["project"] == "acme"
+
+    @pytest.mark.parametrize("tool,tool_input,headline", [
+        ("mcp__ccd_pr__get_status", {}, "Check PR status"),
+        ("mcp__github__push_files", {"owner": "acme", "repo": "x"}, "Push files to GitHub"),
+        ("mcp__Claude_Code_iOS_Simulator__control", {"action": "launch"},
+         "Launch the app in Simulator"),
+        ("mcp__Claude_Code_iOS_Simulator__control", {"action": "open_url", "url": "x://y"},
+         "Open a link in Simulator"),
+        ("mcp__3cf8e385-7cb4-4d9d-b9cd-16ff8945fa3c__search_threads", {"query": "x"},
+         "Search mail"),
+        # A server named by an id is left out: it would read as noise.
+        ("mcp__3cf8e385-7cb4-4d9d-b9cd-16ff8945fa3c__list_labels", {}, "List labels"),
+        ("mcp__scheduled-tasks__update_scheduled_task", {"taskId": "t"},
+         "Update scheduled task · scheduled tasks"),
+    ])
+    def test_an_integration_call_says_what_it_does(self, tool, tool_input, headline):
+        assert crc.wrist_card(tool, tool_input, Risk.MEDIUM)["headline"] == headline
+
+    def test_the_relay_adds_the_session_title(self, monkeypatch):
+        import watch_relay
+        monkeypatch.setattr(watch_relay, "card_session_title",
+                            lambda sid: "Show multi-day appointment times" if sid == "s-1" else "")
+        card = watch_relay.with_session_title({"session_id": "s-1", "headline": "x"})
+        assert card["session_title"] == "Show multi-day appointment times"
+        assert "session_title" not in watch_relay.with_session_title({"session_id": "other"})
+        assert watch_relay.with_session_title({"headline": "no session"}) == {"headline": "no session"}
+
+    def test_the_session_title_comes_from_the_registry_then_the_opening(self, tmp_path):
+        import watch_dashboard
+        path = _write_transcript(tmp_path, "-p", "abcd1234-0000.jsonl", [
+            {"cwd": "/x", "message": {"role": "user", "content":
+             "Show the multi-day appointment times per day on the calendar page please"}}])
+        assert path
+        named = watch_dashboard.card_session_title(
+            "abcd1234-0000", projects_dir=str(tmp_path),
+            registry={"abcd1234-0000": {"name": "HOV Testflight timeline"}})
+        assert named == "HOV Testflight timeline"
+        derived = watch_dashboard.card_session_title(
+            "abcd1234-0000", projects_dir=str(tmp_path), registry={})
+        assert derived and len(derived) <= 60
+        assert watch_dashboard.card_session_title("", projects_dir=str(tmp_path), registry={}) == ""
 
 
 class TestEveryPress:
@@ -9325,6 +9489,60 @@ class TestTheLocalFallbackRunsWhatCiRuns:
         for name in ("requirements.txt", "pyproject.toml"):
             assert name in workflow and name in local, name
 
+    def test_both_read_the_watch_compile_for_swift6_warnings(self):
+        workflow, local = self._files()
+        assert 'WatchApp/swift6-warnings.sh "$RUNNER_TEMP/watch-tests.log"' in workflow
+        assert 'tee "$RUNNER_TEMP/watch-tests.log"' in workflow
+        assert "set -o pipefail" in workflow, "tee must not swallow a failing test run"
+        watch = local.split("# --- the watch app", 1)[1]
+        assert 'WatchApp/swift6-warnings.sh "$WATCH_LOG"' in watch
+        assert watch.index("swift6-warnings.sh") < watch.index('rm -f "$WATCH_LOG"'), (
+            "read the log before deleting it")
+
+
+class TestSwift6WarningsFailCi:
+    """2026-10-02: "Watch: no Swift 6 concurrency warnings" cleared every
+    one, and the proof-covers-answer work put two back. Nothing noticed
+    until the archive of build 146 printed them. The check has to be seen
+    to fail before it is trusted to pass."""
+
+    WARNING = ("/x/WatchApp/Tapproval/RelayModel.swift:1610:62: warning: main "
+               "actor-isolated static property 'provesAnswersKey' can not be "
+               "referenced from a nonisolated autoclosure; this is an error in "
+               "the Swift 6 language mode")
+
+    @staticmethod
+    def _run(tmp_path, text):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "WatchApp", "swift6-warnings.sh")
+        if not os.path.isfile(script):
+            pytest.skip("WatchApp/ is not in this layout (the public repo)")
+        log = tmp_path / "build.log"
+        log.write_text(text, encoding="utf-8")
+        return subprocess.run(["bash", script, str(log)],
+                              capture_output=True, text=True)
+
+    def test_a_swift6_warning_fails(self, tmp_path):
+        done = self._run(tmp_path, "CompileSwift normal\n%s\n** TEST SUCCEEDED **\n"
+                         % self.WARNING)
+        assert done.returncode == 1
+        assert "RelayModel.swift:1610:62" in done.stdout
+
+    def test_other_warnings_pass(self, tmp_path):
+        done = self._run(tmp_path, "/x/PurchaseModel.swift:665:13: warning: "
+                         "switch must be exhaustive\n** TEST SUCCEEDED **\n")
+        assert done.returncode == 0, done.stdout
+
+    def test_the_copy_under_the_excerpt_is_not_counted_again(self, tmp_path):
+        done = self._run(tmp_path, "%s\n 1610 |  x\n      |  `- warning: main "
+                         "actor-isolated ... in the Swift 6 language mode\n"
+                         % self.WARNING)
+        assert done.returncode == 1
+        assert done.stdout.count("warning:") == 1, done.stdout
+
+    def test_an_empty_log_is_not_a_clean_one(self, tmp_path):
+        assert self._run(tmp_path, "").returncode == 2
+
 
 class TestCiCanBeMovedToThisMacAndBack:
     """Where CI runs is one repository variable, and coming back is
@@ -9412,7 +9630,7 @@ class TestTheDocumentsDoNotRestateTheReviewState:
 
     OWNER = {"APP_STORE.md", "CHANGELOG.md"}
     STATES = re.compile(
-        r"\b1\.\d+\b[^\n.]{0,40}\b(is live|is in (?:App )?review"
+        r"\b1\.\d+(?:\.\d+)?\b[^\n.]{0,40}\b(is live|is in (?:App (?:Store )?)?review"
         r"|is `?WAITING_FOR_REVIEW|is on the App Store)", re.I)
 
     def test_only_app_store_md_says_what_is_live_or_in_review(self):
@@ -9432,6 +9650,8 @@ class TestTheDocumentsDoNotRestateTheReviewState:
         "**Now — 1.2 is live; 1.3 is in App Review.** Updated 2026-09-24, night.",
         "**1.3 is live** (released 2026-09-26, build 137) with the listing fixes",
         "and 1.3 is `WAITING_FOR_REVIEW` again, at the back of the queue",
+        # Slipped past an earlier pattern into CLAUDE.md on 2026-10-01.
+        "- **1.4 is in App Store review**, submitted 2026-10-01 after the owner",
     ])
     def test_the_guard_catches_the_sentences_that_went_stale(self, sentence):
         assert self.STATES.search(sentence), sentence

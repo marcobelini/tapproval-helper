@@ -358,6 +358,27 @@ def repo_slug(cwd):
     return slug
 
 
+def card_session_title(session_id, projects_dir=None, registry=None):
+    """The title a wrist card shows after its repository: the name the app
+    gave the session, else a title from its opening ask, at most 60
+    characters; "" when neither is known. Never raises."""
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return ""
+    try:
+        registry = session_registry() if registry is None else registry
+        name = str((registry.get(session_id) or {}).get("name") or "").strip()
+        if not name:
+            path = _find_transcript(session_id[:12], projects_dir)
+            if path:
+                _, opening, _ = session_meta(path, scan_lines=40)
+                name = derive_title(opening)
+        name = " ".join(name.split())
+        return name if len(name) <= 60 else name[:59].rstrip() + "…"
+    except Exception:
+        return ""
+
+
 def derive_title(text):
     """A short title from the opening ask, the way the app titles sessions."""
     if not text:
@@ -380,7 +401,19 @@ def project_root(cwd):
     session ("app-store-version-update-b03a35")."""
     cwd = str(cwd or "")
     marker = shape("path.worktree")
-    return cwd.split(marker, 1)[0] if marker in cwd else cwd
+    if marker in cwd:
+        return cwd.split(marker, 1)[0]
+    # Any other worktree or subfolder ("wt-push", "ios") belongs to the
+    # repository git says it does, the same name the wrist card now uses
+    # (ClaudeRiskClassifier.repository_name), so the list and the card agree.
+    try:
+        from ClaudeRiskClassifier import repository_name
+        name = repository_name(cwd)
+    except Exception:
+        name = None
+    if name and cwd and os.path.basename(cwd.rstrip("/")) != name:
+        return os.path.join(os.path.dirname(cwd.rstrip("/")), name)
+    return cwd
 
 
 def transcript_origin(path, scan_lines=60):
