@@ -113,13 +113,13 @@ watch restored from backup): run
 
 or, on a plugin install, the same file under Claude Code's plugin cache
 (`~/.claude/plugins/cache/tapproval/tapproval-helper/*/watch_relay.py`).
-That opens a ten-minute window on the local network. (A computer that
-has never paired opens the window by itself for half an hour after every
-Claude Code session starts, so a first install needs no command at all.)
-Tell your user to
-open Tapproval on the watch now. A computer that has never paired keeps
-the door open by itself until its first watch connects, so a fresh
-install never needs this.
+That opens a ten-minute window on the local network. Tell your user to
+open Tapproval on the watch now. (A computer that has never paired opens
+the window by itself for half an hour after every Claude Code session
+starts, so a first install needs no command — but then the computer shows
+"Allow a watch to pair?" when the watch knocks, and your user clicks
+**Allow** on it. Where no such dialog can be shown, as on Linux, use
+`--pair`.)
 
 **If asked to UNINSTALL Tapproval Base**: fetch and read
 `https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/uninstall.sh`,

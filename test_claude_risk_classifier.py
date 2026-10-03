@@ -170,6 +170,7 @@ def _known_watch(auth):
 # The real one, kept before any fixture stubs it: the tests about signing
 # in are the tests that must run it.
 _REAL_SIGNED_IN = watch_relay.signed_in
+_REAL_ASK_OWNER_TO_PAIR = watch_relay.ask_owner_to_pair
 
 
 def _watch_present(queue):
@@ -243,6 +244,14 @@ def _no_real_bridge(tmp_path, monkeypatch):
     network pairing door opens. Tests say which world they are in; the
     default is a machine without it, where the door is the only way in."""
     monkeypatch.setattr(watch_relay, "BRIDGE_APP", str(tmp_path / "no-bridge.app"))
+
+
+@pytest.fixture(autouse=True)
+def _no_real_pairing_dialog(monkeypatch):
+    """No test may put "Allow a watch to pair?" on the screen of the Mac
+    running the suite. The default answer is no, the safe one; tests about
+    the question say which answer they want."""
+    monkeypatch.setattr(watch_relay, "ask_owner_to_pair", lambda client_ip: False)
 
 
 @pytest.fixture(autouse=True)
@@ -2722,7 +2731,7 @@ class TestAnICloudCardIsTheWholeCard:
     FIELDS = {"tier": "tier", "headline": "headline", "detail": "detail",
               "project": "project", "kind": "kind", "options": "options",
               "facts": "facts", "plan": "plan", "session_id": "sessionId",
-              "can_always": "canAlways"}
+              "can_always": "canAlways", "session_title": "sessionTitle"}
 
     def _read(self, *parts):
         path = os.path.join(_ROOT, "WatchApp", *parts)
@@ -2748,6 +2757,19 @@ class TestAnICloudCardIsTheWholeCard:
         bridge = self._read("Bridge", "main.swift")
         for field in self.FIELDS.values():
             assert 'record["%s"]' % field in bridge, field
+
+    def test_the_seed_registers_every_field_the_bridge_writes(self):
+        """A Card field reaches the Production schema only through `--seed`
+        then Deploy Schema Changes. The seed never learned plan, facts,
+        sessionId or canAlways (2026-09-30), so Production lacked canAlways,
+        and a bridge built from main had every mirrored card refused with
+        "Cannot create or modify field 'canAlways'" (2026-10-02)."""
+        bridge = self._read("Bridge", "main.swift")
+        mirror = bridge.split("func mirror(", 1)[1].split("\nfunc ", 1)[0]
+        written = set(re.findall(r'record\["(\w+)"\] =', mirror))
+        seed = bridge.split('contains("--seed")', 1)[1].split("specimens.append(card)", 1)[0]
+        seeded = set(re.findall(r'card\["(\w+)"\] =', seed))
+        assert written and written <= seeded, sorted(written - seeded)
 
     def test_the_watch_reads_every_field_back(self):
         cloud = self._read("Tapproval", "CloudRelay.swift")
@@ -4352,14 +4374,78 @@ class TestLanSourceIsNotTrusted:
         auth.devices = []
         auth.relight()          # the door a relay start would have lit
 
-    def test_a_never_paired_machine_keeps_the_door_open(self, lan):
+    def _settle(self, auth):
+        """The question runs on its own thread; wait for its answer."""
+        deadline = time.time() + 5
+        while auth._asking is not None and time.time() < deadline:
+            time.sleep(0.01)
+        assert auth._asking is None
+
+    def test_a_never_paired_machine_keeps_the_door_open(self, lan, monkeypatch):
         base, _, auth = lan
+        asked = []
+        monkeypatch.setattr(watch_relay, "ask_owner_to_pair",
+                            lambda ip: asked.append(ip) or True)
         self._never_paired(auth)
         assert auth.window_open()
+        status, body = self._call(base + "/pair")
+        assert status == 403 and body.get("waiting"), "the Mac asks first"
+        self._settle(auth)
+        assert asked == ["192.168.1.77"]
         status, body = self._call(base + "/pair")
         assert status == 200 and auth.matches(body["token"])
         assert body["token"] != "bootstraptoken", "a key of its own, never the machine's"
         assert not auth.window_open(), "the first watch through shuts the door"
+        assert asked == ["192.168.1.77"], "asked once, not on every poll"
+
+    def test_a_door_the_relay_lit_gives_no_key_unless_the_mac_allows_it(self, lan):
+        """#271: on a Mac that had never paired, every session start opened
+        /pair for half an hour, and anyone on the same café Wi-Fi could
+        claim a key. Nobody clicks Allow (the suite's default answer is no):
+        no key, and the door shuts."""
+        base, _, auth = lan
+        self._never_paired(auth)
+        status, body = self._call(base + "/pair")
+        assert status == 403 and "token" not in body
+        self._settle(auth)
+        assert not auth.window_open(), "a no shuts the door"
+        status, body = self._call(base + "/pair")
+        assert status == 403 and "token" not in body
+
+    def test_polling_while_the_mac_asks_puts_up_one_question(self, lan, monkeypatch):
+        """The watch polls every 2.5 s while the owner reaches for the
+        mouse. Each poll is a 'still waiting', not a new dialog — and not a
+        strike against the rate limit, or the door would shut on the
+        owner's own watch before the click."""
+        base, _, auth = lan
+        gate = threading.Event()
+        asked = []
+
+        def slow(ip):
+            asked.append(ip)
+            gate.wait(5)
+            return True
+
+        monkeypatch.setattr(watch_relay, "ask_owner_to_pair", slow)
+        self._never_paired(auth)
+        for _ in range(8):
+            status, body = self._call(base + "/pair")
+            assert status == 403 and body.get("waiting")
+        gate.set()
+        self._settle(auth)
+        assert asked == ["192.168.1.77"]
+        assert self._call(base + "/pair")[0] == 200
+
+    def test_the_owners_own_pair_window_asks_nothing(self, lan):
+        """--pair is the owner asking already, and the way to pair where no
+        dialog can be shown. The suite's answer is no; it is never asked."""
+        base, _, auth = lan
+        auth.paired_ever = False
+        auth.devices = []
+        auth.open_window()
+        auth.relight()      # a session start must not turn it into one that asks
+        status, body = self._call(base + "/pair")
+        assert status == 200 and auth.matches(body["token"])
 
     def test_the_door_stays_open_long_enough_to_install_and_no_longer(self, lan):
         """The fuse: twenty minutes later still open, an hour later shut —
@@ -9048,8 +9134,61 @@ class TestFirstPairingIsAWindow:
         assert not auth.window_open()
         auth.relight()
         assert auth.window_open()
+        assert auth.claim_window("192.168.1.9") is None, "not before the Mac allows it"
+        ticket = auth.begin_asking("192.168.1.9")
+        assert ticket
+        auth.finish_asking("192.168.1.9", True, ticket)
+        assert auth.claim_window("192.168.1.10") is None, "an Allow is for one address"
         key = auth.claim_window("192.168.1.9")
         assert key and key != auth.bootstrap and auth.matches(key)
+
+    def test_an_allow_does_not_last(self, fresh_auth, monkeypatch):
+        auth = fresh_auth
+        ticket = auth.begin_asking("192.168.1.9")
+        assert ticket
+        assert not auth.begin_asking("192.168.1.50"), "one question at a time"
+        auth.finish_asking("192.168.1.9", True, ticket)
+        now = time.time()
+        monkeypatch.setattr(watch_relay.time, "time",
+                            lambda: now + watch_relay.PAIR_CONSENT_SECONDS + 1)
+        assert auth.needs_consent("192.168.1.9")
+        assert auth.claim_window("192.168.1.9") is None
+
+    def test_a_late_no_does_not_shut_the_owners_pair_window(self, fresh_auth):
+        """The dialog is still on screen when the owner runs --pair to get
+        round it; when the dialog then times out, the --pair window stays
+        open and asks nothing (PR #377 review)."""
+        auth = fresh_auth
+        stale = auth.begin_asking("192.168.1.9")
+        auth.open_window()
+        auth.finish_asking("192.168.1.9", False, stale)
+        assert auth.window_open()
+        assert auth.claim_window("192.168.1.9")
+
+    def test_a_session_start_while_the_mac_asks_keeps_the_question(self, fresh_auth):
+        """Session starts are frequent; one mid-question must not turn
+        the owner's Allow into an answer nobody is listening for."""
+        auth = fresh_auth
+        ticket = auth.begin_asking("192.168.1.9")
+        auth.relight()
+        assert not auth.begin_asking("192.168.1.50"), "still one question up"
+        auth.finish_asking("192.168.1.9", True, ticket)
+        assert auth.claim_window("192.168.1.9")
+
+    @pytest.mark.parametrize("ok, said, allowed", [
+        (True, "button returned:Allow, gave up:false", True),
+        (True, "button returned:, gave up:true", False),
+        (False, "execution error: User canceled. (-128)", False),
+        (False, "[Errno 2] No such file or directory: 'osascript'", False),
+        (True, "", False),
+    ])
+    def test_only_a_clicked_allow_is_a_yes(self, monkeypatch, ok, said, allowed):
+        """Don't Allow, no click, no screen, no osascript: all a no."""
+        seen = []
+        monkeypatch.setattr(watch_relay, "_run_osascript",
+                            lambda script, timeout=4: seen.append(script) or (ok, said))
+        assert _REAL_ASK_OWNER_TO_PAIR("192.168.1.9") is allowed
+        assert "192.168.1.9" in seen[0] and 'default button "Don\'t Allow"' in seen[0]
 
     def test_a_mac_with_the_icloud_bridge_never_opens_the_network_door(self, tmp_path, monkeypatch):
         """Where the bridge mirrors the key into iCloud, a watch pairs

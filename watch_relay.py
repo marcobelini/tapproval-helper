@@ -72,10 +72,12 @@ BRIDGE_APP = os.path.expanduser("~/.tapproval-bridge/TapprovalBridge.app")
 # Bumped whenever the wire contract or the auth rules change, so a running
 # relay from before an update can be recognised — and replaced — instead of
 # quietly serving the old rules forever (see ensure_running).
-RELAY_VERSION = 2
+RELAY_VERSION = 3
 PAIR_WINDOW_SECONDS = 600   # a deliberately opened window, not a standing door
 PAIR_WINDOW_CLAIMS = 2      # one watch, plus one retry
 PAIR_FIRST_WINDOW_SECONDS = 1800   # never paired: half an hour, re-lit by every session start
+PAIR_ASK_SECONDS = 120      # how long the Mac's "Allow a watch?" question waits for a click
+PAIR_CONSENT_SECONDS = 120  # how long an Allow lets that address claim its key
 DEFAULT_WAIT = 6.0     # how long POST /card blocks by default
 try:
     # One number, one owner: the hook's wait, its timeout and this clamp
@@ -1318,6 +1320,43 @@ def _run_osascript(script, timeout=4):
     return False, lines[-1] if lines else "no reason given"
 
 
+def ask_owner_to_pair(client_ip):
+    """True only when the person at this Mac clicked Allow.
+
+    Plain ``display dialog`` from osascript: it needs no automation consent,
+    so it cannot hang on one the way scripting Terminal does. Don't Allow,
+    no click within PAIR_ASK_SECONDS, no screen to show it on, or no
+    osascript at all (Linux) are all a no — fail closed; ``--pair`` is the
+    way in there."""
+    text = ("A watch at %s on your network wants to pair with this "
+            "computer and answer its Claude Code prompts.\n\n"
+            "Allow it only if it is your watch and you just opened "
+            "Tapproval on it." % client_ip)
+    script = ('display dialog %s with title "Tapproval" '
+              'buttons {"Don\'t Allow", "Allow"} default button "Don\'t Allow" '
+              'cancel button "Don\'t Allow" with icon caution '
+              'giving up after %d' % (_applescript_literal(text), PAIR_ASK_SECONDS))
+    ok, said = _run_osascript(script, timeout=PAIR_ASK_SECONDS + 10)
+    if not ok:
+        print("relay: pairing from %s not allowed: %s" % (client_ip, said),
+              file=sys.stderr)
+        return False
+    allowed = "button returned:Allow" in said and "gave up:true" not in said
+    print("relay: pairing from %s %s" % (
+        client_ip, "allowed at this Mac" if allowed else "not answered"),
+        file=sys.stderr)
+    return allowed
+
+
+def _settle_pair_request(auth, client_ip, ticket):
+    """Ask, then record the answer — a no if the asking itself breaks."""
+    allowed = False
+    try:
+        allowed = ask_owner_to_pair(client_ip)
+    finally:
+        auth.finish_asking(client_ip, allowed, ticket)
+
+
 def _terminal_of(pid):
     """(app, tty) of the terminal a process runs in, or None. One `ps`
     snapshot, walked in memory. Never raises."""
@@ -2391,6 +2430,24 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "pair from the watch, not from this computer"}, 403)
             return
         client = self.client_address[0]
+        if auth.needs_consent(client):
+            # The door the relay lit by itself: nobody at this Mac asked
+            # for a watch to pair, so the Mac asks before a key leaves it.
+            # Without this, anyone on the same café Wi-Fi could claim a key
+            # for half an hour after every session start on a Mac that had
+            # never paired (#271). The question is asked off this thread —
+            # the watch gives up on a request after 5 s — and answered on
+            # the watch's next poll. One question at a time, and a refusal
+            # or no answer shuts the door, so a stranger cannot keep
+            # putting it on screen.
+            ticket = auth.begin_asking(client)
+            if ticket:
+                threading.Thread(target=_settle_pair_request,
+                                 args=(auth, client, ticket), daemon=True,
+                                 name="pair-ask").start()
+            self._send_json({"error": "allow this watch on your computer",
+                             "waiting": True}, 403)
+            return
         allowed, retry = LIMITS.allow("pair", client, 5, 600)
         if not allowed:
             # A burst is an attack, not a retry: shut the door rather than
@@ -2982,6 +3039,12 @@ class Auth:
         self._window_until = 0.0
         self._window_claims = 0
         self._window_ips = set()
+        # Whether the open window is one the relay lit by itself, and so
+        # asks the person at the Mac before handing out a key (#271).
+        self._window_asks = False
+        self._consented = {}        # address -> until when its Allow holds
+        self._asking = None         # (address, window) the Mac is asking about now
+        self._window_gen = 1        # which window an answer belongs to
         self._load()
         # A machine that has never paired opens its door for a while at
         # every relay start (here) and every --ensure (relight), not
@@ -2989,6 +3052,7 @@ class Auth:
         # a laptop left on café Wi-Fi is not handing out keys all afternoon.
         if not self.paired_ever and not icloud_carries_the_key():
             self._window_until = time.time() + PAIR_FIRST_WINDOW_SECONDS
+            self._window_asks = True
 
     # ---- persistence -------------------------------------------------
 
@@ -3175,12 +3239,24 @@ class Auth:
 
     # ---- the pairing window -----------------------------------------
 
-    def open_window(self, seconds=PAIR_WINDOW_SECONDS):
-        """Open the LAN pairing door for ``seconds``; returns when it shuts."""
+    def open_window(self, seconds=PAIR_WINDOW_SECONDS, ask=False):
+        """Open the LAN pairing door for ``seconds``; returns when it shuts.
+
+        ``ask``: the relay lit it by itself, not the owner, so each address
+        needs an Allow clicked at this Mac before it gets a key. ``--pair``
+        is the owner asking already, and asks nothing more — which is also
+        the way to pair where no dialog can be shown."""
         with self._lock:
             self._window_until = time.time() + float(seconds)
             self._window_claims = 0
             self._window_ips = set()
+            self._window_asks = bool(ask)
+            self._consented = {}
+            # A new window: an answer to a question the old one asked must
+            # not shut it — a late no from a dialog left on screen used to
+            # close the --pair window opened to get round it.
+            self._window_gen += 1
+            self._asking = None
             return self._window_until
 
     def close_window(self):
@@ -3195,7 +3271,48 @@ class Auth:
         with self._lock:
             if self.paired_ever or icloud_carries_the_key():
                 return self._window_until
-            return self.open_window(PAIR_FIRST_WINDOW_SECONDS)
+            if self.window_open() and not self._window_asks:
+                # The owner's own --pair window is open; a session start
+                # must not turn it back into one that asks.
+                return self._window_until
+            if self.window_open():
+                # The same self-lit window, kept open longer: a question on
+                # screen still counts when the owner gets to it.
+                self._window_until = time.time() + PAIR_FIRST_WINDOW_SECONDS
+                return self._window_until
+            return self.open_window(PAIR_FIRST_WINDOW_SECONDS, ask=True)
+
+    # ---- asking the person at the Mac -------------------------------
+
+    def needs_consent(self, client_ip):
+        """Would a key for this address need an Allow clicked first?"""
+        with self._lock:
+            now = time.time()
+            return (now < self._window_until and self._window_asks
+                    and self._consented.get(client_ip, 0.0) <= now)
+
+    def begin_asking(self, client_ip):
+        """Claim the one question slot. Returns a ticket naming the window
+        that asked, for finish_asking; 0 if a question is already up."""
+        with self._lock:
+            if self._asking is not None:
+                return 0
+            self._asking = (client_ip, self._window_gen)
+            return self._window_gen
+
+    def finish_asking(self, client_ip, allowed, ticket):
+        """An Allow lets this address claim for PAIR_CONSENT_SECONDS.
+        Anything else — Don't Allow, no answer, no way to ask — shuts the
+        door until the next session start or ``--pair``. An answer for a
+        window that has since been replaced changes nothing."""
+        with self._lock:
+            if self._asking != (client_ip, ticket):
+                return
+            self._asking = None
+            if allowed:
+                self._consented[client_ip] = time.time() + PAIR_CONSENT_SECONDS
+            else:
+                self._window_until = 0.0
 
     def window_open(self):
         """Is /pair handing out the bootstrap right now?
@@ -3227,6 +3344,8 @@ class Auth:
         """
         with self._lock:
             if time.time() >= self._window_until:
+                return None
+            if self.needs_consent(client_ip):
                 return None
             if self._window_claims >= PAIR_WINDOW_CLAIMS:
                 return None

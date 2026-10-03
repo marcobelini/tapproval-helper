@@ -53,6 +53,12 @@
 <h2>Fixes, disclosed</h2>
 <p>Newest first. Each entry says what was wrong, when, who could have used it, and the fix. Starting Claude Code once updates the helper.</p>
 
+<h3>1.1.36, 3 October 2026: a computer that had never paired offered a key to its Wi-Fi</h3>
+<p><strong>What was wrong.</strong> So that a first watch could pair with no typing, a computer with no watch paired yet opened its network pairing door by itself for half an hour, again at every Claude Code session start. Anyone on the same network who asked during that time was given a key, and with it could read sessions and answer prompts, CRITICAL ones included. Until 25 September that key was the computer's main key; from then on it was a device key that could be seen and revoked, but still a key.</p>
+<p><strong>Since when.</strong> From the first public release until 1.1.36. Since 25 September, never on a Mac with the iCloud bridge, which pairs through your Apple ID instead. Never through the travel address.</p>
+<p><strong>Who could have used it.</strong> Someone on the same local network, such as a café or office Wi-Fi, as a computer that had the helper installed and no watch paired yet. Once a watch had paired, the door stayed shut unless you opened it.</p>
+<p><strong>The fix.</strong> When a watch asks, the computer now shows "Allow a watch to pair?" with the asking address, and gives a key only after you click Allow. Don't Allow, or no answer within two minutes, shuts the door, and only one question is shown at a time, so a stranger cannot keep putting it on your screen. <code>--pair</code>, which you run yourself, asks nothing more. Tests check that a refusal gives no key and that a late answer cannot shut a door you opened since. <a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.36">Release notes</a>.</p>
+
 <h3>1.1.27, 27 September 2026: a request could borrow the key of the one before it</h3>
 <p><strong>What was wrong.</strong> Several requests can share one network connection. The helper kept what it had learned about a request, including whether its key had been proved, on the connection instead of on the request. A request without a key, sent on a connection just after a request that did prove a key, was treated as proved.</p>
 <p><strong>Since when.</strong> From 1.1.21 (25 September 2026), when signed requests arrived, until 1.1.27.</p>
