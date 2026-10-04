@@ -17,6 +17,7 @@ filesystem for audit-log tests.
 import ast
 import importlib.util
 import base64
+import io
 import json
 import os
 from pathlib import Path
@@ -252,6 +253,15 @@ def _no_real_pairing_dialog(monkeypatch):
     running the suite. The default answer is no, the safe one; tests about
     the question say which answer they want."""
     monkeypatch.setattr(watch_relay, "ask_owner_to_pair", lambda client_ip: False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_codex(tmp_path, monkeypatch):
+    """No test may read or write the owner's real ~/.codex. The first run
+    of the Codex installer's tests, before this existed, wrote our hook
+    into it and left five backups (2026-10-04). The default world is a
+    machine without Codex; tests that are about Codex create the folder."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
 
 
 @pytest.fixture(autouse=True)
@@ -11149,3 +11159,112 @@ class TestTodayIsTheWearersDay:
                             lambda path, offset: offsets.append(offset) or real(path, offset))
         wd.activity_summary(audit_log=log, now=datetime(2026, 10, 1, 9, 0).timestamp())
         assert offsets and offsets[0] > 0
+
+
+
+# --- Codex beside Claude Code (#390, M1a) -------------------------------------
+
+class TestCodexAgent:
+    """One hook for both agents, the decision object identical, the layout
+    on the wrist identical: a Codex card is a normal card with `agent`."""
+
+    PATCH = ("*** Begin Patch\n*** Update File: src/app.py\n@@\n-a\n+b\n"
+             "*** End Patch")
+
+    def test_an_argv_list_command_is_judged_like_its_string(self):
+        """A list used to raise in classify_bash, and the hook escalated with
+        no card on the wrist at all."""
+        listed = crc.classify({"tool_name": "Bash",
+                               "tool_input": {"command": ["git", "push", "--force"]}})
+        written = crc.classify({"tool_name": "Bash",
+                                "tool_input": {"command": "git push --force"}})
+        assert listed["risk"] == written["risk"]
+        assert listed["tool_input"]["command"] == "git push --force"
+        response, audit, card = crc.build_response(
+            {"tool_name": "Bash", "tool_input": {"command": ["ls", "-la"]}},
+            dict(crc.DEFAULT_POLICY))
+        assert card["headline"] and card["detail"] == "ls -la"
+
+    def test_a_patch_is_judged_by_the_files_it_touches(self):
+        safe = crc.classify({"tool_name": "apply_patch", "cwd": "/repo",
+                             "tool_input": {"command": self.PATCH}})
+        env = crc.classify({"tool_name": "apply_patch", "cwd": "/repo",
+                            "tool_input": {"command": self.PATCH.replace("src/app.py", ".env")}})
+        assert env["risk"] > safe["risk"], "a secret file outranks a source file"
+        assert env["risk"] == crc.classify_path(".env", "/repo")[0]
+
+    def test_deleting_a_file_in_a_patch_is_judged_as_rm(self):
+        patch = "*** Begin Patch\n*** Delete File: src/app.py\n*** End Patch"
+        got = crc.classify({"tool_name": "apply_patch", "cwd": "/repo",
+                            "tool_input": {"command": patch}})
+        assert got["risk"] >= crc.classify_bash("rm -- src/app.py")[0]
+
+    def test_a_destructive_statement_inside_a_patch_still_escalates(self):
+        patch = ("*** Begin Patch\n*** Add File: migrate.sql\n+DROP TABLE users;\n"
+                 "*** End Patch")
+        got = crc.classify({"tool_name": "apply_patch", "cwd": "/repo",
+                            "tool_input": {"command": patch}})
+        assert got["risk"] == crc.Risk.CRITICAL and "sql-destructive" in got["rules"]
+
+    def test_a_patch_that_names_no_file_is_not_called_safe(self):
+        got = crc.classify({"tool_name": "apply_patch", "tool_input": {"command": "garbage"}})
+        assert got["risk"] == crc.Risk.MEDIUM and got["rules"] == ["patch-unparsed"]
+
+    def test_a_patch_card_reads_like_an_edit_card(self):
+        card = crc.wrist_card("apply_patch", {"command": self.PATCH}, crc.Risk.LOW)
+        assert card["headline"] == "Edit app.py"
+        two = self.PATCH.replace("*** End Patch", "*** Add File: b.txt\n+x\n*** End Patch")
+        assert crc.wrist_card("apply_patch", {"command": two}, crc.Risk.LOW)["headline"] == "Edit 2 files"
+
+    def test_a_codex_card_says_so_and_a_claude_card_is_unchanged(self):
+        event = {"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "s"}
+        _, _, claude = crc.build_response(event, dict(crc.DEFAULT_POLICY))
+        _, _, codex = crc.build_response(event, dict(crc.DEFAULT_POLICY), agent="codex")
+        assert "agent" not in claude, "a Claude card must not change by a byte"
+        assert codex.pop("agent") == "codex"
+        assert codex == claude, "otherwise the very same card: identical layout"
+
+    def test_the_decision_object_is_the_same_for_codex(self, monkeypatch, tmp_path):
+        """Codex reads the same {"hookSpecificOutput":{"decision":...}} shape."""
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+        (tmp_path / "settings.json").write_text(json.dumps(
+            {"env": {"CLAUDE_RISK_MODE": "enforce", "CLAUDE_RISK_AUTO_ALLOW": "SAFE"}}))
+        out = io.StringIO()
+        crc.run_hook(stdin=io.StringIO(json.dumps({
+            "hook_event_name": "PermissionRequest", "tool_name": "Bash",
+            "tool_input": {"command": "ls"}, "session_id": "x", "cwd": str(tmp_path)})),
+            stdout=out, agent="codex")
+        decision = json.loads(out.getvalue())["hookSpecificOutput"]
+        assert decision["hookEventName"] == "PermissionRequest"
+        assert decision["decision"] == {"behavior": "allow"}, \
+            "one switch for both agents: Claude Code's settings set Codex's mode too"
+
+    def test_the_installer_wires_codex_only_where_codex_is_used(self, tmp_path, monkeypatch):
+        settings = tmp_path / "settings.json"
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(settings))
+        codex = tmp_path / "codex-home"
+        monkeypatch.setenv("CODEX_HOME", str(codex))
+        assert crc.run_install() == 0
+        assert not codex.exists(), "no ~/.codex, nothing written for Codex"
+        codex.mkdir()
+        probe = {"hooks": {"PermissionRequest": [{"hooks": [
+            {"type": "command", "command": "python3 probe.py", "timeout": 5}]}]}}
+        (codex / "hooks.json").write_text(json.dumps(probe))
+        assert crc.run_install() == 0
+        wired = json.loads((codex / "hooks.json").read_text())
+        commands = [h["command"] for e in wired["hooks"]["PermissionRequest"] for h in e["hooks"]]
+        assert "python3 probe.py" in commands, "someone else's hook is left alone"
+        ours = [c for c in commands if "ClaudeRiskClassifier.py" in c]
+        assert len(ours) == 1 and ours[0].endswith("--agent codex")
+        assert crc.run_install() == 0
+        again = json.loads((codex / "hooks.json").read_text())
+        assert again == wired, "a second install changes nothing"
+        assert crc.run_uninstall() == 0
+        left = json.loads((codex / "hooks.json").read_text())
+        assert left == probe, "uninstall takes ours and only ours"
+
+    def test_codex_is_found_inside_the_chatgpt_app(self, monkeypatch):
+        monkeypatch.setattr(crc.shutil if hasattr(crc, "shutil") else __import__("shutil"),
+                            "which", lambda name: None)
+        monkeypatch.setattr(crc.os, "access", lambda path, mode: path == crc.CODEX_APP_BINARY)
+        assert crc.ensure_codex_on_path() == crc.CODEX_APP_BINARY

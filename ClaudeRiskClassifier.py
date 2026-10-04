@@ -65,6 +65,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sys
 from collections import Counter
 from datetime import datetime, timezone
@@ -102,7 +103,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.36"
+__version__ = "1.1.37"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -1215,6 +1216,73 @@ def _mcp_risk(tool):
 CONTENT_KEYS = ("content", "new_string", "file_text", "new_source")
 
 
+def _command_as_text(tool_input):
+    """A command given as an argv list, joined into the one string every
+    reader here expects. Claude Code sends a string; Codex's documented
+    shape is a string too, but an argv list used to raise in
+    classify_bash, and the hook then escalated with no card on the wrist
+    at all: a prompt the wearer was never shown."""
+    command = tool_input.get("command")
+    if isinstance(command, (list, tuple)):
+        tool_input = dict(tool_input)
+        tool_input["command"] = shlex.join(str(part) for part in command)
+    return tool_input
+
+
+# Codex's apply_patch: one text that names every file it touches.
+PATCH_FILE = re.compile(
+    r"^\*\*\* (Add|Update|Delete) File: (.+?)\s*$|^\*\*\* Move to: (.+?)\s*$",
+    re.MULTILINE)
+
+
+def patch_files(patch):
+    """``[(verb, path), ...]`` for each file an apply_patch text touches."""
+    found = []
+    for match in PATCH_FILE.finditer(str(patch or "")):
+        if match.group(3):
+            found.append(("Move", match.group(3)))
+        else:
+            found.append((match.group(1), match.group(2)))
+    return found
+
+
+def _patch_risk(patch, cwd):
+    """Codex's apply_patch through the same paths as Write, Edit and rm.
+
+    Each file is judged where it lands (classify_path), a deleted one as
+    an ``rm`` of it would be, and the added lines through the same content
+    scan as a written file. A patch that names no file is not understood,
+    and is MEDIUM rather than SAFE.
+    """
+    files = patch_files(patch)
+    if not files:
+        return Risk.MEDIUM, ["patch-unparsed"]
+    risk, rules = Risk.SAFE, []
+    for verb, path in files:
+        level, found = classify_path(path, cwd)
+        if verb == "Delete":
+            removed, why = classify_bash("rm -- %s" % shlex.quote(path))
+            level, found = max(level, removed), found + why
+        risk = max(risk, level)
+        rules += [rule for rule in found if rule not in rules]
+    added = "\n".join(line[1:] for line in str(patch).splitlines()
+                      if line.startswith("+"))
+    return _scan_content(added, risk, rules)
+
+
+def _scan_content(content, risk, rules):
+    """A benign path can still carry a destructive payload."""
+    if content:
+        if SQL_DESTRUCTIVE.search(content):
+            return max(risk, Risk.CRITICAL), rules + ["sql-destructive"]
+        if SQL_MUTATION.search(content):
+            return max(risk, Risk.HIGH), rules + ["sql-mutation"]
+        for rule_id, pattern, level in SITE_RULES:
+            if pattern.search(content):
+                return max(risk, level), rules + [rule_id]
+    return risk, rules
+
+
 def classify(event):
     """Classify a ``PermissionRequest`` event. Returns a result dict."""
     tool = (event or {}).get("tool_name") or ""
@@ -1222,27 +1290,20 @@ def classify(event):
     cwd = (event or {}).get("cwd")
     if not isinstance(tool_input, dict):
         tool_input = {}
+    tool_input = _command_as_text(tool_input)
 
     if tool in ("Bash", "BashOutput"):
         risk, rules = classify_bash(tool_input.get("command", ""))
+    elif tool == "apply_patch":
+        risk, rules = _patch_risk(tool_input.get("command", ""), cwd)
     elif tool in WRITE_TOOLS:
         risk, rules = classify_path(
             tool_input.get("file_path") or tool_input.get("notebook_path"), cwd
         )
-        # A benign path can still carry a destructive payload.
         content = " ".join(
             str(tool_input.get(key, "")) for key in CONTENT_KEYS if tool_input.get(key)
         )
-        if content:
-            if SQL_DESTRUCTIVE.search(content):
-                risk, rules = max(risk, Risk.CRITICAL), rules + ["sql-destructive"]
-            elif SQL_MUTATION.search(content):
-                risk, rules = max(risk, Risk.HIGH), rules + ["sql-mutation"]
-            else:
-                for rule_id, pattern, level in SITE_RULES:
-                    if pattern.search(content):
-                        risk, rules = max(risk, level), rules + [rule_id]
-                        break
+        risk, rules = _scan_content(content, risk, rules)
     elif tool in READ_ONLY_TOOLS:
         risk, rules = Risk.SAFE, ["read-only-tool"]
     elif tool == "WebSearch":
@@ -1637,6 +1698,19 @@ def wrist_card(tool, tool_input, risk,
         headline = (_fit(described, headline_chars) if described
                     else _bash_headline(command, headline_chars))
         detail = _fit(command, detail_chars)
+    elif tool == "apply_patch":
+        # Codex's file edit: the same card a Write or Edit gets.
+        files = patch_files(tool_input.get("command", ""))
+        names = [os.path.basename(str(path).rstrip("/\\")) or path
+                 for _verb, path in files]
+        if len(names) == 1:
+            verb = {"Add": "Write", "Delete": "Delete"}.get(files[0][0], "Edit")
+            headline = _fit("%s %s" % (verb, names[0]), headline_chars)
+            detail = _fit("%s %s" % (verb, files[0][1]), detail_chars)
+        else:
+            headline = _fit("Edit %d files" % len(names) if names
+                            else "Apply a patch", headline_chars)
+            detail = _fit(", ".join(names), detail_chars)
     elif tool in WRITE_TOOLS:
         path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
         verb = "Write" if tool == "Write" else "Edit"
@@ -1934,7 +2008,7 @@ def _session_auto_wrote_tests(session_id, policy, tail=256 * 1024):
     return False
 
 
-def build_response(event, policy):
+def build_response(event, policy, agent=None):
     """Classify one event; returns ``(response_dict, audit_entry, card)``.
 
     The card returned here is the one the relay shows: run_hook must not
@@ -1964,6 +2038,10 @@ def build_response(event, policy):
     # permission suggestions with the prompt — mirror that, so the wrist
     # never offers a third choice the phone doesn't have.
     card["can_always"] = bool((event or {}).get("permission_suggestions"))
+    # Which agent asked, for a session list that holds both. Only a second
+    # agent is named: a Claude card stays byte-for-byte what it was.
+    if agent and agent != "claude":
+        card["agent"] = agent
     decision, reason = decide(risk, policy)
 
     shadow = str(policy.get("mode", "shadow")).lower() != "enforce"
@@ -2149,8 +2227,32 @@ def matches_user_allowlist(tool, tool_input, cwd=None):
         for piece in pieces)
 
 
-def run_hook(stdin=None, stdout=None):
-    """Hook mode: read the event from stdin, write the decision to stdout."""
+def _shared_settings_env():
+    """The CLAUDE_RISK_* switches as Claude Code's settings hold them.
+
+    One switch for both agents: --watch and --quiet write Claude Code's
+    settings, and a Codex hook reads the same file rather than keeping a
+    second copy that could disagree. A plugin install keeps its switches
+    on its hook's command line instead, so they are read from there.
+    """
+    try:
+        data = _read_settings(_settings_path())
+    except ValueError:
+        data = {}
+    env = {key: str(value) for key, value in (data.get("env") or {}).items()
+           if key.startswith("CLAUDE_RISK_")}
+    if not env.get("CLAUDE_RISK_MODE"):
+        plugin = _plugin_install()
+        if plugin:
+            env = dict(plugin.get("env") or {}, **env)
+    return env
+
+
+def run_hook(stdin=None, stdout=None, agent=None):
+    """Hook mode: read the event from stdin, write the decision to stdout.
+
+    ``agent`` is "codex" when Codex runs the hook (its hooks.json command
+    says --agent codex); Claude Code's command names no agent."""
     stdin = sys.stdin if stdin is None else stdin
     stdout = sys.stdout if stdout is None else stdout
     try:
@@ -2158,8 +2260,11 @@ def run_hook(stdin=None, stdout=None):
         event = json.loads(raw) if raw and raw.strip() else {}
         if not isinstance(event, dict):
             raise ValueError("event is not a JSON object")
-        policy = load_policy()
-        response, audit, card = build_response(event, policy)
+        if agent == "codex":
+            policy = load_policy(dict(_shared_settings_env(), **os.environ))
+        else:
+            policy = load_policy()
+        response, audit, card = build_response(event, policy, agent=agent)
         # Only an enforce-mode escalation with a relay configured can ever
         # reach the wrist; check those cheap facts before touching any
         # settings file for the parity test below.
@@ -2170,7 +2275,9 @@ def run_hook(stdin=None, stdout=None):
         # two classes itself with no visible prompt — its own read-only
         # validation (our SAFE tier mirrors it) and the user's allow
         # rules. Neither may become a wrist card.
-        if wants_wrist:
+        # Codex decided to ask by its own rules; the Claude Code checks
+        # below describe a different program's prompt.
+        if wants_wrist and agent != "codex":
             phone_would_prompt = not (
                 (audit["tier"] == "SAFE"
                  and phone_would_auto_allow(event.get("tool_name", ""),
@@ -2652,6 +2759,13 @@ def _plugin_only_install():
     return _plugin_install()
 
 
+def _read_settings_quietly(path):
+    try:
+        return _read_settings(path)
+    except ValueError:
+        return {}
+
+
 def _read_settings(path):
     """Return the parsed settings. Raises ValueError on malformed JSON."""
     if not os.path.exists(path):
@@ -2759,6 +2873,93 @@ def _strip_our_env(data):
             data.pop("env", None)
 
 
+# --------------------------------------------------------------------------
+# Codex, wired beside Claude Code
+#
+# Codex reads hooks from $CODEX_HOME/hooks.json (default ~/.codex), in the
+# same {"hooks": {Event: [{"hooks": [...]}]}} shape as Claude Code's
+# settings, and answers a PermissionRequest hook in the same decision
+# object. So the one hook serves both, told which agent it is by
+# --agent codex. Nothing is written for someone who does not use Codex:
+# a Claude-only install must not change by a byte (issue #390).
+
+CODEX_APP_BINARY = "/Applications/ChatGPT.app/Contents/Resources/codex"
+
+
+def _codex_home():
+    return os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex")
+
+
+def _codex_hooks_path():
+    return os.path.join(_codex_home(), "hooks.json")
+
+
+def _codex_command():
+    return "%s --agent codex" % _hook_command()
+
+
+def ensure_codex_on_path():
+    """Where the codex binary is, or None. Codex ships inside the ChatGPT
+    app and need not be on PATH at all."""
+    import shutil
+    found = shutil.which("codex")
+    if found:
+        return found
+    return CODEX_APP_BINARY if os.access(CODEX_APP_BINARY, os.X_OK) else None
+
+
+def _codex_handlers(data):
+    return [h for entry in ((data.get("hooks") or {}).get("PermissionRequest") or [])
+            for h in entry.get("hooks", []) if _is_our_hook(h)]
+
+
+def install_codex():
+    """Wire the hook into Codex's hooks.json, if Codex is used here.
+
+    Returns "installed", "current" or None (no Codex). Codex runs a hook
+    only once the user has approved it in the CLI's /hooks, which is said
+    where the install is reported."""
+    if not os.path.isdir(_codex_home()):
+        return None
+    path = _codex_hooks_path()
+    try:
+        data = _read_settings(path)
+    except ValueError:
+        print("Codex  : %s is not valid JSON; left alone." % path)
+        return None
+    entries = data.setdefault("hooks", {}).setdefault("PermissionRequest", [])
+    changed = _sync_hook(entries, _codex_command(), "*", os.path.basename(__file__))
+    for handler in _codex_handlers(data):
+        if handler.get("timeout") != WATCH_HOOK_TIMEOUT:
+            handler["timeout"] = WATCH_HOOK_TIMEOUT
+            changed = True
+    if not changed:
+        return "current"
+    _backup(path)
+    _write_settings(path, data)
+    return "installed"
+
+
+def uninstall_codex():
+    """Take our hook out of Codex's hooks.json, leaving everyone else's.
+    True if anything was removed."""
+    path = _codex_hooks_path()
+    if not os.path.exists(path):
+        return False
+    try:
+        data = _read_settings(path)
+    except ValueError:
+        return False
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict) or not _remove_our_hooks(hooks):
+        return False
+    if not hooks:
+        data.pop("hooks", None)
+    _backup(path)
+    _write_settings(path, data)
+    return True
+
+
 def run_install(then_watch=False):
     """Register this script as a PermissionRequest hook. Safe to re-run.
 
@@ -2788,6 +2989,7 @@ def run_install(then_watch=False):
     # Even a no-op re-run repairs a missing login wake-up: installs from
     # before it existed get it the next time anything runs --install.
     agent = bool(relay_command) and install_launch_agent()
+    codex = install_codex()
 
     if not changed:
         print("Already installed, and the paths are correct.")
@@ -2795,6 +2997,7 @@ def run_install(then_watch=False):
         print("  Command  : %s" % command)
         if agent:
             print("  Reboot   : the relay wakes again at login")
+        _say_codex(codex)
         print("  Nothing to do.")
         return 0
 
@@ -2810,6 +3013,7 @@ def run_install(then_watch=False):
         print("  Reboot   : the relay wakes again at login")
     if backup:
         print("  Backup   : %s" % backup)
+    _say_codex(codex)
     if then_watch:
         return 0
     print("")
@@ -2820,6 +3024,13 @@ def run_install(then_watch=False):
     print("Next: start a new Claude Code session, work normally for a week,")
     print("then run this script again with --report.")
     return 0
+
+
+def _say_codex(codex):
+    if codex == "installed":
+        print("  Codex    : wired too; approve it once: run codex, then /hooks")
+    elif codex == "current":
+        print("  Codex    : wired (approve it once in codex, /hooks)")
 
 
 def _settings_or_explain():
@@ -2857,6 +3068,8 @@ def run_uninstall():
 
     hooks = data.get("hooks")
     removed = _remove_our_hooks(hooks) if isinstance(hooks, dict) else False
+    if uninstall_codex():
+        print("Removed from Codex's hooks too.")
     if not removed:
         # The login job is ours whatever settings say: a hand edit or an
         # earlier --uninstall took the hooks and left it pointing at a
@@ -3219,6 +3432,12 @@ def run_status():
         print("Relay hook    : starts itself with every Claude Code session")
     else:
         print("Relay hook    : not wired \u2014 re-run --install to add it")
+    codex_wired = bool(os.path.exists(_codex_hooks_path()) and _codex_handlers(
+        _read_settings_quietly(_codex_hooks_path())))
+    if codex_wired:
+        print("Codex         : wired; Codex runs it once approved in codex, /hooks")
+    elif os.path.isdir(_codex_home()):
+        print("Codex         : not wired \u2014 re-run --install to add it")
     print("Version       : %s" % __version__)
     if f["login_item"]:
         print("Reboot        : the relay wakes again at login")
@@ -3265,6 +3484,8 @@ def main(argv=None):
                         help="tool name to use with --explain (default: Bash)")
     parser.add_argument("--report", action="store_true",
                         help="summarise the audit log")
+    parser.add_argument("--agent", choices=("claude", "codex"), default=None,
+                        help="which agent runs this hook (Codex's hooks.json says codex)")
     parser.add_argument("--install", action="store_true",
                         help="register this script as a hook in settings.json")
     parser.add_argument("--uninstall", action="store_true",
@@ -3316,7 +3537,7 @@ def _dispatch(args):
         return run_report()
     if args.explain is not None:
         return run_explain(args.explain, args.tool)
-    return run_hook()
+    return run_hook(agent=args.agent)
 
 
 if __name__ == "__main__":
