@@ -2405,6 +2405,71 @@ class TestSyncHelperFlags:
         assert "--check) CHECK=1" in text and "--anyway) ANYWAY=1" in text
 
 
+class TestTheSyncPublishesOnlyMain:
+    """sync-helper.sh copied the working tree, so an uncommitted edit or an
+    unmerged branch reached every user as it sat on disk (2026-10-05
+    review). Run for real in a throwaway clone; GitHub is rewritten to a
+    path that does not exist, so nothing leaves this machine."""
+
+    def _clone(self, tmp_path):
+        import subprocess as sp
+        script = os.path.join(_ROOT, "sync-helper.sh")
+        if not os.path.isfile(script):
+            pytest.skip("sync-helper.sh lives in the product repo only")
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+                   GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+        def run(*a, cwd):
+            return sp.run(a, cwd=cwd, env=env, capture_output=True, text=True, check=True)
+        run("git", "init", "-q", "-b", "main", cwd=origin)
+        (origin / "sync-helper.sh").write_text(open(script, encoding="utf-8").read())
+        (origin / "a.txt").write_text("a\n")
+        run("git", "add", ".", cwd=origin)
+        run("git", "commit", "-q", "-m", "one", cwd=origin)
+        work = tmp_path / "work"
+        run("git", "clone", "-q", str(origin), str(work), cwd=tmp_path)
+        return work, env, run
+
+    @staticmethod
+    def _sync(work, env, *flags):
+        import subprocess as sp
+        env = dict(env, GIT_CONFIG_COUNT="1",
+                   GIT_CONFIG_KEY_0="url./nonexistent/.insteadOf",
+                   GIT_CONFIG_VALUE_0="https://github.com/")
+        return sp.run(["bash", str(work / "sync-helper.sh"), "--check", *flags],
+                      cwd=work, env=env, capture_output=True, text=True, timeout=60)
+
+    def test_an_uncommitted_edit_is_refused(self, tmp_path):
+        work, env, _run = self._clone(tmp_path)
+        (work / "a.txt").write_text("edited\n")
+        done = self._sync(work, env)
+        assert done.returncode == 1 and "not committed" in done.stderr
+
+    def test_anyway_does_not_cover_a_dirty_tree(self, tmp_path):
+        work, env, _run = self._clone(tmp_path)
+        (work / "new.py").write_text("x = 1\n")
+        done = self._sync(work, env, "--anyway")
+        assert done.returncode == 1 and "not committed" in done.stderr
+
+    def test_a_commit_main_does_not_have_is_refused(self, tmp_path):
+        work, env, run = self._clone(tmp_path)
+        (work / "b.txt").write_text("b\n")
+        run("git", "add", ".", cwd=work)
+        run("git", "commit", "-q", "-m", "unmerged", cwd=work)
+        done = self._sync(work, env)
+        assert done.returncode == 1 and "1 ahead" in done.stderr
+
+    def test_a_clean_main_passes_the_gate(self, tmp_path):
+        work, env, _run = self._clone(tmp_path)
+        done = self._sync(work, env)
+        # Past the gate it goes on to clone the public repo, which the
+        # rewrite above sends nowhere: a failure, but not this one.
+        assert "not committed" not in done.stderr and "is not main" not in done.stderr
+        assert "nonexistent" in done.stderr or "fatal" in done.stderr
+
+
 class TestAlertBuckets:
     """What a notification on a closed watch may offer is decided here, once,
     and travels with the card: the watch and the bridge only copy it. A
@@ -9572,6 +9637,41 @@ class TestTheChangelogPageNeverGoesBlank:
         result, page = self._run(tmp_path, "echo '[]'\n")
         assert page == "the page we had"
         assert "NOT re-rendered" in result.stderr
+
+
+class TestTheBetaIsOfferedWherePeopleAlreadyAre:
+    """Launch plan, 2026-10-05: everyone who installs the helper or reads
+    its listing is the exact audience for the beta, so the way in sits
+    next to every App Store link. The installer's machine-read lines must
+    not move for it."""
+
+    BETA = "https://testflight.apple.com/join/dW1tYBQG"
+
+    @staticmethod
+    def _read(relative):
+        path = os.path.join(_ROOT, relative)
+        if not os.path.isfile(path):
+            pytest.skip("%s not in this layout" % relative)
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_the_installer_names_the_beta_after_its_ready_lines(self):
+        script = self._read("install.sh")
+        ready = 'echo "TAPPROVAL_BASE_READY"\necho "OK: Tapproval Base is ready.'
+        assert ready in script, "callers match these lines exactly"
+        assert script.index(self.BETA) > script.index("TAPPROVAL_BASE_READY")
+
+    @pytest.mark.parametrize("relative", [
+        "helper/README.md", "helper/docs/index.html",
+        "helper/docs/apple-watch-claude-code.html"])
+    def test_every_page_with_the_app_store_offers_the_beta(self, relative):
+        text = self._read(relative)
+        assert self.BETA in text and "unlock is free" in text
+
+    @pytest.mark.parametrize("relative", [
+        "helper/.claude-plugin/plugin.json", "helper/.claude-plugin/marketplace.json"])
+    def test_the_plugin_listing_names_the_beta(self, relative):
+        assert "beta on TestFlight" in self._read(relative)
 
 
 class TestTheReleaseToolsSayWhenAStepFailed:

@@ -7,6 +7,8 @@ Watch.**
 [![Or try the beta on TestFlight](https://img.shields.io/badge/TestFlight-Beta-555555?logo=apple&logoColor=white&style=for-the-badge)](https://testflight.apple.com/join/dW1tYBQG)
 [![Website](https://img.shields.io/badge/Website-tapproval.thoughtfulsteward.org-2f7f56?style=for-the-badge)](https://tapproval.thoughtfulsteward.org)
 
+In the TestFlight beta the unlock is free.
+
 Privacy policy: https://tapproval.thoughtfulsteward.org/privacy.html · Support: tapproval@thoughtfulsteward.org
 
 When Claude Code works on your computer, it stops and asks before doing
