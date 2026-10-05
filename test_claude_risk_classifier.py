@@ -318,7 +318,6 @@ class TestClassifyBashReadOnly:
         "git status",
         "git diff --stat",
         "git log --oneline -10",
-        "pytest -q",
         "wc -l *.py",
         "sed -n '1,20p' conftest.py",
     ])
@@ -327,7 +326,7 @@ class TestClassifyBashReadOnly:
         assert risk == Risk.SAFE
 
     def test_chained_read_only_stays_safe(self):
-        risk, _ = crc.classify_bash("git status && ls -la && pytest -q")
+        risk, _ = crc.classify_bash("git status && ls -la && wc -l *.py")
         assert risk == Risk.SAFE
 
     def test_sed_in_place_is_not_safe(self):
@@ -341,7 +340,7 @@ class TestClassifyBashReadOnly:
         assert "redirect-write" in rules
 
     def test_redirect_to_devnull_is_ignored(self):
-        risk, _ = crc.classify_bash("pytest -q > /dev/null")
+        risk, _ = crc.classify_bash("ls -la > /dev/null")
         assert risk == Risk.SAFE
 
 
@@ -11174,22 +11173,77 @@ class TestInstructionsAreNotDocs:
         assert crc.classify_path(path, cwd="/p")[0] == crc.Risk.LOW
 
 
+class TestIssue402:
+    """Shapes of command that read lower than what they do (2026-10-05
+    review). Each tier here was measured on main first; every change may
+    only raise one."""
+
+    @pytest.mark.parametrize("command,tier", [
+        # Process substitution runs its own command.
+        ("diff <(rm -rf ~) a", Risk.CRITICAL),
+        ("tee >(rm -rf ~) < a", Risk.CRITICAL),
+        ("cat <(security find-generic-password -s x -w)", Risk.HIGH),
+        # The shell drops quotes and expands $IFS; the name is still rm.
+        ('"rm" -rf ~', Risk.CRITICAL),
+        ("'rm' -rf ~", Risk.CRITICAL),
+        ('r"m" -rf ~', Risk.CRITICAL),
+        ("\\rm -rf ~", Risk.CRITICAL),
+        ("rm${IFS}-rf${IFS}~", Risk.CRITICAL),
+        ("rm$IFS-rf$IFS~", Risk.CRITICAL),
+        # The home directory itself is the machine's reach.
+        ("find ~ -delete", Risk.CRITICAL),
+        ("find $HOME -delete", Risk.CRITICAL),
+        ("find ${HOME}/ -delete", Risk.CRITICAL),
+        # xargs runs what follows it.
+        ("xargs rm -rf ~", Risk.CRITICAL),
+        ("echo x | xargs -0 -n 1 rm -rf ~", Risk.CRITICAL),
+        ("ls | xargs rm -rf", Risk.HIGH),
+        ("echo x | xargs git push --force origin main", Risk.CRITICAL),
+        ("echo x | xargs -n 1 -P 4 git push --force origin main", Risk.CRITICAL),
+        # Keychain reads in their joined-flag spellings.
+        ("security find-generic-password -ga x", Risk.HIGH),
+        ("security find-generic-password -wa x", Risk.HIGH),
+        ("security find-internet-password -s h -aw", Risk.HIGH),
+    ])
+    def test_it_reads_what_it_does(self, command, tier):
+        assert crc.classify_bash(command)[0] == tier, crc.classify_bash(command)
+
+    @pytest.mark.parametrize("command,ceiling", [
+        ("diff <(ls) <(ls)", Risk.MEDIUM),     # the substitution floor, as $(ls)
+        ("find . -delete", Risk.HIGH),          # the project, not the home
+        ("rm -rf ~/proj/build", Risk.HIGH),
+        ("find ~ -name '*.log'", Risk.SAFE),
+        ("du -sh ~", Risk.SAFE),
+        ("security find-generic-password -s x", Risk.MEDIUM),
+        ('echo "rm"', Risk.SAFE),
+        ("ls | xargs wc -l", Risk.MEDIUM),
+    ])
+    def test_it_does_not_raise_what_it_should_not(self, command, ceiling):
+        assert crc.classify_bash(command)[0] <= ceiling, crc.classify_bash(command)
+
+    def test_the_phone_does_not_forgive_a_process_substitution(self):
+        for command in ("diff <(rm -rf ~) a", "cat >(ls)"):
+            assert crc.phone_would_auto_allow("Bash", {"command": command}) is False
+
+    PATCH = "*** Begin Patch\n*** Update File: src/a.py\n@@\n-x\n+y\n*** End Patch"
+
+    def test_a_patch_with_nowhere_to_land_is_high(self):
+        assert crc.classify({"tool_name": "apply_patch",
+                             "tool_input": {"command": self.PATCH}})["risk"] == Risk.HIGH
+        project = os.path.dirname(os.path.abspath(crc.__file__))
+        assert crc.classify({"tool_name": "apply_patch", "cwd": project,
+                             "tool_input": {"command": self.PATCH}})["risk"] == Risk.MEDIUM
+
+
 class TestTestsAfterAnAutoWrittenTest:
-    """Under --quiet a test file is a LOW write and pytest a SAFE run, so a
-    session could write test_x.py and run it with no human: any code at
-    all. The run is raised when this session had a test file written for
-    it without anyone looking."""
+    """Under --quiet a test file is a LOW write, and pytest was a SAFE run,
+    so a session could write test_x.py and run it with no human: any code
+    at all. A guard read the audit log for that pair; a test run is now
+    MEDIUM in itself, so it asks whatever was written before it."""
 
     def _policy(self, tmp_path):
         return {"mode": "enforce", "auto_allow_at_or_below": "LOW",
                 "audit_log": str(tmp_path / "audit.jsonl")}
-
-    def _write(self, policy, session, path, cwd="/p"):
-        event = {"session_id": session, "tool_name": "Write", "cwd": cwd,
-                 "tool_input": {"file_path": path, "content": "x"}}
-        response, audit, _ = crc.build_response(event, policy)
-        crc.write_audit(audit, policy)
-        return _behavior(response)
 
     def _run_tests(self, policy, session, command="pytest -q"):
         event = {"session_id": session, "tool_name": "Bash", "cwd": "/p",
@@ -11197,37 +11251,25 @@ class TestTestsAfterAnAutoWrittenTest:
         response, audit, _ = crc.build_response(event, policy)
         return _behavior(response), audit
 
-    def test_running_tests_right_after_an_auto_allowed_test_write_asks(self, tmp_path):
-        policy = self._policy(tmp_path)
-        assert self._write(policy, "s1", "/p/test_x.py") == "allow"
-        verdict, audit = self._run_tests(policy, "s1")
+    @pytest.mark.parametrize("command", [
+        "pytest -q", "python3 -m pytest", "python -m unittest", "npm test",
+        "yarn run test", "tox", "tox -e py", "nox", "py.test x", "uv run pytest",
+        "cd sub && pytest", "env CI=1 pytest"])
+    def test_a_test_run_asks_under_quiet(self, tmp_path, command):
+        verdict, audit = self._run_tests(self._policy(tmp_path), "s1", command)
         assert verdict == "escalate"
         assert audit["tier"] == "MEDIUM"
-        assert "tests-after-auto-written-test" in audit["rules"]
+        assert any(rule.endswith("runs-project-code") for rule in audit["rules"]), audit["rules"]
 
-    @pytest.mark.parametrize("command", ["python3 -m pytest", "npm test", "tox", "py.test x"])
-    def test_every_runner_counts(self, tmp_path, command):
-        policy = self._policy(tmp_path)
-        self._write(policy, "s1", "/p/test_x.py")
-        assert self._run_tests(policy, "s1", command)[0] == "escalate"
+    def test_it_reads_no_audit_log(self, tmp_path):
+        """The old guard read the log's tail on every Bash call. A missing
+        log must change nothing now."""
+        policy = dict(self._policy(tmp_path), audit_log=str(tmp_path / "nope" / "a.jsonl"))
+        assert self._run_tests(policy, "s1")[0] == "escalate"
 
-    def test_another_session_is_not_affected(self, tmp_path):
-        policy = self._policy(tmp_path)
-        self._write(policy, "s1", "/p/test_x.py")
-        assert self._run_tests(policy, "s2")[0] == "allow"
-
-    def test_a_doc_write_does_not_count(self, tmp_path):
-        policy = self._policy(tmp_path)
-        self._write(policy, "s1", "/p/README.md")
-        assert self._run_tests(policy, "s1")[0] == "allow"
-
-    def test_the_default_setting_never_reads_the_log(self, tmp_path, monkeypatch):
-        """With nothing auto-allowed there is nothing to raise, and the hook
-        must not pay for a read on every call."""
-        policy = dict(self._policy(tmp_path), auto_allow_at_or_below="NONE")
-        monkeypatch.setattr(crc, "_session_auto_wrote_tests",
-                            lambda *a: pytest.fail("read the audit log"))
-        self._run_tests(policy, "s1")
+    def test_static_checkers_stay_read_only(self):
+        for command in ("mypy .", "flake8 src"):
+            assert crc.classify_bash(command)[0] == Risk.SAFE, command
 
 
 class TestOneOddLineBreaksNothing:

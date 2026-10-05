@@ -103,7 +103,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.38"
+__version__ = "1.1.39"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -425,6 +425,9 @@ def _names_a_secret(word):
     return _words_name_a_secret([p for p in _SECRET_JOINERS.split(bare.lower()) if p])
 
 
+_HOME_ITSELF = re.compile(r"^(~|\$\{?HOME\}?)/?\*?$")
+
+
 def _ontology_risk(segment):
     """The effect this segment names, or None when it names none.
 
@@ -444,6 +447,10 @@ def _ontology_risk(segment):
     if any(w == "/" or w.startswith(("/System", "/Library", "/usr", "/etc", "/var"))
            for w in words[1:]):
         reach = max(reach, Reach.SYSTEM)
+    # The home directory itself is everything the user has on this machine:
+    # `find ~ -delete` is not `find . -delete` (2026-10-05 review).
+    if any(_HOME_ITSELF.match(w.strip("'\"")) for w in words[1:]):
+        reach = max(reach, Reach.MACHINE)
 
     effect = None
     for word in words[1:]:
@@ -475,7 +482,7 @@ READ_ONLY_COMMANDS = frozenset(
     sort uniq diff comm basename dirname realpath readlink jq yq column less
     sw_vers system_profiler
     more nl cut tr rev tac awk true false test id groups locale ps top
-    pytest mypy flake8 tox nox
+    mypy flake8
     """.split()
 )
 
@@ -515,7 +522,7 @@ def phone_would_auto_allow(tool, tool_input):
         # have inherited a silent yes for writes.
         return tool in READ_ONLY_TOOLS
     command = " ".join(str((tool_input or {}).get("command", "")).split())
-    if not command or "$(" in command or "`" in command:
+    if not command or any(form in command for form in ("$(", "<(", ">(", "`")):
         return False
     return all(_first_token(segment) in CC_SILENT_LEADS
                for segment in _segments(command))
@@ -678,12 +685,17 @@ WHOLE_LINE_RULES = [
                 r"(\$\(|<\(|`)\s*(curl|wget)\b"), Risk.CRITICAL),
     ("fork-bomb", re.compile(r":\s*\(\s*\)\s*\{.*\}\s*;\s*:"), Risk.CRITICAL),
     ("history-rewrite", re.compile(r"\bgit\s+filter-(branch|repo)\b"), Risk.CRITICAL),
-    ("cmd-substitution", re.compile(r"\$\(|`"), Risk.MEDIUM),  # inner cmd classified in classify_bash()
+    ("cmd-substitution", re.compile(r"\$\(|[<>]\(|`"), Risk.MEDIUM),  # inner cmd classified in classify_bash()
     # Any `>` that is not a descriptor copy (`2>&1`, `>&2`) or /dev/null.
     # The lookbehind used to skip every `>` after a digit, which took
     # `1> ~/.zshrc` and `2> f` for `2>&1` and left them SAFE (2026-09-30).
     ("redirect-write", re.compile(r"(?<![<>])>>?(?!\s*(&[\d-]|/dev/null\b))"), Risk.MEDIUM),
 ]
+
+# Commands that run the project's tests — which is to say, run code.
+TEST_RUNNER = re.compile(
+    r"(^|[\s/;&|])(pytest|py\.test|tox|nox)\b|\b(npm|yarn|pnpm|bun)\s+(run\s+)?test\b"
+    r"|\bpython[\d.]*\s+-m\s+(pytest|unittest)\b")
 
 # (rule_id, pattern, risk) applied per segment.
 SEGMENT_RULES = [
@@ -720,6 +732,11 @@ SEGMENT_RULES = [
     ("permission-change", re.compile(r"\b(chmod|chown|chgrp|icacls|attrib)\b"), Risk.MEDIUM),
     ("container", re.compile(r"\b(docker|podman|kubectl|helm)\b"), Risk.MEDIUM),
     ("formatter-rewrite", re.compile(r"\b(black|isort|prettier|autopep8)\b"), Risk.MEDIUM),
+    # A test run runs the repository's code — conftest.py, noxfile.py, a
+    # package.json script. pytest, tox and nox sat among the read-only
+    # commands, so under --quiet a session could write test_x.py and run
+    # it with nobody looking (2026-09-30, 2026-10-05 reviews).
+    ("runs-project-code", TEST_RUNNER, Risk.MEDIUM),
 ]
 
 RM_RE = re.compile(r"\brm\b((?:\s+-{1,2}[A-Za-z-]+)*)\s*(.*)")
@@ -749,7 +766,7 @@ CATASTROPHIC_TARGETS = re.compile(
 # Contents of an innermost `$(…)` (no nested parens) or a backtick pair.
 # Innermost-first means nested substitutions surface one layer per pass and
 # recursion in classify_bash() reaches the rest.
-_SUBSTITUTION_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+_SUBSTITUTION_RE = re.compile(r"[$<>]\(([^()]*)\)|`([^`]*)`")
 
 
 def _segments(command):
@@ -859,6 +876,8 @@ _PASS_THROUGH = frozenset("env command builtin nice nohup exec time timeout sudo
 # `if true; then rm -rf ~; fi` splits into segments led by these words.
 _SHELL_KEYWORDS = frozenset("if then else elif do while until !".split())
 _SHELLS = frozenset("sh bash zsh dash ksh fish".split())
+_IFS = re.compile(r"\$\{?IFS\}?")
+_XARGS_VALUE_FLAGS = frozenset("-n -I -L -P -d -E -s -a".split())
 
 
 def _unwrapped(segment):
@@ -871,6 +890,16 @@ def _unwrapped(segment):
     text = segment.strip()
     if text.startswith("\\"):
         return text[1:]
+    # `rm${IFS}-rf${IFS}~` is `rm -rf ~` to the shell.
+    if _IFS.search(text):
+        return _IFS.sub(" ", text)
+    # `"rm" -rf ~`, `'rm'`, `r"m"`: the shell drops the quotes, and the
+    # name they spell is the command that runs (2026-10-05 review).
+    first = text.split(None, 1)
+    if first and first[0][:1] not in "({" and any(q in first[0] for q in "'\"\\"):
+        bare = re.sub(r"['\"\\]", "", first[0])
+        if bare:
+            return " ".join([bare] + first[1:])
     if (text.startswith("(") and text.endswith(")")) or (
             text.startswith("{") and text.endswith("}")):
         inner = text[1:-1].strip().rstrip(";").strip()
@@ -897,6 +926,13 @@ def _unwrapped(segment):
                                and "c" in arg[1:]):
                 return args[i + 1] if i + 1 < len(args) else None
         return None
+    if lead == "xargs":
+        # `xargs rm -rf` runs rm. Skip xargs' own options to reach it.
+        rest = words[1:]
+        while rest and rest[0].startswith("-"):
+            takes_value = rest[0] in _XARGS_VALUE_FLAGS
+            rest = rest[2:] if takes_value else rest[1:]
+        return " ".join(rest) or None
     if lead in _PASS_THROUGH:
         rest = words[1:]
         # Skip the wrapper's own options and arguments: `nice -n 5`,
@@ -940,7 +976,7 @@ for _awk in ("gawk", "nawk", "mawk"):
 # ontology cannot see: a one-letter flag, a BSD ps option, a keychain dump.
 CREDENTIAL_READS = re.compile(
     r"\bgh\s+auth\s+status\b[^|;&]*(\s-t\b|--show-token)"
-    r"|\bsecurity\s+(find-(generic|internet)-password\b[^|;&]*\s-[a-z]*[wg]\b"
+    r"|\bsecurity\s+(find-(generic|internet)-password\b[^|;&]*\s-[a-z]*[wg][a-z]*\b"
     r"|dump-keychain\b|export\b)"
     r"|\bps\b(\s+-\S+)*(\s+-[a-zA-Z]*E[a-zA-Z]*|\s+[acehjlmrSTuvwxX]*e[acehjlmrSTuvwxX]*)(?=\s|$)"
     r"|\bjq\b[^|;&]*\$ENV\b")
@@ -1074,7 +1110,6 @@ SCRATCH_PATH = re.compile(r"([/\\](tmp|scratchpad|\.cache)[/\\])", re.I)
 INSTRUCTION_PATH = re.compile(
     r"(^|[/\\])(CLAUDE(\.local)?\.md|AGENTS\.md)$"
     r"|(^|[/\\])\.claude[/\\](commands|agents|skills|hooks)[/\\]", re.I)
-TEST_CODE_PATH = re.compile(r"(^|[/\\])(test_[^/\\]*|[^/\\]*_test)\.py$", re.I)
 
 
 def classify_path(path, cwd=None):
@@ -1119,9 +1154,6 @@ def classify_path(path, cwd=None):
     if INSTRUCTION_PATH.search(normalised):
         return Risk.MEDIUM, ["agent-instructions"]
     if LOW_RISK_PATH.search(normalised):
-        # Tagged, so the hook can tell a test it may later be asked to run.
-        if TEST_CODE_PATH.search(normalised):
-            return Risk.LOW, ["docs-or-test", "test-code"]
         return Risk.LOW, ["docs-or-test"]
 
     return Risk.MEDIUM, ["project-file"]
@@ -1258,6 +1290,10 @@ def _patch_risk(patch, cwd):
     if not files:
         return Risk.MEDIUM, ["patch-unparsed"]
     risk, rules = Risk.SAFE, []
+    if not cwd:
+        # With no working directory no path can be judged inside the
+        # project; a relative one could land anywhere (2026-10-05 review).
+        risk, rules = Risk.HIGH, ["patch-without-cwd"]
     for verb, path in files:
         level, found = classify_path(path, cwd)
         if verb == "Delete":
@@ -1973,41 +2009,6 @@ def _input_digests(tool, tool_input):
     return digests
 
 
-# Commands that run the project's tests — which is to say, run code.
-TEST_RUNNER = re.compile(
-    r"(^|[\s/;&|])(pytest|py\.test|tox|nox)\b|\b(npm|yarn|pnpm|bun)\s+(run\s+)?test\b"
-    r"|\bpython[\d.]*\s+-m\s+(pytest|unittest)\b")
-
-
-def _session_auto_wrote_tests(session_id, policy, tail=256 * 1024):
-    """Did this session have a test file written with nobody looking?
-
-    A test file is a LOW write and pytest a SAFE run, so under --quiet a
-    session could write test_x.py and run it without a human: any code at
-    all (2026-09-30 review). The audit log already records both halves;
-    this reads its tail. Never raises; unknown is no.
-    """
-    if not session_id:
-        return False
-    try:
-        with open(_audit_path(policy), "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            handle.seek(max(0, handle.tell() - tail))
-            lines = handle.read().decode("utf-8", "replace").splitlines()
-    except OSError:
-        return False
-    for line in lines:
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        if (isinstance(entry, dict) and entry.get("session_id") == session_id
-                and entry.get("effective") == "allow"
-                and "test-code" in (entry.get("rules") or [])):
-            return True
-    return False
-
-
 def build_response(event, policy, agent=None):
     """Classify one event; returns ``(response_dict, audit_entry, card)``.
 
@@ -2016,12 +2017,6 @@ def build_response(event, policy, agent=None):
     """
     result = classify(event)
     risk = result["risk"]
-    if (result["tool"] == "Bash" and risk < Risk.MEDIUM
-            and TEST_RUNNER.search(str((result["tool_input"] or {}).get("command", "")))
-            and decide(risk, policy)[0] == "allow"
-            and _session_auto_wrote_tests((event or {}).get("session_id"), policy)):
-        risk = result["risk"] = Risk.MEDIUM
-        result["rules"] = list(result["rules"]) + ["tests-after-auto-written-test"]
     card = wrist_card(
         result["tool"],
         result["tool_input"],
