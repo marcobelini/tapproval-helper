@@ -103,7 +103,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.39"
+__version__ = "1.1.40"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -1916,23 +1916,17 @@ def read_audit(policy):
 # --------------------------------------------------------------------------
 
 
-def repository_name(cwd):
-    """The name of the repository a working directory belongs to.
+def repository_root(cwd):
+    """The folder of the repository a working directory belongs to, or None.
 
-    The folder Claude works in is often a worktree with a name nobody chose
-    ("cranky-shannon-3187c0", "wt-push") or a subfolder ("ios"); on 74% of
-    287 prompts the wrist named that while the phone named the repository
-    (2026-10-02). Walks up to the nearest `.git`: a folder is the repository
-    itself, a worktree's file points into `<repo>/.git/worktrees/`. The home
-    folder is never taken for a repository (a dotfiles checkout would name
-    every project after the user), and with no repository the folder's own
-    name stands. Only names are returned, never a path; a few stat calls,
-    no subprocess, never raises.
+    Walks up to the nearest `.git`: a folder is the repository itself, a
+    worktree's file points into `<repo>/.git/worktrees/`. The home folder
+    is never taken for a repository (a dotfiles checkout would claim every
+    project). A few stat calls, no subprocess, never raises.
     """
     if not cwd:
         return None
     path = str(cwd).replace("\\", "/").rstrip("/")
-    folder = os.path.basename(path) or None
     try:
         home = os.path.realpath(os.path.expanduser("~"))
         here = path
@@ -1941,21 +1935,39 @@ def repository_name(cwd):
                 break
             marker = os.path.join(here, ".git")
             if os.path.isdir(marker):
-                return os.path.basename(here) or folder
+                return here
             if os.path.isfile(marker):
                 with open(marker, encoding="utf-8", errors="replace") as handle:
                     line = handle.readline().strip()
                 gitdir = line[len("gitdir:"):].strip() if line.startswith("gitdir:") else ""
+                if gitdir and not os.path.isabs(gitdir):
+                    gitdir = os.path.normpath(os.path.join(here, gitdir))
                 if "/.git/worktrees/" in gitdir:
-                    return os.path.basename(gitdir.split("/.git/worktrees/", 1)[0]) or folder
-                return os.path.basename(here) or folder
+                    return gitdir.split("/.git/worktrees/", 1)[0] or here
+                return here
             parent = os.path.dirname(here)
             if parent == here:
                 break
             here = parent
     except (OSError, ValueError):
         pass
-    return folder
+    return None
+
+
+def repository_name(cwd):
+    """The name of the repository a working directory belongs to.
+
+    The folder Claude works in is often a worktree with a name nobody chose
+    ("cranky-shannon-3187c0", "wt-push") or a subfolder ("ios"); on 74% of
+    287 prompts the wrist named that while the phone named the repository
+    (2026-10-02). The repository_root's name; with no repository, the
+    folder's own name stands. Only a name, never a path.
+    """
+    if not cwd:
+        return None
+    folder = os.path.basename(str(cwd).replace("\\", "/").rstrip("/")) or None
+    root = repository_root(cwd)
+    return (os.path.basename(root) if root else None) or folder
 
 
 def _project_name(cwd):

@@ -237,6 +237,9 @@ def _no_real_home_files(tmp_path, monkeypatch):
     # about signing in put the real function back.
     monkeypatch.setattr(watch_relay, "_SIGNIN", {"at": 0.0, "in": None})
     monkeypatch.setattr(watch_relay, "signed_in", lambda *a, **k: None)
+    # A send remembered by one test must not be answered as a repeat in
+    # the next.
+    monkeypatch.setattr(watch_relay, "_RECENT_SENDS", {})
 
 
 @pytest.fixture(autouse=True)
@@ -2903,7 +2906,7 @@ class TestTheRelayLogCarriesTheTime:
         monkeypatch.setattr(watch_relay, "type_into_session", lambda *a: False)
         monkeypatch.setattr(watch_relay, "say_guard", lambda *a, **k: None)
         monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
-        monkeypatch.setattr(watch_relay, "signed_in", lambda: True)
+        monkeypatch.setattr(watch_relay, "signed_in", lambda *a, **k: True)
         monkeypatch.setattr(watch_relay, "_spawn_detached", lambda *a, **k: None)
         assert watch_relay.say_to_session("abcdef", "What's left?") == "sent"
         assert "say abcdef12 headless" in capsys.readouterr().err
@@ -2961,6 +2964,22 @@ class TestTheAwayAddressIsWatched:
                     checks=watch_relay.TUNNEL_PROBE_EVERY)
         assert asked == [self.URL] * watch_relay.TUNNEL_WATCH_TRIES, \
             "asked through the public address, a few times before giving up"
+        assert self.restarts == [(8978, "tok")]
+        assert self._said()
+
+    def test_a_tunnel_that_never_names_its_address_is_reopened(self, monkeypatch):
+        """Alive with no address used to count as "still announcing" for as
+        long as it ran, and the travel route stayed off (2026-10-05)."""
+        monkeypatch.setattr(watch_relay, "TUNNEL_URL", None)
+        monkeypatch.setattr(watch_relay, "_pid_alive", lambda pid: True)
+        stopped = []
+        monkeypatch.setattr(watch_relay, "_stop_tunnel", lambda handle: stopped.append(handle))
+        stuck = watch_relay._AdoptedTunnel(4242)
+        # Within the announce wait: left alone.
+        self._watch(stuck, checks=2)
+        assert self.restarts == [] and stopped == []
+        self._watch(stuck, checks=3)
+        assert stopped == [stuck], "the silent one is stopped, not left running"
         assert self.restarts == [(8978, "tok")]
         assert self._said()
 
@@ -6824,6 +6843,41 @@ class TestASignedOutMacSaysSo:
         watch_relay.signed_in(runner=once)
         assert len(calls) == 1, "a subprocess per health poll is a subprocess too many"
 
+    def test_a_slow_answer_does_not_hold_up_the_caller(self, monkeypatch):
+        """`claude auth status` may take 15 s; /health waited for it under
+        a lock while the watch gave up at 5 s (2026-10-05 review)."""
+        import subprocess as sp
+        gate = threading.Event()
+        def slow():
+            gate.wait(5)
+            return sp.CompletedProcess(["claude"], 0, '{"loggedIn": false}', "")
+        started = time.monotonic()
+        assert watch_relay.signed_in(runner=slow, wait=0.1) is None
+        assert time.monotonic() - started < 1.0
+        gate.set()
+        for _ in range(50):
+            if watch_relay._SIGNIN.get("asked"):
+                break
+            time.sleep(0.02)
+        assert watch_relay.signed_in(runner=slow) is False, "the refreshed answer is used"
+        assert "signin" in [c["key"] for c in watch_relay.conditions()]
+
+    def test_callers_meanwhile_share_one_question(self):
+        import subprocess as sp
+        calls, gate = [], threading.Event()
+        def slow():
+            calls.append(1)
+            gate.wait(5)
+            return sp.CompletedProcess(["claude"], 0, '{"loggedIn": true}', "")
+        threads = [threading.Thread(target=watch_relay.signed_in,
+                                    kwargs={"runner": slow, "wait": 0.05}) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(2)
+        gate.set()
+        assert len(calls) == 1
+
     def test_a_send_refuses_in_words_rather_than_spawning(self, tmp_path, monkeypatch):
         """Spawning anyway is what put the CLI's error in the transcript."""
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/bin/claude")
@@ -8007,7 +8061,7 @@ class TestTwoRelaysOnePort:
     @pytest.fixture
     def relay(self, fresh_auth, monkeypatch):
         """A real relay holding a port, the way the first one held 8977."""
-        monkeypatch.setattr(watch_relay, "signed_in", lambda: True)
+        monkeypatch.setattr(watch_relay, "signed_in", lambda *a, **k: True)
         server, _ = watch_relay.serve("127.0.0.1", 0, auth=fresh_auth)
         _serve(server)
         yield server
@@ -8018,7 +8072,7 @@ class TestTwoRelaysOnePort:
             self, relay, monkeypatch, capsys):
         """The trigger, as it happened: /health slower than the probe."""
         monkeypatch.setattr(watch_relay, "signed_in",
-                            lambda: time.sleep(2.5) or True)
+                            lambda *a, **k: time.sleep(2.5) or True)
         monkeypatch.setattr(watch_relay, "DEFAULT_PORT", relay.server_address[1])
         monkeypatch.setattr(watch_relay, "_self_update", lambda: None)
         monkeypatch.setattr(watch_relay, "_rotate_log", lambda path: None)
@@ -8038,7 +8092,7 @@ class TestTwoRelaysOnePort:
             self, relay, monkeypatch):
         """2026-09-24: kickstart after an update left the old relay serving,
         because a slow /health skipped the replace decision entirely."""
-        monkeypatch.setattr(watch_relay, "signed_in", lambda: time.sleep(2.5) or True)
+        monkeypatch.setattr(watch_relay, "signed_in", lambda *a, **k: time.sleep(2.5) or True)
         monkeypatch.setattr(watch_relay, "DEFAULT_PORT", relay.server_address[1])
         monkeypatch.setattr(watch_relay, "_self_update", lambda: None)
         monkeypatch.setattr(watch_relay, "_serving_older_code", lambda running: True)
@@ -10281,12 +10335,24 @@ class TestSilentFailuresStayLoud:
         adv = self._advertiser(monkeypatch, old, self._Alive())
         monkeypatch.setattr(watch_relay, "TUNNEL_URL", "https://x.trycloudflare.com/t/tok")
         monkeypatch.setattr(watch_relay.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(watch_relay, "advertise_txt", lambda _port: {"ip": "10.0.0.9"})
         adv._republish()
         assert old.terminated
         assert adv.process is not old                          # the replacement, not the corpse
         assert adv.check_once() == "fine"
         assert watch_relay.conditions() == []
         assert "stopped" not in capsys.readouterr().err
+
+    def test_an_unchanged_record_is_not_published_again(self, monkeypatch):
+        """The record no longer carries the away address, so the republish
+        when the tunnel came up re-registered the same record — and the
+        watch could lose the computer for a moment (2026-10-05 review)."""
+        old = self._Alive()
+        adv = self._advertiser(monkeypatch, old, self._Alive())
+        monkeypatch.setattr(watch_relay, "TUNNEL_URL", "https://x.trycloudflare.com/t/tok")
+        monkeypatch.setattr(watch_relay.time, "sleep", lambda seconds: None)
+        adv._republish()
+        assert not old.terminated and adv.process is old
 
     def test_a_republish_after_unproven_restarts_does_not_inherit_their_count(self, monkeypatch):
         """Three unproven restarts, then the tunnel comes up and
@@ -10299,6 +10365,7 @@ class TestSilentFailuresStayLoud:
         assert adv.check_once() == "restarted"                 # two unproven
         monkeypatch.setattr(watch_relay, "TUNNEL_URL", "https://x.trycloudflare.com/t/tok")
         monkeypatch.setattr(watch_relay.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(watch_relay, "advertise_txt", lambda _port: {"ip": "10.0.0.9"})
         adv._republish()                                        # installs an _Alive
         assert [c["key"] for c in watch_relay.conditions()] == ["bonjour"]   # not yet proven
         assert adv.check_once() == "fine"
@@ -11171,6 +11238,159 @@ class TestInstructionsAreNotDocs:
     @pytest.mark.parametrize("path", ["/p/README.md", "/p/docs/guide.md", "/p/test_x.py"])
     def test_ordinary_docs_and_tests_stay_low(self, path):
         assert crc.classify_path(path, cwd="/p")[0] == crc.Risk.LOW
+
+
+class TestIssue400:
+    """Relay and dashboard findings from the 2026-10-05 review."""
+
+    # -- New Session finds the project from its git folder ---------------
+
+    @staticmethod
+    def _repo(root):
+        (root / ".git" / "worktrees").mkdir(parents=True)
+        return root
+
+    def test_a_subfolder_belongs_to_its_repository(self, tmp_path):
+        repo = self._repo(tmp_path / "proj")
+        (repo / "ios").mkdir()
+        assert watch_dashboard.project_root(str(repo / "ios")) == str(repo)
+
+    def test_a_worktree_elsewhere_belongs_to_its_repository(self, tmp_path):
+        repo = self._repo(tmp_path / "code" / "proj")
+        tree = tmp_path / "elsewhere" / "wt-push"
+        tree.mkdir(parents=True)
+        (tree / ".git").write_text("gitdir: %s/.git/worktrees/wt-push\n" % repo)
+        assert watch_dashboard.project_root(str(tree)) == str(repo)
+
+    def test_a_relative_gitdir_is_followed(self, tmp_path):
+        repo = self._repo(tmp_path / "proj")
+        tree = tmp_path / "wt"
+        tree.mkdir()
+        (tree / ".git").write_text("gitdir: ../proj/.git/worktrees/wt\n")
+        assert watch_dashboard.project_root(str(tree)) == str(repo)
+
+    def test_a_folder_outside_git_is_its_own_project(self, tmp_path):
+        plain = tmp_path / "notes"
+        plain.mkdir()
+        assert watch_dashboard.project_root(str(plain)) == str(plain)
+
+    def test_the_card_still_names_the_repository(self, tmp_path):
+        repo = self._repo(tmp_path / "proj")
+        (repo / "ios").mkdir()
+        assert crc.repository_name(str(repo / "ios")) == "proj"
+
+    # -- A repeated send is answered, not run twice ------------------------
+
+    @pytest.fixture
+    def relay(self, fresh_auth, monkeypatch):
+        watch_relay.LIMITS.reset()
+        ran = []
+        monkeypatch.setattr(watch_relay, "start_session",
+                            lambda path, text: ran.append((path, text)) or "started")
+        server, _queue = watch_relay.serve(port=0, auth=_known_watch(fresh_auth))
+        _serve(server)
+        yield "http://127.0.0.1:%d" % server.server_address[1], ran
+        server.shutdown()
+        server.server_close()
+
+    def _new(self, base, text="go"):
+        return relay_call(base + "/new", token="bootstraptoken", method="POST",
+                          body={"path": "/p", "text": text})
+
+    def test_the_same_send_twice_runs_once(self, relay):
+        base, ran = relay
+        first = self._new(base)
+        second = self._new(base)
+        assert ran == [("/p", "go")]
+        assert first == (200, {"ok": True, "status": "started"})
+        assert second == (200, {"ok": True, "status": "started", "repeat": True})
+
+    def test_different_words_are_a_different_send(self, relay):
+        base, ran = relay
+        self._new(base, "one")
+        self._new(base, "two")
+        assert len(ran) == 2
+
+    def test_after_the_window_it_runs_again(self, relay, monkeypatch):
+        base, ran = relay
+        clock = [1000.0]
+        monkeypatch.setattr(watch_relay, "_send_clock", lambda: clock[0])
+        self._new(base)
+        clock[0] += watch_relay.SEND_REPEAT_SECONDS + 1
+        self._new(base)
+        assert len(ran) == 2
+
+    def test_a_refusal_is_not_remembered(self, relay, monkeypatch):
+        base, ran = relay
+        monkeypatch.setattr(watch_relay, "start_session",
+                            lambda path, text: ran.append(1) or "signed out")
+        self._new(base)
+        self._new(base)
+        assert len(ran) == 2, "a refusal is worth trying again"
+
+    # -- Dashboard reads and caches ----------------------------------------
+
+    def test_the_small_caches_survive_many_threads(self, monkeypatch):
+        import sys as _sys
+        errors = []
+        monkeypatch.setattr(watch_dashboard, "_REPO_SLUG_MAX", 4)
+        import subprocess as _sp
+        # A cache miss asks git; here it answers at once.
+        monkeypatch.setattr(watch_dashboard.subprocess, "run", lambda *a, **k:
+                            _sp.CompletedProcess(a, 0, "git@github.com:o/r.git\n", ""))
+        def hammer(n):
+            try:
+                for i in range(3000):
+                    key = "/p%d" % ((n * 7 + i) % 12)
+                    watch_dashboard._remember_repo_slug(key, "o/r")
+                    watch_dashboard.repo_slug(key)
+            except Exception as exc:          # noqa: BLE001 — the point
+                errors.append(exc)
+        # Switch threads as often as the interpreter allows, so a move and
+        # a trim from two threads meet within the test's run.
+        old = _sys.getswitchinterval()
+        _sys.setswitchinterval(1e-6)
+        try:
+            threads = [threading.Thread(target=hammer, args=(n,)) for n in range(16)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+        finally:
+            _sys.setswitchinterval(old)
+        assert errors == [], errors[:3]
+        assert len(watch_dashboard._REPO_SLUG_CACHE) <= watch_dashboard._REPO_SLUG_MAX
+
+    def test_remembered_transcript_paths_are_bounded(self, tmp_path, monkeypatch):
+        project = tmp_path / "-p"
+        project.mkdir()
+        for i in range(12):
+            (project / ("s%02d.jsonl" % i)).write_text("{}\n")
+        monkeypatch.setattr(watch_dashboard, "CLAUDE_PROJECTS", str(tmp_path))
+        monkeypatch.setattr(watch_dashboard, "_TRANSCRIPT_PATHS", {})
+        monkeypatch.setattr(watch_dashboard, "_TRANSCRIPT_PATHS_MAX", 5)
+        for i in range(12):
+            assert watch_dashboard._find_transcript("s%02d" % i)
+        assert len(watch_dashboard._TRANSCRIPT_PATHS) == 5
+
+    def test_usage_keeps_only_a_day(self, tmp_path):
+        path = tmp_path / "t.jsonl"
+        def line(stamp, out):
+            return json.dumps({"timestamp": stamp, "message": {
+                "role": "assistant", "model": "m",
+                "usage": {"input_tokens": 1, "output_tokens": out}}}) + "\n"
+        path.write_text(line("2026-10-01T10:00:00Z", 1) + line("2026-10-05T10:00:00Z", 2))
+        watch_dashboard._USAGE_FILES.pop(str(path), None)
+        horizon = watch_dashboard._parse_stamp("2026-10-04T12:00:00Z")
+        kept = watch_dashboard._usage_entries(str(path), horizon)
+        assert [e[2] for e in kept] == [2]
+        assert [e[2] for e in watch_dashboard._USAGE_FILES[str(path)]["entries"]] == [2]
+
+    def test_appended_lines_stop_at_a_half_written_one(self, tmp_path):
+        path = tmp_path / "audit.jsonl"
+        path.write_bytes(b'{"a": 1}\n{"b": 2}\n{"c": ')
+        lines, offset, shrunk = watch_dashboard._read_appended(str(path), 0)
+        assert lines == ['{"a": 1}', '{"b": 2}'] and offset == 18 and not shrunk
 
 
 class TestIssue402:

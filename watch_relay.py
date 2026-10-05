@@ -72,7 +72,7 @@ BRIDGE_APP = os.path.expanduser("~/.tapproval-bridge/TapprovalBridge.app")
 # Bumped whenever the wire contract or the auth rules change, so a running
 # relay from before an update can be recognised — and replaced — instead of
 # quietly serving the old rules forever (see ensure_running).
-RELAY_VERSION = 4
+RELAY_VERSION = 5
 PAIR_WINDOW_SECONDS = 600   # a deliberately opened window, not a standing door
 PAIR_WINDOW_CLAIMS = 2      # one watch, plus one retry
 PAIR_FIRST_WINDOW_SECONDS = 1800   # never paired: half an hour, re-lit by every session start
@@ -1128,11 +1128,17 @@ SIGNIN_CACHE_SECONDS = 120.0
 # uncached, every /health started `claude auth status` again, up to 15 s
 # each, several at once from the Connection screen (2026-09-25 review).
 SIGNIN_UNKNOWN_CACHE_SECONDS = 30.0
+# How long a caller waits for a fresh answer before going on with the last
+# one. `claude auth status` may take 15 s; the watch gives up at 5 s, and a
+# /health that waited for it answered nobody (2026-10-05 review).
+SIGNIN_WAIT_SECONDS = 2.0
+# /health uses the answer only to say so on the Connection screen.
+HEALTH_SIGNIN_WAIT = 0.5
 _SIGNIN = {"at": 0.0, "in": None, "asked": False}
 _SIGNIN_LOCK = threading.Lock()
 
 
-def signed_in(runner=None, now=None):
+def signed_in(runner=None, now=None, wait=None):
     """True, False, or None when it cannot be told.
 
     `claude auth status` prints JSON with `loggedIn`. None — an old CLI
@@ -1147,15 +1153,34 @@ def signed_in(runner=None, now=None):
     say it on the Connection screen where every other fault is reported.
     """
     stamp = time.time() if now is None else now
-    # One question at a time: callers that arrive meanwhile wait for its
-    # answer instead of each starting a subprocess of their own.
+    # One question at a time, asked off the caller's thread and never under
+    # the lock: callers that arrive meanwhile share it, and none waits
+    # longer than SIGNIN_WAIT_SECONDS — after that, the last answer.
     with _SIGNIN_LOCK:
         if _SIGNIN.get("asked"):
             trusted = (SIGNIN_CACHE_SECONDS if _SIGNIN["in"] is not None
                        else SIGNIN_UNKNOWN_CACHE_SECONDS)
             if stamp - _SIGNIN["at"] < trusted:
                 return _SIGNIN["in"]
-        return _ask_signed_in(runner, stamp)
+        answered = _SIGNIN.get("asking")
+        if answered is None:
+            answered = _SIGNIN["asking"] = threading.Event()
+            threading.Thread(target=_refresh_signed_in, args=(runner, stamp, answered),
+                             daemon=True, name="signin").start()
+        last = _SIGNIN["in"]
+    if answered.wait(SIGNIN_WAIT_SECONDS if wait is None else wait):
+        with _SIGNIN_LOCK:
+            return _SIGNIN["in"]
+    return last
+
+
+def _refresh_signed_in(runner, stamp, answered):
+    try:
+        _ask_signed_in(runner, stamp)
+    finally:
+        with _SIGNIN_LOCK:
+            _SIGNIN.pop("asking", None)
+        answered.set()
 
 
 def _ask_signed_in(runner, stamp):
@@ -1168,7 +1193,8 @@ def _ask_signed_in(runner, stamp):
             answer = bool(json.loads(done.stdout or "{}").get("loggedIn"))
     except Exception:
         answer = None
-    _SIGNIN.update(at=stamp, asked=True, **{"in": answer})
+    with _SIGNIN_LOCK:
+        _SIGNIN.update(at=stamp, asked=True, **{"in": answer})
     if answer is False:
         note_condition("signin", "Claude Code on your computer is signed out. "
                                  "Open a Terminal there and run: claude auth login")
@@ -2724,8 +2750,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             # Ask before answering: a watch that opens the Connection screen
             # should learn the Mac is signed out without having to send
             # something first and watch it fail. Cached, so this is a
-            # subprocess about twice a minute at worst.
-            signed_in()
+            # subprocess about twice a minute at worst — and it waits half
+            # a second at most: a slow answer lands on the next poll.
+            signed_in(wait=HEALTH_SIGNIN_WAIT)
             self._send_json({"ok": True,
                              "pending": len(self.queue.pending()),
                              "watch_seen_seconds_ago":
@@ -2848,6 +2875,14 @@ class RelayHandler(BaseHTTPRequestHandler):
         `act(body)` returns the status word; the reply says whether it
         was the good one."""
         who = self._presented() or self.client_address[0]
+        body = self._read_json() or {}
+        key = _send_key(who, self.path, body)
+        replay = _recent_send(key)
+        if replay is not None:
+            # The watch gave up waiting (5 s) and the person tapped again;
+            # the first one had already run. Answer it, run nothing.
+            self._send_json(dict(replay, repeat=True))
+            return
         allowed, retry = LIMITS.allow("say", who, 6, 60)
         if not allowed:
             self._send_json({"error": "too many messages"}, 429,
@@ -2858,10 +2893,13 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "a message is already being sent"}, 429)
             return
         try:
-            status, good = act(self._read_json() or {})
+            status, good = act(body)
         finally:
             gate.release()
-        self._send_json({"ok": status == good, "status": status})
+        answer = {"ok": status == good, "status": status}
+        if answer["ok"]:
+            _remember_send(key, answer)
+        self._send_json(answer)
 
     def _post_new(self, path, query):
         # Opens a Terminal on this Mac.
@@ -3020,6 +3058,38 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, queue=None, token=None,
 
 # Set by install_crash_reporting: how a request handler's crash is reported.
 _ON_HANDLER_ERROR = None
+
+
+# A send the watch repeats within this long, word for word, is the same
+# send: it timed out on the wrist after 5 s while the Mac went on and did
+# it, and the retry opened a second Terminal or said it twice (2026-10-05
+# review). Only a send that went through is remembered; a refusal is
+# worth trying again.
+SEND_REPEAT_SECONDS = 30.0
+_RECENT_SENDS = {}
+_RECENT_SENDS_LOCK = threading.Lock()
+_send_clock = time.monotonic
+
+
+def _send_key(who, path, body):
+    import hashlib
+    raw = json.dumps([who, path, body], sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _recent_send(key):
+    now = _send_clock()
+    with _RECENT_SENDS_LOCK:
+        for old, (at, _answer) in list(_RECENT_SENDS.items()):
+            if now - at > SEND_REPEAT_SECONDS:
+                del _RECENT_SENDS[old]
+        found = _RECENT_SENDS.get(key)
+    return found[1] if found else None
+
+
+def _remember_send(key, answer):
+    with _RECENT_SENDS_LOCK:
+        _RECENT_SENDS[key] = (_send_clock(), dict(answer))
 
 
 class _RelayServer(ThreadingHTTPServer):
@@ -3800,6 +3870,17 @@ def _tunnel_alive(handle):
     return _pid_alive(handle.pid)
 
 
+def _stop_tunnel(handle):
+    """Stop a cloudflared that is running but useless. Never raises."""
+    try:
+        if hasattr(handle, "terminate"):
+            handle.terminate()
+        elif handle is not None and handle.pid:
+            os.kill(handle.pid, signal.SIGTERM)
+    except (OSError, AttributeError):
+        pass
+
+
 def watch_tunnel(handle, port, token, sleep=time.sleep, checks=None):
     """Keep the travel address alive for as long as the relay runs.
 
@@ -3813,24 +3894,39 @@ def watch_tunnel(handle, port, token, sleep=time.sleep, checks=None):
     global TUNNEL_URL
     failures = 0
     done = 0
+    unannounced = 0                     # seconds alive with no address yet
     while checks is None or done < checks:
-        sleep(TUNNEL_CHECK_EVERY if not failures
-              else TUNNEL_BACKOFF[min(failures, len(TUNNEL_BACKOFF)) - 1])
+        pause = (TUNNEL_CHECK_EVERY if not failures
+                 else TUNNEL_BACKOFF[min(failures, len(TUNNEL_BACKOFF)) - 1])
+        sleep(pause)
         done += 1
         url = TUNNEL_URL
         if _tunnel_alive(handle):
-            if not url or done % TUNNEL_PROBE_EVERY:
-                failures = 0            # alive, or still announcing itself
-                continue
-            if _tunnel_answers_soon(url.split("/t/")[0], _live_tunnel_secret(token),
-                                    tries=TUNNEL_WATCH_TRIES):
+            if not url:
+                # Still announcing itself — for a while. One that never
+                # printed its address was waited on for as long as it ran,
+                # and the travel route stayed off (2026-10-05 review).
+                unannounced += pause
+                if unannounced <= TUNNEL_ANNOUNCE_WAIT + TUNNEL_CHECK_EVERY:
+                    continue
+                why = "never announced its address"
+                _stop_tunnel(handle)
+            elif done % TUNNEL_PROBE_EVERY:
                 failures = 0
+                unannounced = 0
+                continue
+            elif _tunnel_answers_soon(url.split("/t/")[0], _live_tunnel_secret(token),
+                                      tries=TUNNEL_WATCH_TRIES):
+                failures = 0
+                unannounced = 0
                 clear_condition("tunnel")   # a changed-address notice ends here
                 continue
-            why = "no longer answers"
+            else:
+                why = "no longer answers"
         else:
             why = "has exited"
         failures += 1
+        unannounced = 0
         TUNNEL_URL = None
         note_condition(
             "tunnel",
@@ -3976,6 +4072,7 @@ class _Advertiser:
         # stands until the next look finds the replacement alive.
         self._restarts = 0
         txt = advertise_txt(port)
+        self.txt = txt
         self.process = advertise(port, txt)
         if self.process is not None:
             clear_condition("bonjour")
@@ -3992,11 +4089,19 @@ class _Advertiser:
                 break
         if not TUNNEL_URL:
             return
+        txt = advertise_txt(self.port)
         with self._lock:
             if self.process is None:
                 return
+            if txt == self.txt:
+                # The record does not carry the away address any more, so
+                # this usually changed nothing — and re-registering an
+                # identical record can make the watch lose the computer
+                # for a moment (2026-10-05 review).
+                return
             self.process.terminate()
-            self.process = advertise(self.port)
+            self.txt = txt
+            self.process = advertise(self.port, txt)
             # A deliberate fresh start: whatever run of unproven restarts
             # came before does not carry into the give-up count. But if a
             # condition is standing from one, this new process still has
@@ -4005,8 +4110,7 @@ class _Advertiser:
             # If advertise() returned None it said why; the watchdog then
             # finds nothing to watch and ends. No further restarts: the
             # tool that was there a minute ago is gone, not flapping.
-        print("relay: re-advertised with the away address included",
-              file=sys.stderr)
+        print("relay: re-advertised with %s" % txt, file=sys.stderr)
 
     def watch(self):
         threading.Thread(target=self._watch, daemon=True).start()
@@ -4067,7 +4171,8 @@ class _Advertiser:
                 "The network announcement stopped (dns-sd exited with code %s), "
                 "so the watch may no longer find this computer by itself. "
                 "Trying to announce again." % code)
-            self.process = advertise(self.port)
+            self.txt = advertise_txt(self.port)
+            self.process = advertise(self.port, self.txt)
             if self.process is None:
                 return "down"          # advertise() has said why, in its own words
         return "restarted"

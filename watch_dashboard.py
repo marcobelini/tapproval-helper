@@ -46,15 +46,19 @@ def _read_appended(path, offset):
             offset, shrunk = 0, True
         if size == offset:
             return [], offset, shrunk
+        lines, read = [], 0
         with open(path, "rb") as handle:
             handle.seek(offset)
-            chunk = handle.read()
+            # Line by line: the first read after a start is the whole log,
+            # and one read() of it sat in memory twice over (2026-10-05).
+            for raw in handle:
+                if not raw.endswith(b"\n"):
+                    break                      # a line still being written
+                read += len(raw)
+                lines.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
     except OSError:
         return [], offset, shrunk
-    if chunk and not chunk.endswith(b"\n"):
-        chunk = chunk[:chunk.rfind(b"\n") + 1]
-    return (chunk.decode("utf-8", "replace").splitlines(),
-            offset + len(chunk), shrunk)
+    return lines, offset + read, shrunk
 
 
 
@@ -66,6 +70,13 @@ CLAUDE_SESSIONS = os.path.expanduser("~/.claude/sessions")
 # Claude Code's usage limits run on a rolling five-hour window, so that is
 # the number worth putting on a wrist.
 USAGE_WINDOW_HOURS = 5
+
+# One lock for the small caches below. The relay serves each request on
+# its own thread, and an OrderedDict moved and trimmed from two at once
+# raises (2026-10-05 review). Held only around the dict, never around the
+# work that fills it.
+_CACHE_LOCK = threading.RLock()
+
 
 def _stat_cached(cache, path, compute, extra=None, limit=64):
     """Memoize ``compute()`` per path until the file's (mtime, size) changes.
@@ -81,13 +92,15 @@ def _stat_cached(cache, path, compute, extra=None, limit=64):
         key = (st.st_mtime, st.st_size, extra)
     except OSError:
         return compute()
-    cached = cache.get(path)
+    with _CACHE_LOCK:
+        cached = cache.get(path)
     if cached and cached[0] == key:
         return cached[1]
     result = compute()
-    cache[path] = (key, result)
-    while len(cache) > limit:
-        cache.pop(next(iter(cache)), None)
+    with _CACHE_LOCK:
+        cache[path] = (key, result)
+        while len(cache) > limit:
+            cache.pop(next(iter(cache)), None)
     return result
 
 
@@ -111,7 +124,7 @@ def _parse_stamp(text):
 _USAGE_LOCK = threading.Lock()
 
 
-def _usage_entries(path):
+def _usage_entries(path, horizon=None):
     """All usage records in one transcript, read once and then followed.
 
     An active transcript changes every few seconds, and a cache keyed on
@@ -141,6 +154,10 @@ def _usage_entries(path):
                                 state["entries"].append(entry)
             except OSError:
                 pass
+        if horizon is not None:
+            # Nothing reads past a day, and a transcript that stays active
+            # for weeks kept every entry it ever had (2026-10-05 review).
+            state["entries"] = [e for e in state["entries"] if e[0] >= horizon]
         _USAGE_FILES[path] = state
         return state["entries"]
 
@@ -236,7 +253,7 @@ def usage_summary(projects_dir=None, now=None):
             _USAGE_FILES.pop(stale, None)   # fell out of the 24h window
 
     for path in paths:
-        for stamp, inp, out, cached_read, model in _usage_entries(path):
+        for stamp, inp, out, cached_read, model in _usage_entries(path, day_start):
             if stamp < day_start:
                 continue
             totals["day_input"] += inp
@@ -327,10 +344,11 @@ _REPO_SLUG_MAX = 128
 def _remember_repo_slug(cwd, slug):
     """Bounded cache: a project's remote rarely changes, but the map must
     not grow for the life of a process that runs for weeks."""
-    _REPO_SLUG_CACHE[cwd] = slug
-    _REPO_SLUG_CACHE.move_to_end(cwd)
-    while len(_REPO_SLUG_CACHE) > _REPO_SLUG_MAX:
-        _REPO_SLUG_CACHE.popitem(last=False)
+    with _CACHE_LOCK:
+        _REPO_SLUG_CACHE[cwd] = slug
+        _REPO_SLUG_CACHE.move_to_end(cwd)
+        while len(_REPO_SLUG_CACHE) > _REPO_SLUG_MAX:
+            _REPO_SLUG_CACHE.popitem(last=False)
 
 
 def repo_slug(cwd):
@@ -341,9 +359,10 @@ def repo_slug(cwd):
     """
     if not cwd:
         return ""
-    if cwd in _REPO_SLUG_CACHE:
-        _REPO_SLUG_CACHE.move_to_end(cwd)
-        return _REPO_SLUG_CACHE[cwd]
+    with _CACHE_LOCK:
+        if cwd in _REPO_SLUG_CACHE:
+            _REPO_SLUG_CACHE.move_to_end(cwd)
+            return _REPO_SLUG_CACHE[cwd]
     slug = ""
     try:
         out = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"],
@@ -404,16 +423,16 @@ def project_root(cwd):
     if marker in cwd:
         return cwd.split(marker, 1)[0]
     # Any other worktree or subfolder ("wt-push", "ios") belongs to the
-    # repository git says it does, the same name the wrist card now uses
-    # (ClaudeRiskClassifier.repository_name), so the list and the card agree.
+    # repository git says it does — found, not rebuilt. "Parent of the
+    # folder plus the repository's name" made /x/proj/ios into /x/proj/proj,
+    # and a project New Session could not open dropped out of its list
+    # without a word (2026-10-05 review).
     try:
-        from ClaudeRiskClassifier import repository_name
-        name = repository_name(cwd)
+        from ClaudeRiskClassifier import repository_root
+        root = repository_root(cwd)
     except Exception:
-        name = None
-    if name and cwd and os.path.basename(cwd.rstrip("/")) != name:
-        return os.path.join(os.path.dirname(cwd.rstrip("/")), name)
-    return cwd
+        root = None
+    return root or cwd
 
 
 def transcript_origin(path, scan_lines=60):
@@ -681,13 +700,14 @@ def remember_image(part):
                 or len(data) > IMAGE_MAX_BYTES):
             return None
         ref = hashlib.sha256(data.encode("ascii", "ignore")).hexdigest()[:16]
-        if ref in _IMAGES:
-            _IMAGES.move_to_end(ref)
-        else:
-            _IMAGES[ref] = (media, data)
-        while (len(_IMAGES) > IMAGE_CACHE_MAX
-               or sum(len(v[1]) for v in _IMAGES.values()) > IMAGE_CACHE_BYTES):
-            _IMAGES.popitem(last=False)
+        with _CACHE_LOCK:
+            if ref in _IMAGES:
+                _IMAGES.move_to_end(ref)
+            else:
+                _IMAGES[ref] = (media, data)
+            while (len(_IMAGES) > IMAGE_CACHE_MAX
+                   or sum(len(v[1]) for v in _IMAGES.values()) > IMAGE_CACHE_BYTES):
+                _IMAGES.popitem(last=False)
         return ref
     except Exception:
         return None
@@ -744,24 +764,29 @@ _META_SETTLED = OrderedDict()
 def session_meta(path, scan_lines=600):
     """Cached front for :func:`_session_meta` —
     /sessions re-reads a dozen transcripts per watch visit otherwise."""
-    settled = _META_SETTLED.get(path)
+    with _CACHE_LOCK:
+        settled = _META_SETTLED.get(path)
     if settled is not None and settled[1] == scan_lines:
         try:
             if os.path.getsize(path) >= settled[0]:
                 return settled[2]
         except OSError:
             pass
-        _META_SETTLED.pop(path, None)       # shrank: a rewrite
+        with _CACHE_LOCK:
+            _META_SETTLED.pop(path, None)   # shrank: a rewrite
     result = _stat_cached(_META_CACHE, path,
                           lambda: _session_meta(path, scan_lines),
                           extra=scan_lines)
     if result[0] and result[1] and _has_lines(path, scan_lines):
         try:
-            _META_SETTLED[path] = (os.path.getsize(path), scan_lines, result)
-            while len(_META_SETTLED) > 256:
-                _META_SETTLED.popitem(last=False)
+            size = os.path.getsize(path)
         except OSError:
-            pass
+            size = None
+        if size is not None:
+            with _CACHE_LOCK:
+                _META_SETTLED[path] = (size, scan_lines, result)
+                while len(_META_SETTLED) > 256:
+                    _META_SETTLED.popitem(last=False)
     return result
 
 
@@ -999,16 +1024,18 @@ def recap_summary(audit_log=None, now=None):
         key = (st.st_mtime, st.st_size)
     except OSError:
         key = None
-    cached = _RECAP_CACHE.get(path)
+    with _CACHE_LOCK:
+        cached = _RECAP_CACHE.get(path)
     if cached is not None:
         cached_key, computed_at, stats = cached
         unchanged = key is not None and cached_key == key
         if unchanged or clock - computed_at < RECAP_MIN_INTERVAL:
             return stats
     stats = _recap_uncached(path, now)
-    _RECAP_CACHE[path] = (key, clock, stats)
-    while len(_RECAP_CACHE) > 8:
-        _RECAP_CACHE.pop(next(iter(_RECAP_CACHE)), None)
+    with _CACHE_LOCK:
+        _RECAP_CACHE[path] = (key, clock, stats)
+        while len(_RECAP_CACHE) > 8:
+            _RECAP_CACHE.pop(next(iter(_RECAP_CACHE)), None)
     return stats
 
 
@@ -1044,6 +1071,7 @@ def _recap_uncached(path, now=None):
 
 
 _TRANSCRIPT_PATHS = {}   # prefix -> path, validated with exists()
+_TRANSCRIPT_PATHS_MAX = 4096
 
 
 def _find_transcript(prefix, projects_dir=None):
@@ -1051,7 +1079,8 @@ def _find_transcript(prefix, projects_dir=None):
     None when there is no match. Memoised — the watch resolves the same
     session every couple of seconds while a thread view is open. Never
     raises."""
-    cached = _TRANSCRIPT_PATHS.get(prefix)
+    with _CACHE_LOCK:
+        cached = _TRANSCRIPT_PATHS.get(prefix)
     if cached and os.path.exists(cached):
         return cached
     root = projects_dir or CLAUDE_PROJECTS
@@ -1064,7 +1093,10 @@ def _find_transcript(prefix, projects_dir=None):
                 if entry.endswith(".jsonl") and entry.startswith(prefix):
                     path = os.path.join(pdir, entry)
                     if projects_dir is None:
-                        _TRANSCRIPT_PATHS[prefix] = path
+                        with _CACHE_LOCK:
+                            _TRANSCRIPT_PATHS[prefix] = path
+                            while len(_TRANSCRIPT_PATHS) > _TRANSCRIPT_PATHS_MAX:
+                                _TRANSCRIPT_PATHS.pop(next(iter(_TRANSCRIPT_PATHS)), None)
                     return path
     except OSError:
         pass
@@ -1886,7 +1918,8 @@ def prompts_at_the_mac(audit_log=None, tail=128 * 1024):
     except OSError:
         return set()
     key = (stat.st_size, stat.st_mtime)
-    cached = _AT_MAC_CACHE.get(path)
+    with _CACHE_LOCK:
+        cached = _AT_MAC_CACHE.get(path)
     if cached and cached[0] == key:
         return cached[1]
     found = set()
@@ -1901,8 +1934,9 @@ def prompts_at_the_mac(audit_log=None, tail=128 * 1024):
                     found.add(str(entry["tool_use_id"]))
     except OSError:
         return set()
-    _AT_MAC_CACHE.clear()
-    _AT_MAC_CACHE[path] = (key, found)
+    with _CACHE_LOCK:
+        _AT_MAC_CACHE.clear()
+        _AT_MAC_CACHE[path] = (key, found)
     return found
 
 
