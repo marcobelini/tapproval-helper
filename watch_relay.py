@@ -72,7 +72,7 @@ BRIDGE_APP = os.path.expanduser("~/.tapproval-bridge/TapprovalBridge.app")
 # Bumped whenever the wire contract or the auth rules change, so a running
 # relay from before an update can be recognised — and replaced — instead of
 # quietly serving the old rules forever (see ensure_running).
-RELAY_VERSION = 3
+RELAY_VERSION = 4
 PAIR_WINDOW_SECONDS = 600   # a deliberately opened window, not a standing door
 PAIR_WINDOW_CLAIMS = 2      # one watch, plus one retry
 PAIR_FIRST_WINDOW_SECONDS = 1800   # never paired: half an hour, re-lit by every session start
@@ -419,7 +419,7 @@ def _spawn_detached(command, log_path, cwd=None):
     return ""
 
 
-def _loopback_json(path, data=None, timeout=5, port=None):
+def _loopback_json(path, data=None, timeout=5, port=None, headers=None):
     """One request to the relay on this machine: the parsed JSON reply, or
     None for any failure at all — no relay, a slow one, a bad body. GET
     without ``data``, POST with it."""
@@ -427,7 +427,7 @@ def _loopback_json(path, data=None, timeout=5, port=None):
     request = urllib.request.Request(
         "http://127.0.0.1:%d%s" % (port or DEFAULT_PORT, path), data=data,
         method="POST" if data is not None else "GET",
-        headers={"Content-Type": "application/json"})
+        headers=dict({"Content-Type": "application/json"}, **(headers or {})))
     try:
         with urllib.request.urlopen(request, timeout=timeout) as reply:
             return json.loads(reply.read().decode("utf-8"))
@@ -531,10 +531,28 @@ def _relay_is_down():
     return _probe_relay(timeout=1) is None and not _port_in_use(TUNNEL_PORT)
 
 
+def _admin_signature(path, body, auth_file=None):
+    """The headers proving this user holds the key file, signed with the
+    bootstrap so the key itself never travels; {} if it cannot be read,
+    and the relay decides what an unproven caller may do."""
+    try:
+        with open(auth_file or AUTH_FILE, encoding="utf-8") as handle:
+            bootstrap = str(json.load(handle).get("bootstrap") or "")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    if not bootstrap:
+        return {}
+    stamp, nonce = int(time.time()), uuid.uuid4().hex
+    mac = sign_request(bootstrap, "POST", path, stamp, nonce, body, query="")
+    return {"X-Tapproval-Signature": "v2 %d %s %s" % (stamp, nonce, mac)}
+
+
 def _admin_call(path, timeout=5):
     """Loopback-only administration: the relay owns the state, this just
-    asks it. Returns the parsed reply or None."""
-    return _loopback_json(path, data=b"{}", timeout=timeout)
+    asks it, signed with the key file. Returns the parsed reply or None."""
+    body = b"{}"
+    return _loopback_json(path, data=body, timeout=timeout,
+                          headers=_admin_signature(path, body))
 
 
 def run_admin(args):
@@ -1670,6 +1688,10 @@ def start_session(path, text, projects_dir=None, platform=None):
     text = " ".join(str(text or "").split())[:500]
     if not text:
         return "empty"
+    if text[:1] in ("!", "#"):
+        # As in type_into_session: first in Claude Code's prompt, `!` runs
+        # the rest as a shell command with no card, and `#` writes memory.
+        return "a first message cannot start with ! or #"
     if (platform or sys.platform) != "darwin":
         return "new sessions need a Mac"
     path = os.path.expanduser(str(path or ""))
@@ -1915,8 +1937,22 @@ def _prompt_resolver(card, projects_dir=None):
 
 
 
+def _normal_ip(ip):
+    """``ip`` as an address object, IPv4-mapped forms unwrapped and an
+    IPv6 scope dropped; None for anything that is not an address."""
+    import ipaddress
+    try:
+        address = ipaddress.ip_address(str(ip or "").split("%", 1)[0])
+    except ValueError:
+        return None
+    return getattr(address, "ipv4_mapped", None) or address
+
+
 def _is_loopback(ip):
-    return str(ip or "").startswith(("127.", "::1", "::ffff:127."))
+    """By address, never by prefix: "::1:2" is somebody else's machine,
+    and a prefix match called it this one (2026-10-05 review)."""
+    address = _normal_ip(ip)
+    return address is not None and address.is_loopback
 
 
 def _is_ip_literal(text):
@@ -2308,6 +2344,28 @@ class RelayHandler(BaseHTTPRequestHandler):
         return (self.required_token is None
                 and _is_loopback(self.client_address[0]))
 
+    def _from_this_machine(self):
+        """Loopback, or a process here that dialled this Mac's own network
+        address — both ends of the connection then carry the same address.
+        Used only to refuse, never to trust: loopback stays the only free
+        pass. A stranger cannot fake it; the reply to a forged source
+        address never leaves this Mac (2026-10-05 review)."""
+        peer = _normal_ip(self.client_address[0])
+        if peer is not None and peer.is_loopback:
+            return True
+        try:
+            here = _normal_ip(self.connection.getsockname()[0])
+        except (OSError, AttributeError, IndexError):
+            return False
+        return peer is not None and peer == here
+
+    def _proves_bootstrap(self):
+        """A local process holding the bootstrap from the 0600 auth file:
+        this user, not merely this machine."""
+        return (self._is_local_process()
+                and hasattr(self.auth, "is_bootstrap")
+                and self.auth.is_bootstrap(self._presented()))
+
     def _route(self):
         """Return ``(path, query)``, enforcing the token prefix if set."""
         from urllib.parse import parse_qs, urlsplit
@@ -2422,11 +2480,13 @@ class RelayHandler(BaseHTTPRequestHandler):
         if auth is None or not hasattr(auth, "claim_window"):
             self._send_json({"error": "pairing closed"}, 403)
             return
-        if self._is_local_process():
+        if self._from_this_machine():
             # No watch pairs from this Mac. A process here that could open
             # the window (`--pair`) and claim it from 127.0.0.1 held a key
             # of its own — enough for a prompt-injected session to answer
-            # its own CRITICAL card (2026-09-30 review).
+            # its own CRITICAL card (2026-09-30 review). Dialling the Mac's
+            # own Wi-Fi address instead of 127.0.0.1 got round that until
+            # 2026-10-05.
             self._send_json({"error": "pair from the watch, not from this computer"}, 403)
             return
         client = self.client_address[0]
@@ -2603,6 +2663,14 @@ class RelayHandler(BaseHTTPRequestHandler):
                 not self._is_local_process()
                 or (rules.get("admin") and not hasattr(self.auth, "rotate"))):
             self._send_json({"error": "local processes only"}, 403)
+            return
+        if (rules.get("admin") and not self._proves_bootstrap()
+                and path != "/admin/pair-open"):
+            # Loopback is any process of any user on this Mac. Unpairing
+            # the watch, or rotating its key, takes the key file too
+            # (2026-10-05 review). /admin/pair-open answers without it,
+            # but opens a window that asks at the Mac first.
+            self._send_json({"error": "the key file is required"}, 403)
             return
         if rules.get("token") and not self._proves_key():
             self._send_json({"error": "a device key is required, even from "
@@ -2861,7 +2929,9 @@ class RelayHandler(BaseHTTPRequestHandler):
         if path == "/admin/pair-relight":
             self._send_json({"ok": True, "until": int(self.auth.relight())})
         elif path == "/admin/pair-open":
-            until = self.auth.open_window()
+            # Without the key file, the person at the Mac is asked before
+            # any watch gets a key: a command Claude runs can reach here.
+            until = self.auth.open_window(ask=not self._proves_bootstrap())
             self._send_json({"ok": True, "seconds": PAIR_WINDOW_SECONDS,
                              "until": int(until)})
         elif path == "/admin/pair-reset":
@@ -2957,8 +3027,34 @@ class _RelayServer(ThreadingHTTPServer):
 
     The stock server catches whatever a handler raises and prints it to
     stderr, so threading.excepthook never sees it: every route could fail
-    with no record, no wrist condition and no mail (2026-09-25 review)."""
+    with no record, no wrist condition and no mail (2026-09-25 review).
+
+    At most MAX_CONNECTIONS at once, each a thread: past that a connection
+    is closed unanswered. One person's watch, bridge and hooks never come
+    near it; a flood of held-open sockets no longer grows threads without
+    end (2026-10-05 review)."""
     daemon_threads = True
+    MAX_CONNECTIONS = 64
+
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(self.MAX_CONNECTIONS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
     def handle_error(self, request, client_address):
         kind, value, tb = sys.exc_info()
