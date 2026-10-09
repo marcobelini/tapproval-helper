@@ -9,7 +9,7 @@
       "name": "tapproval-helper",
       "source": "./",
       "description": "Tapproval Base — answer Claude Code's permission prompts from your Apple Watch. Nothing is ever approved automatically: a person taps Allow or Deny on the watch, or the usual terminal prompt appears exactly as before. Open source, standard-library Python only, no servers, no accounts. Get the watch app from the App Store, or the free-unlock beta on TestFlight.",
-      "version": "1.1.41",
+      "version": "1.1.42",
       "author": {
         "name": "Tapproval"
       },

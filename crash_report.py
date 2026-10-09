@@ -223,6 +223,18 @@ def running_under_test(env=None, modules=None):
 
 def send(entry, count, settings=None, opener=None):
     """POST one report to Resend. Returns a reason string, never raises."""
+    return deliver(subject_for(entry, count), body_for(entry, count),
+                   settings=settings, opener=opener)
+
+
+def deliver(subject, text, settings=None, opener=None, html=None,
+            timeout=None):
+    """POST one e-mail to Resend. Returns a reason string, never raises.
+
+    The crash reporter's door, opened for the desk's fortnightly report
+    (``WatchApp/asc/desk.py``) so there is one mailer, one key, one set
+    of rules about tests — not a second copy that forgets the user agent.
+    """
     key, to, sender = settings or mail_settings()
     if not (key and to and sender):
         return "mail_not_configured"
@@ -231,11 +243,10 @@ def send(entry, count, settings=None, opener=None):
     # from a test run is not.
     if opener is None and running_under_test():
         return "not_sent_in_tests"
-    payload = json.dumps({
-        "from": sender, "to": [to],
-        "subject": subject_for(entry, count),
-        "text": body_for(entry, count),
-    }).encode("utf-8")
+    message = {"from": sender, "to": [to], "subject": subject, "text": text}
+    if html:
+        message["html"] = html
+    payload = json.dumps(message).encode("utf-8")
     request = urllib.request.Request(
         "https://api.resend.com/emails", data=payload,
         headers={"Authorization": "Bearer " + key,
@@ -250,7 +261,7 @@ def send(entry, count, settings=None, opener=None):
                  "User-Agent": USER_AGENT})
     try:
         with (opener or urllib.request.urlopen)(
-                request, timeout=SEND_TIMEOUT) as reply:
+                request, timeout=timeout or SEND_TIMEOUT) as reply:
             return "sent" if 200 <= reply.status < 300 else "send_failed"
     except Exception as error:                       # never from a crash path
         # Resend refuses a from-address on a domain it has not verified, and

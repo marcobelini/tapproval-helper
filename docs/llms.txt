@@ -1,0 +1,49 @@
+# Tapproval
+
+> Approve Claude Code's permission prompts from an Apple Watch. When the
+> agent on your computer asks permission, the question appears on the
+> watch, marked with one of five risk tiers, and one tap answers it.
+> No account and no server of ours. Independent; not affiliated with Anthropic.
+
+## What it does
+- Approve or deny Claude Code permission prompts with one tap on the watch.
+- Sorts every request into one of five risk tiers on the computer; the card
+  shows the tier. Nothing is approved automatically unless the user turns
+  that on, and a CRITICAL request never is.
+- Shows which sessions need you, which are running and which are idle;
+  read a conversation and reply, or start a new session from the watch.
+- Multiple-choice questions arrive with the same choices as on the desktop.
+
+## What it needs
+- An Apple Watch running watchOS 10 or later.
+- Claude Code on a Mac or a Linux machine.
+- The free, open-source helper (MIT licence), which Claude Code installs
+  when told: "Install the Tapproval plugin from marcobelini/tapproval-helper".
+- Works on the same Wi-Fi, or away from home through a private travel address.
+
+## Price
+- The first 100 answers are free; then $5 once unlocks unlimited answers
+  for good. No subscription. An optional $1 tip is offered too.
+- Reading sessions and the day's overview stays free.
+
+## Where to get it
+- App Store, outside the EU for now: https://apps.apple.com/app/tapproval/id6805869018
+- TestFlight beta, everywhere: https://testflight.apple.com/join/dW1tYBQG
+- Helper source: https://github.com/marcobelini/tapproval-helper
+
+## Privacy
+Tapproval collects nothing: no accounts, no analytics, no servers of ours.
+Prompts and conversations travel between the watch and the user's own
+computer, directly or through an encrypted tunnel.
+
+## Key pages
+- Home: https://tapproval.thoughtfulsteward.org/
+- Setup guide: https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html
+- The PermissionRequest hook's decision shape: https://tapproval.thoughtfulsteward.org/claude-code-permission-hook.html
+- Ways to approve Claude Code away from the desk, compared: https://tapproval.thoughtfulsteward.org/compare.html
+- Security: https://tapproval.thoughtfulsteward.org/security.html
+- Changelog: https://tapproval.thoughtfulsteward.org/changelog.html
+- Privacy policy: https://tapproval.thoughtfulsteward.org/privacy.html
+
+## Contact
+tapproval@thoughtfulsteward.org
