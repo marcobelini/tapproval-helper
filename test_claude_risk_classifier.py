@@ -75,6 +75,27 @@ def _serve(server):
     return thread
 
 
+def _wait_until(predicate, timeout=5.0, interval=0.02, what=None):
+    """Poll ``predicate`` until it returns something truthy; return that.
+
+    The one way a test waits for another thread, a server or a file: it
+    returns the moment the condition holds, where a fixed sleep always
+    costs its full length and still guesses wrong on a loaded runner. On
+    timeout it fails the test and says what it was waiting for — a
+    hand-rolled loop that ran out used to fall through to an IndexError
+    two lines later. A sleep whose point is that time passes (a window, a
+    probe clock) is not a wait and does not belong here."""
+    deadline = time.monotonic() + timeout
+    while True:
+        value = predicate()
+        if value:
+            return value
+        if time.monotonic() >= deadline:
+            pytest.fail("waited %.1f s for %s, and it never came"
+                        % (timeout, what or getattr(predicate, "__name__", "a condition")))
+        time.sleep(interval)
+
+
 def _behavior(payload):
     """What Claude Code will actually do with a hook response.
 
@@ -1490,15 +1511,10 @@ class TestWatchRelayBridge:
 
     def _answer_first_card(self, queue, decision):
         """Background 'human': decide the first card that appears."""
-        import time
 
         def worker():
-            for _ in range(200):
-                pending = queue.pending()
-                if pending:
-                    queue.decide(pending[0]["id"], decision)
-                    return
-                time.sleep(0.01)
+            pending = _wait_until(queue.pending, what="a card to answer")
+            queue.decide(pending[0]["id"], decision)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1543,11 +1559,7 @@ class TestWatchRelayBridge:
         threading.Thread(
             target=lambda: card_ids.append(queue.submit(self.CARD, 1.0)),
             daemon=True).start()
-        import time
-        for _ in range(200):
-            if queue.pending():
-                break
-            time.sleep(0.01)
+        _wait_until(queue.pending, what="the card to be queued")
         live = queue.pending()[0]["id"]
         assert queue.decide(live, "shrug") is False            # invalid verdict
         assert queue.decide(live, "allow") is True
@@ -2370,6 +2382,7 @@ class TestSignedRequests:
         assert mac == "40a76bfa5eb884abf31631274d03a1b20118e1094116cc82836f47dc8e7a1d4a"
 
 
+@pytest.mark.private_layout
 class TestEveryCommittingScriptSaysWhoItIs:
     """CLAUDE.md constraint 5: commits made by scripts are the project's.
     sync-helper.sh set the identity script-wide; deploy-testflight.sh
@@ -2394,6 +2407,7 @@ class TestEveryCommittingScriptSaysWhoItIs:
         assert len(committing) >= 2, committing
 
 
+@pytest.mark.private_layout
 class TestSyncHelperFlags:
     def test_a_dry_run_is_a_dry_run_whatever_the_order(self):
         path = os.path.join(_ROOT, "sync-helper.sh")
@@ -2405,6 +2419,7 @@ class TestSyncHelperFlags:
         assert "--check) CHECK=1" in text and "--anyway) ANYWAY=1" in text
 
 
+@pytest.mark.private_layout
 class TestTheSyncPublishesOnlyMain:
     """sync-helper.sh copied the working tree, so an uncommitted edit or an
     unmerged branch reached every user as it sat on disk (2026-10-05
@@ -2493,31 +2508,23 @@ class TestAlertBuckets:
         assert watch_relay.alert_bucket(card) == "stop"
 
     def test_a_queued_card_carries_its_bucket(self):
-        import time as _time
         queue = watch_relay.CardQueue()
         thread = threading.Thread(target=lambda: queue.submit(
             {"tier": "MEDIUM", "headline": "x", "detail": "x"}, wait=5), daemon=True)
         thread.start()
-        for _ in range(200):
-            if queue.pending():
-                break
-            _time.sleep(0.01)
+        _wait_until(queue.pending, what="the card to be queued")
         card = queue.pending()[0]
         assert card["alert"] == "careful"
         queue.decide(card["id"], "deny")
         thread.join(timeout=5)
 
     def test_a_bucket_sent_by_the_hook_is_not_trusted(self):
-        import time as _time
         queue = watch_relay.CardQueue()
         thread = threading.Thread(target=lambda: queue.submit(
             {"tier": "CRITICAL", "alert": "go", "headline": "x", "detail": "x"},
             wait=5), daemon=True)
         thread.start()
-        for _ in range(200):
-            if queue.pending():
-                break
-            _time.sleep(0.01)
+        _wait_until(queue.pending, what="the card to be queued")
         card = queue.pending()[0]
         assert card["alert"] == "stop"
         queue.decide(card["id"], "deny")
@@ -2608,17 +2615,13 @@ class TestEachRequestOnAConnectionStandsAlone:
         conn.close()
 
     def test_an_answer_really_reaches_its_card_on_a_reused_connection(self, relay):
-        import time as _time
         port, queue = relay
         result = {}
         waiter = threading.Thread(target=lambda: result.update(
             decision=queue.submit({"tier": "MEDIUM", "headline": "x", "detail": "x"},
                                   wait=10)[1]), daemon=True)
         waiter.start()
-        for _ in range(200):
-            if queue.pending():
-                break
-            _time.sleep(0.01)
+        _wait_until(queue.pending, what="the card to be queued")
         card = queue.pending()[0]["id"]
         conn = self._connection(port)
         self._ask(conn, "GET", "/pending", token="devicetoken")
@@ -2712,7 +2715,6 @@ class TestAnUpdateKeepsTheAwayAddress:
         assert watch_relay.TUNNEL_URL == self.URL + "/t/tok"
 
     def test_a_changed_address_is_said_not_silent(self, monkeypatch):
-        import time as _time
         monkeypatch.setattr(watch_relay, "_cloudflared", lambda: "/usr/bin/true")
         monkeypatch.setattr(watch_relay, "_adoptable_tunnel",
                             lambda port: {"pid": 4242, "url": self.URL, "port": port})
@@ -2724,10 +2726,7 @@ class TestAnUpdateKeepsTheAwayAddress:
 
         _fake_cloudflared(monkeypatch, fresh)
         watch_relay.start_tunnel(8978, "tok")
-        for _ in range(200):
-            if watch_relay.TUNNEL_URL:
-                break
-            _time.sleep(0.01)
+        _wait_until(lambda: watch_relay.TUNNEL_URL, what="the tunnel address")
         assert watch_relay.TUNNEL_URL == fresh + "/t/tok"
         said = [c["detail"] for c in watch_relay.conditions() if c["key"] == "tunnel"]
         assert said and "changed" in said[0] and "icloud" in said[0].lower(), said
@@ -2761,6 +2760,7 @@ class TestAnUpdateKeepsTheAwayAddress:
         assert not [c for c in watch_relay.conditions() if c["key"] == "tunnel"]
 
 
+@pytest.mark.private_layout
 class TestTheBridgeSigns:
     """The Mac bridge proved its key by sending it, in X-Tapproval-Token,
     and so kept the relay accepting a key sent in the clear from every
@@ -2787,15 +2787,58 @@ class TestTheBridgeSigns:
         assert "relaySession.data(for: RelaySigning.signed(" in main
 
     def test_the_signature_is_the_relays_own(self):
-        """The message is built as sign_request builds it: a drift here is
-        a bridge whose every /decision is refused as unproven."""
+        """The message is built as sign_request builds it, query included:
+        a drift here is a bridge whose every /decision is refused."""
         signing = self._source("Signing.swift")
-        assert ("[method.uppercased(), path, String(stamp), nonce, bodyHash]"
+        assert ("[method.uppercased(), path, query, String(stamp), nonce, bodyHash]"
                 in signing)
         assert '"X-Tapproval-Signature"' in signing
-        assert '"v1 \\(stamp) \\(nonce) \\(mac)"' in signing
+        assert '"v2 \\(stamp) \\(nonce) \\(mac)"' in signing
+
+    def test_the_compiled_signer_passes_the_relays_own_check(self, tmp_path):
+        """Not the shape but the fact: Signing.swift compiled, its headers
+        verified by verify_signature — and a query changed on the way is
+        refused, which is what v2 exists for (2026-10-10 debt pass)."""
+        import shutil
+        import subprocess
+        signing = self._source("Signing.swift")
+        if not shutil.which("swiftc"):
+            pytest.skip("no Swift compiler on this machine")
+        driver = tmp_path / "main.swift"   # top-level code lives only in main.swift
+        driver.write_text(
+            'import Foundation\n'
+            'let a = CommandLine.arguments\n'
+            'var r = URLRequest(url: URL(string: a[2])!)\n'
+            'r.httpMethod = a[3]\n'
+            'r.httpBody = a[4].isEmpty ? nil : Data(a[4].utf8)\n'
+            'let s = RelaySigning.signed(r, key: a[1])\n'
+            'print(s.value(forHTTPHeaderField: "X-Tapproval-Signature") ?? "")\n')
+        (tmp_path / "Signing.swift").write_text(signing)
+        binary = tmp_path / "signer"
+        built = subprocess.run(
+            ["swiftc", "-O", "-o", str(binary), str(tmp_path / "Signing.swift"),
+             str(driver)], capture_output=True, text=True, timeout=300)
+        assert built.returncode == 0, built.stderr[-2000:]
+        key = "k" * 32
+
+        def header(url, method="GET", body=""):
+            return subprocess.run([str(binary), key, url, method, body],
+                                  capture_output=True, text=True,
+                                  timeout=30).stdout.strip()
+
+        signed = header("http://127.0.0.1:8977/thread?id=A%20B&n=2")
+        assert signed.startswith("v2 ")
+        assert watch_relay.verify_signature(
+            signed, "GET", "/thread", b"", [key], query="id=A%20B&n=2")[0] == key
+        replayed = header("http://127.0.0.1:8977/thread?id=A")
+        assert watch_relay.verify_signature(
+            replayed, "GET", "/thread", b"", [key], query="id=B")[0] is None
+        posted = header("http://127.0.0.1:8977/decision", "POST", '{"id":"x"}')
+        assert watch_relay.verify_signature(
+            posted, "POST", "/decision", b'{"id":"x"}', [key], query="")[0] == key
 
 
+@pytest.mark.private_layout
 class TestAnICloudCardIsTheWholeCard:
     """A card has three definitions: what the watch decodes from /pending
     (WristCard), what the Mac bridge writes to iCloud, and what the watch
@@ -2852,6 +2895,81 @@ class TestAnICloudCardIsTheWholeCard:
         cloud = self._read("Tapproval", "CloudRelay.swift")
         for field in self.FIELDS.values():
             assert 'record["%s"]' % field in cloud, field
+
+
+class TestTheBridgeReadsTheWholeCard:
+    """The Mac bridge decodes /pending with a `Card` of its own, beside the
+    watch's `WristCard`; nothing compared the two, and a field the watch
+    reads but the bridge drops never reaches a watch away from home. The
+    iCloud field tables above hold the record; this holds the decoder
+    (2026-10-10 debt pass)."""
+
+    # One card carrying every field, typed as the relay sends it.
+    CARD = {"id": "c0ffee000001", "tier": "HIGH", "headline": "Run rm -rf build",
+            "detail": "Deletes the build folder", "project": "tapproval",
+            "kind": "question", "options": ["Yes", "No"], "alert": "careful",
+            "plan": "1. Delete\n2. Rebuild", "facts": [["Command", "rm -rf build"]],
+            "session_id": "s-1", "can_always": True, "session_title": "Release"}
+
+    def _read(self, *parts):
+        path = os.path.join(_ROOT, "WatchApp", *parts)
+        if not os.path.isfile(path):
+            pytest.skip("no watch app in this layout")
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    @staticmethod
+    def _wire_keys(source, struct):
+        body = re.search(r"struct %s\b.*?enum CodingKeys: String, CodingKey \{(.*?)\n\s*\}"
+                         % struct, source, re.S).group(1)
+        keys = set()
+        for line in re.findall(r"case ([^\n]+)", body):
+            for part in line.split(","):
+                part = part.strip()
+                keys.add(part.split('"')[1] if '"' in part else part)
+        return keys
+
+    def test_the_bridge_decodes_every_field_the_watch_does(self):
+        watch = self._wire_keys(self._read("Tapproval", "RelayModel.swift"), "WristCard")
+        bridge = self._wire_keys(self._read("Bridge", "main.swift"), "Card")
+        assert watch <= bridge, "the bridge drops %s" % sorted(watch - bridge)
+        assert bridge <= set(self.CARD), "the fixture lacks %s" % sorted(bridge - set(self.CARD))
+
+    def test_the_compiled_card_carries_every_field_through(self, tmp_path):
+        """Not the key names but the types: the bridge's real Card, compiled,
+        decodes the relay's card and encodes every field back out."""
+        import json as _json
+        import shutil
+        import subprocess
+        source = self._read("Bridge", "main.swift")
+        if not shutil.which("swiftc"):
+            pytest.skip("no Swift compiler on this machine")
+        start = source.index("struct Card: Codable")
+        depth, end = 0, None
+        for i in range(source.index("{", start), len(source)):
+            depth += {"{": 1, "}": -1}.get(source[i], 0)
+            if depth == 0:
+                end = i + 1
+                break
+        (tmp_path / "Card.swift").write_text("import Foundation\n" + source[start:end] + "\n")
+        (tmp_path / "main.swift").write_text(
+            "import Foundation\n"
+            "let data = FileHandle.standardInput.readDataToEndOfFile()\n"
+            "let card = try JSONDecoder().decode(Card.self, from: data)\n"
+            "let out = try JSONEncoder().encode(card)\n"
+            "print(String(decoding: out, as: UTF8.self))\n")
+        binary = tmp_path / "card"
+        built = subprocess.run(["swiftc", "-o", str(binary), str(tmp_path / "Card.swift"),
+                                str(tmp_path / "main.swift")],
+                               capture_output=True, text=True, timeout=300)
+        assert built.returncode == 0, built.stderr[-2000:]
+        ran = subprocess.run([str(binary)], input=_json.dumps(self.CARD),
+                             capture_output=True, text=True, timeout=30)
+        assert ran.returncode == 0, ran.stderr[-1000:]
+        back = _json.loads(ran.stdout)
+        watch = self._wire_keys(self._read("Tapproval", "RelayModel.swift"), "WristCard")
+        for key in watch | {"id", "alert"}:
+            assert back.get(key) == self.CARD[key], key
 
 
 class TestTheBridgeIsWatched:
@@ -3177,7 +3295,6 @@ class TestTheTravelAddressSurvivesARestart:
         assert reaped == [4242], "orphans go, the adopted one stays"
 
     def test_a_tunnel_that_does_not_answer_is_replaced_and_remembered(self, monkeypatch):
-        import time as _time
         monkeypatch.setattr(watch_relay, "_cloudflared", lambda: "/usr/bin/true")
         monkeypatch.setattr(watch_relay, "_adoptable_tunnel",
                             lambda port: {"pid": 4242, "url": self.URL, "port": port})
@@ -3190,10 +3307,7 @@ class TestTheTravelAddressSurvivesARestart:
         _fake_cloudflared(monkeypatch, fresh)
         handle = watch_relay.start_tunnel(8978, "tok")
         assert handle.pid == 5151
-        for _ in range(200):
-            if watch_relay.TUNNEL_URL:
-                break
-            _time.sleep(0.01)
+        _wait_until(lambda: watch_relay.TUNNEL_URL, what="the tunnel address")
         assert watch_relay.TUNNEL_URL == fresh + "/t/tok"
         assert reaped == [None], "nothing is kept when nothing is adopted"
         saved = json.loads(self.state.read_text())
@@ -3209,7 +3323,6 @@ class TestTheTravelAddressSurvivesARestart:
         real record; every suite run on that Mac (CI included) did it again,
         and the next relay found nothing of its own to adopt. The thread now
         uses the files that were in force when the tunnel started."""
-        import time as _time
         # What the paths are put back to: here, stand-ins for the real ones.
         home_log = tmp_path / "home.log"
         home_log.write_text("INF |  https://home-words.trycloudflare.com  |\n")
@@ -3234,10 +3347,7 @@ class TestTheTravelAddressSurvivesARestart:
         # The patches are gone, as at a test's teardown; the address comes now.
         with open(run_log, "a", encoding="utf-8") as handle:
             handle.write("INF |  https://run-words.trycloudflare.com  |\n")
-        for _ in range(200):
-            if watch_relay.TUNNEL_URL:
-                break
-            _time.sleep(0.01)
+        _wait_until(lambda: watch_relay.TUNNEL_URL, what="the tunnel address")
         assert watch_relay.TUNNEL_URL == "https://run-words.trycloudflare.com/t/tok"
         assert not self.state.exists(), "the record in force afterwards is untouched"
         assert json.loads(run_state.read_text())["url"] == \
@@ -3570,7 +3680,6 @@ class TestWatchPresence:
     never a gate."""
 
     def test_a_card_queues_even_with_no_watch_yet(self):
-        import time as _time
         queue = watch_relay.CardQueue()          # nobody has ever polled
         result = {}
 
@@ -3580,10 +3689,7 @@ class TestWatchPresence:
 
         thread = threading.Thread(target=submit, daemon=True)
         thread.start()
-        for _ in range(200):
-            if queue.pending():
-                break
-            _time.sleep(0.01)
+        _wait_until(queue.pending, what="the card to be queued")
         cards = queue.pending(from_watch=True)   # the wrist rises late...
         assert cards, "the card must be waiting for a late wrist"
         queue.decide(cards[0]["id"], "allow")    # ...and can still answer
@@ -3594,14 +3700,10 @@ class TestWatchPresence:
         """`_inject`'s worker unpacks submit()'s return; a 2/3-tuple
         mismatch killed the --demo/--card path silently (worker thread
         died after the wait, outcome never printed)."""
-        import time as _time
         queue = watch_relay.CardQueue()
         thread = watch_relay._inject(
             queue, {"tier": "HIGH", "headline": "x", "detail": "x"}, wait=10)
-        for _ in range(200):
-            if queue.pending():
-                break
-            _time.sleep(0.01)
+        _wait_until(queue.pending, what="the card to be queued")
         cards = queue.pending(from_watch=True)
         assert cards
         queue.decide(cards[0]["id"], "allow")
@@ -3646,12 +3748,8 @@ class TestLateDecisions:
 
         thread = threading.Thread(target=submit)
         thread.start()
-        for _ in range(50):
-            pending = queue.pending()
-            if pending:
-                assert queue.decide(pending[0]["id"], "deny") is True
-                break
-            time.sleep(0.05)
+        pending = _wait_until(queue.pending, what="the card to be queued")
+        assert queue.decide(pending[0]["id"], "deny") is True
         thread.join(timeout=6)
         assert result["decision"] == "deny"
 
@@ -3673,10 +3771,13 @@ class TestWaitsOnlyWhileWatched:
             done.set()
 
         threading.Thread(target=submit, daemon=True).start()
-        time.sleep(0.3)
+        _wait_until(queue.pending, what="the card to be queued")
         assert queue.pending(), "card should be up while the watch is present"
         # The watch goes quiet: last poll ages far past the presence window.
         queue.last_poll = time.monotonic() - (queue.WATCH_PRESENT_SECONDS + 60)
+        # Not a wait: time has to pass, past submit()'s 5 s probe clock,
+        # with nothing happening. CardQueue reads time.monotonic itself, so
+        # there is no clock to wind forward instead.
         time.sleep(6)
         assert not done.is_set(), "the card must still be waiting"
         assert queue.pending(), "and still visible for the returning wrist"
@@ -3693,7 +3794,7 @@ class TestWaitsOnlyWhileWatched:
 
         threading.Thread(target=submit, daemon=True).start()
         for _ in range(6):          # keep the watch "present" for ~3s
-            time.sleep(0.5)
+            time.sleep(0.5)         # time passing, not a wait: see above
             queue.pending(from_watch=True)
         assert not done.is_set(), "must still be waiting for a listening watch"
         assert queue.pending()
@@ -4469,10 +4570,7 @@ class TestLanSourceIsNotTrusted:
 
     def _settle(self, auth):
         """The question runs on its own thread; wait for its answer."""
-        deadline = time.time() + 5
-        while auth._asking is not None and time.time() < deadline:
-            time.sleep(0.01)
-        assert auth._asking is None
+        _wait_until(lambda: auth._asking is None, what="the pairing question to be answered")
 
     def test_a_never_paired_machine_keeps_the_door_open(self, lan, monkeypatch):
         base, _, auth = lan
@@ -4609,18 +4707,27 @@ class TestGhostCards:
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
         alive = {"value": True}
+        probes = []
         result = {}
+
+        def probed():
+            living = alive["value"]         # read first, then say so
+            probes.append(living)
+            return living
 
         def submit():
             started = time.monotonic()
             _, result["decision"], _ = queue.submit(
                 {"tier": "HIGH", "headline": "x", "detail": "x"}, wait=600,
-                caller_alive=lambda: alive["value"])
+                caller_alive=probed)
             result["elapsed"] = time.monotonic() - started
 
         thread = threading.Thread(target=submit)
         thread.start()
-        time.sleep(0.3)
+        # The hook dies mid-wait: after the card is up and the first probe
+        # has seen it alive, so the retraction is the probe clock's doing.
+        _wait_until(lambda: probes and queue.pending(),
+                    what="the card to be up and probed once")
         assert queue.pending(), "card should be up while the hook lives"
         alive["value"] = False                    # the hook was killed
         thread.join(timeout=10)
@@ -5088,17 +5195,11 @@ class TestQuestionCards:
     def test_answer_travels_back_as_the_deny_reason(self, live_relay,
                                                     tmp_path, monkeypatch):
         import io
-        import time as _time
         port, queue = live_relay
 
         def answer_first_card():
-            for _ in range(60):
-                cards = queue.pending()
-                if cards:
-                    queue.decide(cards[0]["id"], "answer",
-                                 answer="Del hele ugen i to")
-                    return
-                _time.sleep(0.05)
+            cards = _wait_until(queue.pending, what="the question's card")
+            queue.decide(cards[0]["id"], "answer", answer="Del hele ugen i to")
 
         threading.Thread(target=answer_first_card, daemon=True).start()
         monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
@@ -5165,16 +5266,11 @@ class TestThePlanCard:
     def test_approve_and_auto_mode_travels_as_a_mode_the_cli_accepts(self, live_relay,
                                                                      tmp_path, monkeypatch):
         import io
-        import time as _time
         port, queue = live_relay
 
         def answer_first_card():
-            for _ in range(60):
-                cards = queue.pending()
-                if cards:
-                    queue.decide(cards[0]["id"], "answer", answer="Approve & auto mode")
-                    return
-                _time.sleep(0.05)
+            cards = _wait_until(queue.pending, what="the plan's card")
+            queue.decide(cards[0]["id"], "answer", answer="Approve & auto mode")
 
         threading.Thread(target=answer_first_card, daemon=True).start()
         monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
@@ -5553,15 +5649,11 @@ class TestEveryPress:
             _os.environ.update(env_backup)
 
     def _press(self, queue, decision, answer=None):
-        import time as _time
 
         def worker():
-            for _ in range(100):
-                cards = queue.pending(from_watch=True)
-                if cards:
-                    queue.decide(cards[0]["id"], decision, answer=answer)
-                    return
-                _time.sleep(0.05)
+            cards = _wait_until(lambda: queue.pending(from_watch=True),
+                                what="a card to press")
+            queue.decide(cards[0]["id"], decision, answer=answer)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -5714,18 +5806,14 @@ class TestPromptParity:
         assert queue.pending() == []
 
     def test_a_real_prompt_still_cards(self, live_relay, tmp_path):
-        import time as _time
         port, queue = live_relay
         seen = {}
 
         def watcher():
-            for _ in range(100):
-                cards = queue.pending(from_watch=True)
-                if cards:
-                    seen["card"] = cards[0]["headline"]
-                    queue.decide(cards[0]["id"], "allow")
-                    return
-                _time.sleep(0.05)
+            cards = _wait_until(lambda: queue.pending(from_watch=True),
+                                what="the prompt's card")
+            seen["card"] = cards[0]["headline"]
+            queue.decide(cards[0]["id"], "allow")
 
         threading.Thread(target=watcher, daemon=True).start()
         result = self._hook(port, tmp_path, "rm -rf build")
@@ -5903,16 +5991,12 @@ class TestPhoneSilenceMirror:
         """pytest is SAFE in our tables but prompts on the phone — the
         wrist must card it, not skip it as parity."""
         import io
-        import time as _time
         port, queue = live_relay
 
         def press():
-            for _ in range(100):
-                cards = queue.pending(from_watch=True)
-                if cards:
-                    queue.decide(cards[0]["id"], "allow")
-                    return
-                _time.sleep(0.05)
+            cards = _wait_until(lambda: queue.pending(from_watch=True),
+                                what="the pytest card")
+            queue.decide(cards[0]["id"], "allow")
 
         threading.Thread(target=press, daemon=True).start()
         monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
@@ -5956,7 +6040,6 @@ class TestFingerprintPerTool:
 
 class TestEmptyAnswerRefused:
     def test_answer_with_no_words_is_refused(self):
-        import time as _time
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
         result = {}
@@ -5966,10 +6049,7 @@ class TestEmptyAnswerRefused:
                 {"tier": "MEDIUM", "headline": "q", "detail": "q"}, wait=5)
 
         threading.Thread(target=submit, daemon=True).start()
-        for _ in range(200):
-            if queue.pending():
-                break
-            _time.sleep(0.01)
+        _wait_until(queue.pending, what="the card to be queued")
         live = queue.pending()[0]["id"]
         assert queue.decide(live, "answer") is False          # no words
         assert queue.decide(live, "answer", answer="Ja") is True
@@ -6017,18 +6097,26 @@ class TestResolvedElsewhere:
         queue = watch_relay.CardQueue()
         queue.pending(from_watch=True)
         result = {}
+        resolver = watch_relay._prompt_resolver(card, projects_dir=str(tmp_path))
+        probes = []
+
+        def probed():
+            answered = resolver()           # read first, then say so
+            probes.append(answered)
+            return answered
 
         def submit():
             started = _time.monotonic()
             _, result["decision"], _ = queue.submit(
-                card, wait=30,
-                resolved_elsewhere=watch_relay._prompt_resolver(
-                    card, projects_dir=str(tmp_path)))
+                card, wait=30, resolved_elsewhere=probed)
             result["elapsed"] = _time.monotonic() - started
 
         thread = threading.Thread(target=submit, daemon=True)
         thread.start()
-        _time.sleep(0.5)
+        # The phone answers mid-wait: after the first probe has read the
+        # transcript's tail, as it would for a card already standing.
+        _wait_until(lambda: probes and queue.pending(),
+                    what="the card to be up and probed once")
         assert queue.pending(), "card should be up before the phone answers"
         # The phone answers: the session writes the tool_result.
         with open(path, "a", encoding="utf-8") as handle:
@@ -6147,12 +6235,8 @@ class TestAlwaysMirrorsThePhone:
                 "fingerprint": "abc123", "can_always": False}
 
         def press_always():
-            for _ in range(100):
-                cards = queue.pending()
-                if cards:
-                    queue.decide(cards[0]["id"], "always")
-                    return
-                _time.sleep(0.05)
+            cards = _wait_until(queue.pending, what="the card to press always on")
+            queue.decide(cards[0]["id"], "always")
 
         threading.Thread(target=press_always, daemon=True).start()
         _, decision, _ = queue.submit(dict(card), wait=10)
@@ -6327,6 +6411,7 @@ def _helper_manifest(*parts):
         return json.load(handle)
 
 
+@pytest.mark.private_layout
 class TestEveryPublicWorkflowIsPublished:
     """sync-helper.sh copies workflows by name, one line each. A workflow
     added under helper/.github/workflows without its line is tested here,
@@ -6388,6 +6473,7 @@ class TestTheSyncScriptSaysWhatItDidAndDidNot:
         gate = script[script.index('FORBIDDEN="'):]
         return gate[:gate.index("\n  fi")]
 
+    @pytest.mark.private_layout
     def test_every_carrier_really_holds_the_version(self):
         """The list is only worth checking a message against if it is
         itself true."""
@@ -6409,6 +6495,7 @@ class TestTheSyncScriptSaysWhatItDidAndDidNot:
         start = script.index("the helper's sources changed")
         return script[start:script.index("exit 1", start)]
 
+    @pytest.mark.private_layout
     def test_the_version_refusal_names_every_file_that_carries_it(self):
         refusal = self._refusal(self._script())
         missing = [rel for rel in self.CARRIERS if rel not in refusal]
@@ -6417,6 +6504,7 @@ class TestTheSyncScriptSaysWhatItDidAndDidNot:
             "not name: %s. A message that names some of them is how "
             "marketplace.json was left behind." % (missing,))
 
+    @pytest.mark.private_layout
     def test_the_script_refuses_to_publish_a_version_backwards(self):
         """The gate above asks only whether the number changed. It cannot
         see a number that changed downwards, and on 2026-09-17 the public
@@ -6447,6 +6535,7 @@ class TestTheSyncScriptSaysWhatItDidAndDidNot:
         assert (done.returncode == 0) is refuses, (
             "%s over %s: expected refuses=%s" % (local, published, refuses))
 
+    @pytest.mark.private_layout
     def test_the_identifier_gate_says_so_when_it_does_not_run(self):
         """The else is the whole point: without it the gate is silent
         exactly when it is inert."""
@@ -6456,6 +6545,7 @@ class TestTheSyncScriptSaysWhatItDidAndDidNot:
                 if ">&2" in line and "did NOT run" in line], (
             "the skip must say on stderr that it did not run")
 
+    @pytest.mark.private_layout
     def test_the_refusal_is_read_apart_from_the_cp_lines_above_it(self):
         """Prove the scoping matters: the whole file mentions every
         carrier even when the message names none of them."""
@@ -6920,10 +7010,8 @@ class TestASignedOutMacSaysSo:
         assert watch_relay.signed_in(runner=slow, wait=0.1) is None
         assert time.monotonic() - started < 1.0
         gate.set()
-        for _ in range(50):
-            if watch_relay._SIGNIN.get("asked"):
-                break
-            time.sleep(0.02)
+        _wait_until(lambda: watch_relay._SIGNIN.get("asked"),
+                    what="the slow sign-in answer to land")
         assert watch_relay.signed_in(runner=slow) is False, "the refreshed answer is used"
         assert "signin" in [c["key"] for c in watch_relay.conditions()]
 
@@ -8778,10 +8866,7 @@ class TestRelayRoutes:
             {"tier": "HIGH", "headline": "x", "detail": "x",
              "session_id": "dddd4444-full-id"}, 3.0), daemon=True)
         waiter.start()
-        for _ in range(50):
-            if queue.pending():
-                break
-            time.sleep(0.02)
+        _wait_until(queue.pending, what="the card to be queued")
         status, body = self._call(base + "/thread?id=dddd4444")
         assert (body["state"], body["state_reason"]) == ("asking", "card")
 
@@ -9010,7 +9095,10 @@ class TestLocalMeansLocal:
             for _ in range(2):          # two idle sockets hold both slots
                 sock = _socket.create_connection(server.server_address, timeout=5)
                 held.append(sock)
-            time.sleep(0.3)
+            # Accepted, not merely connected: the kernel completes a
+            # handshake before the server has taken a slot for it.
+            _wait_until(lambda: server._slots._value == 0,
+                        what="the server to take both slots")
             third = _socket.create_connection(server.server_address, timeout=5)
             held.append(third)
             third.sendall(b"GET /health HTTP/1.0\r\n\r\n")
@@ -9021,7 +9109,9 @@ class TestLocalMeansLocal:
             assert answer == b"", "the third connection was served"
             for sock in held[:2]:
                 sock.close()
-            time.sleep(0.3)
+            # The third was closed unanswered and never held one.
+            _wait_until(lambda: server._slots._value == 2,
+                        what="the closed connections to give their slots back")
             assert relay_call("http://127.0.0.1:%d/health" % server.server_address[1])[0] == 200
         finally:
             for sock in held:
@@ -9601,6 +9691,7 @@ class TestTheSiteMapMatchesTheSite:
         assert missing == []
 
 
+@pytest.mark.private_layout
 class TestTheChangelogPageNeverGoesBlank:
     """render-changelog.py fetches the releases with gh. When that fails —
     offline, logged out, rate-limited — the page it already has must stay:
@@ -9619,6 +9710,7 @@ class TestTheChangelogPageNeverGoesBlank:
         root = tmp_path / "repo"
         (root / "helper" / "docs").mkdir(parents=True)
         shutil.copy(self.SCRIPT, root / "render-changelog.py")
+        shutil.copy(os.path.join(_ROOT, "render_page.py"), root / "render_page.py")
         page = root / "helper" / "docs" / "changelog.html"
         page.write_text("the page we had")
         env = dict(os.environ, PATH="%s:%s" % (fake, os.environ["PATH"]))
@@ -9637,6 +9729,117 @@ class TestTheChangelogPageNeverGoesBlank:
         result, page = self._run(tmp_path, "echo '[]'\n")
         assert page == "the page we had"
         assert "NOT re-rendered" in result.stderr
+
+
+class TestTheSiteHasOnePageFrame:
+    """render-privacy.py and render-changelog.py each carried a whole copy
+    of the page and their own uvx line (2026-10-10). The frame and the
+    pinned markdown now live in render_page.py; a script growing its own
+    copy back is the drift this was cut to end."""
+
+    SCRIPTS = ("render-privacy.py", "render-changelog.py")
+
+    def _read(self, name):
+        path = os.path.join(_ROOT, name)
+        if not os.path.isfile(path):
+            pytest.skip("%s lives in the product repo only" % name)
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    @pytest.mark.parametrize("script", SCRIPTS)
+    def test_no_renderer_carries_its_own_frame_or_markdown(self, script):
+        text = self._read(script)
+        assert "<!doctype" not in text.lower() and "</html>" not in text
+        assert "uvx" not in re.sub(r'"""[\s\S]*?"""|#[^\n]*', "", text), \
+            "markdown is borrowed in render_page.markdown(), once"
+        assert "render_page.page(" in text and "render_page.markdown(" in text
+
+    def test_the_frame_wraps_what_it_is_given(self):
+        self._read("render_page.py")
+        spec = importlib.util.spec_from_file_location(
+            "render_page", os.path.join(_ROOT, "render_page.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        out = mod.page("T", '<meta name="x">\n', "<p>body</p>", "<p>foot</p>",
+                       nav="<nav>n</nav>")
+        assert out.startswith("<!doctype html>\n") and out.endswith("</html>\n")
+        assert "<title>T</title>\n<meta name=\"x\">\n<link rel=\"icon\"" in out
+        assert "</strong></a><nav>n</nav></header>" in out
+        assert '<main class="policy">\n<p>body</p>\n</main>' in out
+        assert "<footer><p>foot</p></footer>" in out
+
+
+class TestTheSyncRefusesAStalePage:
+    """sync-helper.sh, without uvx, warned and published the pages as they
+    stood — the old policy, after PRIVACY.md had changed. It now stops when
+    a page's source has moved and the page cannot follow. The block runs
+    for real here, in a throwaway repo, with uvx kept off PATH."""
+
+    @staticmethod
+    def _block():
+        path = os.path.join(_ROOT, "sync-helper.sh")
+        if not os.path.isfile(path):
+            pytest.skip("sync-helper.sh lives in the product repo only")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        start = text.index("if command -v uvx >/dev/null 2>&1; then\n  if ! python3 render-privacy.py")
+        end = text.index('rm -rf "$CLONE/docs"', start)
+        return text[start:end]
+
+    def _repo(self, tmp_path, gh_body, privacy_changed=False,
+              page_tag="v1.0.1"):
+        block = self._block()
+        env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+                   GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+        repo = tmp_path / "repo"
+        (repo / "helper" / "docs").mkdir(parents=True)
+        def git(*a):
+            subprocess.run(("git",) + a, cwd=repo, env=env, check=True,
+                           capture_output=True)
+        git("init", "-q", "-b", "main")
+        (repo / "PRIVACY.md").write_text("# Policy\n")
+        (repo / "helper" / "docs" / "privacy.html").write_text("<p>Policy</p>\n")
+        (repo / "helper" / "docs" / "changelog.html").write_text(
+            '<a href="https://github.com/x/y/releases/tag/%s">' % page_tag)
+        git("add", ".")
+        git("commit", "-q", "-m", "rendered")
+        if privacy_changed:
+            (repo / "PRIVACY.md").write_text("# Policy, changed\n")
+            git("commit", "-q", "-am", "policy edited")
+        fake = tmp_path / "bin"
+        fake.mkdir()
+        for tool in ("git", "grep"):
+            os.symlink(shutil.which(tool), fake / tool)
+        (fake / "gh").write_text("#!/bin/sh\n" + gh_body)
+        (fake / "gh").chmod(0o755)
+        path = "%s:/usr/bin:/bin" % fake
+        if shutil.which("uvx", path=path):
+            pytest.skip("uvx is on the system PATH here")
+        (tmp_path / "block.sh").write_text("set -euo pipefail\n" + block)
+        return subprocess.run(["/bin/bash", str(tmp_path / "block.sh")], cwd=repo,
+                              env=dict(env, PATH=path), capture_output=True,
+                              text=True, timeout=60)
+
+    def test_a_changed_policy_that_cannot_be_rendered_stops_the_sync(self, tmp_path):
+        done = self._repo(tmp_path, "echo v1.0.1\n", privacy_changed=True)
+        assert done.returncode == 1, done.stderr
+        assert "PRIVACY.md changed" in done.stderr
+
+    def test_a_release_missing_from_the_page_stops_the_sync(self, tmp_path):
+        done = self._repo(tmp_path, "echo v1.0.2\n")
+        assert done.returncode == 1, done.stderr
+        assert "v1.0.2 is not on changelog.html" in done.stderr
+
+    def test_unmoved_sources_go_as_they_are_and_it_is_said(self, tmp_path):
+        done = self._repo(tmp_path, "echo v1.0.1\n")
+        assert done.returncode == 0, done.stderr
+        assert "NOT re-rendered" in done.stderr
+
+    def test_a_gh_that_cannot_answer_is_said_not_hidden(self, tmp_path):
+        done = self._repo(tmp_path, "exit 1\n")
+        assert done.returncode == 0, done.stderr
+        assert "unchecked" in done.stderr
 
 
 class TestTheBetaIsOfferedWherePeopleAlreadyAre:
@@ -9661,6 +9864,7 @@ class TestTheBetaIsOfferedWherePeopleAlreadyAre:
         assert ready in script, "callers match these lines exactly"
         assert script.index(self.BETA) > script.index("TAPPROVAL_BASE_READY")
 
+    @pytest.mark.private_layout
     @pytest.mark.parametrize("relative", [
         "helper/README.md", "helper/docs/index.html",
         "helper/docs/apple-watch-claude-code.html"])
@@ -9668,6 +9872,7 @@ class TestTheBetaIsOfferedWherePeopleAlreadyAre:
         text = self._read(relative)
         assert self.BETA in text and "unlock is free" in text
 
+    @pytest.mark.private_layout
     @pytest.mark.parametrize("relative", [
         "helper/.claude-plugin/plugin.json", "helper/.claude-plugin/marketplace.json"])
     def test_the_plugin_listing_names_the_beta(self, relative):
@@ -9686,6 +9891,7 @@ class TestTheReleaseToolsSayWhenAStepFailed:
         with open(path, encoding="utf-8") as handle:
             return handle.read()
 
+    @pytest.mark.private_layout
     def test_the_sync_checks_the_version_of_every_file_it_publishes(self):
         script = self._read("sync-helper.sh")
         preflight = self._read(os.path.join("WatchApp", "asc", "preflight_repo.py"))
@@ -9696,12 +9902,14 @@ class TestTheReleaseToolsSayWhenAStepFailed:
         assert "cp $HELPER_SOURCES" in script
         assert "--quiet -- $HELPER_SOURCES" in script, "the version check reads the same list"
 
+    @pytest.mark.private_layout
     def test_a_failed_export_stops_the_deploy(self):
         script = self._read(os.path.join("WatchApp", "deploy-testflight.sh"))
         block = script[script.index('EXPORT/UPLOAD FAILED for build'):]
         assert block.index("exit 1") < block.index("\nfi"), \
             "a failed export went on to commit, print Done and distribute"
 
+    @pytest.mark.private_layout
     def test_the_deploy_signs_with_the_certificate_its_profiles_name(self):
         """A second "Apple Distribution" certificate on the keychain search
         list (another project's EAS build, 2026-10-01) won the name, and
@@ -9711,11 +9919,13 @@ class TestTheReleaseToolsSayWhenAStepFailed:
         assert "<string>${SIGNING_SHA}</string>" in script
         assert "<string>Apple Distribution</string>" not in script
 
+    @pytest.mark.private_layout
     def test_an_unrecorded_build_number_is_said(self):
         script = self._read(os.path.join("WatchApp", "deploy-testflight.sh"))
         record = script[script.index('commit -q -m "Ship build'):]
         assert "else" in record[:record.index("\nfi")]
 
+    @pytest.mark.private_layout
     def test_the_fresh_profiles_are_installed_from_where_they_were_written(self):
         script = self._read(os.path.join("WatchApp", "enable-icloud.sh"))
         assert 'os.environ["PROFILE_DIR"]' in script
@@ -9737,17 +9947,20 @@ class TestTheReleaseToolsSayWhenAStepFailed:
         assert crc.run_uninstall() == 0
         assert not agent.exists()
 
+    @pytest.mark.private_layout
     def test_a_failed_picture_export_fails_the_screenshot_run(self):
         script = self._read(os.path.join("WatchApp", "watch-shots.sh"))
         export = script[script.index("xcresulttool export attachments"):]
         assert "FAILED=1" in export[:400]
         assert "<<'PY' || FAILED=1" in script
 
+    @pytest.mark.private_layout
     def test_a_failed_flow_names_its_test(self):
         script = self._read(os.path.join("WatchApp", "watch-flows.sh"))
         assert "xcresulttool get test-results tests" in script
         assert '"    FAILED %s: %s"' in script
 
+    @pytest.mark.private_layout
     def test_the_changelog_refuses_active_html(self, tmp_path):
         release = [{"tag_name": "v9", "name": "v9", "published_at": "2026-09-30T00:00:00Z",
                     "html_url": "https://example.org",
@@ -9861,6 +10074,7 @@ def _ci_files(*names):
     return out
 
 
+@pytest.mark.private_layout
 class TestTheLocalFallbackRunsWhatCiRuns:
     """`ci-local.sh` is the proof when GitHub will not run the workflow.
 
@@ -9910,14 +10124,17 @@ class TestTheLocalFallbackRunsWhatCiRuns:
         loop = re.search(r'for version in ([^;]+); do', local).group(1).split()
         assert loop == versions, (loop, versions)
 
+    SHELLCHECK = "git ls-files -z '*.sh' ':!:design/**' | xargs -0 shellcheck"
+
     def test_the_same_scripts_are_shellchecked(self):
+        """Every tracked script, by the same line in both. The hand-kept
+        lists drifted (ci-local.sh added itself) and neither named
+        ci-runner.sh, which holds gh admin rights (2026-10-10 debt pass)."""
         workflow, local = self._files()
-        def targets(text):
-            line = re.search(r'^\s*(?:- run: )?shellcheck (install\.sh[^\n]+)',
-                             text, re.MULTILINE).group(1)
-            # ci-local.sh checks itself too; CI has no such file to check.
-            return sorted(set(line.split()) - {"ci-local.sh"})
-        assert targets(local) == targets(workflow)
+        assert self.SHELLCHECK in workflow
+        assert self.SHELLCHECK in local
+        listed = re.findall(r'^\s*(?:- run: )?shellcheck \S', workflow + local, re.MULTILINE)
+        assert not listed, "a hand-kept list of scripts is back: %s" % listed
 
     def test_ruff_is_run_with_the_same_rules(self):
         workflow, local = self._files()
@@ -9963,6 +10180,7 @@ class TestTheLocalFallbackRunsWhatCiRuns:
             "read the log before deleting it")
 
 
+@pytest.mark.private_layout
 class TestSwift6WarningsFailCi:
     """2026-10-02: "Watch: no Swift 6 concurrency warnings" cleared every
     one, and the proof-covers-answer work put two back. Nothing noticed
@@ -10007,6 +10225,7 @@ class TestSwift6WarningsFailCi:
         assert self._run(tmp_path, "").returncode == 2
 
 
+@pytest.mark.private_layout
 class TestCiCanBeMovedToThisMacAndBack:
     """Where CI runs is one repository variable, and coming back is
     deleting it.
@@ -10638,6 +10857,7 @@ class TestConditionsAreSaidOutLoud:
             server.server_close()
 
 
+@pytest.mark.private_layout
 def test_the_watch_names_the_helper_version_this_repository_ships():
     """The watch warns when the helper on the computer is behind it, and it
     can only do that against a version it was told to expect. That constant
@@ -10656,6 +10876,7 @@ def test_the_watch_names_the_helper_version_this_repository_ships():
         % (found.group(1), crc.__version__))
 
 
+@pytest.mark.private_layout
 def test_the_two_ci_workflows_share_their_test_steps():
     """helper/.github/workflows/tests.yml is copied verbatim into the public
     repo. Its Python steps must be the private workflow's, or the public
@@ -10681,6 +10902,41 @@ def test_the_two_ci_workflows_share_their_test_steps():
         return [line for line in rest[:end]
                 if "vars.CI_RUNNER" not in line and "runs-on:" not in line]
     assert python_steps(private) == python_steps(public)
+
+
+@pytest.mark.private_layout
+def test_the_public_pytest_ini_differs_only_where_it_must():
+    """This file is copied verbatim into the public repo, where WatchApp/,
+    sync-helper.sh and the CI tooling are not. Tests that need them carry
+    @pytest.mark.private_layout, and helper/pytest.ini deselects that
+    marker, so the public run says "deselected" where it used to say
+    "skipped" for a reason nobody read. The two ini files may differ in
+    testpaths (no WatchApp/asc over there) and in that one -m, nothing
+    else — a marker registered in one only, or a deselect lost in the
+    public copy, fails here instead of quietly changing what runs there."""
+    private = os.path.join(_ROOT, "pytest.ini")
+    public = os.path.join(_ROOT, "helper", "pytest.ini")
+    if not os.path.isfile(public):
+        pytest.skip("no helper/ in this layout")
+    deselect = ' -m "not private_layout"'
+
+    def lines(path):
+        with open(path, encoding="utf-8") as handle:
+            return [line.rstrip() for line in handle.read().splitlines()]
+
+    mine, theirs = lines(private), lines(public)
+    assert [line for line in theirs if deselect in line] == \
+        ["addopts = -v" + deselect], "the public run must deselect private_layout"
+    assert not [line for line in mine if "not private_layout" in line], \
+        "the product repo runs every test"
+    assert any(line.strip().startswith("private_layout:") for line in mine), \
+        "the marker must be registered"
+
+    def normalized(found):
+        return [line.replace(deselect, "") for line in found
+                if not line.startswith("testpaths")]
+
+    assert normalized(mine) == normalized(theirs)
 
 
 class TestTheEffectOntology:
@@ -11793,3 +12049,123 @@ class TestCodexAgent:
                             "which", lambda name: None)
         monkeypatch.setattr(crc.os, "access", lambda path, mode: path == crc.CODEX_APP_BINARY)
         assert crc.ensure_codex_on_path() == crc.CODEX_APP_BINARY
+
+
+class TestCardsAnsweredAtTheDeskLeave:
+    """Seven plan cards answered at the desk stayed on the wrist
+    (2026-10-11): Claude Code hands the hook a plan that is not the text
+    the transcript records, so no fingerprint or digest ever matched. A
+    question answered on 2026-10-05 stayed six days: its transcript was
+    compacted and the resolver forgot the call it had matched, and the
+    24 h limit ran on a clock that stops while the Mac sleeps."""
+
+    SID = "deskanswered01"
+
+    def _plan_card(self, hook_input):
+        return {"tier": "MEDIUM", "headline": "Plan", "detail": "",
+                "tool": "ExitPlanMode", "session_id": self.SID,
+                "fingerprint": crc._card_fingerprint("ExitPlanMode", hook_input),
+                "input_digests": crc._input_digests("ExitPlanMode", hook_input),
+                "plan_card": True}
+
+    def _transcript(self, tmp_path, calls):
+        lines = [{"cwd": "/x", "message": {"role": "user", "content": "go"}}]
+        for use_id, plan in calls:
+            lines.append({"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": use_id, "name": "ExitPlanMode",
+                 "input": {"plan": plan, "planFilePath": "/p/plan.md"}}]}})
+        return _write_transcript(tmp_path, "-p", self.SID + ".jsonl", lines)
+
+    @staticmethod
+    def _answer(path, use_id):
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": use_id,
+                 "content": "approved"}]}}) + "\n")
+
+    def _resolver(self, tmp_path, hook_input):
+        return watch_relay._prompt_resolver(self._plan_card(hook_input),
+                                            projects_dir=str(tmp_path))
+
+    def test_a_plan_whose_text_differs_leaves_when_answered(self, tmp_path):
+        path = self._transcript(tmp_path, [("toolu_plan", "# Plan as written")])
+        resolver = self._resolver(
+            tmp_path, {"plan": "# Plan as the hook got it, longer",
+                       "planFilePath": "/p/plan.md"})
+        assert resolver() is False                     # still open
+        self._answer(path, "toolu_plan")
+        assert resolver() is True
+
+    def test_a_plan_the_hook_got_empty_leaves_when_answered(self, tmp_path):
+        path = self._transcript(tmp_path, [("toolu_plan", "# Plan")])
+        resolver = self._resolver(tmp_path, {})
+        assert resolver() is False
+        self._answer(path, "toolu_plan")
+        assert resolver() is True
+
+    def test_an_answered_earlier_plan_does_not_count(self, tmp_path):
+        path = self._transcript(tmp_path, [("toolu_old", "# First")])
+        self._answer(path, "toolu_old")
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_new", "name": "ExitPlanMode",
+                 "input": {"plan": "# Second", "planFilePath": "/p/plan.md"}}]}}) + "\n")
+        resolver = self._resolver(tmp_path, {"plan": "# Second, as the hook got it"})
+        assert resolver() is False                     # the old answer is not this one
+        self._answer(path, "toolu_new")
+        assert resolver() is True
+
+    def test_two_open_calls_adopt_neither(self, tmp_path):
+        path = self._transcript(tmp_path, [("toolu_a", "# A"), ("toolu_b", "# B")])
+        resolver = self._resolver(tmp_path, {"plan": "# neither, as the hook got it"})
+        assert resolver() is False
+        self._answer(path, "toolu_a")
+        self._answer(path, "toolu_b")
+        assert resolver() is False                     # cannot tell which: the card stays
+
+    def test_a_call_that_opens_after_the_card_is_never_adopted(self, tmp_path):
+        path = self._transcript(tmp_path, [])
+        resolver = self._resolver(tmp_path, {"plan": "# as the hook got it"})
+        assert resolver() is False                     # nothing open at the first look
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_later", "name": "ExitPlanMode",
+                 "input": {"plan": "# Later"}}]}}) + "\n")
+        self._answer(path, "toolu_later")
+        assert resolver() is False
+
+    def test_compaction_keeps_the_call_it_matched(self, tmp_path):
+        path = self._transcript(tmp_path, [("toolu_plan", "# Plan")])
+        resolver = self._resolver(tmp_path, {"plan": "# hook copy"})
+        assert resolver() is False                     # adopts toolu_plan
+        # Compaction: the file is rewritten smaller, and the answer to the
+        # very call this card is about is part of the rewritten history.
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_plan",
+                 "content": "approved"}]}}) + "\n")
+        assert resolver() is True
+
+    def test_the_wait_ends_by_the_calendar_too(self, monkeypatch):
+        import time as _time
+        queue = watch_relay.CardQueue()
+        start = _time.time()
+        clock = {"now": start}
+        monkeypatch.setattr(watch_relay.CardQueue, "wall_clock",
+                            staticmethod(lambda: clock["now"]))
+        result = {}
+
+        def submit():
+            started = _time.monotonic()
+            _, result["decision"], _ = queue.submit(
+                {"tier": "LOW", "headline": "x", "detail": ""}, wait=3600)
+            result["elapsed"] = _time.monotonic() - started
+
+        thread = threading.Thread(target=submit, daemon=True)
+        thread.start()
+        _wait_until(lambda: queue.pending(), what="the card to be up")
+        clock["now"] = start + 3601                    # the Mac slept through it
+        thread.join(timeout=15)
+        assert result["decision"] == "none"
+        assert result["elapsed"] < 12
+        assert queue.pending() == []

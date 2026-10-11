@@ -841,6 +841,8 @@ def alert_bucket(card):
 class CardQueue:
     """Pending wrist cards and the decisions made about them."""
 
+    wall_clock = staticmethod(time.time)    # a test may move it on
+
     def __init__(self):
         self._lock = threading.Condition()
         self._pending = OrderedDict()   # id -> card dict
@@ -907,6 +909,10 @@ class CardQueue:
                                              int(time.time() * 1000)),
               file=sys.stderr)
         deadline = time.monotonic() + wait
+        # The monotonic clock stops while a Mac sleeps, so on its own a 24 h
+        # wait could hold a card for days of calendar time (six, for one
+        # answered question on 2026-10-05). The wall clock bounds it too.
+        wall_deadline = self.wall_clock() + wait
         with self._lock:
             self._pending[card_id] = entry
             self._lock.notify_all()
@@ -934,7 +940,7 @@ class CardQueue:
                 if card_id in self._decisions:
                     break
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if remaining <= 0 or self.wall_clock() >= wall_deadline:
                     break
                 self._lock.wait(max(0.05, min(
                     remaining, next_probe - time.monotonic())))
@@ -1820,6 +1826,10 @@ class _PromptResolver:
         self.path = None            # the session transcript, once found
         self.files = {}             # transcript path -> bytes already read
         self.use_ids = set()        # tool_use ids that match the card
+        # Calls of this card's tool that have no result yet, in the order
+        # they were written: the fallback when nothing matches by content.
+        self.open_calls = {}
+        self.first_read = True      # the fallback is decided once, here
         self.scan_at = 0.0          # next time to look for new subagents
         self.retry_at = 0.0         # next time to look for a missing transcript
 
@@ -1834,6 +1844,9 @@ class _PromptResolver:
                     path, self.files[path])
                 if self._scan(lines, shrunk, path):
                     resolved = True
+            if self.first_read:
+                self.first_read = False
+                self._adopt_the_one_open_call()
             return resolved
         except (OSError, ValueError):
             return False
@@ -1889,35 +1902,62 @@ class _PromptResolver:
             if shrunk:
                 # The transcript was rewritten (compaction). Its history
                 # now contains earlier runs of possibly the SAME command
-                # with their old results — matching those would retract a
-                # live card nobody answered. Go dormant past the rewrite:
-                # only appends from here on can resolve this card.
-                self.use_ids.clear()
-                try:
-                    self.files[path] = os.path.getsize(path)
-                except OSError:
-                    pass
-                return False
-            for line in lines:
-                entry = _json_object(line)
-                if entry is None:
-                    continue
-                content = _message_of(entry).get("content")
-                if not isinstance(content, list):
-                    continue
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    if (part.get("type") == "tool_use"
-                            and part.get("name") == self.tool
-                            and self._same_call(part.get("input") or {})):
+                # with their old results — matching those BY CONTENT would
+                # retract a live card nobody answered, so nothing new is
+                # matched in the rewritten history. But a tool_use id is
+                # unique: a result carrying an id this card already
+                # matched can only be that call's answer, wherever it
+                # sits. Forgetting the ids here left a question answered
+                # at the desk on the wrist for six days (2026-10-05).
+                self.open_calls.clear()
+                return any(
+                    part.get("type") == "tool_result"
+                    and part.get("tool_use_id") in self.use_ids
+                    for part in self._parts(lines))
+            for part in self._parts(lines):
+                if (part.get("type") == "tool_use"
+                        and part.get("name") == self.tool):
+                    self.open_calls[part.get("id")] = path
+                    if self._same_call(part.get("input") or {}):
                         self.use_ids.add(part.get("id"))
-                    elif (part.get("type") == "tool_result"
-                          and part.get("tool_use_id") in self.use_ids):
+                elif part.get("type") == "tool_result":
+                    self.open_calls.pop(part.get("tool_use_id"), None)
+                    if part.get("tool_use_id") in self.use_ids:
                         return True
         except (OSError, ValueError):
             return False
         return False
+
+    @staticmethod
+    def _parts(lines):
+        """Every content part of every transcript line, as dicts."""
+        for line in lines:
+            entry = _json_object(line)
+            if entry is None:
+                continue
+            content = _message_of(entry).get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict):
+                    yield part
+
+    def _adopt_the_one_open_call(self):
+        """When nothing in the transcript matches the card by content,
+        watch the one call of its tool still waiting for an answer.
+
+        Claude Code does not always hand the hook what it writes down: a
+        plan reaches the hook as different text (or as {}) from the plan
+        the transcript records, so no fingerprint or digest can ever
+        match, and every plan answered at the desk stayed on the wrist
+        (seven at once on 2026-10-11). A session waits on one prompt at a
+        time, so a single unanswered call of the card's tool is the call
+        being asked about. Two or more, or none, and nothing is adopted:
+        the card stays, as it always did.
+        """
+        if self.use_ids or len(self.open_calls) != 1:
+            return
+        self.use_ids.update(self.open_calls)
 
 
     def _same_call(self, recorded):

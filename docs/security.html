@@ -74,7 +74,7 @@
 <h3>1.1.21, 25 September 2026: the key stopped crossing the network</h3>
 <p><strong>What was wrong.</strong> Before this, a watch proved itself by sending its key with each request, and it trusted any helper that answered on the right address.</p>
 <p><strong>Who could have used it.</strong> Someone able to read the traffic, or to answer in the helper's place on your network, could have learned the key.</p>
-<p><strong>The fix.</strong> Requests are signed and good once, and the helper proves itself in every answer. A Mac with the iCloud bridge never offers a key on the network. The network pairing door hands out a revocable device key rather than the main one. Watches from before signing, including the App Store version today, still send the key, so the helper still accepts it from them; that ends once the App Store version signs. <a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.21">Release notes</a>.</p>
+<p><strong>The fix.</strong> Requests are signed and good once, and the helper proves itself in every answer. A Mac with the iCloud bridge never offers a key on the network. The network pairing door hands out a revocable device key rather than the main one. Watches from before signing (the App Store's 1.3 and earlier) still send the key, so the helper still accepts it from them. Every App Store version since 1.4 (2 October 2026) signs; accepting a sent key ends once watches on 1.3 have had time to update. <a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.21">Release notes</a>.</p>
 
 <h3>Before the first public release, August–September 2026</h3>
 <ul>
