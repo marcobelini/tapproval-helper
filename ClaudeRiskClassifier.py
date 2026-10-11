@@ -103,7 +103,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.43"
+__version__ = "1.1.44"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -1590,13 +1590,82 @@ def _plan_plain(plan):
     return "\n".join(lines).strip()
 
 
+# The Markdown a plan card keeps for a watch that renders it: the same
+# reading as watch_dashboard._flatten_line(keep_inline=True) gives a reply,
+# copied because the hook runs alone (TestThePlanKeepsItsFormatting holds
+# the two copies together). Headings, nesting and code are the plan's own.
+_PM_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
+_PM_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+")
+_PM_QUOTE = re.compile(r"^\s{0,3}>\s?")
+_PM_BULLET = re.compile(r"^(\s*)[-*+]\s+")
+_PM_NUMBER = re.compile(r"^\s*\d+[.)]\s+")
+_PM_HR = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
+_PM_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+_PM_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+_PM_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_PM_HTML = re.compile(r"</?[a-zA-Z][^>]*>")
+_PM_ESCAPE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!>])")
+
+
+def _plan_marked_line(line):
+    """One plan line with its block markup read and its inline marks
+    (bold, emphasis, code, strike) left for the watch to draw."""
+    line = _PM_HEADING.sub("", line)
+    line = _PM_QUOTE.sub("", line)
+    line = _PM_BULLET.sub(r"\1• ", line)
+    if line.lstrip().startswith("|"):
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        line = " · ".join(c for c in cells if c)
+    line = _PM_IMAGE.sub(r"\1", line)
+    line = _PM_LINK.sub(r"\1", line)
+    line = _PM_HTML.sub("", line)
+    return _PM_ESCAPE.sub(r"\1", line)
+
+
+def _plan_marked(plan):
+    """A plan as the phone shows it, in what a watch can draw: a heading is
+    a bold line, a nested item is indented two spaces a level, code lines
+    are set apart as code, and bold stays bold (2026-10-11)."""
+    lines, in_fence = [], False
+    for raw in str(plan or "").expandtabs(4).splitlines():
+        if _PM_FENCE.match(raw):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            code = raw.strip()
+            if code:
+                lines.append("  " + (code if "`" in code else "`%s`" % code))
+            continue
+        if not raw.strip() or _PM_HR.match(raw) or _PM_TABLE_SEP.match(raw):
+            if not raw.strip() and lines and lines[-1]:
+                lines.append("")
+            continue
+        text = _plan_marked_line(raw).strip()
+        if not text:
+            continue
+        if _PM_HEADING.match(raw):
+            text = "**%s**" % text.replace("**", "")
+            if lines and lines[-1]:
+                lines.append("")   # set apart, as the phone sets it
+        elif _PM_BULLET.match(raw) or _PM_NUMBER.match(raw):
+            depth = (len(raw) - len(raw.lstrip(" "))) // 2
+            text = "  " * min(depth, 3) + text
+        lines.append(text)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)
+
+
 def _plan_card(tool_input, risk, headline_chars, detail_chars):
-    plan = str(tool_input.get("plan") or "")
+    # Redacted before anything is read from it: the plan travels whole,
+    # line breaks and all, so it cannot rely on _fit to do this for it.
+    plan = redact_secrets(str(tool_input.get("plan") or ""))
     title = ""
     for raw in plan.splitlines():
         if raw.strip():
             title = _plan_plain(raw).lstrip("• ").strip()
             break
+    room = headline_chars * 2 - len("Plan: ")
     return {
         "kind": "question",
         "plan_card": True,
@@ -1605,8 +1674,11 @@ def _plan_card(tool_input, risk, headline_chars, detail_chars):
                          headline_chars * 2),
         "detail": _fit(" · ".join(PLAN_OPTIONS), detail_chars),
         "options": list(PLAN_OPTIONS),
-        "plan": _plan_fit(_plan_body(_plan_plain(plan), title,
-                                     headline_chars * 2 - len("Plan: "))),
+        # Plain, for every watch already sold: one that predates
+        # plan_marked would show its asterisks.
+        "plan": _plan_fit(_plan_body(_plan_plain(plan), title, room)),
+        "plan_marked": _plan_fit(_plan_body(_plan_marked(plan), title, room),
+                                 marks=True),
     }
 
 
@@ -1616,18 +1688,25 @@ def _plan_body(text, title, room):
     long for the headline stays, or its end would be lost."""
     lines = text.splitlines()
     if (lines and title and len(title) <= room
-            and lines[0].lstrip("• ").strip() == title):
+            and _plan_plain(lines[0]).lstrip("• ").strip() == title):
         lines = lines[1:]
     return "\n".join(lines).strip()
 
 
-def _plan_fit(text, limit=PLAN_CHARS):
+def _plan_fit(text, limit=PLAN_CHARS, marks=False):
     """Cap a plan for the wrist without flattening it: its line breaks are
-    its structure, which _fit (one line, whitespace collapsed) would lose."""
+    its structure, which _fit (one line, whitespace collapsed) would lose.
+    With ``marks``, never end inside a pair: an open ** would turn the
+    rest of a rendered plan bold."""
     if len(text) <= limit:
         return text
     cut = text[:limit]
-    return cut[:max(cut.rfind("\n"), cut.rfind(" "), limit // 2)].rstrip() + " …"
+    cut = cut[:max(cut.rfind("\n"), cut.rfind(" "), limit // 2)].rstrip()
+    if marks:
+        for mark in ("**", "~~", "`"):
+            while cut.count(mark) % 2:
+                cut = cut[:cut.rfind(mark)].rstrip()
+    return cut + " …"
 
 
 def plan_decision(chosen):

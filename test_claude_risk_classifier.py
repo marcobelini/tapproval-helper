@@ -2730,6 +2730,9 @@ class TestAnUpdateKeepsTheAwayAddress:
         assert watch_relay.TUNNEL_URL == fresh + "/t/tok"
         said = [c["detail"] for c in watch_relay.conditions() if c["key"] == "tunnel"]
         assert said and "changed" in said[0] and "icloud" in said[0].lower(), said
+        # Nothing is asked of the person: iCloud carries the new address.
+        assert [c["tone"] for c in watch_relay.conditions()
+                if c["key"] == "tunnel"] == ["in_hand"]
 
     def test_cloudflared_does_not_die_with_the_relay(self, monkeypatch):
         """Its stderr was a pipe into the relay: when the relay exited,
@@ -2852,6 +2855,12 @@ class TestAnICloudCardIsTheWholeCard:
               "project": "project", "kind": "kind", "options": "options",
               "facts": "facts", "plan": "plan", "session_id": "sessionId",
               "can_always": "canAlways", "session_title": "sessionTitle"}
+    # Fields the watch reads only from the relay, on purpose. plan_marked
+    # (2026-10-11) waits for its CloudKit field: Production refuses a
+    # record with a field it does not know, so the bridge may write it only
+    # after the field is deployed there (CLAUDE.md) — until then a card
+    # that came through iCloud shows the plain plan, which it carries.
+    RELAY_ONLY = {"plan_marked"}
 
     def _read(self, *parts):
         path = os.path.join(_ROOT, "WatchApp", *parts)
@@ -2871,7 +2880,16 @@ class TestAnICloudCardIsTheWholeCard:
                 part = part.strip()
                 decoded.add(part.split('"')[1] if '"' in part else part)
         decoded.discard("id")
-        assert decoded == set(self.FIELDS), "a new card field needs an iCloud field here"
+        assert decoded - self.RELAY_ONLY == set(self.FIELDS), \
+            "a new card field needs an iCloud field here, or a reason in RELAY_ONLY"
+
+    def test_a_relay_only_field_never_reaches_icloud_unannounced(self):
+        # The day the bridge writes one, its CloudKit field must already be
+        # in Production; moving it into FIELDS is that decision, made here.
+        bridge = self._read("Bridge", "main.swift")
+        for key in self.RELAY_ONLY:
+            camel = re.sub(r"_(\w)", lambda m: m.group(1).upper(), key)
+            assert 'record["%s"]' % camel not in bridge, key
 
     def test_the_bridge_writes_every_field(self):
         bridge = self._read("Bridge", "main.swift")
@@ -2932,6 +2950,7 @@ class TestTheBridgeReadsTheWholeCard:
     def test_the_bridge_decodes_every_field_the_watch_does(self):
         watch = self._wire_keys(self._read("Tapproval", "RelayModel.swift"), "WristCard")
         bridge = self._wire_keys(self._read("Bridge", "main.swift"), "Card")
+        watch -= TestAnICloudCardIsTheWholeCard.RELAY_ONLY
         assert watch <= bridge, "the bridge drops %s" % sorted(watch - bridge)
         assert bridge <= set(self.CARD), "the fixture lacks %s" % sorted(bridge - set(self.CARD))
 
@@ -2968,6 +2987,7 @@ class TestTheBridgeReadsTheWholeCard:
         assert ran.returncode == 0, ran.stderr[-1000:]
         back = _json.loads(ran.stdout)
         watch = self._wire_keys(self._read("Tapproval", "RelayModel.swift"), "WristCard")
+        watch -= TestAnICloudCardIsTheWholeCard.RELAY_ONLY
         for key in watch | {"id", "alert"}:
             assert back.get(key) == self.CARD[key], key
 
@@ -3137,6 +3157,8 @@ class TestTheAwayAddressIsWatched:
         assert watch_relay.TUNNEL_URL is None, "a dead address is not handed out"
         said = self._said()
         assert said and "away" in said[0].lower() and "icloud" in said[0].lower(), said
+        assert [c["tone"] for c in watch_relay.conditions()
+                if c["key"] == "tunnel"] == ["in_hand"], "the relay is reopening it itself"
 
     def test_a_tunnel_that_stops_answering_is_reopened(self, monkeypatch):
         monkeypatch.setattr(watch_relay, "_pid_alive", lambda pid: True)
@@ -5121,6 +5143,79 @@ class TestSlashCommandsReachTheWrist:
         assert watch_dashboard._command_sent("plain words") is None
 
 
+class TestNoticesCarryATone:
+    """A thread notice says which kind of thing it is, so the watch can
+    draw it: "signin" (Claude Code's own sign-in has lapsed, and the fix
+    is on the Mac), "error" (a line the CLI marks as a failure), and
+    "output" (what a slash command printed — a /recap is not a fault).
+    Until 2026-10-11 every notice was the same red, and a wrist /recap
+    sent while the CLI was signed out came back as the CLI's raw
+    "Failed to authenticate…" in red: the existing rewrite only looked
+    at assistant prose, and this time the line was a local_command."""
+
+    SIGNED_OUT = "Claude Code on this computer is signed out — run: claude auth login"
+
+    def _notices(self, tmp_path, name, lines):
+        _write_transcript(tmp_path, "-p", name + ".jsonl",
+                          [{"cwd": "/x", "message": {"role": "user", "content": "hello"}}] + lines)
+        turns = watch_dashboard.session_thread(name, projects_dir=str(tmp_path))
+        return [(t["text"], t.get("tone")) for t in turns if t.get("kind") == "notice"]
+
+    def test_a_signed_out_cli_answering_a_slash_command_is_a_signin_notice(self, tmp_path):
+        # The line exactly as Claude Code wrote it on 2026-10-11.
+        notices = self._notices(tmp_path, "tone1", [
+            {"message": {"role": "user", "content": "<command-name>/recap</command-name>"}},
+            {"type": "system", "subtype": "local_command", "level": "info",
+             "content": "<local-command-stdout>Failed to authenticate: OAuth session "
+                        "expired and could not be refreshed</local-command-stdout>"},
+        ])
+        assert notices == [(self.SIGNED_OUT, "signin")]
+
+    def test_the_same_on_stderr_is_the_same_notice(self, tmp_path):
+        notices = self._notices(tmp_path, "tone2", [
+            {"type": "system", "subtype": "local_command", "level": "error",
+             "content": "<local-command-stderr>Failed to authenticate: API Error: "
+                        "401</local-command-stderr>"},
+        ])
+        assert notices == [(self.SIGNED_OUT, "signin")]
+
+    def test_a_recaps_output_is_output_not_a_fault(self, tmp_path):
+        notices = self._notices(tmp_path, "tone3", [
+            {"message": {"role": "user", "content": "<command-name>/recap</command-name>"}},
+            {"type": "system", "subtype": "local_command", "level": "info",
+             "content": "<local-command-stdout>Goal: ship. Next: merge.</local-command-stdout>"},
+        ])
+        assert notices == [("Goal: ship. Next: merge.", "output")]
+
+    def test_a_line_the_cli_marks_as_an_error_is_an_error(self, tmp_path):
+        notices = self._notices(tmp_path, "tone4", [
+            {"type": "system", "level": "error", "content": "API rate limit reached"},
+        ])
+        assert notices == [("API rate limit reached", "error")]
+
+    def test_a_sign_in_failure_in_claudes_prose_is_a_signin_notice(self, tmp_path):
+        notices = self._notices(tmp_path, "tone5", [
+            {"message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Failed to authenticate: OAuth session "
+                                         "expired and could not be refreshed"}]}},
+        ])
+        assert notices == [(self.SIGNED_OUT, "signin")]
+
+    def test_every_notice_has_one_of_the_three_tones(self, tmp_path):
+        _write_transcript(tmp_path, "-p", "tone6.jsonl", [
+            {"cwd": "/x", "message": {"role": "user", "content": "hello"}},
+            {"type": "system", "subtype": "local_command",
+             "content": "<local-command-stderr>Unknown command: /verify</local-command-stderr>"},
+            {"type": "system", "level": "error", "content": "Something broke"},
+            {"type": "system", "subtype": "local_command",
+             "content": "<local-command-stdout>Failed to authenticate</local-command-stdout>"},
+        ])
+        turns = watch_dashboard.session_thread("tone6", projects_dir=str(tmp_path))
+        notices = [t for t in turns if t.get("kind") == "notice"]
+        assert len(notices) == 3
+        assert all(t.get("tone") in ("signin", "error", "output") for t in notices), notices
+
+
 class TestFenceNesting:
     """Four-backtick fences exist to contain ``` lines — an inner fence
     must not flip the state (the motivating case for the {3,} widening)."""
@@ -5286,6 +5381,91 @@ class TestThePlanCard:
         result = json.loads(out.getvalue())["hookSpecificOutput"]
         assert result["decision"] == {"behavior": "allow", "updatedPermissions": [
             {"type": "setMode", "mode": "auto", "destination": "session"}]}
+
+class TestThePlanKeepsItsFormatting:
+    """2026-10-11, on the owner's wrist: a plan card lost its bold, and its
+    headings read as body text, where the phone shows both. ``plan`` stays
+    plain for every watch already sold; ``plan_marked`` keeps the inline
+    marks and the shape for a watch that renders them."""
+
+    PLAN = ("# Fix the merge conflicts\n\n## Context\n"
+            "- **#830** was merged with a *different* D1\n"
+            "  - it adds `name-change-signals.ts`\n"
+            "    - and a ~~second~~ queue\n\n"
+            "| Step | Who |\n|---|---|\n| Close #831 | me |\n\n---\n"
+            "> Read [the note](https://example.org/n) first.\n\n"
+            "```bash\ngh pr close 831\n```\n"
+            "## Plan\n1. Close **#831** with a comment\n2. New PR for D2\n")
+
+    def card(self, plan=None):
+        return crc.wrist_card("ExitPlanMode", {"plan": plan or self.PLAN},
+                              Risk.MEDIUM)
+
+    def test_bold_italic_code_and_strike_reach_the_wrist(self):
+        marked = self.card()["plan_marked"]
+        assert "**#830**" in marked and "*different*" in marked
+        assert "`name-change-signals.ts`" in marked and "~~second~~" in marked
+        assert "1. Close **#831** with a comment" in marked.splitlines()
+
+    def test_a_heading_is_a_bold_line_of_its_own(self):
+        lines = self.card()["plan_marked"].splitlines()
+        assert "**Context**" in lines and "**Plan**" in lines
+        assert not any(line.lstrip().startswith("#") for line in lines)
+
+    def test_a_heading_always_has_air_above_it(self):
+        # The owner's photo: "## Plan" right under a paragraph read as one
+        # more line of it. The phone sets a heading apart; so does this.
+        marked = self.card("# T\nIntro line\n## Plan\n1. Close #831")["plan_marked"]
+        assert "Intro line\n\n**Plan**\n1. Close #831" in marked
+
+    def test_nesting_survives_as_indentation(self):
+        lines = self.card()["plan_marked"].splitlines()
+        assert "• **#830** was merged with a *different* D1" in lines
+        assert "  • it adds `name-change-signals.ts`" in lines
+        assert "    • and a ~~second~~ queue" in lines
+
+    def test_block_markup_is_read_not_shown(self):
+        marked = self.card()["plan_marked"]
+        lines = marked.splitlines()
+        assert "Step · Who" in lines and "Close #831 · me" in lines
+        assert "Read the note first." in lines
+        assert "  `gh pr close 831`" in lines, "code keeps its text, set apart"
+        for gone in ("|---", "```", "](", "> ", "---"):
+            assert gone not in marked, gone
+
+    def test_the_title_is_still_said_once(self):
+        card = self.card()
+        assert card["headline"] == "Plan: Fix the merge conflicts"
+        assert not card["plan_marked"].startswith("**Fix the merge")
+
+    def test_the_plain_plan_is_unchanged_for_watches_already_sold(self):
+        plan = self.card()["plan"]
+        assert "**" not in plan and "`" not in plan and "#830 was merged" in plan
+
+    def test_a_secret_in_a_plan_never_reaches_the_wrist(self):
+        card = self.card("# Deploy\n- run with GITHUB_TOKEN=ghp_abcdefghijklmnop1234\n"
+                         "- and `--password hunter2hunter2`")
+        for field in ("plan", "plan_marked"):
+            assert "ghp_abcdefghijklmnop1234" not in card[field], field
+            assert "hunter2hunter2" not in card[field], field
+            assert "\n" in card[field], "redaction keeps the lines"
+
+    def test_the_cap_never_leaves_a_mark_open(self):
+        plan = "# Long\n" + "**word** and more " * 400
+        marked = self.card(plan)["plan_marked"]
+        assert len(marked) <= crc.PLAN_CHARS + 2 and marked.endswith(" …")
+        assert marked.count("**") % 2 == 0 and marked.count("`") % 2 == 0
+
+    def test_one_reading_of_a_line_on_both_sides_of_the_mac(self):
+        # The thread's replies and a plan card read Markdown by the same
+        # rules; the hook carries its own copy (it must run alone), so the
+        # two are held together here rather than by memory.
+        for line in ("- **bold** and *em* with `code`", "  * nested ~~gone~~ item",
+                     "> a quote with [a link](https://x.y)", "plain \\*escaped\\*",
+                     "<b>html</b> stays words", "| a | b |"):
+            assert crc._plan_marked_line(line).strip() == \
+                watch_dashboard._flatten_line(line, keep_inline=True).strip(), line
+
 
 class TestPhoneVocabulary:
     """The watch thread speaks the phone app's language: tool bursts
@@ -6971,7 +7151,22 @@ class TestASignedOutMacSaysSo:
         assert said, "the wrist learns of this on the Connection screen or not at all"
         assert "claude auth login" in said[0]["detail"], "say the fix, not the fault"
 
-    @pytest.mark.parametrize("code,out", [(1, ""), (0, "not json at all")])
+    def test_signed_out_is_read_although_the_cli_exits_1(self):
+        """The real shape, seen 2026-10-11 with Claude Code 2.1.288: signed
+        out, `claude auth status` prints its JSON and exits 1. Read only on
+        exit 0, that answer was "cannot tell", so the Connection screen
+        stayed silent and three wrist sends died with "Failed to
+        authenticate" in red in the thread."""
+        out = '{"loggedIn": false, "authMethod": "none", "apiProvider": "firstParty"}'
+        assert watch_relay.signed_in(runner=self._answer(1, out)) is False
+        said = [c for c in watch_relay.conditions() if c["key"] == "signin"]
+        assert said and "claude auth login" in said[0]["detail"]
+
+    @pytest.mark.parametrize("code,out", [
+        (1, ""), (0, "not json at all"),
+        (1, "error: unknown command 'auth'"),            # an old CLI
+        (1, '{"loggedIn": "no"}'), (0, '["loggedIn"]'),  # no boolean to read
+    ])
     def test_an_answer_that_cannot_be_read_is_not_a_refusal(self, code, out):
         """None, never False: this must not become a reason a send fails."""
         assert watch_relay.signed_in(runner=self._answer(code, out)) is None
@@ -10516,6 +10711,115 @@ class TestTheReportingItselfIsChecked:
             "function that reports its other failures: %s" % silent)
 
 
+class TestConditionsCarryATone:
+    """A condition says whether the person is asked for anything.
+    "needs_you" (the default) is something only the person can fix, and
+    the sentence says how; "in_hand" is news — the relay is already
+    dealing with it, and the watch draws it quietly (grey, not amber).
+
+    in_hand is the exception, so it is an explicit list: a condition that
+    asks something of the person and is marked in_hand would be drawn as
+    nothing to worry about. A new in_hand use fails the guard below until
+    it is added here, deliberately."""
+
+    # (key, how the sentence opens) for every note_condition(..., tone="in_hand").
+    IN_HAND = {
+        ("update", "A newer helper is waiting to take over."),
+        ("tunnel", "The away address changed."),
+        ("tunnel", "Answering from away stopped. Reopening it"),
+        ("bonjour", "The network announcement stopped"),
+    }
+
+    @staticmethod
+    def _calls():
+        """(key, sentence opening, tone or None, line) per note_condition(),
+        however each argument is passed — by position or by name."""
+        tree = TestTheReportingItselfIsChecked._module_source("watch_relay.py")
+        found = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "note_condition"):
+                continue
+            names = ("key", "detail", "tone")
+            given = {names[i]: arg for i, arg in enumerate(node.args[:len(names)])}
+            given.update({k.arg: k.value for k in node.keywords})
+            found.append(tuple(TestConditionsCarryATone._literal(given.get(name))
+                               for name in names) + (node.lineno,))
+        return found
+
+    @staticmethod
+    def _literal(value):
+        if isinstance(value, ast.BinOp):                    # "…%s…" % value
+            value = value.left
+        if value is None:
+            return None
+        return value.value if isinstance(value, ast.Constant) else "<not a literal>"
+
+    def test_the_guard_sees_every_call(self):
+        """The first cut of the guard below skipped a call whose sentence
+        was passed by name, so tone="in_hand" there went unseen."""
+        assert len(self._calls()) == len(re.findall(
+            r"\bnote_condition\(", open(os.path.join(_ROOT, "watch_relay.py"),
+                                         encoding="utf-8").read())) - 1   # minus the def
+
+    def test_a_condition_asks_for_the_person_unless_told_otherwise(self):
+        watch_relay.note_condition("port", "Another program is using the port.")
+        assert watch_relay.conditions() == [
+            {"key": "port", "detail": "Another program is using the port.",
+             "tone": "needs_you"}]
+
+    def test_in_hand_is_carried(self):
+        watch_relay.note_condition("tunnel", "The away address changed.", tone="in_hand")
+        assert watch_relay.conditions()[0]["tone"] == "in_hand"
+
+    def test_a_tone_nobody_defined_asks_for_the_person(self):
+        """Fail toward attention: a misspelt tone must not quieten a
+        condition that may need the person."""
+        watch_relay.note_condition("port", "Another program is using the port.",
+                                   tone="in-hand")
+        assert watch_relay.conditions()[0]["tone"] == "needs_you"
+
+    def test_the_same_sentence_in_a_new_tone_is_a_new_tone(self):
+        watch_relay.note_condition("bonjour", "Trying again.", tone="in_hand")
+        watch_relay.note_condition("bonjour", "Trying again.")
+        assert watch_relay.conditions()[0]["tone"] == "needs_you"
+
+    def test_health_carries_the_tone(self, fresh_auth):
+        watch_relay.note_condition("claude", "The helper cannot find Claude Code.")
+        server, _queue = watch_relay.serve(port=0, auth=_known_watch(fresh_auth))
+        _serve(server)
+        try:
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            _status, body = relay_call(base + "/health", token="devicetoken")
+            assert body["conditions"] == [
+                {"key": "claude", "detail": "The helper cannot find Claude Code.",
+                 "tone": "needs_you"}]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_only_the_listed_conditions_are_in_hand(self):
+        calls = self._calls()
+        unreadable = [c for c in calls if c[2] not in (None, "needs_you", "in_hand")]
+        assert not unreadable, (
+            "a tone must be a literal this guard can read: %s" % unreadable)
+        in_hand = [(key, opening, line) for key, opening, tone, line in calls
+                   if tone == "in_hand"]
+        unlisted = [(key, opening, line) for key, opening, line in in_hand
+                    if opening is None or not any(
+                        key == k and opening.startswith(start) for k, start in self.IN_HAND)]
+        assert not unlisted, (
+            "in_hand tells the watch nothing is asked of the person; add each "
+            "of these to IN_HAND only if that is true: %s" % unlisted)
+
+    def test_every_listed_in_hand_condition_is_still_in_hand(self):
+        in_hand = [(key, opening) for key, opening, tone, _l in self._calls()
+                   if tone == "in_hand"]
+        for key, start in self.IN_HAND:
+            assert any(k == key and o and o.startswith(start) for k, o in in_hand), (
+                "listed as in_hand but no longer said that way: %s %r" % (key, start))
+
+
 def _unreported_none_returns(func):
     """Lines in `func` returning None with no note_condition before them.
 
@@ -10618,6 +10922,7 @@ class TestSilentFailuresStayLoud:
         assert adv.check_once() == "restarted"
         assert "announcement stopped" in capsys.readouterr().err
         assert [c["key"] for c in watch_relay.conditions()] == ["bonjour"]   # not yet
+        assert watch_relay.conditions()[0]["tone"] == "in_hand"             # it is retrying
         assert adv.check_once() == "fine"
         assert watch_relay.conditions() == []                               # now
         assert "announcing again" in capsys.readouterr().err
@@ -10633,6 +10938,7 @@ class TestSilentFailuresStayLoud:
         assert adv.check_once() == "down"
         detail = watch_relay.conditions()[0]["detail"]
         assert "keeps stopping" in detail and "by hand" in detail
+        assert watch_relay.conditions()[0]["tone"] == "needs_you", "it asks for an address"
         assert adv.process is None
         assert adv.check_once() == "none"              # nothing left to watch
 
@@ -10706,6 +11012,7 @@ class TestSilentFailuresStayLoud:
             _status, body = relay_call(base + "/health", token="devicetoken")
             assert [c["key"] for c in body["conditions"]] == ["update"]
             assert "pending" not in body["conditions"][0]["detail"]
+            assert body["conditions"][0]["tone"] == "in_hand", "it takes over by itself"
         finally:
             server.shutdown()
             server.server_close()
@@ -10750,7 +11057,8 @@ class TestConditionsAreSaidOutLoud:
 
     def test_a_condition_is_recorded_and_withdrawn(self):
         watch_relay.note_condition("tunnel", "off")
-        assert watch_relay.conditions() == [{"key": "tunnel", "detail": "off"}]
+        assert watch_relay.conditions() == [{"key": "tunnel", "detail": "off",
+                                             "tone": "needs_you"}]
         watch_relay.clear_condition("tunnel")
         assert watch_relay.conditions() == []
 
@@ -10823,7 +11131,8 @@ class TestConditionsAreSaidOutLoud:
             assert body == {"ok": True}
             _status, body = relay_call(base + "/health", token="devicetoken")
             assert body["conditions"] == [{"key": "bonjour",
-                                           "detail": "not announcing"}]
+                                           "detail": "not announcing",
+                                           "tone": "needs_you"}]
         finally:
             server.shutdown()
             server.server_close()
@@ -10851,7 +11160,8 @@ class TestConditionsAreSaidOutLoud:
             base = "http://127.0.0.1:%d" % server.server_address[1]
             _status, body = relay_call(base + "/health")
             assert body["conditions"] == [{"key": "bonjour",
-                                           "detail": "not announcing"}]
+                                           "detail": "not announcing",
+                                           "tone": "needs_you"}]
         finally:
             server.shutdown()
             server.server_close()

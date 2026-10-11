@@ -252,20 +252,33 @@ BONJOUR_TYPE = "_wristtriage._tcp"
 # screen the user actually looks at. The relay sends the sentence and not
 # only a key, so a condition invented by a newer relay still reads correctly
 # on a watch app that has never heard of it.
+#
+# Each also carries a tone, so the watch can draw it as what it is:
+#   "needs_you" — only the person can fix it, and the sentence says how.
+#                 The default, and where anything unrecognised lands.
+#   "in_hand"   — news: the relay is already dealing with it and nothing is
+#                 asked of the person. Used sparingly, and only at the sites
+#                 TestConditionsCarryATone lists, so a condition that needs
+#                 somebody is never drawn as one that does not.
+
+CONDITION_TONES = ("needs_you", "in_hand")
 
 _CONDITIONS = {}
 _CONDITIONS_LOCK = threading.Lock()
 
 
-def note_condition(key, detail):
+def note_condition(key, detail, tone="needs_you"):
     """Record something degraded, and say it on stderr the first time.
 
     Re-noting the same detail is silent: a warning that repeats on every
-    retry teaches the reader to skip warnings.
+    retry teaches the reader to skip warnings. A tone nobody defined is
+    read as needs_you: fail toward the person's attention.
     """
+    if tone not in CONDITION_TONES:
+        tone = "needs_you"
     with _CONDITIONS_LOCK:
-        repeated = _CONDITIONS.get(key) == detail
-        _CONDITIONS[key] = detail
+        repeated = _CONDITIONS.get(key, (None, None))[0] == detail
+        _CONDITIONS[key] = (detail, tone)
     if not repeated:
         print("relay: %s" % detail, file=sys.stderr)
 
@@ -279,8 +292,8 @@ def clear_condition(key):
 def conditions():
     """Everything currently wrong, key order, for /health and the tests."""
     with _CONDITIONS_LOCK:
-        return [{"key": key, "detail": detail}
-                for key, detail in sorted(_CONDITIONS.items())]
+        return [{"key": key, "detail": detail, "tone": tone}
+                for key, (detail, tone) in sorted(_CONDITIONS.items())]
 
 
 def check_helper_is_visible():
@@ -1195,8 +1208,15 @@ def _ask_signed_in(runner, stamp):
         run = runner or (lambda: subprocess.run(
             ["claude", "auth", "status"], capture_output=True, text=True, timeout=15))
         done = run()
-        if getattr(done, "returncode", 1) == 0:
-            answer = bool(json.loads(done.stdout or "{}").get("loggedIn"))
+        # The JSON is the answer, whatever the exit code: signed out, the
+        # CLI prints {"loggedIn": false, ...} and exits 1 (seen 2026-10-11,
+        # Claude Code 2.1.288). Read only on exit 0, a plain "signed out"
+        # became "cannot tell", the Connection screen said nothing, and
+        # wrist sends died with "Failed to authenticate" in the thread.
+        # Only a real boolean counts; anything else stays None.
+        said = json.loads(done.stdout or "")
+        if isinstance(said, dict) and isinstance(said.get("loggedIn"), bool):
+            answer = said["loggedIn"]
     except Exception:
         answer = None
     with _SIGNIN_LOCK:
@@ -3034,7 +3054,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                 "update",
                 "A newer helper is waiting to take over. It will replace "
                 "this one the next time Claude Code starts with no card "
-                "waiting.")
+                "waiting.", tone="in_hand")
             self._send_json({"ok": True})
         elif path == "/admin/rotate":
             secret = self.auth.rotate()
@@ -3828,7 +3848,8 @@ def start_tunnel(port, token):
                     note_condition(
                         "tunnel",
                         "The away address changed. Your watch learns the new "
-                        "one through iCloud within a minute or two.")
+                        "one through iCloud within a minute or two.",
+                        tone="in_hand")
                 else:
                     clear_condition("tunnel")
                 TUNNEL_URL = "%s/t/%s" % (match.group(0), token)
@@ -3971,7 +3992,7 @@ def watch_tunnel(handle, port, token, sleep=time.sleep, checks=None):
         note_condition(
             "tunnel",
             "Answering from away stopped. Reopening it — your watch learns "
-            "the new address through iCloud.")
+            "the new address through iCloud.", tone="in_hand")
         print("relay: tunnel %s — reopening" % why, file=sys.stderr)
         handle = start_tunnel(port, _live_tunnel_secret(token))
 
@@ -4210,7 +4231,7 @@ class _Advertiser:
                 "bonjour",
                 "The network announcement stopped (dns-sd exited with code %s), "
                 "so the watch may no longer find this computer by itself. "
-                "Trying to announce again." % code)
+                "Trying to announce again." % code, tone="in_hand")
             self.txt = advertise_txt(self.port)
             self.process = advertise(self.port, self.txt)
             if self.process is None:

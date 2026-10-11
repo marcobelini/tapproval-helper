@@ -501,10 +501,11 @@ def transcripts_newest_first(projects_dir=None):
 UPSTREAM_SHAPES = {
     "system.subtype.local_command":
         ("local_command", "A slash command the CLI answered itself; its "
-         "output is a system line, not an assistant turn.", "2026-09-08"),
+         "output is a system line, not an assistant turn.", "2026-10-11"),
     "system.level.error":
         ("error", "A system line the CLI marks as a failure. The phone "
-         "paints both of these red.", "2026-09-08"),
+         "paints both of these red; the watch is told which is which, by "
+         "a notice's tone.", "2026-09-08"),
     "tag.command_name":
         ("<command-name>", "The echo of a slash command a person sent, "
          "carried as a user turn.", "2026-09-08"),
@@ -513,12 +514,14 @@ UPSTREAM_SHAPES = {
     "tag.local_command_out":
         ("<local-command-", "What the command printed: stdout and stderr are "
          "the same tag with a different word, which is why the reader below "
-         "matches the stem.", "2026-09-08"),
+         "matches the stem.", "2026-10-11"),
     "text.auth_failed":
         ("Failed to authenticate", "What Claude Code writes when its own "
          "sign-in has expired. It is the CLI's fault line, not Claude "
          "speaking — the wrist showed it as a reply, in a thread, under a "
-         "working pulse.", "2026-09-18"),
+         "working pulse. It also opens a slash command's local_command "
+         "output when the CLI is signed out (a wrist /recap, "
+         "2026-10-11).", "2026-10-11"),
     "text.nothing_to_add":
         ("No response requested.", "What Claude says when the CLI already "
          "answered and its own turn has nothing to add. Not a reply.",
@@ -670,6 +673,25 @@ def _system_text(entry):
                 text = text[:12000].rsplit(" ", 1)[0] + " …"
             return text
     return ""
+
+
+# What a thread notice can be, so the watch can draw each as what it is:
+#   "signin" — Claude Code on this Mac is signed out; the person has to act
+#              there, and the notice says how.
+#   "error"  — a line the CLI itself marks as a failure.
+#   "output" — what a slash command printed (/recap, /cost): ordinary
+#              output, not a fault.
+# Claude Code's own fault lines are notices, never drawn as replies.
+NOTICE_TONES = ("signin", "error", "output")
+
+SIGNED_OUT_NOTICE = ("Claude Code on this computer is signed out — run: "
+                     "claude auth login")
+
+
+def _notice(text, tone, entry):
+    """A system notice turn, carrying the tone the watch draws it in."""
+    return {"role": "system", "kind": "notice", "tone": tone, "text": text,
+            "desc": "", "at": entry.get("timestamp", "")}
 
 
 # Pictures a transcript carries, kept in memory so the watch can ask for
@@ -1682,18 +1704,24 @@ def _thread_line(state, line, limit):
     if entry.get("type") == "system":
         # A slash command the CLI answered itself — /recap, /cost, an
         # unknown command — writes its output here, not as an assistant
-        # turn, and the phone paints it red with a warning triangle. So
-        # does the watch now; it used to drop the line, and a send that
-        # bounced showed nothing, which read as the watch being broken.
+        # turn. The watch shows it as a notice; it used to drop the line,
+        # and a send that bounced showed nothing, which read as the watch
+        # being broken. Each notice carries a tone (see NOTICE_TONES): a
+        # /recap is ordinary "output", a line the CLI marks as failed is an
+        # "error", and Claude Code's own sign-in failure is "signin" — on
+        # 2026-10-11 that arrived here, as a local_command, and reached the
+        # wrist raw, because the rewrite below only looked at prose.
         subtype = entry.get("subtype")
         if subtype not in (shape("system.subtype.local_command"), None):
             note_unknown_subtype(subtype)
         if (subtype == shape("system.subtype.local_command")
                 or entry.get("level") == shape("system.level.error")):
             text = _system_text(entry)
-            if text:
-                state["turns"].append({"role": "system", "kind": "notice", "text": text,
-                                       "desc": "", "at": entry.get("timestamp", "")})
+            if text.startswith(shape("text.auth_failed")):
+                state["turns"].append(_notice(SIGNED_OUT_NOTICE, "signin", entry))
+            elif text:
+                failed = entry.get("level") == shape("system.level.error")
+                state["turns"].append(_notice(text, "error" if failed else "output", entry))
         return
     if role not in ("user", "assistant"):
         return
@@ -1746,12 +1774,10 @@ def _thread_line(state, line, limit):
     if role == "user" and kind == "text" and lead.strip() == shape("text.continue_nudge"):
         return
     # Claude Code's own authentication failure. It arrives as prose, so it
-    # reads as a reply; it is a fault, and the watch paints a notice red.
+    # reads as a reply; it is the CLI's fault, not Claude speaking, and the
+    # fix is on the Mac — a "signin" notice, never a reply bubble.
     if kind == "text" and lead.startswith(shape("text.auth_failed")):
-        state["turns"].append({"role": "system", "kind": "notice",
-                               "text": "Claude Code on this computer is signed "
-                                       "out — run: claude auth login",
-                               "desc": "", "at": entry.get("timestamp", "")})
+        state["turns"].append(_notice(SIGNED_OUT_NOTICE, "signin", entry))
         return
     # The watch shows the FULL text of a message, like the phone — a 2KB
     # cap here once cut a real reply mid-sentence on the wrist. Bound the
