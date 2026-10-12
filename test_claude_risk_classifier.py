@@ -2854,13 +2854,13 @@ class TestAnICloudCardIsTheWholeCard:
     FIELDS = {"tier": "tier", "headline": "headline", "detail": "detail",
               "project": "project", "kind": "kind", "options": "options",
               "facts": "facts", "plan": "plan", "session_id": "sessionId",
-              "can_always": "canAlways", "session_title": "sessionTitle"}
-    # Fields the watch reads only from the relay, on purpose. plan_marked
-    # (2026-10-11) waits for its CloudKit field: Production refuses a
-    # record with a field it does not know, so the bridge may write it only
-    # after the field is deployed there (CLAUDE.md) — until then a card
-    # that came through iCloud shows the plain plan, which it carries.
-    RELAY_ONLY = {"plan_marked"}
+              "can_always": "canAlways", "session_title": "sessionTitle",
+              "plan_marked": "planMarked"}
+    # Fields the watch reads only from the relay, on purpose, each with its
+    # reason. Production refuses a record with a field it does not know, so
+    # the bridge may write one only after it is deployed there (CLAUDE.md);
+    # moving it to FIELDS is that decision. plan_marked moved on 2026-10-12.
+    RELAY_ONLY = set()
 
     def _read(self, *parts):
         path = os.path.join(_ROOT, "WatchApp", *parts)
@@ -2927,7 +2927,8 @@ class TestTheBridgeReadsTheWholeCard:
             "detail": "Deletes the build folder", "project": "tapproval",
             "kind": "question", "options": ["Yes", "No"], "alert": "careful",
             "plan": "1. Delete\n2. Rebuild", "facts": [["Command", "rm -rf build"]],
-            "session_id": "s-1", "can_always": True, "session_title": "Release"}
+            "session_id": "s-1", "can_always": True, "session_title": "Release",
+            "plan_marked": "**1.** Delete"}
 
     def _read(self, *parts):
         path = os.path.join(_ROOT, "WatchApp", *parts)
@@ -5961,19 +5962,38 @@ class TestPromptParity:
             _os.environ.clear()
             _os.environ.update(backup)
 
-    def test_read_only_never_reaches_the_wrist(self, live_relay, tmp_path):
+    # The hook gives the relay this long (CLAUDE_RISK_RELAY_WAIT above) once
+    # a card is posted. "Never reached the wrist" is first of all a fact the
+    # relay can count — no card was submitted — and only then a time, held
+    # under that wait: a check at 2 s measured how busy the Mac was.
+    RELAY_WAIT = 5
+
+    def _count_cards(self, queue, monkeypatch):
+        submitted = []
+        real = queue.submit
+
+        def counted(card, *args, **kwargs):
+            submitted.append(card)
+            return real(card, *args, **kwargs)
+        monkeypatch.setattr(queue, "submit", counted)
+        return submitted
+
+    def test_read_only_never_reaches_the_wrist(self, live_relay, tmp_path, monkeypatch):
         """gh pr view shows no phone prompt — so no card, instantly."""
         import time as _time
         port, queue = live_relay
+        submitted = self._count_cards(queue, monkeypatch)
         started = _time.monotonic()
         result = self._hook(port, tmp_path, "gh pr view 12")
         assert _behavior(result) == "escalate"
-        assert _time.monotonic() - started < 2, "must not wait on the relay"
+        assert submitted == [], "must not post a card to the relay"
+        assert _time.monotonic() - started < self.RELAY_WAIT - 1, "must not wait on the relay"
         assert queue.pending() == []
 
-    def test_the_users_own_allow_rule_is_honored(self, live_relay, tmp_path):
+    def test_the_users_own_allow_rule_is_honored(self, live_relay, tmp_path, monkeypatch):
         import time as _time
         port, queue = live_relay
+        submitted = self._count_cards(queue, monkeypatch)
         project = tmp_path / "proj" / ".claude"
         project.mkdir(parents=True)
         (project / "settings.json").write_text(json.dumps(
@@ -5982,7 +6002,8 @@ class TestPromptParity:
         result = self._hook(port, tmp_path, "npm run build --prod",
                             cwd=str(tmp_path / "proj"))
         assert _behavior(result) == "escalate"
-        assert _time.monotonic() - started < 2
+        assert submitted == [], "must not post a card to the relay"
+        assert _time.monotonic() - started < self.RELAY_WAIT - 1
         assert queue.pending() == []
 
     def test_a_real_prompt_still_cards(self, live_relay, tmp_path):
@@ -7203,7 +7224,10 @@ class TestASignedOutMacSaysSo:
             return sp.CompletedProcess(["claude"], 0, '{"loggedIn": false}', "")
         started = time.monotonic()
         assert watch_relay.signed_in(runner=slow, wait=0.1) is None
-        assert time.monotonic() - started < 1.0
+        # Held against the 5 s the slow answer takes, not against 0.1 s: a
+        # caller that waited for the answer would be past 5. A bound of 1 s
+        # measured how busy the Mac was.
+        assert time.monotonic() - started < 4.0
         gate.set()
         _wait_until(lambda: watch_relay._SIGNIN.get("asked"),
                     what="the slow sign-in answer to land")
@@ -8934,7 +8958,8 @@ class TestRelayRoutes:
         for method, routes in handler.ROUTES.items():
             for path, (name, rules) in routes.items():
                 assert callable(getattr(handler, name)), (method, path)
-                assert set(rules) <= {"auth", "lan_only", "local", "admin", "token"}, path
+                assert set(rules) <= {"auth", "lan_only", "local", "admin", "token",
+                                      "no_simulator"}, path
 
     def test_the_two_pairing_routes_are_the_only_ones_without_auth(self):
         open_routes = {(m, p) for m, routes in watch_relay.RelayHandler.ROUTES.items()
@@ -9149,6 +9174,108 @@ class TestRelayRoutes:
         base, _, auth = relay
         status, body = self._call(base + "/admin/rotate", token=auth.bootstrap, method="POST")
         assert status == 200 and body == {"ok": True, "rotated": True}
+
+
+class TestTheRelayRefusesASimulator:
+    """2026-09-27: a tap in the watch Simulator, pointed at the owner's live
+    relay, allowed a real HIGH card when the list re-flowed under it. A
+    Simulator build tags every request; the live relay refuses a tagged
+    answer, and only a relay started with --allow-simulator takes one. The
+    tag is a reason to refuse and never proof of anything: a real watch
+    simply does not send it."""
+
+    GUARDED = [
+        ("/decision", {"id": "ghost", "decision": "allow"}),
+        ("/say", {"session_id": "x", "text": "hi"}),
+        ("/new", {"path": "/x", "text": "hi"}),
+    ]
+
+    @pytest.fixture
+    def relay(self, fresh_auth, monkeypatch, request):
+        watch_relay.LIMITS.reset()
+        ran = []
+        monkeypatch.setattr(watch_relay, "say_to_session",
+                            lambda *a, **k: ran.append("say") or "sent")
+        monkeypatch.setattr(watch_relay, "start_session",
+                            lambda *a, **k: ran.append("new") or "started")
+        allow = getattr(request, "param", False)
+        server, _ = watch_relay.serve(port=0, auth=_known_watch(fresh_auth),
+                                      allow_simulator=allow)
+        _serve(server)
+        yield "http://127.0.0.1:%d" % server.server_address[1], ran
+        server.shutdown()
+        server.server_close()
+
+    @staticmethod
+    def _post(url, body, simulator="1", token="devicetoken"):
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["X-Tapproval-Token"] = token
+        if simulator:
+            headers["X-Tapproval-Simulator"] = simulator
+        if "text" in body:
+            # Unique words per call: /say and /new answer a repeat from memory.
+            body = dict(body, text="%s %s" % (body["text"], uuid.uuid4().hex))
+        request = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                         headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as reply:
+                return reply.status, json.loads(reply.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def test_the_answering_routes_carry_the_rule(self):
+        post = watch_relay.RelayHandler.ROUTES["POST"]
+        guarded = {p for p, (_, rules) in post.items() if rules.get("no_simulator")}
+        assert guarded == {"/decision", "/say", "/new"}
+
+    @pytest.mark.parametrize("tag", ["1", "yes"])
+    @pytest.mark.parametrize("path,body", GUARDED)
+    def test_a_simulator_cannot_answer_the_live_relay(self, relay, path, body, tag):
+        base, ran = relay
+        status, reply = self._post(base + path, body, simulator=tag)
+        assert status == 403 and reply.get("error") == "simulator", reply
+        assert "--allow-simulator" in reply.get("message", "")
+        assert ran == [], "nothing may run behind the refusal"
+
+    @pytest.mark.parametrize("relay", [True], indirect=True)
+    @pytest.mark.parametrize("path,body", GUARDED)
+    def test_a_test_relay_started_for_it_takes_the_simulator(self, relay, path, body):
+        base, _ = relay
+        status, reply = self._post(base + path, body)
+        assert status == 200 and reply.get("error") != "simulator", (status, reply)
+
+    @pytest.mark.parametrize("path,body", GUARDED)
+    def test_a_real_watch_is_unaffected(self, relay, path, body):
+        base, _ = relay
+        status, reply = self._post(base + path, body, simulator=None)
+        assert status == 200, (status, reply)
+
+    @pytest.mark.parametrize("relay", [True], indirect=True)
+    @pytest.mark.parametrize("path,body", GUARDED)
+    def test_the_tag_does_not_stand_in_for_a_key(self, relay, path, body):
+        base, ran = relay
+        status, reply = self._post(base + path, body, token=None)
+        assert status == 403 and reply.get("error") != "simulator", reply
+        assert ran == []
+
+    def test_reading_is_not_answering(self, relay):
+        base, _ = relay
+        request = urllib.request.Request(
+            base + "/pending", method="GET",
+            headers={"X-Tapproval-Token": "devicetoken", "X-Tapproval-Simulator": "1"})
+        with urllib.request.urlopen(request, timeout=5) as reply:
+            assert reply.status == 200 and "cards" in json.loads(reply.read())
+
+    def test_the_flag_parses_and_is_off_by_default(self):
+        parser = watch_relay._build_parser()
+        assert parser.parse_args([]).allow_simulator is False
+        assert parser.parse_args(["--allow-simulator"]).allow_simulator is True
+
+    def test_both_listeners_hear_the_flag(self):
+        import inspect
+        assert "allow_simulator=args.allow_simulator" in inspect.getsource(watch_relay.main)
+        assert "allow_simulator=allow_simulator" in inspect.getsource(watch_relay._start_tunnel)
 
 
 class TestLocalMeansLocal:
@@ -10230,23 +10357,63 @@ class TestTheHookStaysFast:
               "gh pr merge 5", "echo hi > /etc/hosts", "aws s3 rm s3://bucket --recursive",
               "sed -i 's/a/b/' file.txt", "kubectl delete ns prod"] * 20
 
+    # Two clocks, because each is blind where the other sees. CPU time —
+    # this thread's alone — is the work, and a busy Mac does not inflate it:
+    # on 2026-10-11, at a load average near 157, the wall clock alone failed
+    # the import check and stopped a helper release over code that was fine.
+    # But a sleep or a network wait costs no CPU, so the wall clock stays
+    # too, at ten times the CPU limit. Each takes its best of five runs:
+    # load only ever adds, so the fastest run is the closest to the code.
+    RUNS = 5
+    WALL_SLACK = 10
+
+    @classmethod
+    def _best(cls, work):
+        """(cpu, wall) seconds of `work`, each the minimum over RUNS."""
+        cpu, wall = [], []
+        for _ in range(cls.RUNS):
+            cpu_started, wall_started = time.thread_time(), time.perf_counter()
+            work()
+            cpu.append(time.thread_time() - cpu_started)
+            wall.append(time.perf_counter() - wall_started)
+        return min(cpu), min(wall)
+
     def test_classifying_three_hundred_commands_is_quick(self):
-        import time
-        for command in self.CORPUS[:15]:                       # warm caches
-            crc.classify({"tool_name": "Bash", "tool_input": {"command": command}})
-        started = time.perf_counter()
-        for command in self.CORPUS:
-            crc.classify({"tool_name": "Bash", "tool_input": {"command": command}})
-        per_call = (time.perf_counter() - started) / len(self.CORPUS)
-        assert per_call < 300e-6, "classify() now averages %.0f µs" % (per_call * 1e6)
+        def corpus():
+            for command in self.CORPUS:
+                crc.classify({"tool_name": "Bash", "tool_input": {"command": command}})
+        corpus()                                                # warm caches
+        cpu, wall = (t / len(self.CORPUS) for t in self._best(corpus))
+        limit = 300e-6
+        assert cpu < limit, "classify() now costs %.0f µs of CPU a call" % (cpu * 1e6)
+        assert wall < limit * self.WALL_SLACK, (
+            "classify() takes %.0f µs a call but works for only %.0f — it waits "
+            "on something" % (wall * 1e6, cpu * 1e6))
 
     def test_importing_the_hook_is_quick(self):
         import importlib
-        import time
-        started = time.perf_counter()
-        importlib.reload(crc)
-        took = time.perf_counter() - started
-        assert took < 0.2, "importing ClaudeRiskClassifier took %.0f ms" % (took * 1e3)
+        cpu, wall = self._best(lambda: importlib.reload(crc))
+        limit = 0.2
+        assert cpu < limit, "importing ClaudeRiskClassifier costs %.0f ms of CPU" % (cpu * 1e3)
+        assert wall < limit * self.WALL_SLACK, (
+            "importing ClaudeRiskClassifier takes %.0f ms but works for only %.0f — "
+            "it waits on something" % (wall * 1e3, cpu * 1e3))
+
+    def test_importing_the_hook_opens_no_connection_and_starts_no_process(self):
+        """The clock-free half of the same promise. The hook imports its
+        network and process modules inside the functions that need them,
+        so a fresh interpreter that only imports it has none of them — and
+        without them it cannot have dialled anything at import time."""
+        probe = ("import sys; sys.path.insert(0, sys.argv[1]); "
+                 "import ClaudeRiskClassifier; "
+                 "print(' '.join(m for m in sys.argv[2:] if m in sys.modules))")
+        forbidden = ["socket", "ssl", "http.client", "urllib.request",
+                     "subprocess", "asyncio"]
+        found = subprocess.run(
+            [sys.executable, "-I", "-c", probe,
+             os.path.dirname(os.path.abspath(crc.__file__))] + forbidden,
+            capture_output=True, text=True, timeout=60, check=True).stdout.split()
+        assert found == [], "importing the hook now loads %s" % ", ".join(found)
 
 
 def _ci_files(*names):
@@ -10374,6 +10541,23 @@ class TestTheLocalFallbackRunsWhatCiRuns:
         assert watch.index("swift6-warnings.sh") < watch.index('rm -f "$WATCH_LOG"'), (
             "read the log before deleting it")
 
+    def test_both_test_runs_are_held_to_the_skip_allowlist(self):
+        """Purchase tests skip on this Mac (StoreKit testing serves nothing
+        here), and a skip read as green is how the purchase path went
+        unproven. A skip count above WatchApp/expected-skips.txt fails the
+        run; a run that proves no purchase says so at the end."""
+        _, local = self._files()
+        watch = local.split("# --- the watch app", 1)[1]
+        assert 'WatchApp/ci_skips.py "$WATCH_LOG"' in watch
+        assert watch.index('ci_skips.py "$WATCH_LOG"') < watch.index('rm -f "$WATCH_LOG"'), (
+            "read the log before deleting it")
+        assert 'WatchApp/ci_skips.py "$PURCHASE_LOG"' in watch
+        assert watch.index('ci_skips.py "$PURCHASE_LOG"') < watch.index('rm -f "$PURCHASE_LOG"')
+        assert "PURCHASES UNPROVEN: record a device purchase check for this build (RELEASING.md)" in local
+        # A new skip is a failure, through the same mechanism as every
+        # other job, not a line that scrolls past.
+        assert re.search(r'record "?\$\(\(\w+ & 1\)\)"? "[^"]*skips', watch), watch
+
 
 @pytest.mark.private_layout
 class TestSwift6WarningsFailCi:
@@ -10418,6 +10602,114 @@ class TestSwift6WarningsFailCi:
 
     def test_an_empty_log_is_not_a_clean_one(self, tmp_path):
         assert self._run(tmp_path, "").returncode == 2
+
+
+def _xctest_suite(name, executed, skipped, failures=0):
+    """The two lines xcodebuild prints when a test class finishes."""
+    tail = ("with %d test%s skipped and " % (skipped, "" if skipped == 1 else "s")
+            if skipped else "with ")
+    return ("Test Suite '%s' %s at 2026-10-12 10:00:00.000.\n"
+            "\t Executed %d test%s, %s%d failures (0 unexpected) in 1.0 (1.0) seconds\n"
+            % (name, "failed" if failures else "passed", executed,
+               "" if executed == 1 else "s", tail, failures))
+
+
+@pytest.mark.private_layout
+class TestNewSkipsFailCi:
+    """StoreKit testing serves nothing on the CI Mac, so every purchase
+    test skips — and "6 skipped" read as green is how the purchase path
+    went unproven. WatchApp/expected-skips.txt holds today's counts; one
+    more skip anywhere is a regression. The guard has to be seen to fail
+    before it is trusted to pass."""
+
+    @staticmethod
+    def _module():
+        path = os.path.join(_ROOT, "WatchApp", "ci_skips.py")
+        if not os.path.isfile(path):
+            pytest.skip("WatchApp/ is not in this layout (the public repo)")
+        spec = importlib.util.spec_from_file_location("ci_skips", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    WATCH_LOG = ("Test Suite 'All tests' started at 2026-10-12 10:00:00.000.\n"
+                 + _xctest_suite("AlertsTests", 21, 0)
+                 + _xctest_suite("PurchaseCompletesTests", 12, 5)
+                 + _xctest_suite("TapprovalTests.xctest", 107, 5)
+                 + _xctest_suite("All tests", 107, 5)
+                 + "** TEST SUCCEEDED **\n")
+
+    def test_counts_are_read_per_suite_and_the_totals_are_left_out(self):
+        counts = self._module().parse(self.WATCH_LOG)
+        assert counts == {"AlertsTests": (21, 0), "PurchaseCompletesTests": (12, 5)}
+
+    def test_one_skipped_test_is_read_in_the_singular(self):
+        counts = self._module().parse(_xctest_suite("StoreKitHarnessTests", 1, 1))
+        assert counts == {"StoreKitHarnessTests": (1, 1)}
+
+    def test_the_allowlist_reads_names_and_numbers_and_ignores_comments(self):
+        allowed = self._module().read_allowlist(
+            "# why these skip\n\nPurchaseCompletesTests 5   # the till\nStoreKitHarnessTests 1\n")
+        assert allowed == {"PurchaseCompletesTests": 5, "StoreKitHarnessTests": 1}
+
+    def test_as_many_skips_as_allowed_pass(self):
+        m = self._module()
+        assert m.over({"PurchaseCompletesTests": (12, 5)}, {"PurchaseCompletesTests": 5}) == []
+
+    def test_one_more_skip_fails(self):
+        m = self._module()
+        found = m.over({"PurchaseCompletesTests": (12, 6)}, {"PurchaseCompletesTests": 5})
+        assert len(found) == 1 and "PurchaseCompletesTests" in found[0]
+
+    def test_a_skip_in_a_suite_nobody_listed_fails(self):
+        m = self._module()
+        found = m.over({"AlertsTests": (21, 1)}, {"PurchaseCompletesTests": 5})
+        assert len(found) == 1 and "AlertsTests" in found[0]
+
+    def test_a_listed_suite_missing_from_the_run_is_not_a_crash(self):
+        m = self._module()
+        assert m.over({"AlertsTests": (21, 0)}, {"PurchaseOnIOSHostTests": 5}) == []
+
+    def test_the_allowlist_holds_todays_counts(self):
+        """Read from the code on 2026-10-12: five of PurchaseCompletesTests'
+        twelve call requireTestStore; all five PurchaseOnIOSHostTests call
+        requireAWorkingTestStore; StoreKitHarnessTests' one test skips when
+        the store answers nothing — six in the iOS run, as ci-local.sh says."""
+        m = self._module()
+        with open(os.path.join(_ROOT, "WatchApp", "expected-skips.txt"), encoding="utf-8") as f:
+            allowed = m.read_allowlist(f.read())
+        assert allowed == {"PurchaseCompletesTests": 5, "PurchaseOnIOSHostTests": 5,
+                           "StoreKitHarnessTests": 1}
+
+    def _run(self, tmp_path, text):
+        self._module()                      # skips in the public layout
+        log = tmp_path / "test.log"
+        log.write_text(text, encoding="utf-8")
+        return subprocess.run([sys.executable, os.path.join(_ROOT, "WatchApp", "ci_skips.py"),
+                               str(log)], capture_output=True, text=True)
+
+    def test_todays_watch_run_passes_but_proves_no_purchase(self, tmp_path):
+        done = self._run(tmp_path, self.WATCH_LOG)
+        assert done.returncode == 2, done.stdout + done.stderr
+
+    def test_a_new_skip_fails_the_run(self, tmp_path):
+        done = self._run(tmp_path, self.WATCH_LOG + _xctest_suite("AlertsTests", 21, 1))
+        assert done.returncode & 1, done.stdout + done.stderr
+        assert "AlertsTests" in done.stdout
+
+    def test_a_purchase_suite_that_ran_proves_purchases(self, tmp_path):
+        done = self._run(tmp_path, _xctest_suite("PurchaseOnIOSHostTests", 5, 0)
+                         + _xctest_suite("StoreKitHarnessTests", 1, 0))
+        assert done.returncode == 0, done.stdout + done.stderr
+
+    def test_todays_ios_run_proves_no_purchase(self, tmp_path):
+        done = self._run(tmp_path, _xctest_suite("PurchaseOnIOSHostTests", 5, 5)
+                         + _xctest_suite("StoreKitHarnessTests", 1, 1))
+        assert done.returncode == 2, done.stdout + done.stderr
+
+    def test_a_log_with_no_counts_is_not_a_clean_one(self, tmp_path):
+        done = self._run(tmp_path, "** BUILD FAILED **\n")
+        assert done.returncode & 1, done.stdout + done.stderr
 
 
 @pytest.mark.private_layout

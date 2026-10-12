@@ -2331,6 +2331,7 @@ class RelayHandler(BaseHTTPRequestHandler):
     queue = None            # installed by serve()
     required_token = None   # when set, only /t/<token>/... paths are served
     auth = None             # the Auth object: device tokens and pairing
+    allow_simulator = False # a test relay (--allow-simulator) hears a Simulator
     protocol_version = "HTTP/1.1"
 
     # What one request proved about itself. HTTP/1.1 keeps a connection
@@ -2697,16 +2698,18 @@ class RelayHandler(BaseHTTPRequestHandler):
             "/heartbeat": ("_post_heartbeat", dict(local=True, lan_only=True)),
             # token, like /say: a command Claude runs is a local process,
             # and it must not open sessions of its own on this machine.
-            "/new": ("_post_new", dict(token=True)),
+            "/new": ("_post_new", dict(token=True, no_simulator=True)),
             # token: a key from EVERY source. Loopback is a local process,
             # and a command Claude runs is a local process too — it must
             # not be able to answer its own card or speak into a session.
-            "/say": ("_post_say", dict(token=True)),
+            "/say": ("_post_say", dict(token=True, no_simulator=True)),
             # The watch reporting its own trouble. A device token, like
             # /say: a local process must not be able to file a fault in
             # the watch's name.
             "/diagnostic": ("_post_diagnostic", dict(token=True)),
-            "/decision": ("_post_decision", dict(token=True)),
+            # no_simulator, on /new and /say too: a Simulator's tap is never
+            # an answer on a relay real cards reach (see _dispatch).
+            "/decision": ("_post_decision", dict(token=True, no_simulator=True)),
             "/admin/pair-open": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
             "/admin/pair-relight": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
             "/admin/pair-reset": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
@@ -2761,6 +2764,20 @@ class RelayHandler(BaseHTTPRequestHandler):
         if rules.get("token") and not self._proves_key():
             self._send_json({"error": "a device key is required, even from "
                                       "this machine"}, 403)
+            return
+        if (rules.get("no_simulator") and not self.allow_simulator
+                and self.headers.get("X-Tapproval-Simulator", "").strip()):
+            # 2026-09-27: a tap in the watch Simulator, pointed at this
+            # relay, allowed a real HIGH card when the list re-flowed under
+            # it. A Simulator build says what it is, and a relay real cards
+            # reach takes no answer from one. The header is only ever a
+            # reason to refuse: a real watch is trusted by its key, never
+            # by the header's absence.
+            self._send_json({
+                "error": "simulator",
+                "message": "This relay does not take answers from a "
+                           "Simulator. Start a test relay with "
+                           "--allow-simulator."}, 403)
             return
         getattr(self, handler)(path, query)
 
@@ -3100,18 +3117,19 @@ def _rotate_tunnel_prefix(secret):
 
 
 def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, queue=None, token=None,
-          auth=None):
+          auth=None, allow_simulator=False):
     """Build a server (does not block). Caller runs serve_forever().
 
     With ``token`` set, the server answers only under ``/t/<token>/…`` — the
     shape exposed through a public tunnel, where that path is a rendezvous
     address rather than a credential. ``auth`` carries the device tokens
-    every non-local caller must present.
+    every non-local caller must present. ``allow_simulator`` lets a watch
+    Simulator answer cards and speak into sessions: a test relay only.
     """
     queue = queue if queue is not None else CardQueue()
     handler = type("BoundRelayHandler", (RelayHandler,),
                    {"queue": queue, "required_token": token,
-                    "auth": auth})
+                    "auth": auth, "allow_simulator": bool(allow_simulator)})
     server = _RelayServer((host, port), handler)
     return server, queue
 
@@ -4051,6 +4069,9 @@ def _build_parser():
                         help="how long injected cards wait for an answer")
     parser.add_argument("--no-bonjour", action="store_true",
                         help="do not advertise the relay on the local network")
+    parser.add_argument("--allow-simulator", action="store_true",
+                        help="take answers from a watch Simulator: for a "
+                             "test relay only, never one real cards reach")
     parser.add_argument("--tunnel", action="store_true",
                         help="also expose the relay through a Cloudflare "
                              "tunnel so the watch works off Wi-Fi")
@@ -4070,7 +4091,7 @@ def _build_parser():
     return parser
 
 
-def _start_tunnel(queue, auth):
+def _start_tunnel(queue, auth, allow_simulator=False):
     """The second listener and the cloudflared process behind it. Two
     independent secrets on the public path: the unguessable rendezvous
     prefix says where, the device token says who."""
@@ -4078,7 +4099,7 @@ def _start_tunnel(queue, auth):
     try:
         tunnel_server, _ = serve("127.0.0.1", TUNNEL_PORT,
                                  queue=queue, token=auth.tunnel_secret,
-                                 auth=auth)
+                                 auth=auth, allow_simulator=allow_simulator)
     except OSError as error:
         # 2026-09-11, 23:58: this raised out of main() and killed a relay
         # whose MAIN listener had already bound. The away route is the
@@ -4321,7 +4342,8 @@ def main(argv=None):
     install_crash_reporting()
 
     try:
-        server, queue = serve(args.host, args.port, auth=auth)
+        server, queue = serve(args.host, args.port, auth=auth,
+                              allow_simulator=args.allow_simulator)
     except OSError as error:
         if error.errno != errno.EADDRINUSE:
             raise
@@ -4330,7 +4352,7 @@ def main(argv=None):
           file=sys.stderr)
     if args.tunnel:
         # Not kept: the tunnel outlives this relay on purpose (see the finally).
-        _start_tunnel(queue, auth)
+        _start_tunnel(queue, auth, allow_simulator=args.allow_simulator)
     threading.Thread(target=watch_bridge, args=(queue,), daemon=True).start()
     advertiser = None
     if not args.no_bonjour:
