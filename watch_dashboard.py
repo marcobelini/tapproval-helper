@@ -1132,6 +1132,7 @@ _MD_FENCE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)")
 _MD_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+")
 _MD_QUOTE = re.compile(r"^\s{0,3}>\s?")
 _MD_BULLET = re.compile(r"^(\s*)[-*+]\s+")
+_MD_NUMBER = re.compile(r"^\s*\d+[.)]\s+")
 _MD_HR = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
 _MD_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
 _MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
@@ -1146,7 +1147,7 @@ _MD_HTML = re.compile(r"</?[a-zA-Z][^>]*>")
 _MD_ESCAPE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!>])")
 
 
-def blocks(markdown):
+def blocks(markdown, always=False):
     """The same reply as ``plain_text`` gives, but with its code kept.
 
     A list of ``{"kind": "text", "text"}`` and ``{"kind": "code", "text",
@@ -1158,17 +1159,22 @@ def blocks(markdown):
     with the language the fence named. A ``markdown`` fence is prose in
     disguise and lands in a text block, as in ``plain_text``.
 
-    Returns ``[]`` when nothing would be gained — no fence at all — so a
-    turn carries blocks only when it has code to show. Never raises.
+    Text blocks keep the reply's shape as the phone shows it (2026-10-12):
+    bold, emphasis and code marks, a heading as a bold line, and nested
+    points indented two spaces a level — the rules of the hook's
+    ``_plan_marked``, so a thread and a plan card read alike.
+
+    Returns ``[]`` when there is no fence, unless ``always``: a reply with
+    nothing but prose still has a shape worth sending. Never raises.
     """
     lines = str(markdown or "").splitlines()
-    if not any(_MD_FENCE.match(line) for line in lines):
+    if not always and not any(_MD_FENCE.match(line) for line in lines):
         return []
     out, prose, code, lang = [], [], [], ""
     fence_len, fence_is_prose = 0, False
 
     def flush_prose():
-        text = _flatten_lines(prose, keep_inline=True)
+        text = _marked_lines(prose)
         if text:
             out.append({"kind": "text", "text": text})
         prose.clear()
@@ -1228,6 +1234,34 @@ def _flatten_line(line, keep_inline=False):
         line = _MD_STRIKE.sub(r"\1", line)
     line = _MD_HTML.sub("", line)
     return _MD_ESCAPE.sub(r"\1", line)
+
+
+def _marked_lines(lines):
+    """Prose lines as the phone shows them, in what a watch can draw: the
+    inline marks kept, a heading as a bold line with air above it, a
+    nested point indented two spaces a level, block markup read. The
+    hook's ``_plan_marked`` applies the same rules to a plan."""
+    out = []
+    for raw in lines:
+        raw = raw.expandtabs(4)
+        if not raw.strip() or _MD_HR.match(raw) or _MD_TABLE_SEP.match(raw):
+            if not raw.strip() and out and out[-1]:
+                out.append("")
+            continue
+        text = _flatten_line(raw, keep_inline=True).strip()
+        if not text:
+            continue
+        if _MD_HEADING.match(raw):
+            text = "**%s**" % text.replace("**", "")
+            if out and out[-1]:
+                out.append("")
+        elif _MD_BULLET.match(raw) or _MD_NUMBER.match(raw):
+            depth = (len(raw) - len(raw.lstrip(" "))) // 2
+            text = "  " * min(depth, 3) + text
+        out.append(text)
+    while out and not out[-1]:
+        out.pop()
+    return "\n".join(out)
 
 
 def _flatten_lines(lines, keep_inline=False):
@@ -1802,9 +1836,12 @@ def _thread_line(state, line, limit):
     # The phone shows code in a box; "[code]" in ``text`` is the wrist's
     # box for a watch that cannot do better. One that can gets the code
     # itself, alongside — never instead — so an older watch keeps reading.
-    if kind == "text" and role == "assistant" and "[code]" in text:
-        parts = blocks(str(raw_text)[:32768])
-        if parts:
+    # And a reply without code carries its shape the same way — bold,
+    # nesting, air between points — but only when it has one: a plain
+    # sentence would only be sent twice (2026-10-12).
+    if kind == "text" and role == "assistant":
+        parts = blocks(str(raw_text)[:32768], always=True)
+        if parts and ("[code]" in text or parts != [{"kind": "text", "text": text}]):
             turn["blocks"] = parts
     if pictures:
         turn["images"] = pictures

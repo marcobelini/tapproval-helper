@@ -4900,7 +4900,8 @@ class TestCodeBlocksForTheWatch:
 
     def test_a_markdown_fence_is_prose_and_a_nested_fence_is_content(self):
         md = "````markdown\n# T\n```\ninner\n```\n````"
-        assert watch_dashboard.blocks(md) == [{"kind": "text", "text": "T\ninner"}]
+        # A heading is a bold line, as on the plan card (2026-10-12).
+        assert watch_dashboard.blocks(md) == [{"kind": "text", "text": "**T**\ninner"}]
 
     def test_an_unclosed_fence_is_still_code(self):
         assert watch_dashboard.blocks("```sh\nls -la") == [
@@ -4921,6 +4922,48 @@ class TestCodeBlocksForTheWatch:
             {"kind": "code", "lang": "swift", "text": "let a = 1"}]
         assert "blocks" not in by_text["plain reply"]
         assert "blocks" not in by_text["[code]"]      # the user's own bubble stays flat
+
+
+class TestARepliesShapeReachesTheWatch:
+    """2026-10-12, the owner's phone beside his wrist: the phone showed a
+    reply's bold labels, its nested points indented and its points apart;
+    the wrist showed one flat block, because a reply without code carried
+    no blocks and the flat text has neither marks nor indentation."""
+
+    REPLY = ("- **Naming a brand** to say the app works with it is allowed:\n"
+             "  - EU: referential use. It must be *needed*.\n"
+             "  - US: nominative fair use.\n"
+             "- **Copyright:** colour numbers are facts, not works.\n\n"
+             "## Next\n1. Measure the colours\n2. Ship")
+
+    def test_a_reply_without_code_keeps_its_marks_and_its_nesting(self):
+        assert watch_dashboard.blocks(self.REPLY, always=True) == [{"kind": "text", "text": (
+            "• **Naming a brand** to say the app works with it is allowed:\n"
+            "  • EU: referential use. It must be *needed*.\n"
+            "  • US: nominative fair use.\n"
+            "• **Copyright:** colour numbers are facts, not works.\n\n"
+            "**Next**\n1. Measure the colours\n2. Ship")}]
+
+    def test_without_always_a_reply_without_code_still_has_no_blocks(self):
+        assert watch_dashboard.blocks(self.REPLY) == []
+
+    def test_the_thread_sends_the_shape_only_when_there_is_one(self, tmp_path):
+        _write_transcript(tmp_path, "-p", "shape1.jsonl", [
+            {"cwd": "/x", "message": {"role": "user", "content": "go"}},
+            {"message": {"role": "assistant", "content": [{"type": "text", "text": self.REPLY}]}},
+            {"message": {"role": "assistant", "content": [{"type": "text", "text": "plain reply"}]}},
+        ])
+        turns = watch_dashboard.session_thread("shape1", projects_dir=str(tmp_path))
+        shaped = [t for t in turns if t.get("blocks")]
+        assert len(shaped) == 1 and "  • EU" in shaped[0]["blocks"][0]["text"]
+        assert "**" not in shaped[0]["text"], "the flat text stays flat for older watches"
+        assert not [t for t in turns if t["text"] == "plain reply" and t.get("blocks")], \
+            "a reply that is only plain text carries nothing extra"
+
+    def test_the_thread_and_the_plan_card_read_markdown_alike(self):
+        # The hook carries its own copy of the rules (it must run alone).
+        assert watch_dashboard.blocks(self.REPLY, always=True)[0]["text"] == \
+            crc._plan_marked(self.REPLY).replace("\n\n**Next**", "\n\n**Next**")
 
 
 class TestPlainTextForTheWatch:
