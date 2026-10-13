@@ -103,7 +103,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.47"
+__version__ = "1.1.48"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -1656,6 +1656,85 @@ def _plan_marked(plan):
     return "\n".join(lines)
 
 
+PLAN_FILE_BYTES = 256 * 1024          # a plan, not a book
+TRANSCRIPT_TAIL = 2 * 1024 * 1024     # how far back to look for the plan's file
+
+
+def _plans_dir(environ=None):
+    environ = os.environ if environ is None else environ
+    home = environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(home, "plans")
+
+
+def _read_plan_file(path, inside=None):
+    """A plan file's text, or "" when it is not one. Only a .md file is
+    read, at most PLAN_FILE_BYTES; ``inside`` (when given) is the folder
+    it must be in, after links are followed."""
+    try:
+        real = os.path.realpath(os.path.expanduser(str(path)))
+        if not real.endswith(".md") or not os.path.isfile(real):
+            return ""
+        if inside is not None:
+            root = os.path.realpath(inside)
+            if os.path.commonpath([real, root]) != root:
+                return ""
+        with open(real, encoding="utf-8", errors="replace") as handle:
+            return handle.read(PLAN_FILE_BYTES)
+    except (OSError, ValueError):
+        return ""
+
+
+def _transcript_plan_path(transcript_path):
+    """The newest plan file the session's transcript names. Claude Code
+    records it as ``attachment.planFilePath`` while plan mode is on."""
+    try:
+        with open(transcript_path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - TRANSCRIPT_TAIL))
+            tail = handle.read().decode("utf-8", "replace")
+    except (OSError, TypeError, ValueError):
+        return ""
+    for line in reversed(tail.splitlines()):
+        if '"planFilePath"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        found = ((entry.get("attachment") or {}).get("planFilePath")
+                 if isinstance(entry, dict) else None)
+        if found:
+            return str(found)
+    return ""
+
+
+def plan_text(tool_input, event=None, plans_dir=None):
+    """The plan an ExitPlanMode call is asking about. Claude Code used to
+    pass it as ``tool_input["plan"]``; since about 2026-10 the call comes
+    with an empty input and the plan sits in a file, named by
+    ``planFilePath`` or by the transcript (2026-10-13: every plan on the
+    wrist read "Claude has a plan", with nothing to read). A path the call
+    itself names must be inside the plans folder, because the model writes
+    the call; the transcript's is written by Claude Code. "" when none is
+    found — the card then says so, and still waits for the human."""
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    if tool_input.get("plan"):
+        return str(tool_input["plan"])
+    folder = plans_dir or _plans_dir()
+    named = tool_input.get("planFilePath")
+    if named:
+        text = _read_plan_file(named, inside=folder)
+        if text.strip():
+            return text
+    transcript = (event or {}).get("transcript_path")
+    if transcript:
+        found = _transcript_plan_path(transcript)
+        if found:
+            return _read_plan_file(found)
+    return ""
+
+
 def _plan_card(tool_input, risk, headline_chars, detail_chars):
     # Redacted before anything is read from it: the plan travels whole,
     # line breaks and all, so it cannot rely on _fit to do this for it.
@@ -2108,9 +2187,14 @@ def build_response(event, policy, agent=None):
     """
     result = classify(event)
     risk = result["risk"]
+    shown = result["tool_input"]
+    if result["tool"] == "ExitPlanMode" and isinstance(shown, dict) and not shown.get("plan"):
+        # The card shows the plan; the fingerprint below keeps the call's
+        # own input, which is what the relay matches a desk answer by.
+        shown = dict(shown, plan=plan_text(shown, event))
     card = wrist_card(
         result["tool"],
-        result["tool_input"],
+        shown,
         risk,
         *_card_budgets(policy),
     )

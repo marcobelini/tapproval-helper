@@ -5391,6 +5391,80 @@ class TestThePlanCard:
         card = crc.wrist_card("ExitPlanMode", {}, Risk.MEDIUM)
         assert card["headline"] == "Claude has a plan" and card["options"]
 
+
+class TestThePlanComesFromItsFile:
+    """2026-10-13, a photo from the owner's wrist: "Claude has a plan" and
+    nothing to read. Claude Code now calls ExitPlanMode with an empty input
+    and keeps the plan in a file the transcript names."""
+
+    PLAN = "# Ship the desk retry\n\n- Ask Apple once more on a 5xx\n- token sk-ant-api03-" + "x" * 40
+
+    def _setup(self, tmp_path, name="calm-river.md", text=None):
+        plans = tmp_path / "plans"
+        plans.mkdir(exist_ok=True)
+        plan = plans / name
+        plan.write_text(text or self.PLAN, encoding="utf-8")
+        transcript = tmp_path / "session.jsonl"
+        lines = [json.dumps({"type": "user", "message": {"content": "plan it"}}),
+                 json.dumps({"type": "attachment", "attachment": {"type": "plan_mode",
+                                                                  "planFilePath": str(plan)}})]
+        transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return plans, plan, transcript
+
+    def _card(self, event, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        policy = dict(crc.DEFAULT_POLICY, mode="enforce", audit_log=str(tmp_path / "a.jsonl"))
+        _response, _audit, card = crc.build_response(event, policy)
+        return card
+
+    def test_the_transcript_names_the_plan_and_the_card_shows_it(self, tmp_path, monkeypatch):
+        _plans, _plan, transcript = self._setup(tmp_path)
+        card = self._card({"tool_name": "ExitPlanMode", "tool_input": {},
+                           "transcript_path": str(transcript)}, tmp_path, monkeypatch)
+        assert card["headline"] == "Plan: Ship the desk retry"
+        assert "Ask Apple once more on a 5xx" in card["plan"]
+        assert "sk-ant-api03-xxxx" not in card["plan"] + card["plan_marked"], "secrets redacted"
+        # The fingerprint is the call's own input, which the relay matches by.
+        assert card["fingerprint"] == crc._card_fingerprint("ExitPlanMode", {})
+
+    def test_the_newest_plan_the_transcript_names_wins(self, tmp_path, monkeypatch):
+        plans, _old, transcript = self._setup(tmp_path, "old.md", "# The old plan\n- x")
+        newer = plans / "new.md"
+        newer.write_text("# The new plan\n- y", encoding="utf-8")
+        with open(transcript, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "attachment",
+                                     "attachment": {"planFilePath": str(newer)}}) + "\n")
+        card = self._card({"tool_name": "ExitPlanMode", "tool_input": {},
+                           "transcript_path": str(transcript)}, tmp_path, monkeypatch)
+        assert card["headline"] == "Plan: The new plan"
+
+    def test_a_path_the_call_names_must_be_in_the_plans_folder(self, tmp_path, monkeypatch):
+        plans, plan, _t = self._setup(tmp_path)
+        card = self._card({"tool_name": "ExitPlanMode", "tool_input": {"planFilePath": str(plan)}},
+                          tmp_path, monkeypatch)
+        assert card["headline"] == "Plan: Ship the desk retry"
+        elsewhere = tmp_path / "notes.md"
+        elsewhere.write_text("# Private notes\n- not a plan", encoding="utf-8")
+        card = self._card({"tool_name": "ExitPlanMode",
+                           "tool_input": {"planFilePath": str(elsewhere)}}, tmp_path, monkeypatch)
+        assert card["headline"] == "Claude has a plan" and "Private" not in card["plan"]
+        secret = tmp_path / "id_rsa"
+        secret.write_text("-----BEGIN KEY-----", encoding="utf-8")
+        assert crc.plan_text({"planFilePath": str(secret)}, plans_dir=str(plans)) == ""
+
+    def test_a_missing_file_still_asks(self, tmp_path, monkeypatch):
+        _plans, plan, transcript = self._setup(tmp_path)
+        plan.unlink()
+        card = self._card({"tool_name": "ExitPlanMode", "tool_input": {},
+                           "transcript_path": str(transcript)}, tmp_path, monkeypatch)
+        assert card["headline"] == "Claude has a plan" and card["options"]
+        assert crc.plan_text({}, {"transcript_path": str(tmp_path / "none.jsonl")}) == ""
+
+    def test_a_plan_in_the_input_is_still_used_first(self, tmp_path, monkeypatch):
+        _plans, _plan, transcript = self._setup(tmp_path)
+        assert crc.plan_text({"plan": "# Given\n- here"},
+                             {"transcript_path": str(transcript)}).startswith("# Given")
+
     @pytest.mark.parametrize("said,behavior,mode,words", [
         ("Approve", "allow", None, ""),
         ("Approve & auto mode", "allow", "auto", ""),
