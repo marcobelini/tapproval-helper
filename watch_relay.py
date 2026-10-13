@@ -3170,6 +3170,48 @@ def _remember_send(key, answer):
         _RECENT_SENDS[key] = (_send_clock(), dict(answer))
 
 
+# A caller, or the link to it, that went away mid-request: the watch
+# sleeping, a phone leaving Wi-Fi, a tunnel dropping. The network, never the
+# relay's own fault. ENOTCONN is a plain OSError, not a ConnectionError, and
+# missing it sent the owner three crash e-mails in an hour and put a crash
+# row on the wrist (helper 1.1.46, 2026-10-13). An errno not named here —
+# EMFILE, ENOSPC, EADDRINUSE — is the relay's own trouble and is reported.
+_HUNG_UP = frozenset(getattr(errno, name) for name in (
+    "ENOTCONN", "ECONNRESET", "ECONNABORTED", "EPIPE", "ETIMEDOUT",
+    "ENETRESET", "ESHUTDOWN", "EHOSTDOWN") if hasattr(errno, name))
+
+
+def _caller_went_away(error):
+    import socket
+    if isinstance(error, (ConnectionError, TimeoutError, socket.timeout)):
+        return True
+    return isinstance(error, OSError) and error.errno in _HUNG_UP
+
+
+# Hang-ups are counted, not reported, and summed up in the log at most once
+# an hour: a reconnect storm stays visible without a traceback per socket.
+HANG_UP_SUMMARY_SECONDS = 60 * 60
+_HANG_UPS = {"count": 0, "last": None, "since": None}   # None: none noted yet
+_HANG_UPS_LOCK = threading.Lock()
+
+
+def _note_hang_up(error, now=None):
+    now = time.time() if now is None else now
+    code = getattr(error, "errno", None)
+    name = errno.errorcode.get(code) if code else None
+    with _HANG_UPS_LOCK:
+        _HANG_UPS["count"] += 1
+        _HANG_UPS["last"] = name or type(error).__name__
+        since = _HANG_UPS["since"]
+        if since is not None and now - since < HANG_UP_SUMMARY_SECONDS:
+            return
+        count, last = _HANG_UPS["count"], _HANG_UPS["last"]
+        _HANG_UPS["count"], _HANG_UPS["since"] = 0, now
+    print("relay: %d caller%s hung up mid-request since the last note "
+          "(last: %s) — the network, not a fault"
+          % (count, "" if count == 1 else "s", last), file=sys.stderr)
+
+
 class _RelayServer(ThreadingHTTPServer):
     """ThreadingHTTPServer, with handler crashes reported like any other.
 
@@ -3206,11 +3248,12 @@ class _RelayServer(ThreadingHTTPServer):
 
     def handle_error(self, request, client_address):
         kind, value, tb = sys.exc_info()
-        super().handle_error(request, client_address)
-        # A caller that went away or stalled is the network, not a fault.
-        import socket
-        if isinstance(value, (ConnectionError, TimeoutError, socket.timeout)):
+        # A caller that went away or stalled is the network, not a fault:
+        # no traceback, no report, no crash row on the wrist — a count.
+        if _caller_went_away(value):
+            _note_hang_up(value)
             return
+        super().handle_error(request, client_address)
         if _ON_HANDLER_ERROR is not None:
             _ON_HANDLER_ERROR(kind, value, tb)
 

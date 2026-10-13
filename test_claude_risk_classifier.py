@@ -11986,20 +11986,63 @@ class TestTheRelayServerItself:
                 watch_relay._RelayServer.handle_error(server, None, ("127.0.0.1", 1))
         assert seen == [KeyError]
 
+    @staticmethod
+    def _handle(error):
+        """What the relay's handle_error writes for `error`, raised as a
+        request handler would raise it."""
+        import contextlib
+        import io
+        server = watch_relay._RelayServer.__new__(watch_relay._RelayServer)
+        written = io.StringIO()
+        try:
+            raise error
+        except Exception:
+            with contextlib.redirect_stderr(written):
+                watch_relay._RelayServer.handle_error(server, None, ("127.0.0.1", 1))
+        return written.getvalue()
+
     def test_a_caller_that_went_away_is_not_a_crash(self, monkeypatch):
+        # 2026-10-13: ENOTCONN, a watch hanging up between accept and the
+        # first read, is a plain OSError, not a ConnectionError. It reached
+        # the owner's inbox three times in an hour, and a crash row on the
+        # wrist, from helper 1.1.46.
+        import errno
         seen = []
         monkeypatch.setattr(watch_relay, "_ON_HANDLER_ERROR",
                             lambda kind, value, tb: seen.append(kind))
-        server = watch_relay._RelayServer.__new__(watch_relay._RelayServer)
-        import contextlib
-        import io
-        for error in (ConnectionResetError(), BrokenPipeError(), TimeoutError()):
-            try:
-                raise error
-            except OSError:
-                with contextlib.redirect_stderr(io.StringIO()):
-                    watch_relay._RelayServer.handle_error(server, None, ("127.0.0.1", 1))
+        monkeypatch.setattr(watch_relay, "_HANG_UPS", {"count": 0, "last": None, "since": None})
+        written = ""
+        for error in (ConnectionResetError(), BrokenPipeError(), TimeoutError(),
+                      OSError(errno.ENOTCONN, "Socket is not connected"),
+                      OSError(errno.ECONNABORTED, "Software caused connection abort"),
+                      OSError(errno.ETIMEDOUT, "Operation timed out")):
+            written += self._handle(error)
         assert seen == []
+        assert "Traceback" not in written, "a hang-up wrote a traceback into the relay log"
+
+    def test_the_relays_own_os_errors_are_still_reported(self, monkeypatch):
+        import errno
+        seen = []
+        monkeypatch.setattr(watch_relay, "_ON_HANDLER_ERROR",
+                            lambda kind, value, tb: seen.append(value.errno))
+        for code in (errno.EMFILE, errno.ENOSPC):
+            assert "Traceback" in self._handle(OSError(code, os.strerror(code)))
+        assert seen == [errno.EMFILE, errno.ENOSPC]
+
+    def test_hang_ups_are_counted_once_an_hour(self, monkeypatch):
+        import contextlib
+        import errno
+        monkeypatch.setattr(watch_relay, "_HANG_UPS", {"count": 0, "last": None, "since": None})
+        written = io.StringIO()
+        with contextlib.redirect_stderr(written):
+            watch_relay._note_hang_up(OSError(errno.ENOTCONN, "x"), now=1000.0)
+            for minute in range(1, 60):
+                watch_relay._note_hang_up(ConnectionResetError(), now=1000.0 + minute * 60)
+            watch_relay._note_hang_up(OSError(errno.ENOTCONN, "x"), now=1000.0 + 3600)
+        lines = written.getvalue().splitlines()
+        assert len(lines) == 2, lines
+        assert "1 caller" in lines[0] and "ENOTCONN" in lines[0]
+        assert "60 callers" in lines[1] and "ENOTCONN" in lines[1]
 
     def test_a_silent_socket_is_closed(self):
         assert 0 < watch_relay.RelayHandler.timeout <= 60

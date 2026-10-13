@@ -39,7 +39,7 @@
 <li><strong>It approves nothing on its own by default.</strong> Allowing the harmless tiers automatically is something you switch on. A CRITICAL call is never auto-allowed, whatever the setting.</li>
 <li><strong>It fails closed.</strong> Anything it cannot parse, reach or judge ends with the ordinary prompt in your terminal, exactly as if Tapproval were not installed.</li>
 <li><strong>Only a process on your own computer is let in without a key</strong>, and even that process can post a card but never answer one, so a command Claude runs cannot approve its own prompt. Being on the same Wi-Fi counts for nothing: on a café network, that is a room full of strangers.</li>
-<li><strong>A current watch never sends its key.</strong> From TestFlight build 138 on, it signs each request. Each signature can be used once. The helper proves itself in its answer, and the watch keeps an address only from an answer carrying that proof.</li>
+<li><strong>A current watch never sends its key.</strong> Every App Store version from 1.4 signs each request. Each signature can be used once. The helper proves itself in its answer, and the watch keeps an address only from an answer carrying that proof.</li>
 <li><strong>Standard-library Python only.</strong> The helper installs no third-party packages, so there is no dependency tree to trust.</li>
 </ul>
 
@@ -52,6 +52,12 @@
 
 <h2>Fixes, disclosed</h2>
 <p>Newest first. Each entry says what was wrong, when, who could have used it, and the fix. Starting Claude Code once updates the helper.</p>
+
+<h3>1.1.45, 12 October 2026: a test copy of the app could answer real prompts</h3>
+<p><strong>What was wrong.</strong> A copy of the watch app running in Apple's Simulator on a Mac, the way the app is tested, could be paired like a real watch and then answer the prompts waiting on that computer. A tap meant for a test card once allowed a real one when the list moved under it.</p>
+<p><strong>Since when.</strong> From the first public release until 1.1.45.</p>
+<p><strong>Who could have used it.</strong> Nobody from outside. It needs a paired copy of the app on your own Mac, so the risk was a mistaken tap during testing, not an attack.</p>
+<p><strong>The fix.</strong> A Simulator copy marks every request, and the helper refuses its answers, its messages to a session and its new sessions unless it was started for testing. Over iCloud, a Simulator copy writes no answers at all. A real watch never sends the mark and is trusted by its key, as before.</p>
 
 <h3>1.1.38, 5 October 2026: a program on the computer could pair by using its Wi-Fi address</h3>
 <p><strong>What was wrong.</strong> The relay refuses to give a watch key to a program on the computer itself, because such a key would let a command Claude runs answer its own prompt. It recognised such a program only by the address <code>127.0.0.1</code>. A program that asked through the computer's own Wi-Fi address instead looked like a watch. <code>--pair</code>, which opens the door without asking, could be run by any program too. So a command running on the computer could open the door and take a key, then answer its own CRITICAL prompt. Separately, any program on the computer, including one run by another user account, could unpair the watch or replace its key.</p>

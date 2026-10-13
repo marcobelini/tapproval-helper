@@ -10,8 +10,11 @@
 - Sorts every request into one of five risk tiers on the computer; the card
   shows the tier. Nothing is approved automatically unless the user turns
   that on, and a CRITICAL request never is.
-- Shows which sessions need you, which are running and which are idle;
-  read a conversation and reply, or start a new session from the watch.
+- Shows which sessions need you, which are running and which are idle,
+  grouped by what they need and named with their project; read a
+  conversation and reply, or start a new session from the watch.
+- Replies and plans read on the watch the way they do on the phone: bold,
+  lists and indented sub-points.
 - Multiple-choice questions arrive with the same choices as on the desktop.
 
 ## What it needs
