@@ -2856,7 +2856,8 @@ class TestAnICloudCardIsTheWholeCard:
               "project": "project", "kind": "kind", "options": "options",
               "facts": "facts", "plan": "plan", "session_id": "sessionId",
               "can_always": "canAlways", "session_title": "sessionTitle",
-              "plan_marked": "planMarked"}
+              "plan_marked": "planMarked", "allow_label": "allowLabel",
+              "deny_label": "denyLabel"}
     # Fields the watch reads only from the relay, on purpose, each with its
     # reason. Production refuses a record with a field it does not know, so
     # the bridge may write one only after it is deployed there (CLAUDE.md);
@@ -2929,7 +2930,8 @@ class TestTheBridgeReadsTheWholeCard:
             "kind": "question", "options": ["Yes", "No"], "alert": "careful",
             "plan": "1. Delete\n2. Rebuild", "facts": [["Command", "rm -rf build"]],
             "session_id": "s-1", "can_always": True, "session_title": "Release",
-            "plan_marked": "**1.** Delete"}
+            "plan_marked": "**1.** Delete", "allow_label": "Yes, proceed",
+            "deny_label": "No, continue without running it"}
 
     def _read(self, *parts):
         path = os.path.join(_ROOT, "WatchApp", *parts)
@@ -3799,7 +3801,7 @@ class TestWaitsOnlyWhileWatched:
         assert queue.pending(), "card should be up while the watch is present"
         # The watch goes quiet: last poll ages far past the presence window.
         queue.last_poll = time.monotonic() - (queue.WATCH_PRESENT_SECONDS + 60)
-        # Not a wait: time has to pass, past submit()'s 5 s probe clock,
+        # Not a wait: time has to pass, past several of submit()'s probes,
         # with nothing happening. CardQueue reads time.monotonic itself, so
         # there is no clock to wind forward instead.
         time.sleep(6)
@@ -4756,8 +4758,75 @@ class TestGhostCards:
         alive["value"] = False                    # the hook was killed
         thread.join(timeout=10)
         assert result["decision"] == "none"
-        assert result["elapsed"] < 7
+        # One probe clock (PROBE_SECONDS) plus slack: the old 5 s clock
+        # fails this, which is the point of the bound.
+        assert result["elapsed"] < 3
         assert queue.pending() == []              # retracted, not haunting
+
+    @pytest.mark.parametrize("how, reason", [
+        ("tap", "answered-here"),
+        ("hook", "hook-gone"),
+        ("phone", "answered-elsewhere"),
+        ("clock", "expired"),
+    ])
+    def test_the_log_says_why_a_card_left(self, how, reason, capsys):
+        """A slow "Handled elsewhere" is diagnosed from two log lines: when
+        the card was queued, and when and why it left. Each of the four
+        ways out names itself."""
+        queue = watch_relay.CardQueue()
+        result = {}
+
+        def submit():
+            result["value"] = queue.submit(
+                {"tier": "HIGH", "headline": "x", "detail": "x"},
+                wait=0.3 if how == "clock" else 30,
+                caller_alive=lambda: how != "hook",
+                resolved_elsewhere=lambda: how == "phone")
+
+        thread = threading.Thread(target=submit, daemon=True)
+        thread.start()
+        if how == "tap":
+            card = _wait_until(queue.pending, what="the card to be queued")[0]
+            queue.decide(card["id"], "allow")
+        thread.join(timeout=5)
+        card_id = result["value"][0]
+        err = capsys.readouterr().err
+        assert re.search(r"relay: left %s %s after \d+ms" % (card_id, reason),
+                         err), err
+
+    def test_probes_keep_time_not_card_traffic(self):
+        """The faster probe clock must stay a clock: a flood of unrelated
+        cards wakes every waiter, and the transcript must not be read once
+        per wakeup."""
+        queue = watch_relay.CardQueue()
+        queue.PROBE_SECONDS = 0.2
+        probes = []
+        stop = threading.Event()
+
+        def probed():
+            probes.append(time.monotonic())
+            return stop.is_set()
+
+        thread = threading.Thread(target=lambda: queue.submit(
+            {"tier": "HIGH", "headline": "x", "detail": "x"}, wait=30,
+            resolved_elsewhere=probed), daemon=True)
+        thread.start()
+        _wait_until(lambda: probes, what="the first probe")
+        started = time.monotonic()
+        # Not a wait: traffic has to flow for a while. Each unrelated card
+        # notifies every waiter; each is decided at once so none lingers.
+        while time.monotonic() - started < 1.0:
+            other = threading.Thread(target=lambda: queue.submit(
+                {"tier": "LOW", "headline": "y", "detail": "y"}, wait=0.05),
+                daemon=True)
+            other.start()
+            other.join()
+        elapsed = time.monotonic() - started
+        stop.set()
+        thread.join(timeout=5)
+        # About elapsed / 0.2 probes, give or take; per-wakeup probing
+        # would be in the dozens.
+        assert len(probes) <= elapsed / queue.PROBE_SECONDS + 3, len(probes)
 
     def test_a_live_caller_keeps_waiting(self):
         queue = watch_relay.CardQueue()
@@ -5376,7 +5445,7 @@ class TestThePlanCard:
                               Risk.MEDIUM)
         assert card["kind"] == "question" and card["plan_card"] is True
         assert card["headline"] == "Plan: Roll out shared working principles"
-        assert card["options"] == ["Approve", "Approve & auto mode", "Keep planning"]
+        assert card["options"] == ["Approve & auto mode"]
         assert "ExitPlanMode" not in card["headline"]
         lines = card["plan"].splitlines()
         assert "• Sync CLAUDE.md into every repo" in lines, "markers gone, lines kept"
@@ -5387,6 +5456,16 @@ class TestThePlanCard:
         card = crc.wrist_card("ExitPlanMode", {"plan": "word " * 2000}, Risk.MEDIUM)
         assert len(card["plan"]) <= crc.PLAN_CHARS + 2
         assert card["plan"].endswith(" …")
+
+    def test_the_wrist_offers_only_what_the_phone_offers(self):
+        """2026-10-14, a photo of the phone: two answers to a plan, "Approve
+        & auto mode" and "Suggest edits". The wrist had three buttons beside
+        the edits, two of which the phone never shows. The one option is
+        the approval; the edits are the plan screen's own field."""
+        card = crc.wrist_card("ExitPlanMode", {"plan": self.PLAN}, Risk.MEDIUM)
+        assert card["options"] == ["Approve & auto mode"]
+        assert card["detail"] == "Approve & auto mode · Suggest edits"
+        assert crc.plan_decision(card["options"][0]) == ("allow", "", "auto")
 
     def test_an_empty_plan_still_asks(self):
         card = crc.wrist_card("ExitPlanMode", {}, Risk.MEDIUM)
@@ -5467,10 +5546,9 @@ class TestThePlanComesFromItsFile:
                              {"transcript_path": str(transcript)}).startswith("# Given")
 
     @pytest.mark.parametrize("said,behavior,mode,words", [
-        ("Approve", "allow", None, ""),
         ("Approve & auto mode", "allow", "auto", ""),
-        ("Keep planning", "deny", None, "keep planning"),
         ("Suggest edits: drop step two", "deny", None, "drop step two"),
+        ("drop step two", "deny", None, "drop step two"),
     ])
     def test_each_answer_means_what_the_phone_means(self, said, behavior, mode, words):
         got = crc.plan_decision(said)
@@ -6517,7 +6595,9 @@ class TestResolvedElsewhere:
                  "content": "ok"}]}}) + "\n")
         thread.join(timeout=15)
         assert result["decision"] == "none"
-        assert result["elapsed"] < 12          # retracted, not expired
+        # Retracted within a probe clock or two, not expired — and not on
+        # the old 5 s clock, which left a phone answer on the wrist.
+        assert result["elapsed"] < 3
         assert queue.pending() == []
 
     def test_unrelated_results_do_not_retract(self, tmp_path):
@@ -8430,7 +8510,7 @@ class TestTheWristAnswersAHeadlessSend:
         Risk = crc.Risk
         decide = staticmethod(crc.decide)
         plan_decision = staticmethod(crc.plan_decision)
-        PLAN_APPROVE = crc.PLAN_APPROVE
+        PLAN_APPROVE_AUTO = crc.PLAN_APPROVE_AUTO
 
         def load_policy(self):
             policy = {"relay": self.relay, "relay_wait": 6.0, "mode": "enforce"}
@@ -8462,7 +8542,7 @@ class TestTheWristAnswersAHeadlessSend:
 
     def test_a_plan_approved_on_the_wrist_goes_ahead(self):
         out = wpt.decide("ExitPlanMode", {"plan": "x"},
-                         crc=self._Fake("answer", answer=crc.PLAN_APPROVE))
+                         crc=self._Fake("answer", answer=crc.PLAN_APPROVE_AUTO))
         assert out["behavior"] == "allow"
 
     def test_shadow_mode_never_auto_allows_here_either(self):
@@ -12931,7 +13011,28 @@ class TestCodexAgent:
         _, _, codex = crc.build_response(event, dict(crc.DEFAULT_POLICY), agent="codex")
         assert "agent" not in claude, "a Claude card must not change by a byte"
         assert codex.pop("agent") == "codex"
+        codex.pop("allow_label"), codex.pop("deny_label")
         assert codex == claude, "otherwise the very same card: identical layout"
+
+    def test_a_codex_card_answers_in_codexs_own_words(self):
+        """2026-10-14, the owner: a Codex prompt's buttons must say what
+        Codex's own prompt says. These are the two rows of Codex's approval
+        list a hook can answer: allow, and deny (which lets the turn go on)."""
+        event = {"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "s"}
+        _, _, claude = crc.build_response(event, dict(crc.DEFAULT_POLICY))
+        _, _, codex = crc.build_response(event, dict(crc.DEFAULT_POLICY), agent="codex")
+        assert codex["allow_label"] == "Yes, proceed"
+        assert codex["deny_label"] == "No, continue without running it"
+        assert "allow_label" not in claude and "deny_label" not in claude, \
+            "Claude's cards keep the watch's own Allow/Deny"
+
+    def test_a_question_from_codex_keeps_its_options(self):
+        """Labels name an allow/deny pair; a question's answers are its options."""
+        event = {"tool_name": "AskUserQuestion", "session_id": "s", "tool_input": {
+            "questions": [{"question": "Which?", "options": [
+                {"label": "One"}, {"label": "Two"}]}]}}
+        _, _, codex = crc.build_response(event, dict(crc.DEFAULT_POLICY), agent="codex")
+        assert codex["kind"] == "question" and "allow_label" not in codex
 
     def test_the_decision_object_is_the_same_for_codex(self, monkeypatch, tmp_path):
         """Codex reads the same {"hookSpecificOutput":{"decision":...}} shape."""

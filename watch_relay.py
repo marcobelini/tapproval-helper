@@ -877,6 +877,13 @@ class CardQueue:
     # The bridge polls every 2 s while it runs; three missed polls and
     # nothing will mirror a card into iCloud, so nothing will buzz.
     BRIDGE_ALIVE_SECONDS = 30
+    # How often a waiting card asks "is the hook still there, and has the
+    # transcript answered this prompt?". It was 5 s, and an answer given on
+    # the phone could stand on the wrist that long before the watch's own
+    # 2 s poll even had a chance to see it go. An idle probe is one
+    # zero-timeout select and one file-size check per transcript, so a
+    # second is still cheap.
+    PROBE_SECONDS = 1.0
 
     def submit(self, card, wait, caller_alive=None, resolved_elsewhere=None):
         """Queue a card and block until it is decided or ``wait`` expires.
@@ -936,27 +943,33 @@ class CardQueue:
         # socket and file I/O, so they run with the lock RELEASED — the
         # watch's /pending poll must never queue behind a transcript read.
         # They fire immediately on entry (a prompt already answered when
-        # the card is posted must not stand even five seconds) and then on
-        # a ~5s CLOCK, not per wakeup: notify_all() for unrelated cards
-        # wakes every waiter, and probe I/O must scale with time, not with
-        # card traffic. The exit predicate lives in exactly one place.
+        # the card is posted must not stand even a second) and then on a
+        # PROBE_SECONDS CLOCK, not per wakeup: notify_all() for unrelated
+        # cards wakes every waiter, and probe I/O must scale with time, not
+        # with card traffic. The exit predicate lives in exactly one place,
+        # and names why the card left.
+        started = time.monotonic()
         next_probe = 0.0
-        while True:
+        reason = None
+        while reason is None:
             now = time.monotonic()
             if now >= next_probe:
-                next_probe = now + 5.0
+                next_probe = now + self.PROBE_SECONDS
                 if caller_alive is not None and not caller_alive():
+                    reason = "hook-gone"
                     break
                 if resolved_elsewhere is not None and resolved_elsewhere():
+                    reason = "answered-elsewhere"
                     break
             with self._lock:
-                if card_id in self._decisions:
-                    break
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or self.wall_clock() >= wall_deadline:
-                    break
-                self._lock.wait(max(0.05, min(
-                    remaining, next_probe - time.monotonic())))
+                if card_id in self._decisions:
+                    reason = "answered-here"
+                elif remaining <= 0 or self.wall_clock() >= wall_deadline:
+                    reason = "expired"
+                else:
+                    self._lock.wait(max(0.05, min(
+                        remaining, next_probe - time.monotonic())))
         with self._lock:
             # Whatever happened, the card is no longer pending: either it
             # was decided, or it expired and the watch must not answer a
@@ -967,6 +980,14 @@ class CardQueue:
                 if replayable:
                     self._session_allows.add(rule)
                 decision = "allow"
+        if decision != "none":
+            reason = "answered-here"    # a tap that beat the probe to it
+        # The other half of the "queued" line: how long a card stood on the
+        # wrist and why it left. A prompt answered on the phone that is slow
+        # to leave the watch is read off these two lines.
+        print("relay: left %s %s after %dms" % (
+            card_id, reason, int((time.monotonic() - started) * 1000)),
+            file=sys.stderr)
         return card_id, decision, answer
 
     def pending(self, from_watch=False, from_bridge=False):

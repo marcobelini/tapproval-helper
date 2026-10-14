@@ -103,7 +103,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.49"
+__version__ = "1.1.51"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -1557,14 +1557,30 @@ def _facts_detail(facts, limit):
                 limit)
 
 
-# ExitPlanMode on the wrist: a question with the phone's answers. A watch
-# from before plan cards shows it as any question, with these three
-# buttons; a newer one also shows the plan itself and can dictate edits.
-PLAN_APPROVE = "Approve"
+# ExitPlanMode on the wrist: a question with the phone's answers, and only
+# those. The phone offers two, "Approve & auto mode" and "Suggest edits"
+# (owner's photo, 2026-10-14); the wrist offered three buttons beside the
+# edits — "Approve" and "Keep planning" too, which the phone never shows.
+# Claude Code sends no suggestions with ExitPlanMode (2.1.299:
+# checkPermissions asks "Exit plan mode?" with none), so the phone's words
+# cannot be read off the event and are mirrored here. The one option is the
+# approval; the edits are the plan screen's own field, sent with PLAN_EDITS.
 PLAN_APPROVE_AUTO = "Approve & auto mode"
-PLAN_KEEP = "Keep planning"
-PLAN_OPTIONS = [PLAN_APPROVE, PLAN_APPROVE_AUTO, PLAN_KEEP]
+PLAN_OPTIONS = [PLAN_APPROVE_AUTO]
 PLAN_EDITS = "Suggest edits:"     # a newer watch prefixes dictated edits
+
+# The words on an allow/deny card, by the agent that asked, so the wrist
+# says what that agent's own prompt says. Claude's cards keep the watch's
+# Allow/Deny and carry no labels at all. Codex's are the two rows of its
+# approval list a hook can answer (codex-rs approval_overlay.rs, read
+# 2026-10-14): a PermissionRequest hook can only allow, or deny with a
+# message, which blocks the call and lets the turn go on — Codex's
+# "Denied", not its "tell Codex what to do differently". The words travel
+# on the card because the watch ships on Apple's schedule; a watch that
+# predates them ignores them and says Allow/Deny.
+AGENT_ANSWERS = {
+    "codex": ("Yes, proceed", "No, continue without running it"),
+}
 PLAN_CHARS = 2400
 # The modes Claude Code's validator accepts for setMode (2.1.280).
 PERMISSION_MODES = frozenset(
@@ -1785,7 +1801,8 @@ def _plan_card(tool_input, risk, headline_chars, detail_chars):
         "tier": risk.name,
         "headline": _fit("Plan: %s" % title if title else "Claude has a plan",
                          headline_chars * 2),
-        "detail": _fit(" · ".join(PLAN_OPTIONS), detail_chars),
+        "detail": _fit(" · ".join(PLAN_OPTIONS + [PLAN_EDITS.rstrip(":")]),
+                       detail_chars),
         "options": list(PLAN_OPTIONS),
         # Plain, for every watch already sold: one that predates
         # plan_marked would show its asterisks.
@@ -1826,13 +1843,8 @@ def plan_decision(chosen):
     """What a wrist answer to a plan card means for the hook:
     (behavior, message, mode)."""
     said = " ".join(str(chosen or "").split())
-    if said == PLAN_APPROVE:
-        return "allow", "", None
     if said == PLAN_APPROVE_AUTO:
         return "allow", "", "auto"
-    if said == PLAN_KEEP:
-        return ("deny", "The user wants to keep planning before you start. "
-                "Ask them what to change.", None)
     edits = said[len(PLAN_EDITS):].strip() if said.startswith(PLAN_EDITS) else said
     return ("deny", "The user asks for changes to the plan, from their "
             "watch: %s. Revise the plan and present it again." % edits, None)
@@ -2252,6 +2264,8 @@ def build_response(event, policy, agent=None):
     # agent is named: a Claude card stays byte-for-byte what it was.
     if agent and agent != "claude":
         card["agent"] = agent
+    if agent in AGENT_ANSWERS and not card.get("kind"):
+        card["allow_label"], card["deny_label"] = AGENT_ANSWERS[agent]
     decision, reason = decide(risk, policy)
 
     shadow = str(policy.get("mode", "shadow")).lower() != "enforce"
