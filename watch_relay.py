@@ -2861,6 +2861,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                              "helper_commit": (_PROVENANCE or (None, None))[0],
                              "helper_date": (_PROVENANCE or (None, None))[1],
                              "conditions": conditions(),
+                             "agents": wired_agents(),
                              "paired_ever": getattr(self.auth, "paired_ever", True)})
         else:
             self._send_json({"ok": True})
@@ -3982,6 +3983,22 @@ def check_bridge(queue, started, now=None):
         "running, so away from home cards cannot reach your watch. "
         "Restarting the computer starts it again.")
     return False
+
+
+def wired_agents():
+    """The agents whose hook is wired on this Mac, for /health: Claude Code
+    always (this relay is its helper), and Codex once our hook is in its
+    hooks.json, trusted or not. The watch marks each card with its agent
+    only once both are in use (owner, 2026-10-14), and learns that here
+    before the first Codex card arrives."""
+    agents = ["claude"]
+    try:
+        from ClaudeRiskClassifier import codex_hook_trusted
+        if codex_hook_trusted() is not None:
+            agents.append("codex")
+    except Exception:                  # no helper beside us: `helper` says so
+        pass
+    return agents
 
 
 def check_codex_hook():

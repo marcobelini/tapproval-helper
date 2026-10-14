@@ -2857,7 +2857,7 @@ class TestAnICloudCardIsTheWholeCard:
               "facts": "facts", "plan": "plan", "session_id": "sessionId",
               "can_always": "canAlways", "session_title": "sessionTitle",
               "plan_marked": "planMarked", "allow_label": "allowLabel",
-              "deny_label": "denyLabel"}
+              "deny_label": "denyLabel", "agent": "agent"}
     # Fields the watch reads only from the relay, on purpose, each with its
     # reason. Production refuses a record with a field it does not know, so
     # the bridge may write one only after it is deployed there (CLAUDE.md);
@@ -2931,7 +2931,8 @@ class TestTheBridgeReadsTheWholeCard:
             "plan": "1. Delete\n2. Rebuild", "facts": [["Command", "rm -rf build"]],
             "session_id": "s-1", "can_always": True, "session_title": "Release",
             "plan_marked": "**1.** Delete", "allow_label": "Yes, proceed",
-            "deny_label": "No, continue without running it"}
+            "deny_label": "No, continue without running it",
+            "agent": "codex"}
 
     def _read(self, *parts):
         path = os.path.join(_ROOT, "WatchApp", *parts)
@@ -13160,6 +13161,30 @@ class TestCodexAgent:
         crc._say_codex("installed")
         said = capsys.readouterr().out
         assert "Trust all and continue" in said and "/hooks" not in said
+
+
+class TestTheWatchLearnsWhichAgentsAreWired:
+    """The wrist marks each card with its agent only once both agents are in
+    use (owner, 2026-10-14). /health says which are wired on this Mac, so
+    the marks can appear before the first Codex card does (M2 of #390)."""
+
+    def test_claude_alone(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "none"))
+        assert watch_relay.wired_agents() == ["claude"]
+
+    def test_codex_counts_once_our_hook_is_in_its_hooks(self, tmp_path, monkeypatch):
+        home = tmp_path / "codex"
+        home.mkdir()
+        monkeypatch.setenv("CODEX_HOME", str(home))
+        (home / "hooks.json").write_text(json.dumps({"hooks": {}}))
+        assert watch_relay.wired_agents() == ["claude"], "Codex here, our hook not"
+        (home / "hooks.json").write_text(json.dumps({"hooks": {"PermissionRequest": [
+            {"hooks": [{"type": "command", "command": crc._codex_command()}]}]}}))
+        assert watch_relay.wired_agents() == ["claude", "codex"], "wired, trusted or not"
+
+    def test_health_carries_it(self):
+        import inspect
+        assert '"agents": wired_agents()' in inspect.getsource(watch_relay.RelayHandler._get_health)
 
 
 class TestCodexHookTrust:
