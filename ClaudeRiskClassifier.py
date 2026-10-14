@@ -103,7 +103,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.48"
+__version__ = "1.1.49"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -1576,7 +1576,7 @@ def _plan_plain(plan):
     gone, the line structure kept. Headings, bullets and numbers stay as
     words; code keeps its text without the fences."""
     lines = []
-    for raw in str(plan or "").splitlines():
+    for raw in _unwrap(str(plan or "").splitlines()):
         line = raw.strip()
         if line.startswith("```"):
             continue
@@ -1622,12 +1622,46 @@ def _plan_marked_line(line):
     return _PM_ESCAPE.sub(r"\1", line)
 
 
+def _unwrap(lines):
+    """Markdown lines with each wrapped paragraph or point joined into one
+    line, as Markdown itself reads them. The watch draws a line at a time,
+    so a ``**bold**`` opened on one line of a hard-wrapped plan and closed
+    on the next showed its asterisks (the owner's wrist, 2026-10-14). A
+    line that starts something of its own — a heading, a point, a quote, a
+    table row, a rule, a fence — is never joined, and nothing joins onto a
+    heading, a table row or code. watch_dashboard carries the same rule for
+    replies; TestWrappedLinesAreOneLine holds the two copies together."""
+    out, joinable, in_fence = [], False, False
+    for raw in lines:
+        if _PM_FENCE.match(raw):
+            in_fence, joinable = not in_fence, False
+            out.append(raw)
+            continue
+        closed = (not raw.strip() or in_fence or _PM_HEADING.match(raw)
+                  or _PM_HR.match(raw) or _PM_TABLE_SEP.match(raw)
+                  or raw.lstrip().startswith("|"))
+        opens = _PM_BULLET.match(raw) or _PM_NUMBER.match(raw) or _PM_QUOTE.match(raw)
+        if joinable and not (closed or opens):
+            out[-1] = out[-1].rstrip() + " " + raw.strip()
+        else:
+            out.append(raw)
+            joinable = not closed
+        # A hard break — a trailing backslash or two spaces — is a line
+        # break the writer asked for, never a wrap; its backslash is markup.
+        if joinable and (out[-1].endswith("  ") or out[-1].endswith("\\")):
+            end = out[-1].rstrip(" ")
+            out[-1] = (end[:-1] if end.endswith("\\") else end).rstrip()
+            joinable = False
+    return out
+
+
 def _plan_marked(plan):
     """A plan as the phone shows it, in what a watch can draw: a heading is
     a bold line, a nested item is indented two spaces a level, code lines
-    are set apart as code, and bold stays bold (2026-10-11)."""
+    are set apart as code, and bold stays bold (2026-10-11). A paragraph
+    wrapped over several lines is one line (``_unwrap``)."""
     lines, in_fence = [], False
-    for raw in str(plan or "").expandtabs(4).splitlines():
+    for raw in _unwrap(str(plan or "").expandtabs(4).splitlines()):
         if _PM_FENCE.match(raw):
             in_fence = not in_fence
             continue
@@ -2192,6 +2226,12 @@ def build_response(event, policy, agent=None):
         # The card shows the plan; the fingerprint below keeps the call's
         # own input, which is what the relay matches a desk answer by.
         shown = dict(shown, plan=plan_text(shown, event))
+    if (agent == "codex" and result["tool"] == "Bash"
+            and isinstance(shown, dict) and shown.get("description")):
+        # Codex's description is the question it puts to the person ("Do
+        # you want to allow …?"), not Claude's short imperative, so the
+        # card is headed by the command, as a Claude call without one is.
+        shown = {k: v for k, v in shown.items() if k != "description"}
     card = wrist_card(
         result["tool"],
         shown,
@@ -2430,6 +2470,11 @@ def run_hook(stdin=None, stdout=None, agent=None):
         event = json.loads(raw) if raw and raw.strip() else {}
         if not isinstance(event, dict):
             raise ValueError("event is not a JSON object")
+        if agent == "codex" and event.get("hook_event_name") not in (None, "PermissionRequest"):
+            # Codex fires PreToolUse for every call, its memory job's
+            # included. Only a PermissionRequest is a question; an empty
+            # stdout is Codex's "no decision" for anything else.
+            return 0
         if agent == "codex":
             policy = load_policy(dict(_shared_settings_env(), **os.environ))
         else:
@@ -3053,7 +3098,14 @@ def _strip_our_env(data):
 # --agent codex. Nothing is written for someone who does not use Codex:
 # a Claude-only install must not change by a byte (issue #390).
 
-CODEX_APP_BINARY = "/Applications/ChatGPT.app/Contents/Resources/codex"
+# Where the ChatGPT app keeps codex: codex-cli/bin since at least 0.162
+# (seen 2026-10-14); the bare Resources/codex is the first guess, kept in
+# case an older app put it there.
+CODEX_APP_BINARIES = (
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+)
+CODEX_APP_BINARY = CODEX_APP_BINARIES[0]
 
 
 def _codex_home():
@@ -3075,7 +3127,70 @@ def ensure_codex_on_path():
     found = shutil.which("codex")
     if found:
         return found
-    return CODEX_APP_BINARY if os.access(CODEX_APP_BINARY, os.X_OK) else None
+    for path in CODEX_APP_BINARIES:
+        if os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _codex_hook_hash(event_label, matcher, handler):
+    """Codex's trust hash for one hook, as codex-rs computes it
+    (hooks/src/engine/discovery.rs hook_hash, config/src/fingerprint.rs
+    version_for_toml): the event's snake_case label, the group's matcher
+    and the one normalized handler, as JSON with every object's keys
+    sorted and no spaces, SHA-256, prefixed "sha256:". A command handler
+    normalizes to its type, command, timeout (600 when unset), async, and
+    statusMessage only when set. Checked against three real hashes from
+    Codex 0.162 on 2026-10-14."""
+    import hashlib
+    normal = {"type": "command", "command": str(handler.get("command", "")),
+              "timeout": max(1, int(handler.get("timeout") or 600)),
+              "async": bool(handler.get("async", False))}
+    if handler.get("statusMessage") is not None:
+        normal["statusMessage"] = handler["statusMessage"]
+    identity = {"event_name": event_label, "hooks": [normal]}
+    if matcher is not None:
+        identity["matcher"] = matcher
+    text = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def codex_hook_trusted():
+    """Whether Codex will run our hook: True, False, or None when there is
+    nothing to trust (no Codex here, or our hook is not in its hooks.json).
+
+    Codex runs a hook only once the person has trusted it on the CLI's
+    "Hooks need review" screen, and keeps that in config.toml as
+    [hooks.state."<hooks.json>:permission_request:<entry>:<hook>"] with a
+    trusted_hash (seen 2026-10-14, Codex 0.162). The stored hash must equal
+    the hook's current one: a handler changed in place (a new command
+    path, a new timeout) is "modified" to Codex and skipped until trusted
+    again. Python 3.9 has no tomllib, hence a line scan. Anything
+    unreadable is False: never a confident "trusted" nobody has seen."""
+    path = _codex_hooks_path()
+    if not os.path.isdir(_codex_home()):
+        return None
+    entries = (_read_settings_quietly(path).get("hooks") or {}).get("PermissionRequest") or []
+    ours = [('[hooks.state."%s:permission_request:%d:%d"]' % (path, i, j),
+             _codex_hook_hash("permission_request", entry.get("matcher"), handler))
+            for i, entry in enumerate(entries) if isinstance(entry, dict)
+            for j, handler in enumerate(entry.get("hooks") or [])
+            if isinstance(handler, dict) and _is_our_hook(handler)]
+    if not ours:
+        return None
+    try:
+        with open(os.path.join(_codex_home(), "config.toml"), encoding="utf-8") as handle:
+            lines = [line.strip() for line in handle]
+    except (OSError, UnicodeDecodeError):
+        return False
+    stored = {}
+    section = None
+    for line in lines:
+        if line.startswith("["):
+            section = line
+        elif section and line.split("=", 1)[0].strip() == "trusted_hash" and "=" in line:
+            stored[section] = line.split("=", 1)[1].strip().strip('"')
+    return any(stored.get(section) == current for section, current in ours)
 
 
 def _codex_handlers(data):
@@ -3198,9 +3313,16 @@ def run_install(then_watch=False):
 
 def _say_codex(codex):
     if codex == "installed":
-        print("  Codex    : wired too; approve it once: run codex, then /hooks")
+        print("  Codex    : wired too; open codex in Terminal once and choose "
+              "\"Trust all and continue\"")
     elif codex == "current":
-        print("  Codex    : wired (approve it once in codex, /hooks)")
+        # An unchanged hooks.json says nothing about trust: ask Codex's own
+        # record, and keep the instruction until it says trusted.
+        if codex_hook_trusted() is True:
+            print("  Codex    : wired and trusted")
+        else:
+            print("  Codex    : wired, not trusted yet; open codex in Terminal once "
+                  "and choose \"Trust all and continue\"")
 
 
 def _settings_or_explain():

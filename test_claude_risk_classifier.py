@@ -18,6 +18,7 @@ import ast
 import importlib.util
 import base64
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -5585,6 +5586,79 @@ class TestThePlanKeepsItsFormatting:
                 watch_dashboard._flatten_line(line, keep_inline=True).strip(), line
 
 
+class TestWrappedLinesAreOneLine:
+    """2026-10-14, the owner's wrist: a plan's Context paragraph showed
+    ``**en diskret indikator … Codex**`` with its asterisks. The plan file
+    was wrapped by hand, the bold opened on one line and closed on the
+    next, and the watch draws (and so parses) one line at a time.
+    Markdown reads a wrapped paragraph as one; so must what we send."""
+
+    PLAN = ("# Codex på uret\n\n## Kontekst\n"
+            "Ejeren (2026-10-14) vil have Codex-sessioner på uret med designet\n"
+            "stort set uændret og **en diskret indikator for, om en session er\n"
+            "Claude Code eller Codex**. Han spørger også om tre ting.\n\n"
+            "## Plan\n"
+            "1. Tilføj et felt, der\n   siger hvilken agent\n"
+            "2. Vis **det\n   lille** mærke\n"
+            "- et punkt\n  med en fortsættelse\n"
+            "- næste punkt\n\n"
+            "| a | b |\n|---|---|\n| c | d |\n\n"
+            "```sh\nls\n-la\n```\nefter koden\n")
+
+    def card(self):
+        return crc.wrist_card("ExitPlanMode", {"plan": self.PLAN}, Risk.MEDIUM)
+
+    def test_bold_split_by_a_wrap_is_one_line_on_the_marked_plan(self):
+        lines = self.card()["plan_marked"].splitlines()
+        assert ("Ejeren (2026-10-14) vil have Codex-sessioner på uret med designet "
+                "stort set uændret og **en diskret indikator for, om en session er "
+                "Claude Code eller Codex**. Han spørger også om tre ting.") in lines
+        for line in lines:
+            assert line.count("**") % 2 == 0, line
+
+    def test_a_wrapped_point_stays_one_point(self):
+        lines = self.card()["plan_marked"].splitlines()
+        assert "1. Tilføj et felt, der siger hvilken agent" in lines
+        assert "2. Vis **det lille** mærke" in lines
+        assert "• et punkt med en fortsættelse" in lines
+        assert "• næste punkt" in lines, "a new point is never joined"
+
+    def test_headings_tables_and_code_are_never_joined(self):
+        lines = self.card()["plan_marked"].splitlines()
+        assert "**Kontekst**" in lines and "**Plan**" in lines
+        assert "a · b" in lines and "c · d" in lines
+        assert "  `ls`" in lines and "  `-la`" in lines
+        assert "efter koden" in lines
+
+    def test_the_plain_plan_loses_every_asterisk(self):
+        plain = self.card()["plan"]
+        assert "**" not in plain
+        assert "uændret og en diskret indikator" in plain
+
+    def test_a_reply_in_the_thread_is_read_the_same_way(self):
+        text = watch_dashboard.blocks(self.PLAN, always=True)[0]["text"]
+        assert "og **en diskret indikator for, om en session er Claude Code " \
+               "eller Codex**." in text
+        for line in text.splitlines():
+            assert line.count("**") % 2 == 0, line
+
+    def test_a_hard_break_is_kept_on_every_path(self):
+        # Codex's review of #496: a trailing backslash or two spaces is a
+        # line break the writer asked for, not a wrap.
+        md = "# T\nfør\\\nefter\n\nen  \nto\ntre"
+        want = ["før", "efter", "", "en", "to tre"]
+        assert crc._plan_marked(md).splitlines()[1:] == want
+        assert crc._plan_plain(md).splitlines()[1:] == want
+        text = watch_dashboard.blocks(md, always=True)[0]["text"]
+        assert text.splitlines()[1:] == want
+
+    def test_one_rule_on_both_sides_of_the_mac(self):
+        # The hook carries its own copy (it must run alone).
+        for md in (self.PLAN, "a\\\nb  \nc\nd"):
+            lines = md.splitlines()
+            assert crc._unwrap(lines) == watch_dashboard._unwrap(lines)
+
+
 class TestPhoneVocabulary:
     """The watch thread speaks the phone app's language: tool bursts
     become one phrase, and running background tasks are counted."""
@@ -6523,6 +6597,98 @@ class TestTaskVerdictsCanRecover:
         # The task wakes and writes again: the verdict must recover.
         out.write_text("still working\nmore output\n")
         assert watch_dashboard._task_state("sess", "tid2") == "running"
+
+
+class TestASilentTaskOfALiveSessionStillRuns:
+    """A wait that sends its output to /dev/null writes nothing until it
+    ends, so its output file goes stale while it runs. The wrist called a
+    Remote Control session idle 36 minutes into "gh run watch … >/dev/null"
+    while the phone showed one running task (2026-10-14). A stale file with
+    no exit marker is running when the session's live process was already
+    started when the file was born; a dead owner or an older file is not."""
+
+    SID = "quiet01"
+
+    def _registry(self, tmp_path, monkeypatch, started_at, alive=True):
+        import watch_dashboard
+        sessions = tmp_path / "sessions"
+        sessions.mkdir(exist_ok=True)
+        pid = os.getpid() if alive else 2 ** 22 + 7
+        (sessions / "1.json").write_text(json.dumps({
+            "pid": pid, "sessionId": self.SID, "entrypoint": "cli",
+            "startedAt": int(started_at * 1000)}), encoding="utf-8")
+        monkeypatch.setattr(watch_dashboard, "CLAUDE_SESSIONS", str(sessions))
+
+    def _quiet_file(self, tmp_path, monkeypatch, born, text=""):
+        import watch_dashboard
+        tasks = tmp_path / "tmp" / "claude-1" / "proj" / self.SID / "tasks"
+        tasks.mkdir(parents=True, exist_ok=True)
+        out = tasks / "bquiet.output"
+        out.write_text(text, encoding="utf-8")
+        os.utime(out, (born, born))                 # quiet since it was born
+        monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+        monkeypatch.setattr(watch_dashboard, "_born", lambda path: born)
+        return out
+
+    def test_registry_carries_when_the_process_started(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        self._registry(tmp_path, monkeypatch, 1700000000.5)
+        entry = watch_dashboard.session_registry()[self.SID]
+        assert entry["started_at"] == 1700000000.5
+
+    def test_a_quiet_task_of_a_live_process_is_running(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        now = time.time()
+        self._registry(tmp_path, monkeypatch, now - 7200)
+        self._quiet_file(tmp_path, monkeypatch, now - 3600)
+        assert watch_dashboard._task_state(self.SID, "bquiet") == "running"
+
+    def test_a_dead_owner_leaves_it_unknown(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        now = time.time()
+        self._registry(tmp_path, monkeypatch, now - 7200, alive=False)
+        self._quiet_file(tmp_path, monkeypatch, now - 3600)
+        assert watch_dashboard._task_state(self.SID, "bquiet") == "unknown"
+
+    def test_a_file_older_than_the_live_process_is_unknown(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        now = time.time()
+        # Born under an earlier process (before a --resume or a restart).
+        self._registry(tmp_path, monkeypatch, now - 600)
+        self._quiet_file(tmp_path, monkeypatch, now - 3600)
+        assert watch_dashboard._task_state(self.SID, "bquiet") == "unknown"
+
+    def test_the_exit_marker_still_wins(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        now = time.time()
+        self._registry(tmp_path, monkeypatch, now - 7200)
+        self._quiet_file(tmp_path, monkeypatch, now - 3600,
+                         text="x\n[exited with code 0]\n")
+        assert watch_dashboard._task_state(self.SID, "bquiet") == "done"
+
+    def test_the_session_reads_running_not_idle(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        now = time.time()
+        self._registry(tmp_path, monkeypatch, now - 7200)
+        self._quiet_file(tmp_path, monkeypatch, now - 3600)
+        path = _write_transcript(tmp_path, "-p", self.SID + ".jsonl", [
+            {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_q1", "name": "Bash",
+                 "input": {"description": "Wait for both model evals to finish",
+                           "command": "gh run watch 1 >/dev/null 2>&1",
+                           "run_in_background": True}}]}},
+            {"message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_q1", "content":
+                 "Command running in background with ID: bquiet. Output is "
+                 "being written to: /x/bquiet.output"}]}},
+        ])
+        watch_dashboard._THREAD_STATE.pop(str(path), None)
+        _, running, tool = watch_dashboard._parse_thread(str(path), 14)
+        assert running == 1
+        assert watch_dashboard._THREAD_STATE[str(path)]["running_label"] == \
+            "Wait for both model evals to finish"
+        assert watch_dashboard.session_state(2160, tool, running, False, False) \
+            == ("running", "tasks")
 
 
 class TestAlwaysMirrorsThePhone:
@@ -11063,7 +11229,7 @@ class TestTheReportingItselfIsChecked:
     # a key that is not here fails the first test below, which is the
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
-    VOCABULARY = {"bonjour", "bridge", "claude", "crash", "helper", "port", "signin", "tunnel", "update"}
+    VOCABULARY = {"bonjour", "bridge", "claude", "codex", "crash", "helper", "port", "signin", "tunnel", "update"}
 
     @staticmethod
     def _module_source(name):
@@ -12811,6 +12977,195 @@ class TestCodexAgent:
                             "which", lambda name: None)
         monkeypatch.setattr(crc.os, "access", lambda path, mode: path == crc.CODEX_APP_BINARY)
         assert crc.ensure_codex_on_path() == crc.CODEX_APP_BINARY
+
+    # What Codex 0.162 actually sent on 2026-10-14 (M0 of #390), the user's
+    # paths replaced by /repo. The CLI and the ChatGPT app sent the same shape.
+    M0_BASH = {"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+               "tool_input": {"command": "/usr/bin/curl -sI https://example.com",
+                              "description": "Do you want to allow the requested "
+                                             "network-only curl probe to example.com?"},
+               "session_id": "01a13960-b12c-7cf2-8f03-6a854e64ad66",
+               "turn_id": "t1", "cwd": "/repo", "model": "gpt-5.6",
+               "permission_mode": "default",
+               "transcript_path": "/repo/.codex/sessions/rollout.jsonl"}
+    M0_PATCH = {"hook_event_name": "PreToolUse", "tool_name": "apply_patch",
+                "tool_input": {"command": "*** Begin Patch\n*** Add File: /repo/README.md\n"
+                                          "+Tapproval Codex hook probe\n*** End Patch\n"},
+                "session_id": "s", "turn_id": "t2", "cwd": "/repo",
+                "permission_mode": "default"}
+    M0_MCP = {"hook_event_name": "PreToolUse", "tool_name": "mcp__cua_repl__js",
+              "tool_input": {"title": "Read available MCP surface state",
+                             "code": "await cua.getState();"},
+              "session_id": "s", "turn_id": "t3", "cwd": "/repo",
+              "permission_mode": "default"}
+
+    @staticmethod
+    def _hook(event, monkeypatch, tmp_path, mode="shadow"):
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+        (tmp_path / "settings.json").write_text(json.dumps(
+            {"env": {"CLAUDE_RISK_MODE": mode}}))
+        for name in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY", "CLAUDE_RISK_RELAY_WAIT"):
+            monkeypatch.delenv(name, raising=False)
+        out = io.StringIO()
+        assert crc.run_hook(stdin=io.StringIO(json.dumps(event)), stdout=out,
+                            agent="codex") == 0
+        return out.getvalue()
+
+    def test_a_real_codex_request_escalates_in_the_shape_codex_reads(self, monkeypatch, tmp_path):
+        """Escalating is saying nothing: no decision key, so Codex asks as usual."""
+        said = json.loads(self._hook(self.M0_BASH, monkeypatch, tmp_path, mode="enforce"))
+        assert said == {"hookSpecificOutput": {"hookEventName": "PermissionRequest"}}
+
+    def test_a_codex_event_that_is_not_a_permission_request_says_nothing(self, monkeypatch, tmp_path):
+        """Codex fires PreToolUse for every call, its own memory job included.
+        Only a PermissionRequest is a question; anything else gets no card
+        and no answer, and an empty stdout is Codex's "no decision"."""
+        for event in (self.M0_PATCH, self.M0_MCP):
+            assert self._hook(event, monkeypatch, tmp_path, mode="enforce") == ""
+
+    def test_a_claude_event_without_an_event_name_is_still_answered(self, monkeypatch, tmp_path):
+        """The filter is Codex's alone: Claude Code's events are untouched."""
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+        out = io.StringIO()
+        crc.run_hook(stdin=io.StringIO(json.dumps({"tool_name": "Bash",
+                                                    "tool_input": {"command": "ls"}})),
+                     stdout=out)
+        assert json.loads(out.getvalue())["hookSpecificOutput"]["hookEventName"] == "PermissionRequest"
+
+    def test_a_codex_card_is_headed_by_its_command_not_its_question(self):
+        """Codex's description is the question it puts to the person ("Do you
+        want to allow …?"), not Claude's short imperative. The wrist names
+        the command instead; a Claude card keeps its description."""
+        _, _, codex = crc.build_response(self.M0_BASH, dict(crc.DEFAULT_POLICY), agent="codex")
+        bare = crc.wrist_card("Bash", {"command": self.M0_BASH["tool_input"]["command"]},
+                              crc.Risk.LOW)
+        assert codex["headline"] == bare["headline"] == "Fetch https://example.com"
+        _, _, claude = crc.build_response(
+            {"tool_name": "Bash", "tool_input": {"command": "gh pr list",
+                                                 "description": "List open PRs"}},
+            dict(crc.DEFAULT_POLICY))
+        assert claude["headline"] == "List open PRs"
+
+    def test_codex_is_found_where_the_chatgpt_app_keeps_it_today(self, monkeypatch):
+        """0.162 lives in Resources/codex-cli/bin/codex; the first guess,
+        Resources/codex, was never there."""
+        today = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+        assert today in crc.CODEX_APP_BINARIES
+        monkeypatch.setattr(__import__("shutil"), "which", lambda name: None)
+        monkeypatch.setattr(crc.os, "access", lambda path, mode: path == today)
+        assert crc.ensure_codex_on_path() == today
+
+    def test_the_installer_describes_the_screen_codex_shows(self, capsys):
+        crc._say_codex("installed")
+        said = capsys.readouterr().out
+        assert "Trust all and continue" in said and "/hooks" not in said
+
+
+class TestCodexHookTrust:
+    """Codex runs a hook only once the person has trusted it, at the CLI's
+    "Hooks need review" screen; the ChatGPT app has no such screen. Until
+    then every question stays at the computer, and the wrist should say so.
+    Codex keeps the trust in config.toml as
+    [hooks.state."<hooks.json>:permission_request:<entry>:<hook>"]
+    with a trusted_hash (seen 2026-10-14, Codex 0.162)."""
+
+    @pytest.fixture(autouse=True)
+    def _home(self, tmp_path, monkeypatch):
+        self.home = tmp_path / "codex"
+        monkeypatch.setenv("CODEX_HOME", str(self.home))
+        watch_relay.clear_condition("codex")
+        yield
+        watch_relay.clear_condition("codex")
+
+    def _wire(self, ours_at=1):
+        self.home.mkdir(exist_ok=True)
+        entries = [{"hooks": [{"type": "command", "command": "python3 probe.py"}]}]
+        entries.insert(ours_at, {"hooks": [{"type": "command",
+                                            "command": crc._codex_command()}]})
+        (self.home / "hooks.json").write_text(json.dumps(
+            {"hooks": {"PermissionRequest": entries}}))
+        return "%s:permission_request:%d:0" % (crc._codex_hooks_path(), ours_at)
+
+    def _trust(self, *keys, hashed=None):
+        """Trust each key with the hash Codex would store for our hook as
+        it stands in hooks.json now, or with `hashed` when given."""
+        wired = json.loads((self.home / "hooks.json").read_text())["hooks"]["PermissionRequest"]
+        lines = ['model = "x"', "", "[hooks.state]", ""]
+        for key in keys:
+            i, j = (int(n) for n in key.rsplit(":", 2)[1:])
+            entry = wired[i]
+            value = hashed or crc._codex_hook_hash(
+                "permission_request", entry.get("matcher"), entry["hooks"][j])
+            lines += ['[hooks.state."%s"]' % key, 'trusted_hash = "%s"' % value, ""]
+        (self.home / "config.toml").write_text("\n".join(lines))
+
+    def test_the_hash_is_codexs_own(self):
+        """Codex's identity for a hook: event label, matcher, the normalized
+        handler, as sorted compact JSON, SHA-256. The same recipe matched
+        three real trusted_hash values from Codex 0.162 on 2026-10-14."""
+        handler = {"type": "command", "command": "python3 probe.py", "timeout": 5}
+        expected = "sha256:" + hashlib.sha256(json.dumps(
+            {"event_name": "permission_request",
+             "hooks": [{"async": False, "command": "python3 probe.py",
+                        "timeout": 5, "type": "command"}]},
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        assert crc._codex_hook_hash("permission_request", None, handler) == expected
+        assert crc._codex_hook_hash("permission_request", "*", handler) != expected, \
+            "the matcher is part of the identity"
+        assert (crc._codex_hook_hash("permission_request", None, {"command": "x"})
+                == crc._codex_hook_hash("permission_request", None,
+                                        {"command": "x", "timeout": 600})), \
+            "an unset timeout is Codex's 600"
+
+    def test_a_hook_changed_since_it_was_trusted_is_not_trusted(self):
+        """Codex calls it "modified" and skips it until trusted again."""
+        key = self._wire()
+        self._trust(key, hashed="sha256:" + "0" * 64)
+        assert crc.codex_hook_trusted() is False
+
+    def test_the_installer_keeps_asking_until_codex_trusts_it(self, capsys):
+        key = self._wire()
+        crc._say_codex("current")
+        assert "Trust all and continue" in capsys.readouterr().out
+        self._trust(key)
+        crc._say_codex("current")
+        said = capsys.readouterr().out
+        assert "trusted" in said and "Trust all and continue" not in said
+
+    def test_no_codex_is_nothing_to_trust(self):
+        assert crc.codex_hook_trusted() is None
+
+    def test_codex_without_our_hook_is_nothing_to_trust(self):
+        self.home.mkdir()
+        (self.home / "hooks.json").write_text(json.dumps({"hooks": {}}))
+        assert crc.codex_hook_trusted() is None
+
+    def test_our_hook_untrusted_is_said(self):
+        self._wire()
+        self._trust("%s:permission_request:0:0" % crc._codex_hooks_path())  # the probe's only
+        assert crc.codex_hook_trusted() is False
+
+    def test_our_hook_trusted_is_found_at_its_own_index(self):
+        self._trust(self._wire(ours_at=1))
+        assert crc.codex_hook_trusted() is True
+        self._trust(self._wire(ours_at=0))
+        assert crc.codex_hook_trusted() is True
+
+    def test_an_unreadable_config_is_never_trust(self):
+        self._wire()
+        (self.home / "config.toml").write_bytes(b"\xff\xfe\x00garbage")
+        assert crc.codex_hook_trusted() is False
+        (self.home / "config.toml").unlink()
+        assert crc.codex_hook_trusted() is False
+
+    def test_the_relay_says_it_on_the_wrist_and_clears_it(self):
+        key = self._wire()
+        assert watch_relay.check_codex_hook() is False
+        said = [c for c in watch_relay.conditions() if c["key"] == "codex"]
+        assert said and "Trust all and continue" in said[0]["detail"], said
+        self._trust(key)
+        assert watch_relay.check_codex_hook() is True
+        assert not [c for c in watch_relay.conditions() if c["key"] == "codex"]
 
 
 class TestCardsAnsweredAtTheDeskLeave:

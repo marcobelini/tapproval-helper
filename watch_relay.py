@@ -3963,6 +3963,26 @@ def check_bridge(queue, started, now=None):
     return False
 
 
+def check_codex_hook():
+    """Note or clear the `codex` condition: our hook is in Codex's
+    hooks.json but Codex has not been told to trust it, so every Codex
+    question stays at the computer. True when all is well, or when there
+    is no Codex here. Paths are read on each call (#362)."""
+    try:
+        from ClaudeRiskClassifier import codex_hook_trusted
+        trusted = codex_hook_trusted()
+    except Exception:                  # no helper beside us: `helper` says so
+        trusted = None
+    if trusted is False:
+        note_condition(
+            "codex",
+            "Codex asks its questions on the computer until you open codex "
+            "in Terminal once and choose \"Trust all and continue\".")
+        return False
+    clear_condition("codex")
+    return True
+
+
 def watch_bridge(queue, sleep=time.sleep, checks=None):
     """Look at the bridge once a minute for as long as the relay runs."""
     started = time.monotonic()
@@ -3971,6 +3991,7 @@ def watch_bridge(queue, sleep=time.sleep, checks=None):
         sleep(60)
         done += 1
         check_bridge(queue, started)
+        check_codex_hook()
 
 
 # How often the relay looks at its own tunnel. start_tunnel() checked once,
@@ -4380,6 +4401,7 @@ def main(argv=None):
               file=sys.stderr)
 
     check_helper_is_visible()
+    check_codex_hook()
     ensure_claude_on_path()
     helper_provenance()
     install_crash_reporting()

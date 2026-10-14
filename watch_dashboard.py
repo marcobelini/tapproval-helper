@@ -325,8 +325,17 @@ def session_registry(sessions_dir=None):
                      != shape("registry.name_derived") else ""),
             "cwd": str(data.get("cwd") or ""),
             "pid": int(pid),
+            "started_at": _started_seconds(data.get(shape("registry.started_at"))),
         }
     return registry
+
+
+def _started_seconds(value):
+    """The registry's startedAt (ms) as seconds, or None when absent."""
+    try:
+        return float(value) / 1000.0 if value else None
+    except (TypeError, ValueError):
+        return None
 
 
 def live_sessions(sessions_dir=None):
@@ -534,6 +543,10 @@ UPSTREAM_SHAPES = {
     "registry.bridged":
         ("bridgeSessionId", "The session registry's mark of a session "
          "Remote Control carries to the phone.", "2026-09-03"),
+    "registry.started_at":
+        ("startedAt", "When the registry says a session's process started, "
+         "in milliseconds: a task output file born after it belongs to the "
+         "live process, which writes the exit marker itself.", "2026-10-14"),
     "registry.name_source":
         ("nameSource", "How the registry says a session's name came about.",
          "2026-09-03"),
@@ -1205,7 +1218,7 @@ def blocks(markdown, always=False):
         if fence_len and not fence_is_prose:
             code.append(raw)
             continue
-        prose.append(line)
+        prose.append(raw)   # trailing spaces can be a hard break
     if code:
         # An unclosed fence at the end of a reply is still code.
         out.append({"kind": "code", "lang": lang, "text": "\n".join(code).strip("\n")})
@@ -1236,13 +1249,44 @@ def _flatten_line(line, keep_inline=False):
     return _MD_ESCAPE.sub(r"\1", line)
 
 
+def _unwrap(lines):
+    """Markdown lines with each wrapped paragraph or point joined into one
+    line, as Markdown itself reads them: the watch draws a line at a time,
+    so a ``**bold**`` split by a hard wrap showed its asterisks (the
+    owner's wrist, 2026-10-14). The hook's ``_unwrap`` is the same rule;
+    TestWrappedLinesAreOneLine holds the two copies together."""
+    out, joinable, in_fence = [], False, False
+    for raw in lines:
+        if _MD_FENCE.match(raw):
+            in_fence, joinable = not in_fence, False
+            out.append(raw)
+            continue
+        closed = (not raw.strip() or in_fence or _MD_HEADING.match(raw)
+                  or _MD_HR.match(raw) or _MD_TABLE_SEP.match(raw)
+                  or raw.lstrip().startswith("|"))
+        opens = _MD_BULLET.match(raw) or _MD_NUMBER.match(raw) or _MD_QUOTE.match(raw)
+        if joinable and not (closed or opens):
+            out[-1] = out[-1].rstrip() + " " + raw.strip()
+        else:
+            out.append(raw)
+            joinable = not closed
+        # A hard break — a trailing backslash or two spaces — is a line
+        # break the writer asked for, never a wrap; its backslash is markup.
+        if joinable and (out[-1].endswith("  ") or out[-1].endswith("\\")):
+            end = out[-1].rstrip(" ")
+            out[-1] = (end[:-1] if end.endswith("\\") else end).rstrip()
+            joinable = False
+    return out
+
+
 def _marked_lines(lines):
     """Prose lines as the phone shows them, in what a watch can draw: the
     inline marks kept, a heading as a bold line with air above it, a
-    nested point indented two spaces a level, block markup read. The
-    hook's ``_plan_marked`` applies the same rules to a plan."""
+    nested point indented two spaces a level, block markup read, and a
+    wrapped paragraph one line (``_unwrap``). The hook's ``_plan_marked``
+    applies the same rules to a plan."""
     out = []
-    for raw in lines:
+    for raw in _unwrap(lines):
         raw = raw.expandtabs(4)
         if not raw.strip() or _MD_HR.match(raw) or _MD_TABLE_SEP.match(raw):
             if not raw.strip() and out and out[-1]:
@@ -1404,7 +1448,22 @@ def _task_state(session_id, task_id):
     resumes writing, or a transient read error, must be able to come
     back — only an exit marker is forever.
     """
-    return _judge_task_files(_task_output_files(session_id).get(task_id, ()))
+    return _judge_task_files(_task_output_files(session_id).get(task_id, ()),
+                             _owner_started(session_id))
+
+
+def _owner_started(session_id):
+    """When the live process that owns this session started, in seconds,
+    or None when no live process owns it."""
+    return session_registry().get(session_id, {}).get("started_at")
+
+
+def _born(path):
+    """When a file was created: its birth time where the platform keeps
+    one (macOS), else its mtime — later than birth, so never a reason to
+    believe a file is newer than it is."""
+    info = os.stat(path)
+    return getattr(info, "st_birthtime", None) or info.st_mtime
 
 
 def _task_output_files(session_id):
@@ -1427,8 +1486,16 @@ def _task_output_files(session_id):
     return by_task
 
 
-def _judge_task_files(found):
-    """The verdict for one task, from its output files (see _task_state)."""
+def _judge_task_files(found, owner_started=None):
+    """The verdict for one task, from its output files (see _task_state).
+
+    A file quiet for half an hour is still "running" when the process that
+    owns the session is alive and started before the file was born: that
+    process writes the exit marker itself when its task ends, so no marker
+    from a live owner means not ended. A wait that sends its output to
+    /dev/null ("gh run watch … >/dev/null") writes nothing until it ends,
+    and the wrist called a session idle 36 minutes into one (2026-10-14).
+    A dead owner, or a file older than the live one, stays "unknown"."""
     # No file at all is no evidence, and no evidence is not "running".
     #
     # This used to let the transcript's word stand, which sounds humble and
@@ -1447,6 +1514,8 @@ def _judge_task_files(found):
             if shape("task.exited") in tail or shape("task.killed") in tail:
                 return "done"
             if time.time() - os.path.getmtime(path) <= 1800:
+                return "running"
+            if owner_started is not None and _born(path) >= owner_started:
                 return "running"
         except OSError:
             continue
@@ -1601,11 +1670,12 @@ def _running_task_count(state, session_id):
     running = 0
     outstanding = state["launched"] - state["finished"]
     files = _task_output_files(session_id) if outstanding else {}
+    owner_started = _owner_started(session_id) if outstanding else None
     labels = state.setdefault("task_labels", {})
     label = None
     # Launch order, so the label is the newest running task's.
     for tid in [t for t in labels if t in outstanding] + sorted(outstanding - set(labels)):
-        verdict = _judge_task_files(files.get(tid, ()))
+        verdict = _judge_task_files(files.get(tid, ()), owner_started)
         if verdict == "done":
             state["finished"].add(tid)
         elif verdict == "running":
