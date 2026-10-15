@@ -15,7 +15,7 @@
   conversation and reply, or start a new session from the watch.
 - Replies and plans read on the watch the way they do on the phone: bold,
   lists and indented sub-points.
-- Multiple-choice questions arrive with the same choices as on the desktop.
+- Multiple-choice questions arrive with the same choices as on the desktop; several questions arrive one after another. From watch app 2.0, more than one answer can be picked where Claude allows it.
 
 ## What it needs
 - An Apple Watch running watchOS 10 or later.

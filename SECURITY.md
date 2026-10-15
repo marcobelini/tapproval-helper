@@ -47,6 +47,13 @@ longer. A problem that is not yet fixed is not described in public.
   could therefore answer a prompt. Protect it with two-factor
   authentication. A second key stored beside the first would add nothing,
   and a key kept anywhere else would end automatic pairing.
+- **"Don't ask again" on the watch writes what the terminal's would.** The
+  terminal's words appear only where Claude Code itself offers the row, and
+  the tap writes only what that row applies: a rule for the exact command
+  (or the web host) in the project's `.claude/settings.local.json`, or a
+  switch to accept edits for this session. Never to your user or shared
+  project settings, never on a CRITICAL card, and never anything Base cannot
+  read word for word.
 
 ## Design rules we will not trade away
 

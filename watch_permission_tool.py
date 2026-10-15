@@ -126,7 +126,10 @@ def decide(tool_name, tool_input, crc=None, cwd=None):
             return {"behavior": "allow",
                     "updatedInput": dict(tool_input, answers=answer)}
         return deny("The user answered from their watch: %s" % answer)
-    if verdict == "allow":
+    # A permission-prompt tool is not sent Claude Code's suggestions, so its
+    # cards carry no "don't ask again" row; a "dont_ask" that arrives anyway
+    # allows this once.
+    if verdict in ("allow", "dont_ask"):
         return {"behavior": "allow", "updatedInput": tool_input}
     if verdict == "deny":
         return deny("You denied this on your watch.")

@@ -103,7 +103,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.55"
+__version__ = "1.1.57"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -1614,6 +1614,34 @@ PLAN_EDITS = "Suggest edits:"     # the wire prefix for dictated edits; every
 AGENT_ANSWERS = {
     "codex": ("Yes, proceed", "No, continue without running it"),
 }
+
+# "Don't ask again" on an ordinary prompt, as the terminal offers it (#560,
+# owner 2026-10-15). Claude Code 2.1.300 sends the prompt's
+# permission_suggestions to the hook, and its dialog builds the row from
+# them, filtered (J0/ho): allow rules and directories for Bash, the mode
+# and directories for a file tool, a domain rule for WebFetch; only the
+# localSettings and session destinations. A hook's updatedPermissions go
+# through the same persistPermissions the dialog's row does, but unfiltered,
+# so the filter is applied here: never a userSettings or projectSettings
+# write the terminal would not have made. The labels are the terminal's,
+# read off its screen on 2026-10-15:
+#   "Yes, and don’t ask again for: python3 -c 'print(42)'"  (Bash, one rule;
+#        the terminal shows its own guessed prefix there, "python3 *", and
+#        writes that: the owner chose the exact command the suggestion
+#        names, so the label says exactly what is written)
+#   "Yes, and always allow access to /dir from this project"  (Bash, dirs)
+#   "Yes, and switch to accept edits (auto-approve file edits and common
+#        file commands) for this session"  (Write, Edit)
+#   "… ; Yes, and always allow access to /a, /b for this session"
+#   "Yes, and don't ask again for example.com"  (WebFetch)
+# Anything this cannot validate or word gives no row: the watch then keeps
+# its old "Always allow for this session", which writes nothing.
+DONT_ASK_DESTINATIONS = frozenset(("localSettings", "session"))
+FILE_TOOLS = frozenset(("Write", "Edit", "MultiEdit", "NotebookEdit"))
+ACCEPT_EDITS_WORDS = ("accept edits (auto-approve file edits and common "
+                      "file commands)")
+DONT_ASK_MAX_ITEMS = 8           # the terminal drops a row naming more
+DONT_ASK_MAX_CHARS = 160         # … or one whose words run longer (Bash)
 # Two copies travel (plain and marked), inside the relay's 64 KB body.
 PLAN_CHARS = 6000
 # The modes Claude Code's validator accepts for setMode (2.1.280).
@@ -1983,7 +2011,9 @@ def _mcp_headline(tool, action):
 
 
 def _questions(tool_input):
-    """AskUserQuestion's questions, each as (text, option labels)."""
+    """AskUserQuestion's questions, each as (text, option labels, whether
+    several may be chosen). Labels are flattened to one line, which is
+    what lets a multi-select answer carry one label per line."""
     questions = (tool_input or {}).get("questions") if isinstance(tool_input, dict) else None
     found = []
     for entry in (questions if isinstance(questions, list) else [])[:4]:
@@ -1993,8 +2023,8 @@ def _questions(tool_input):
             " ".join(str(o.get("label", "")).split())
             for o in (entry.get("options") or [])
             if isinstance(o, dict) and o.get("label")
-        ][:4]))
-    return found or [("", [])]
+        ][:4], entry.get("multiSelect") is True))
+    return found or [("", [], False)]
 
 
 def questions_need_typing(tool_input):
@@ -2004,7 +2034,7 @@ def questions_need_typing(tool_input):
     or "number", which carry none; malformed input carries none either.
     The wrist only chooses, and an Allow on such a card went back with no
     answers, which Claude Code drops (2026-10-15)."""
-    return any(not options for _, options in _questions(tool_input))
+    return any(not options for _, options, _multi in _questions(tool_input))
 
 
 def question_cards(card, tool_input, headline_chars=HEADLINE_CHARS,
@@ -2016,10 +2046,12 @@ def question_cards(card, tool_input, headline_chars=HEADLINE_CHARS,
     that question's words and labels. With more than one question the
     headline says which ("1 of 2 · …"): until 2026-10-15 only the first
     reached the wrist, and Claude took its one label for every answer.
+    A question that allows several answers says so (``multi_select``);
+    a watch older than that field taps one, which is still an answer.
     """
     found = _questions(tool_input)
     cards = []
-    for index, (question, options) in enumerate(found):
+    for index, (question, options, multi) in enumerate(found):
         question = " ".join(question.split()) or "Claude has a question"
         if len(found) > 1:
             question = "%d of %d · %s" % (index + 1, len(found), question)
@@ -2027,8 +2059,11 @@ def question_cards(card, tool_input, headline_chars=HEADLINE_CHARS,
                    headline=_fit(question, TEXT_CHARS),
                    detail=_fit(" · ".join(options), detail_chars))
         one.pop("options", None)
+        one.pop("multi_select", None)
         if options:
             one["options"] = options
+            if multi:
+                one["multi_select"] = True
         cards.append(one)
     return cards
 
@@ -2388,6 +2423,15 @@ def build_response(event, policy, agent=None):
         card["agent"] = agent
     if agent in AGENT_ANSWERS and not card.get("kind"):
         card["allow_label"], card["deny_label"] = AGENT_ANSWERS[agent]
+    # The terminal's "don't ask again", in its words, for a watch that
+    # shows them; one that predates the label keeps "Always allow for
+    # this session", which writes nothing. Never on CRITICAL, as the
+    # watch has never offered a third button there.
+    if (card.get("can_always") and not card.get("kind") and agent in (None, "claude")
+            and risk != Risk.CRITICAL):
+        row = dont_ask_row(event)
+        if row:
+            card["always_label"] = row[0]
     decision, reason = decide(risk, policy)
 
     shadow = str(policy.get("mode", "shadow")).lower() != "enforce"
@@ -2456,6 +2500,10 @@ def ask_watch(card, policy, project=None):
     decision = answer.get("decision")
     if decision == "answer" and answer.get("answer"):
         return "answer", str(answer["answer"])[:600]
+    if decision == "allow" and answer.get("dont_ask") is True:
+        # The terminal's "don't ask again", tapped on a watch that showed
+        # its words (card["always_label"]).
+        return "dont_ask", None
     return (decision if decision in ("allow", "deny") else "none"), None
 
 
@@ -2494,17 +2542,131 @@ def ask_questions(card, tool_input, policy, project=None, ask=None):
         # Claude Code drops an allow without them for this tool.
         if verdict != "answer" or not chosen:
             return "none", None
-        answers[questions[index][0]] = chosen
+        text, options, multi = questions[index]
+        answers[text] = _chosen_labels(chosen, options) if multi else chosen
     return "answer", answers
+
+
+def _chosen_labels(chosen, options):
+    """A multi-select card's answer: the watch sends every label it picked,
+    one per line. As a list when each is one of the card's options — the
+    shape 2.1.300's dialog hands the tool for a multiSelect question.
+    Otherwise the words as they came: nothing is guessed, and Claude Code
+    tells Claude to read an answer that is not an option."""
+    picked = chosen.split("\n")
+    return picked if all(label in options for label in picked) else chosen
 
 
 def _answers_in_words(answers):
     """The terminal's own rendering of answers ("Q"="A", …), for a channel
-    that carries only words."""
-    return ", ".join('"%s"="%s"' % pair for pair in answers.items())
+    that carries only words. Several labels read "A, B", as there."""
+    return ", ".join('"%s"="%s"' % (question, ", ".join(answer)
+                                    if isinstance(answer, list) else answer)
+                     for question, answer in answers.items())
 
 
-def _permission_output(behavior, message="", mode=None, updated_input=None):
+def _and_list(items):
+    """The terminal's list: "a", "a and b", "a, b, and c"."""
+    items = list(items)
+    if len(items) <= 2:
+        return " and ".join(items)
+    return ", ".join(items[:-1]) + ", and " + items[-1]
+
+
+def _valid_update(update):
+    """One permission update in the shape the CLI's validator accepts, and
+    of a kind the terminal's own "don't ask again" row would apply."""
+    if not isinstance(update, dict):
+        return False
+    kind, where = update.get("type"), update.get("destination")
+    if where not in DONT_ASK_DESTINATIONS:
+        return False
+    if kind == "addRules":
+        rules = update.get("rules")
+        return (update.get("behavior") == "allow" and isinstance(rules, list)
+                and bool(rules) and all(
+                    isinstance(r, dict) and isinstance(r.get("toolName"), str)
+                    and r["toolName"] and isinstance(r.get("ruleContent", ""), str)
+                    and set(r) <= {"toolName", "ruleContent"} for r in rules)
+                and set(update) == {"type", "rules", "behavior", "destination"})
+    if kind == "addDirectories":
+        dirs = update.get("directories")
+        return (isinstance(dirs, list) and bool(dirs)
+                and all(isinstance(d, str) and d for d in dirs)
+                and set(update) == {"type", "directories", "destination"})
+    if kind == "setMode":
+        return (update.get("mode") == "acceptEdits" and where == "session"
+                and set(update) == {"type", "mode", "destination"})
+    return False
+
+
+def dont_ask_row(event):
+    """The terminal's "don't ask again" row for this prompt, as
+    ``(label, updates)``, or None when it offers none this hook can give.
+
+    Built only from the event's own ``permission_suggestions``: nothing is
+    invented, and anything not understood gives no row (fail closed)."""
+    event = event or {}
+    tool = str(event.get("tool_name") or "")
+    raw = event.get("permission_suggestions")
+    if not isinstance(raw, list) or not raw:
+        return None
+    if tool == "Bash":
+        kept = [u for u in raw if isinstance(u, dict)
+                and u.get("type") in ("addRules", "addDirectories")
+                and _valid_update(u)]
+        rules = [r for u in kept if u["type"] == "addRules" for r in u["rules"]]
+        if any(r["toolName"] != "Bash" or not r.get("ruleContent") for r in rules):
+            return None
+        dirs = [d for u in kept if u["type"] == "addDirectories" for d in u["directories"]]
+        commands = [r["ruleContent"] for r in rules]
+        if not kept or len(commands) + len(dirs) > DONT_ASK_MAX_ITEMS:
+            return None
+        if commands and not dirs:
+            label = ("Yes, and don\u2019t ask again for: %s" % commands[0]
+                     if len(commands) == 1 else
+                     "Yes, and don't ask again for %s commands in %s"
+                     % (_and_list(commands), event.get("cwd") or "this folder"))
+        elif dirs and not commands:
+            label = ("Yes, and always allow access to %s from this project"
+                     % _and_list(dirs))
+        elif len(dirs) == 1 and len(commands) == 1:
+            label = ("Yes, and allow access to %s and %s commands"
+                     % (dirs[0], commands[0]))
+        else:
+            label = ("Yes, and allow %s access and %s commands"
+                     % (_and_list(dirs), _and_list(commands)))
+        if len(label) > DONT_ASK_MAX_CHARS:
+            return None
+        return label, kept
+    if tool in FILE_TOOLS:
+        if not all(_valid_update(u) and u["type"] in ("setMode", "addDirectories")
+                   and u["destination"] == "session" for u in raw):
+            return None
+        parts = []
+        if any(u["type"] == "setMode" for u in raw):
+            parts.append("Yes, and switch to %s for this session" % ACCEPT_EDITS_WORDS)
+        dirs = [d for u in raw if u["type"] == "addDirectories" for d in u["directories"]]
+        if dirs:
+            parts.append("Yes, and always allow access to %s for this session"
+                         % ", ".join(dirs))
+        if not parts or len(dirs) > DONT_ASK_MAX_ITEMS:
+            return None
+        return "; ".join(parts), list(raw)
+    if tool == "WebFetch":
+        if len(raw) != 1 or not _valid_update(raw[0]) or raw[0]["type"] != "addRules":
+            return None
+        rules = raw[0]["rules"]
+        content = rules[0].get("ruleContent", "") if len(rules) == 1 else ""
+        if (rules[0]["toolName"] != "WebFetch" or not content.startswith("domain:")
+                or "*" in content or len(content) <= len("domain:")):
+            return None
+        return "Yes, and don't ask again for %s" % content[len("domain:"):], list(raw)
+    return None
+
+
+def _permission_output(behavior, message="", mode=None, updated_input=None,
+                       updated_permissions=None):
     """The hookSpecificOutput block Claude Code will actually accept.
 
     The shape is checked, and the CLI's own validator spells it out:
@@ -2537,9 +2699,18 @@ def _permission_output(behavior, message="", mode=None, updated_input=None):
         # (2.1.280) accepts updatedPermissions entries of type setMode with
         # a known mode and a destination; "session" touches no settings
         # file. Only modes the validator knows are ever sent.
+        updates = []
         if mode in PERMISSION_MODES:
-            output["decision"]["updatedPermissions"] = [
-                {"type": "setMode", "mode": mode, "destination": "session"}]
+            updates.append({"type": "setMode", "mode": mode, "destination": "session"})
+        # "Don't ask again": the terminal row's own updates (dont_ask_row).
+        # Checked again here, at the one place a decision is built, so an
+        # update the CLI's validator or its dialog would refuse is never
+        # sent — a shape it rejects makes the whole answer vanish.
+        if isinstance(updated_permissions, list) and all(
+                _valid_update(u) for u in updated_permissions):
+            updates.extend(updated_permissions)
+        if updates:
+            output["decision"]["updatedPermissions"] = updates
     elif behavior == "deny":
         output["decision"] = {"behavior": "deny", "message": message}
     return output
@@ -2741,6 +2912,16 @@ def run_hook(stdin=None, stdout=None, agent=None):
                 audit["answer"] = words
                 response["hookSpecificOutput"] = _permission_output(
                     "deny", "The user answered from their watch: %s" % words)
+            elif verdict == "dont_ask":
+                # The terminal's row: allow, and apply what it would apply.
+                # Re-derived from this same event, never taken from the
+                # watch; a row that cannot be rebuilt allows this once.
+                row = dont_ask_row(event)
+                audit["effective"] = "allow"
+                if row:
+                    audit["updates"] = row[1]
+                response["hookSpecificOutput"] = _permission_output(
+                    "allow", updated_permissions=row[1] if row else None)
             elif verdict in ("allow", "deny"):
                 audit["effective"] = verdict
                 response["hookSpecificOutput"] = _permission_output(

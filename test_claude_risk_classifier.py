@@ -3077,7 +3077,8 @@ class TestAnICloudCardIsTheWholeCard:
               "facts": "facts", "plan": "plan", "session_id": "sessionId",
               "can_always": "canAlways", "session_title": "sessionTitle",
               "plan_marked": "planMarked", "allow_label": "allowLabel",
-              "deny_label": "denyLabel", "agent": "agent"}
+              "deny_label": "denyLabel", "agent": "agent",
+              "multi_select": "multiSelect"}
     # Fields the watch reads only from the relay, on purpose, each with its
     # reason. Production refuses a record with a field it does not know, so
     # the bridge may write one only after it is deployed there (CLAUDE.md);
@@ -3152,7 +3153,7 @@ class TestTheBridgeReadsTheWholeCard:
             "session_id": "s-1", "can_always": True, "session_title": "Release",
             "plan_marked": "**1.** Delete", "allow_label": "Yes, proceed",
             "deny_label": "No, continue without running it",
-            "agent": "codex"}
+            "agent": "codex", "multi_select": True}
 
     def _read(self, *parts):
         path = os.path.join(_ROOT, "WatchApp", *parts)
@@ -5802,7 +5803,7 @@ class TestQuestionCards:
         result = self._run_hook(self.TWO_QUESTIONS, port, tmp_path, monkeypatch)
         assert _behavior(result) == "allow"
         assert result["decision"]["updatedInput"]["answers"] == {
-            "Which library?": "Luxon", "Which features?": "Time zones"}
+            "Which library?": "Luxon", "Which features?": ["Time zones"]}
         assert [c["options"] for c in seen] == [
             ["date-fns", "Luxon"], ["Parsing", "Time zones", "Formatting"]]
         assert seen[0]["headline"] == "1 of 2 · Which library?"
@@ -5937,6 +5938,71 @@ class TestQuestionCards:
             assert crc.ask_questions({}, tool_input, {"relay_wait": 10.0},
                                      ask=ask) == ("none", None)
         assert asked == []
+
+    # Claude marks a question multiSelect when more than one option may
+    # be chosen. The card says so, and the watch sends every label it
+    # picked as one string, one label per line: a label never holds a
+    # line break (_questions flattens whitespace), and a string travels
+    # unchanged over every path — relay, bridge, iCloud's Decision record.
+
+    def test_a_multi_select_question_says_so_on_its_card(self):
+        cards = crc.question_cards({}, self.TWO_QUESTIONS)
+        assert "multi_select" not in cards[0], "single choice stays as it was"
+        assert cards[1]["multi_select"] is True
+
+    def test_several_labels_go_back_as_a_list(self):
+        """2.1.300 takes a list of labels for a multiSelect question, as its
+        own dialog gives them, and tells Claude "A, B"."""
+        replies = iter([("answer", "Luxon"), ("answer", "Parsing\nTime zones")])
+        verdict, answers = crc.ask_questions(
+            {}, self.TWO_QUESTIONS, {"relay_wait": 10.0},
+            ask=lambda card, policy, project=None: next(replies))
+        assert verdict == "answer"
+        assert answers == {"Which library?": "Luxon",
+                           "Which features?": ["Parsing", "Time zones"]}
+
+    def test_one_label_on_a_multi_select_card_is_still_a_list(self):
+        """A watch older than multi-select taps one option."""
+        replies = iter([("answer", "Luxon"), ("answer", "Formatting")])
+        _, answers = crc.ask_questions(
+            {}, self.TWO_QUESTIONS, {"relay_wait": 10.0},
+            ask=lambda card, policy, project=None: next(replies))
+        assert answers["Which features?"] == ["Formatting"]
+
+    def test_a_reply_that_is_not_the_options_is_passed_on_in_words(self):
+        """Nothing is guessed: words that are not the card's labels go to
+        Claude as they are, and Claude Code tells it to read them."""
+        replies = iter([("answer", "Luxon"), ("answer", "Parsing\nSomething else")])
+        _, answers = crc.ask_questions(
+            {}, self.TWO_QUESTIONS, {"relay_wait": 10.0},
+            ask=lambda card, policy, project=None: next(replies))
+        assert answers["Which features?"] == "Parsing\nSomething else"
+
+    def test_a_single_choice_answer_is_never_split(self):
+        replies = iter([("answer", "date-fns\nLuxon"), ("answer", "Parsing")])
+        _, answers = crc.ask_questions(
+            {}, self.TWO_QUESTIONS, {"relay_wait": 10.0},
+            ask=lambda card, policy, project=None: next(replies))
+        assert answers["Which library?"] == "date-fns\nLuxon"
+
+    def test_several_labels_reach_the_hook_through_the_relay(
+            self, live_relay, tmp_path, monkeypatch):
+        port, queue = live_relay
+        self._answer_in_turn(queue, ["Luxon", "Parsing\nTime zones\nFormatting"])
+        result = self._run_hook(self.TWO_QUESTIONS, port, tmp_path, monkeypatch)
+        assert _behavior(result) == "allow"
+        assert result["decision"]["updatedInput"]["answers"]["Which features?"] == [
+            "Parsing", "Time zones", "Formatting"]
+        entry = json.loads(log_lines(tmp_path / "a.jsonl")[-1])
+        assert '"Which features?"="Parsing, Time zones, Formatting"' in entry["answer"]
+
+    def test_codex_reads_several_labels_in_words(self, live_relay, tmp_path,
+                                                monkeypatch):
+        port, queue = live_relay
+        self._answer_in_turn(queue, ["Luxon", "Parsing\nTime zones"])
+        result = self._run_hook(self.TWO_QUESTIONS, port, tmp_path, monkeypatch,
+                                agent="codex")
+        assert '"Which features?"="Parsing, Time zones"' in _decision_message(result)
 
     def test_an_allow_is_not_an_answer(self):
         """A bare Allow on a question card goes back without answers and
@@ -6693,6 +6759,167 @@ class TestTheCardSaysWhereAndWhat:
         assert watch_dashboard.card_session_title("", projects_dir=str(tmp_path), registry={}) == ""
 
 
+class TestDontAskAgainIsTheTerminals:
+    """#560 (owner, 2026-10-15): a prompt's "don't ask again" on the wrist
+    is the terminal's row, in its words, applying what it applies. The
+    suggestions below were captured from Claude Code 2.1.300's own
+    PermissionRequest events that day, and the labels read off its screen
+    for the same prompts. The one choice that differs on purpose: for a
+    shell command the terminal shows and writes its own guessed prefix
+    ("python3 *"); the watch names and writes the exact rule the
+    suggestion carries, so its label says exactly what is allowed."""
+
+    PY = [{"type": "addRules", "rules": [{"toolName": "Bash",
+           "ruleContent": "python3 -c 'print(41+1)'"}], "behavior": "allow",
+           "destination": "localSettings"}]
+    TOUCH = [{"type": "addDirectories", "directories": ["/w/proj"], "destination": "session"},
+             {"type": "setMode", "mode": "acceptEdits", "destination": "session"}]
+    WRITE = [{"type": "setMode", "mode": "acceptEdits", "destination": "session"}]
+    WRITE_OUTSIDE = [{"type": "setMode", "mode": "acceptEdits", "destination": "session"},
+                     {"type": "addDirectories", "directories": ["/tmp/x", "/private/tmp/x"],
+                      "destination": "session"}]
+    FETCH = [{"type": "addRules", "destination": "localSettings", "rules": [
+        {"toolName": "WebFetch", "ruleContent": "domain:example.com"}], "behavior": "allow"}]
+
+    def _row(self, tool, suggestions, cwd="/w/proj"):
+        return crc.dont_ask_row({"tool_name": tool, "cwd": cwd,
+                                 "permission_suggestions": suggestions})
+
+    def test_a_shell_command_names_the_exact_rule_it_writes(self):
+        label, updates = self._row("Bash", self.PY)
+        assert label == "Yes, and don\u2019t ask again for: python3 -c 'print(41+1)'"
+        assert updates == self.PY
+
+    def test_a_file_command_allows_its_folder_and_not_a_mode(self):
+        """`touch` comes with a folder and accept-edits; the terminal's
+        shell row shows and applies the folder only."""
+        label, updates = self._row("Bash", self.TOUCH)
+        assert label == "Yes, and always allow access to /w/proj from this project"
+        assert updates == [self.TOUCH[0]]
+
+    def test_a_file_tool_switches_to_accept_edits(self):
+        label, updates = self._row("Write", self.WRITE)
+        assert label == ("Yes, and switch to accept edits (auto-approve file edits"
+                         " and common file commands) for this session")
+        assert updates == self.WRITE
+
+    def test_outside_the_workspace_the_folders_are_named_too(self):
+        label, updates = self._row("Edit", self.WRITE_OUTSIDE)
+        assert label == ("Yes, and switch to accept edits (auto-approve file edits"
+                         " and common file commands) for this session; Yes, and always"
+                         " allow access to /tmp/x, /private/tmp/x for this session")
+        assert updates == self.WRITE_OUTSIDE
+
+    def test_a_fetch_names_its_host(self):
+        label, updates = self._row("WebFetch", self.FETCH)
+        assert label == "Yes, and don't ask again for example.com"
+        assert updates == self.FETCH
+
+    @pytest.mark.parametrize("tool,suggestions", [
+        # A destination the terminal's row never writes: user or shared
+        # project settings reach every project, or every teammate.
+        ("Bash", [dict(PY[0], destination="userSettings")]),
+        ("Bash", [dict(PY[0], destination="projectSettings")]),
+        ("WebFetch", [dict(FETCH[0], destination="userSettings")]),
+        ("Bash", [dict(PY[0], behavior="deny")]),
+        ("Bash", [{"type": "addRules", "rules": [{"toolName": "Write"}], "behavior": "allow",
+                   "destination": "localSettings"}]),
+        ("Bash", [{"type": "rule", "rule": "Bash(ls)"}]),
+        ("Bash", [dict(PY[0], extra=1)]),
+        ("Write", [{"type": "setMode", "mode": "bypassPermissions", "destination": "session"}]),
+        ("WebFetch", [{"type": "addRules", "destination": "localSettings", "behavior": "allow",
+                       "rules": [{"toolName": "WebFetch", "ruleContent": "domain:*"}]}]),
+        ("mcp__srv__tool", [{"type": "addRules", "rules": [{"toolName": "mcp__srv__tool"}],
+                             "behavior": "allow", "destination": "localSettings"}]),
+        ("Bash", []),
+        ("Bash", None),
+    ])
+    def test_anything_not_understood_offers_no_row(self, tool, suggestions):
+        assert self._row(tool, suggestions) is None
+
+    def test_too_many_or_too_long_is_no_row_as_in_the_terminal(self):
+        many = [{"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "c%d" % i}
+                 for i in range(9)], "behavior": "allow", "destination": "localSettings"}]
+        assert self._row("Bash", many) is None
+        long = [dict(self.PY[0], rules=[{"toolName": "Bash", "ruleContent": "x" * 200}])]
+        assert self._row("Bash", long) is None
+
+    def _event(self, tool="Bash", suggestions=None, tool_input=None):
+        return {"tool_name": tool, "session_id": "s1", "cwd": "/w/proj",
+                "tool_input": tool_input or {"command": "python3 -c 'print(41+1)'"},
+                "permission_suggestions": self.PY if suggestions is None else suggestions}
+
+    def test_the_card_carries_the_label(self):
+        _, _, card = crc.build_response(self._event(), {"mode": "enforce"})
+        assert card["can_always"] is True
+        assert card["always_label"] == "Yes, and don\u2019t ask again for: python3 -c 'print(41+1)'"
+
+    def test_never_on_critical_nor_for_codex_nor_without_a_row(self):
+        _, _, card = crc.build_response(self._event(tool_input={"command": "rm -rf /"}),
+                                        {"mode": "enforce"})
+        assert card["tier"] == "CRITICAL" and "always_label" not in card
+        _, _, card = crc.build_response(self._event(), {"mode": "enforce"}, agent="codex")
+        assert "always_label" not in card
+        _, _, card = crc.build_response(self._event(suggestions=[{"type": "rule"}]),
+                                        {"mode": "enforce"})
+        assert card["can_always"] is True and "always_label" not in card
+
+    def test_the_decision_carries_only_updates_the_cli_accepts(self):
+        out = crc._permission_output("allow", updated_permissions=self.PY)
+        assert out["decision"] == {"behavior": "allow", "updatedPermissions": self.PY}
+        bad = [dict(self.PY[0], destination="userSettings")]
+        assert crc._permission_output("allow", updated_permissions=bad)["decision"] == {
+            "behavior": "allow"}
+        assert "updatedPermissions" not in crc._permission_output(
+            "deny", "no", updated_permissions=self.PY)["decision"]
+
+    def _hook(self, port, tmp_path, event):
+        import io
+        import os as _os
+        env_backup = dict(_os.environ)
+        _os.environ.update({
+            "CLAUDE_RISK_MODE": "enforce",
+            "CLAUDE_RISK_RELAY": "http://127.0.0.1:%d" % port,
+            "CLAUDE_RISK_RELAY_WAIT": "10",
+            "CLAUDE_RISK_AUDIT_LOG": str(tmp_path / "a.jsonl"),
+            "CLAUDE_SETTINGS_PATH": str(tmp_path / "user-settings.json"),
+        })
+        _os.environ.pop("CLAUDE_RISK_CONFIG", None)
+        _os.environ.pop("CLAUDE_RISK_AUTO_ALLOW", None)
+        try:
+            out = io.StringIO()
+            crc.run_hook(stdin=io.StringIO(json.dumps(event)), stdout=out)
+            return json.loads(out.getvalue())["hookSpecificOutput"]
+        finally:
+            _os.environ.clear()
+            _os.environ.update(env_backup)
+
+    def _press(self, queue, decision):
+        def worker():
+            cards = _wait_until(lambda: queue.pending(from_watch=True), what="a card")
+            queue.decide(cards[0]["id"], decision)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def test_the_tap_writes_the_terminals_rule_and_the_relay_keeps_none(
+            self, live_relay, tmp_path):
+        port, queue = live_relay
+        self._press(queue, "dont_ask")
+        result = self._hook(port, tmp_path, self._event())
+        assert result["decision"] == {"behavior": "allow", "updatedPermissions": self.PY}
+        # Claude Code holds the rule now; the relay grants nothing itself,
+        # so an identical ask that did reach the hook would queue a card.
+        assert queue._session_allows == set()
+        audit = [json.loads(line) for line in (tmp_path / "a.jsonl").read_text().splitlines()]
+        assert audit[-1]["watch"] == "dont_ask" and audit[-1]["updates"] == self.PY
+
+    def test_an_old_watchs_always_is_exactly_as_before(self, live_relay, tmp_path):
+        port, queue = live_relay
+        self._press(queue, "always")
+        result = self._hook(port, tmp_path, self._event())
+        assert result["decision"] == {"behavior": "allow"}, "no rule from an old watch"
+        assert queue._session_allows, "and its session grant still kept"
+
+
 class TestEveryPress:
     """Every press the watch can make, mock-verified end to end through
     the hook: allow, deny, an option answer, and the phone's third
@@ -7139,6 +7366,27 @@ class TestFingerprintPerTool:
                               {"owner": "x", "repo": "critical-prod"},
                               Risk.HIGH, 64, 80)
         assert "critical-prod" in card["detail"]
+
+
+class TestSeveralLabelsFitTheRelay:
+    def test_four_long_labels_are_kept_whole(self):
+        """A multi-select answer is up to four labels, one per line; the
+        relay kept 200 characters and the hook 600."""
+        queue = watch_relay.CardQueue()
+        queue.pending(from_watch=True)
+        result = {}
+        labels = "\n".join(("Option %d " % n) + "x" * 120 for n in range(4))
+
+        def submit():
+            _, result["decision"], result["answer"] = queue.submit(
+                {"tier": "MEDIUM", "headline": "q", "detail": "q"}, wait=5)
+
+        thread = threading.Thread(target=submit, daemon=True)
+        thread.start()
+        _wait_until(queue.pending, what="the card to be queued")
+        assert queue.decide(queue.pending()[0]["id"], "answer", answer=labels)
+        thread.join(5)
+        assert result["answer"] == labels
 
 
 class TestEmptyAnswerRefused:
@@ -9201,6 +9449,15 @@ class TestTheWristAnswersAHeadlessSend:
                          crc=self._Fake("answer", answer="The second one"))
         assert out["behavior"] == "allow"
         assert out["updatedInput"] == dict(asked, answers={"Which?": "The second one"})
+
+    def test_several_labels_go_ahead_as_a_list(self):
+        """2.1.300's admitter takes a list only for a multiSelect question."""
+        asked = {"questions": [{"question": "Which?", "multiSelect": True, "options": [
+            {"label": "A"}, {"label": "B"}, {"label": "C"}]}]}
+        out = wpt.decide("AskUserQuestion", asked,
+                         crc=self._Fake("answer", answer="A\nC"))
+        assert out == {"behavior": "allow",
+                       "updatedInput": dict(asked, answers={"Which?": ["A", "C"]})}
 
     def test_every_question_is_answered_on_the_wrist(self):
         asked = {"questions": [
@@ -11596,10 +11853,60 @@ class TestSupersededRunsAreCancelled:
         assert block, "no workflow-level concurrency block"
         return block.group(1)
 
+    def _evaluate(self, key, event_name, ref, pr=None):
+        """The block's expression for `key`, evaluated for one event.
+
+        GitHub's `&&` and `||` return an operand, as Python's `and` and
+        `or` do, so the expression is translated rather than re-implemented
+        and nothing is checked by reading it with the eye."""
+        line = re.search(r"^  %s: (.+)$" % key, self._block(), re.MULTILINE).group(1)
+
+        class Ctx:
+            def __init__(self, **fields):
+                self.__dict__.update(fields)
+
+            def __getattr__(self, name):   # a field the event lacks is null,
+                return Ctx()               # and so is anything read through it
+
+            def __bool__(self):
+                return bool(self.__dict__)
+
+            def __str__(self):
+                return ""
+
+        github = Ctx(event_name=event_name, ref=ref,
+                     event=Ctx(pull_request=Ctx(number=pr) if pr else Ctx()))
+
+        def value(expr):
+            py = (expr.replace("&&", " and ").replace("||", " or ")
+                  .replace("!startsWith(", " not startsWith("))
+            return eval(py, {"__builtins__": {}}, {
+                "github": github,
+                "startsWith": lambda a, b: str(a or "").startswith(b),
+                "format": lambda fmt, *args: fmt.format(*args)})
+
+        return re.sub(r"\$\{\{(.+?)\}\}", lambda m: str(value(m.group(1))), line)
+
     def test_one_run_per_ref(self):
-        group = re.search(r"^  group: (.+)$", self._block(), re.MULTILINE)
-        assert group and "${{ github.ref }}" in group.group(1), (
-            "the group must be per ref: one per PR, one for main")
+        main = self._evaluate("group", "push", "refs/heads/main")
+        assert main == "tests-refs/heads/main"
+        open_pr = self._evaluate("group", "pull_request", "refs/pull/568/merge", 568)
+        assert open_pr == "tests-refs/pull/568/merge", "one group per PR"
+        other = self._evaluate("group", "pull_request", "refs/pull/569/merge", 569)
+        assert other != open_pr
+
+    def test_a_merged_pr_never_joins_its_base_branchs_group(self):
+        """When a PR merges, GitHub gives its `closed` run the base branch's
+        ref. Keyed on github.ref, that run cancelled main's run for the
+        merge itself, at every merge from 12:39 to 17:34 on 2026-10-15,
+        and the merged PR's own waiting run ran anyway."""
+        opened = self._evaluate("group", "pull_request", "refs/pull/568/merge", 568)
+        for base in ("refs/heads/main", "refs/heads/release/2-0"):
+            closed = self._evaluate("group", "pull_request", base, 568)
+            assert closed == opened, "the closing run must find the PR's own run"
+            assert closed != self._evaluate("group", "push", base), (
+                "a merge would cancel the base branch's run")
+            assert self._evaluate("cancel-in-progress", "pull_request", base, 568) == "True"
 
     def test_a_newer_commit_cancels_the_older_run(self):
         cancel = re.search(r"^  cancel-in-progress: (.+)$", self._block(), re.MULTILINE)
@@ -11610,7 +11917,8 @@ class TestSupersededRunsAreCancelled:
         cancel = re.search(r"^  cancel-in-progress: (.+)$", self._block(), re.MULTILINE)
         assert cancel and "refs/heads/release/" in cancel.group(1), (
             "a release build that may ship must never be cancelled")
-        assert cancel.group(1).startswith("${{ !startsWith(")
+        assert self._evaluate("cancel-in-progress", "push", "refs/heads/release/2-0") == "False"
+        assert self._evaluate("cancel-in-progress", "push", "refs/heads/main") == "True"
 
     def test_a_pr_that_closes_cancels_its_waiting_run(self):
         """A merged PR never gets a newer push, so its queued run used to
@@ -11723,6 +12031,57 @@ class TestCiRunsWhatTheChangeCanBreak:
             body = workflow.split("\n  %s:\n" % job, 1)[1]
             body = body[:body.find("\n\n  ")] if "\n\n  " in body else body
             assert "fetch-depth: 2" in body, job
+
+
+@pytest.mark.private_layout
+class TestEveryTestRunSaysWhyItEnded:
+    """A test host that is killed or never starts fails no assertion: the
+    run ends "0 failures … TEST FAILED", and the filter each step prints
+    shows nothing else. The watch tests learned to say why on 2026-09-21;
+    the purchase tests, added later, did not, and failed that way twice on
+    2026-10-15 with their log deleted. Every xcodebuild test step now says
+    why and keeps its log."""
+
+    def test_every_logged_test_run_explains_a_failure(self):
+        (script,) = _ci_files("ci-local.sh")
+        logs = re.findall(r'^\s*(\w+_LOG)=\$\(mktemp', script, re.MULTILINE)
+        tested = [name for name in logs
+                  if re.search(r'xcodebuild test[^\n]*(?:\n[^\n]*){0,3}\$%s' % name, script)]
+        assert set(tested) >= {"WATCH_LOG", "PURCHASE_LOG"}, tested
+        for name in tested:
+            assert re.search(r'why_it_ended "\$%s"' % name, script), \
+                "%s's run never says why it ended" % name
+
+    def test_the_cause_lines_are_found_and_the_log_kept(self, tmp_path):
+        import subprocess
+        (script,) = _ci_files("ci-local.sh")
+        func = re.search(r"^why_it_ended\(\) \{.*?^\}", script, re.MULTILINE | re.DOTALL).group(0)
+        log = tmp_path / "x.log"
+        log.write_text("Test Suite 'All tests' started\n"
+                       "Executed 4 tests, with 4 tests skipped and 0 failures\n"
+                       "Testing failed:\n\tTapproval (1234) encountered an error "
+                       "(Early unexpected exit, operation never finished bootstrapping)\n"
+                       "** TEST FAILED **\n", encoding="utf-8")
+        out = subprocess.run(["bash", "-c", func + '\nwhy_it_ended "$1" purchase-tests', "_", str(log)],
+                             cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+        assert "Early unexpected exit" in out and "Testing failed" in out
+        assert (tmp_path / "WatchApp/build/ci-logs/purchase-tests.log").read_text() == log.read_text()
+
+    def test_a_missing_iphone_simulator_is_remade_from_a_real_type(self):
+        """The newest plain iPhone, never "iPhone-18" read out of
+        "iPhone-18-Pro" (a type that does not exist), which left CI unable
+        to remake its iPhone simulator."""
+        import subprocess
+        (script,) = _ci_files("ci-local.sh")
+        pick = re.search(r"IOS_TYPE=\$\(xcrun simctl list devicetypes \\\n(.*?)\)\s+#", script,
+                         re.DOTALL).group(1)
+        listing = "\n".join("%s (com.apple.CoreSimulator.SimDeviceType.%s)" % (n, t) for n, t in [
+            ("iPhone 16 Pro", "iPhone-16-Pro"), ("iPhone 17", "iPhone-17"),
+            ("iPhone 17e", "iPhone-17e"), ("iPhone 17 Pro Max", "iPhone-17-Pro-Max"),
+            ("iPhone 18 Pro", "iPhone-18-Pro"), ("iPhone 18 Pro Max", "iPhone-18-Pro-Max")])
+        got = subprocess.run(["bash", "-c", "printf '%s\\n' \"$1\" " + pick.strip(), "_", listing],
+                             capture_output=True, text=True).stdout.strip()
+        assert got == "com.apple.CoreSimulator.SimDeviceType.iPhone-17"
 
 
 class TestTheLocalFallbackRunsWhatCiRuns:

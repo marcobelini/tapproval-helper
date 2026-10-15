@@ -231,7 +231,7 @@ def helper_provenance(here=None):
     return found
 MAX_BODY = 64 * 1024   # nobody's wrist card is 64KB
 
-VALID_DECISIONS = ("allow", "deny", "answer", "always")
+VALID_DECISIONS = ("allow", "deny", "answer", "always", "dont_ask")
 
 # The Bonjour service type the watch app browses for.
 BONJOUR_TYPE = "_wristtriage._tcp"
@@ -1019,6 +1019,9 @@ class CardQueue:
                 if replayable:
                     self._session_allows.add(rule)
                 decision = "allow"
+            # "dont_ask" (the terminal's "don't ask again", from a watch that
+            # showed its words) stays itself here: the hook writes the rule
+            # into Claude Code, so the relay keeps no grant of its own.
         if decision != "none":
             reason = "answered-here"    # a tap that beat the probe to it
         # The other half of the "queued" line: how long a card stood on the
@@ -1102,9 +1105,12 @@ class CardQueue:
                       "waiting (the computer already handed it back)"
                       % (decision, card_id), file=sys.stderr)
                 return False
-            # "answer" carries the chosen option label for question cards.
+            # "answer" carries the chosen option label for question cards
+            # — several, one per line, on a multi-select card — or a plan's
+            # edits. The hook keeps 600 characters (ask_watch); this kept
+            # 200, which four labels or a dictated edit can pass.
             self._decisions[card_id] = (decision,
-                                        str(answer)[:200] if answer else None)
+                                        str(answer)[:600] if answer else None)
             self._lock.notify_all()
         print("relay: accepted %s for %s" % (decision, card_id),
               file=sys.stderr)
@@ -3068,6 +3074,10 @@ class RelayHandler(BaseHTTPRequestHandler):
         finally:
             gate.release()
         payload = {"id": card_id, "decision": decision}
+        if decision == "dont_ask":
+            # An allow to any hook; the flag tells a hook that knows it to
+            # apply the terminal's row. One from before 1.1.57 allows once.
+            payload = {"id": card_id, "decision": "allow", "dont_ask": True}
         if answer:
             payload["answer"] = answer
         self._send_json(payload)
