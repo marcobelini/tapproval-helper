@@ -103,7 +103,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.52"
+__version__ = "1.1.55"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -121,8 +121,17 @@ RELAY_PORT = 8977
 
 # The wrist card's two budgets. DEFAULT_POLICY quotes these, and the policy
 # file may override them; wrist_card() falls back to them when it does not.
+#
+# Text a card copies — Claude's question, its description of a command, the
+# command itself — travels whole: the phone shows all of it, and a wrist
+# that cut it at 64 or 128 characters asked for an answer whose reasons had
+# been dropped (2026-10-15, "The design…"). The card screen scrolls and the
+# list rows clamp themselves, so the only limit left is the push
+# notification's 4 KB. HEADLINE_CHARS stays the budget for the headlines the
+# helper composes itself ("Delete build -r"), which are summaries, not cuts.
+TEXT_CHARS = 1500
 HEADLINE_CHARS = 64
-DETAIL_CHARS = 80
+DETAIL_CHARS = TEXT_CHARS
 RELAY_URL = "http://127.0.0.1:%d" % RELAY_PORT
 
 DEFAULT_POLICY = {
@@ -1482,7 +1491,12 @@ TARGET_KEYS = ("projectId", "project_id", "project", "owner", "repo",
                "recipient", "table", "host", "branch", "collection",
                "doc_id", "pull_number", "issue_number")
 CARD_FACTS = 3
-FACT_CHARS = 32
+# Each value travels whole, as a card's question and command do: the card
+# screen wraps it, and a value cut to 32 characters was the part a blind
+# tap needed (2026-10-15). The list row clamps itself to one line. Three of
+# these are 4.5 KB at most, well inside the relay's 64 KB body; the push
+# notification carries only the headline.
+FACT_CHARS = 1500
 
 
 def _humanise_key(key):
@@ -1557,17 +1571,36 @@ def _facts_detail(facts, limit):
                 limit)
 
 
-# ExitPlanMode on the wrist: a question with the phone's answers, and only
-# those. The phone offers two, "Approve & auto mode" and "Suggest edits"
-# (owner's photo, 2026-10-14); the wrist offered three buttons beside the
-# edits — "Approve" and "Keep planning" too, which the phone never shows.
-# Claude Code sends no suggestions with ExitPlanMode (2.1.299:
-# checkPermissions asks "Exit plan mode?" with none), so the phone's words
-# cannot be read off the event and are mirrored here. The one option is the
-# approval; the edits are the plan screen's own field, sent with PLAN_EDITS.
-PLAN_APPROVE_AUTO = "Approve & auto mode"
-PLAN_OPTIONS = [PLAN_APPROVE_AUTO]
-PLAN_EDITS = "Suggest edits:"     # a newer watch prefixes dictated edits
+# ExitPlanMode on the wrist: the terminal's own rows, in its words and
+# order (owner, 2026-10-15, #560; until then the phone's two answers, #511).
+# Read from Claude Code 2.1.300's plan dialog, which sends no suggestions
+# with the event, so the words are mirrored here. Its rows:
+#   "Yes, clear context … and …"   a setting, off by default; it starts a new
+#                                   conversation, which no hook can do
+#   "Yes, and switch to BYPASS PERMISSIONS … for this session"
+#                                   only when the session allows it, which a
+#                                   hook cannot see; never offered from a wrist
+#   "Yes, and use auto mode"        when auto mode is available, else
+#   "Yes, auto-accept edits"
+#   "Yes, manually approve edits"
+#   "No, refine with Ultraplan …"   launches a cloud session; no hook can
+#   "No, keep planning"             a text row (placeholder "Tell Claude what
+#                                   to change"); the plan screen's field, sent
+#                                   with PLAN_EDITS. The summary line names it
+#                                   by its label, which keeps it within 80
+# Each Yes is an allow that moves the session to its mode, as the dialog's
+# own rows do (setMode, destination session).
+PLAN_AUTO = "Yes, and use auto mode"
+PLAN_ACCEPT_EDITS = "Yes, auto-accept edits"
+PLAN_MANUAL = "Yes, manually approve edits"
+PLAN_KEEP = "No, keep planning"
+PLAN_MODES = {PLAN_AUTO: "auto", PLAN_ACCEPT_EDITS: "acceptEdits",
+              PLAN_MANUAL: "default",
+              # The phone's words, on a card shown before 1.1.53 and still
+              # waiting when the helper updated.
+              "Approve & auto mode": "auto"}
+PLAN_EDITS = "Suggest edits:"     # the wire prefix for dictated edits; every
+                                  # watch sold sends it, so it never changes
 
 # The words on an allow/deny card, by the agent that asked, so the wrist
 # says what that agent's own prompt says. Claude's cards keep the watch's
@@ -1581,7 +1614,8 @@ PLAN_EDITS = "Suggest edits:"     # a newer watch prefixes dictated edits
 AGENT_ANSWERS = {
     "codex": ("Yes, proceed", "No, continue without running it"),
 }
-PLAN_CHARS = 2400
+# Two copies travel (plain and marked), inside the relay's 64 KB body.
+PLAN_CHARS = 6000
 # The modes Claude Code's validator accepts for setMode (2.1.280).
 PERMISSION_MODES = frozenset(
     "acceptEdits auto bypassPermissions default dontAsk plan".split())
@@ -1785,25 +1819,68 @@ def plan_text(tool_input, event=None, plans_dir=None):
     return ""
 
 
-def _plan_card(tool_input, risk, headline_chars, detail_chars):
+def plan_options(auto_mode=False):
+    """The terminal's Yes rows for a plan: the auto row where auto mode is
+    available, the accept-edits row where it is not, then manual."""
+    return [PLAN_AUTO if auto_mode else PLAN_ACCEPT_EDITS, PLAN_MANUAL]
+
+
+def auto_mode_seen(event):
+    """Whether this session can use auto mode, on positive evidence only.
+
+    The terminal decides it from state no hook can read, so two things it
+    leaves behind stand in: the transcript records ``permissionMode`` on
+    each prompt (a session that has been in auto mode has it), and user
+    settings may make auto the default. Without either, the plan card
+    offers "Yes, auto-accept edits", which works wherever the dialog does."""
+    try:
+        with open(_settings_path(), encoding="utf-8") as handle:
+            settings = json.load(handle)
+        if ((settings.get("permissions") or {}).get("defaultMode")) == "auto":
+            return True
+    except (OSError, ValueError, AttributeError):
+        pass
+    transcript = (event or {}).get("transcript_path")
+    if not transcript:
+        return False
+    try:
+        with open(transcript, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - TRANSCRIPT_TAIL))
+            tail = handle.read().decode("utf-8", "replace")
+    except (OSError, TypeError, ValueError):
+        return False
+    for line in tail.splitlines():
+        if '"permissionMode"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("permissionMode") == "auto":
+            return True
+    return False
+
+
+def _plan_card(tool_input, risk, headline_chars, detail_chars, auto_mode=False):
     # Redacted before anything is read from it: the plan travels whole,
     # line breaks and all, so it cannot rely on _fit to do this for it.
     plan = redact_secrets(str(tool_input.get("plan") or ""))
     title = ""
     for raw in plan.splitlines():
         if raw.strip():
-            title = _plan_plain(raw).lstrip("• ").strip()
+            title = _plan_title(raw)
             break
-    room = headline_chars * 2 - len("Plan: ")
+    room = TEXT_CHARS - len("Plan: ")
+    options = plan_options(auto_mode)
     return {
         "kind": "question",
         "plan_card": True,
         "tier": risk.name,
         "headline": _fit("Plan: %s" % title if title else "Claude has a plan",
-                         headline_chars * 2),
-        "detail": _fit(" · ".join(PLAN_OPTIONS + [PLAN_EDITS.rstrip(":")]),
-                       detail_chars),
-        "options": list(PLAN_OPTIONS),
+                         TEXT_CHARS),
+        "detail": _fit(" · ".join(options + [PLAN_KEEP]), detail_chars),
+        "options": options,
         # Plain, for every watch already sold: one that predates
         # plan_marked would show its asterisks.
         "plan": _plan_fit(_plan_body(_plan_plain(plan), title, room)),
@@ -1812,13 +1889,21 @@ def _plan_card(tool_input, risk, headline_chars, detail_chars):
     }
 
 
+def _plan_title(line):
+    """A plan's first line as the card's headline names it. A plan titled
+    "Plan: …" read "Plan: Plan: …" on the wrist (#560's end-to-end check,
+    2026-10-15)."""
+    title = _plan_plain(line).lstrip("• ").strip()
+    return re.sub(r"^plan:\s*", "", title, flags=re.IGNORECASE)
+
+
 def _plan_body(text, title, room):
     """The plan without its title, which is already the card's headline:
     shown twice, one under the other, it read as a fault. A first line too
     long for the headline stays, or its end would be lost."""
     lines = text.splitlines()
     if (lines and title and len(title) <= room
-            and _plan_plain(lines[0]).lstrip("• ").strip() == title):
+            and _plan_title(lines[0]) == title):
         lines = lines[1:]
     return "\n".join(lines).strip()
 
@@ -1843,8 +1928,8 @@ def plan_decision(chosen):
     """What a wrist answer to a plan card means for the hook:
     (behavior, message, mode)."""
     said = " ".join(str(chosen or "").split())
-    if said == PLAN_APPROVE_AUTO:
-        return "allow", "", "auto"
+    if said in PLAN_MODES:
+        return "allow", "", PLAN_MODES[said]
     edits = said[len(PLAN_EDITS):].strip() if said.startswith(PLAN_EDITS) else said
     return ("deny", "The user asks for changes to the plan, from their "
             "watch: %s. Revise the plan and present it again." % edits, None)
@@ -1897,37 +1982,73 @@ def _mcp_headline(tool, action):
     return " · ".join(pieces)
 
 
+def _questions(tool_input):
+    """AskUserQuestion's questions, each as (text, option labels)."""
+    questions = (tool_input or {}).get("questions") if isinstance(tool_input, dict) else None
+    found = []
+    for entry in (questions if isinstance(questions, list) else [])[:4]:
+        if not isinstance(entry, dict):
+            continue
+        found.append((str(entry.get("question", "")), [
+            " ".join(str(o.get("label", "")).split())
+            for o in (entry.get("options") or [])
+            if isinstance(o, dict) and o.get("label")
+        ][:4]))
+    return found or [("", [])]
+
+
+def questions_need_typing(tool_input):
+    """Whether an AskUserQuestion call holds a question the wrist cannot
+    answer: one without options to choose from. Claude Code 2.1.300's
+    extended form (behind a feature flag) asks questions of kind "text"
+    or "number", which carry none; malformed input carries none either.
+    The wrist only chooses, and an Allow on such a card went back with no
+    answers, which Claude Code drops (2026-10-15)."""
+    return any(not options for _, options in _questions(tool_input))
+
+
+def question_cards(card, tool_input, headline_chars=HEADLINE_CHARS,
+                   detail_chars=DETAIL_CHARS):
+    """One card per question of an AskUserQuestion call, in order.
+
+    Each is ``card`` — the call's card, fingerprint and session included,
+    so the relay can still withdraw it when the terminal answers — with
+    that question's words and labels. With more than one question the
+    headline says which ("1 of 2 · …"): until 2026-10-15 only the first
+    reached the wrist, and Claude took its one label for every answer.
+    """
+    found = _questions(tool_input)
+    cards = []
+    for index, (question, options) in enumerate(found):
+        question = " ".join(question.split()) or "Claude has a question"
+        if len(found) > 1:
+            question = "%d of %d · %s" % (index + 1, len(found), question)
+        one = dict(card, kind="question",
+                   headline=_fit(question, TEXT_CHARS),
+                   detail=_fit(" · ".join(options), detail_chars))
+        one.pop("options", None)
+        if options:
+            one["options"] = options
+        cards.append(one)
+    return cards
+
+
 def wrist_card(tool, tool_input, risk,
-               headline_chars=HEADLINE_CHARS, detail_chars=DETAIL_CHARS):
-    """Build the compact card a watch face can render in one glance."""
+               headline_chars=HEADLINE_CHARS, detail_chars=DETAIL_CHARS,
+               auto_mode=False):
+    """Build the compact card a watch face can render in one glance.
+    ``auto_mode``: whether a plan's session can use auto mode
+    (auto_mode_seen), which picks the plan's first row."""
     tool_input = tool_input if isinstance(tool_input, dict) else {}
 
     if tool == "ExitPlanMode":
-        return _plan_card(tool_input, risk, headline_chars, detail_chars)
+        return _plan_card(tool_input, risk, headline_chars, detail_chars,
+                          auto_mode=auto_mode)
 
     if tool == "AskUserQuestion":
-        questions = tool_input.get("questions")
-        first = (questions[0]
-                 if isinstance(questions, list) and questions else {})
-        if isinstance(first, dict):
-            question = " ".join(str(first.get("question", "")).split())
-            options = [
-                " ".join(str(o.get("label", "")).split())
-                for o in (first.get("options") or [])
-                if isinstance(o, dict) and o.get("label")
-            ][:4]
-        else:
-            question, options = "", []
-        card = {
-            "kind": "question",
-            "tier": risk.name,
-            "headline": _fit(question or "Claude has a question",
-                             headline_chars * 2),
-            "detail": _fit(" · ".join(options), detail_chars),
-        }
-        if options:
-            card["options"] = options
-        return card
+        # The first question's card; ask_questions sends the rest in turn.
+        return question_cards({"kind": "question", "tier": risk.name},
+                              tool_input, headline_chars, detail_chars)[0]
 
     if tool in ("Bash", "BashOutput"):
         command = tool_input.get("command", "")
@@ -1935,7 +2056,7 @@ def wrist_card(tool, tool_input, risk,
         # the phone app shows ("Check mergeability of every open PR"). Use
         # the same words on the wrist; the command itself is the detail.
         described = " ".join(str(tool_input.get("description") or "").split())
-        headline = (_fit(described, headline_chars) if described
+        headline = (_fit(described, TEXT_CHARS) if described
                     else _bash_headline(command, headline_chars))
         detail = _fit(command, detail_chars)
     elif tool == "apply_patch":
@@ -2249,6 +2370,7 @@ def build_response(event, policy, agent=None):
         shown,
         risk,
         *_card_budgets(policy),
+        auto_mode=(result["tool"] == "ExitPlanMode" and auto_mode_seen(event)),
     )
     card["tool"] = result["tool"]
     card["session_id"] = str((event or {}).get("session_id") or "")[:64]
@@ -2315,7 +2437,10 @@ def ask_watch(card, policy, project=None):
     payload = dict(card)
     if project:
         payload["project"] = project
-    body = json.dumps({"card": payload, "wait": wait}).encode("utf-8")
+    # UTF-8, not \u escapes: a plan in Danish or Japanese would otherwise
+    # cost six bytes a letter against the relay's 64 KB body.
+    body = json.dumps({"card": payload, "wait": wait},
+                      ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         relay + "/card", data=body,
         headers={"Content-Type": "application/json"})
@@ -2334,7 +2459,52 @@ def ask_watch(card, policy, project=None):
     return (decision if decision in ("allow", "deny") else "none"), None
 
 
-def _permission_output(behavior, message="", mode=None):
+def ask_questions(card, tool_input, policy, project=None, ask=None):
+    """Ask every question of an AskUserQuestion call on the wrist, in turn.
+
+    Returns ``("answer", {question text: label})`` once every card has an
+    answer — the shape the terminal hands the tool (2.1.300's input schema
+    ``answers``). A deny on any card denies the call. Anything else — a card
+    timed out, withdrawn because the terminal answered, the relay gone —
+    is ``("none", None)``: half an answer is not an answer, so the terminal
+    asks them all. The cards share the one wait the hook was given. A call
+    holding a question the wrist cannot answer (questions_need_typing)
+    sends no card at all.
+    """
+    import time
+
+    if questions_need_typing(tool_input):
+        return "none", None
+    ask = ask or ask_watch
+    try:
+        wait = float(policy.get("relay_wait", 6.0))
+    except (TypeError, ValueError):
+        wait = 6.0
+    deadline = time.monotonic() + wait
+    answers = {}
+    questions = _questions(tool_input)
+    for index, one in enumerate(question_cards(card, tool_input)):
+        left = wait if index == 0 else deadline - time.monotonic()
+        if left <= 0:
+            return "none", None
+        verdict, chosen = ask(one, dict(policy, relay_wait=left), project=project)
+        if verdict == "deny":
+            return "deny", None
+        # An Allow is not an answer: it goes back with no answers, and
+        # Claude Code drops an allow without them for this tool.
+        if verdict != "answer" or not chosen:
+            return "none", None
+        answers[questions[index][0]] = chosen
+    return "answer", answers
+
+
+def _answers_in_words(answers):
+    """The terminal's own rendering of answers ("Q"="A", …), for a channel
+    that carries only words."""
+    return ", ".join('"%s"="%s"' % pair for pair in answers.items())
+
+
+def _permission_output(behavior, message="", mode=None, updated_input=None):
     """The hookSpecificOutput block Claude Code will actually accept.
 
     The shape is checked, and the CLI's own validator spells it out:
@@ -2354,8 +2524,16 @@ def _permission_output(behavior, message="", mode=None):
     output = {"hookEventName": "PermissionRequest"}
     if behavior == "allow":
         output["decision"] = {"behavior": "allow"}
+        # An allow that ends a dialog must say what it allows. For a tool
+        # the CLI marks as needing the user — ExitPlanMode — it drops a
+        # hook's allow without updatedInput and keeps its dialog open
+        # (2.1.300, runHooks: `if(!L.updatedInput&&e.requiresUserInteraction
+        # ?.())return null`). No error, no log: every wrist approval of a
+        # plan was dropped that way until #560 (2026-10-15).
+        if isinstance(updated_input, dict):
+            output["decision"]["updatedInput"] = updated_input
         # An allow may also move the session to another permission mode —
-        # how "Approve & auto mode" on a plan works. The CLI's validator
+        # how each Yes on a plan works. The CLI's validator
         # (2.1.280) accepts updatedPermissions entries of type setMode with
         # a known mode and a destination; "session" touches no settings
         # file. Only modes the validator knows are ever sent.
@@ -2517,27 +2695,52 @@ def run_hook(stdin=None, stdout=None, agent=None):
             if not phone_would_prompt:
                 audit["watch"] = "skipped-parity"
                 wants_wrist = False
+        if (wants_wrist and event.get("tool_name") == "AskUserQuestion"
+                and questions_need_typing(event.get("tool_input"))):
+            # A question the wrist can only answer with typed words stays
+            # at the terminal, with the call's other questions.
+            audit["watch"] = "skipped-typed-answer"
+            wants_wrist = False
         if wants_wrist:
-            verdict, chosen = ask_watch(card, policy,
-                                        project=audit.get("project"))
+            if event.get("tool_name") == "AskUserQuestion":
+                verdict, chosen = ask_questions(card, event.get("tool_input"), policy,
+                                                project=audit.get("project"))
+            else:
+                verdict, chosen = ask_watch(card, policy,
+                                            project=audit.get("project"))
             audit["watch"] = verdict
             if verdict == "answer" and chosen and card.get("plan_card"):
-                # A plan answered on the wrist: approve (optionally moving
-                # the session to auto mode, as the phone's button does),
-                # or keep planning with the user's words.
+                # A plan answered on the wrist: approve into the mode the
+                # terminal's row names, or keep planning with the user's
+                # words. The approval carries the call's own input, unchanged,
+                # or Claude Code ignores it (_permission_output).
                 behavior, message, mode = plan_decision(chosen)
                 audit["effective"] = behavior
                 audit["answer"] = chosen
+                tool_input = event.get("tool_input")
                 response["hookSpecificOutput"] = _permission_output(
-                    behavior, message, mode=mode)
+                    behavior, message, mode=mode,
+                    updated_input=tool_input if isinstance(tool_input, dict) else {})
+            elif verdict == "answer" and isinstance(chosen, dict) and agent != "codex":
+                # Every question answered on the wrist: the call goes ahead
+                # with the answers filled in, as the terminal's dialog runs
+                # it, and Claude reads "Your questions have been answered".
+                # The shown fields go back unchanged (2.1.300 refuses an
+                # answer that alters them).
+                audit["effective"] = "allow"
+                audit["answer"] = _answers_in_words(chosen)
+                response["hookSpecificOutput"] = _permission_output(
+                    "allow", updated_input=dict(event["tool_input"], answers=chosen))
             elif verdict == "answer" and chosen:
-                # A question card answered on the wrist: deny-with-reason is
-                # the one hook channel that can carry the user's words back
-                # to Claude, which then proceeds on the chosen option.
+                # Codex was never seen to take updatedInput: deny-with-reason
+                # is the channel that carries the user's words back, and
+                # Claude proceeds on them.
+                words = (_answers_in_words(chosen) if isinstance(chosen, dict)
+                         else chosen)
                 audit["effective"] = "deny"
-                audit["answer"] = chosen
+                audit["answer"] = words
                 response["hookSpecificOutput"] = _permission_output(
-                    "deny", "The user answered from their watch: %s" % chosen)
+                    "deny", "The user answered from their watch: %s" % words)
             elif verdict in ("allow", "deny"):
                 audit["effective"] = verdict
                 response["hookSpecificOutput"] = _permission_output(
@@ -2775,13 +2978,15 @@ _LAUNCH_AGENT_XML = """<?xml version="1.0" encoding="UTF-8"?>
 
 
 def _launchctl(*args):
-    """Run launchctl quietly; never raises, never blocks an install."""
+    """Run launchctl quietly: True when it succeeded. Never raises, never
+    blocks an install. Its answer used to be dropped, so an install whose
+    bootstrap failed still said the relay wakes at login."""
     import subprocess
     try:
-        subprocess.run(["launchctl"] + list(args),
-                       capture_output=True, timeout=10)
+        return subprocess.run(["launchctl"] + list(args),
+                              capture_output=True, timeout=10).returncode == 0
     except Exception:
-        pass
+        return False
 
 
 def _xml_escape(text):
@@ -2812,9 +3017,21 @@ def install_launch_agent():
     except OSError:
         return False
     if _launch_agent_is_real():
+        import time
         uid = os.getuid()
+        # A bootout of a job that is not loaded fails, and that is fine.
         _launchctl("bootout", "gui/%d/com.tapproval.relay" % uid)
-        _launchctl("bootstrap", "gui/%d" % uid, target)
+        # The bootout finishes asynchronously; a bootstrap straight after it
+        # can fail while launchd is still unloading. One patient retry.
+        if not _launchctl("bootstrap", "gui/%d" % uid, target):
+            time.sleep(1.0)
+            if not _launchctl("bootstrap", "gui/%d" % uid, target):
+                print("Tapproval: the login job could not be registered with "
+                      "launchd, so the relay will not wake by itself after a "
+                      "restart. It still starts with every Claude Code "
+                      "session. Check with: launchctl print gui/%d/"
+                      "com.tapproval.relay" % uid, file=sys.stderr)
+                return False
     return True
 
 

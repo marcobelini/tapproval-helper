@@ -45,4 +45,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - run: shellcheck install.sh uninstall.sh
+      # Every tracked script and the whole tree, the same lines as the
+      # private workflow's: a list of names is a guard that has to be
+      # remembered, and test_the_two_ci_workflows_share_their_test_steps
+      # now holds this job equal to the private one.
+      - run: git ls-files -z '*.sh' ':!:design/**' | xargs -0 shellcheck
+      - run: pipx run ruff==0.16.9 check --select E,F,W,B --ignore E501 --line-length 100 --exclude design .

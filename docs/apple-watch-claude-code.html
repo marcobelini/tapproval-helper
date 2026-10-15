@@ -48,7 +48,7 @@
 <ul>
 <li><strong>Permission prompts</strong>, each marked with one of five risk tiers worked out on your computer. A force-push to main arrives as CRITICAL. Tap Allow or Deny.</li>
 <li><strong>Questions</strong> Claude asks you, with the same options as on the desktop.</li>
-<li><strong>Plans</strong> waiting for approval, laid out as on your phone, with the phone's two answers: Approve &amp; auto mode, or edits you dictate.</li>
+<li><strong>Plans</strong> waiting for approval, laid out as on your phone, with the terminal's own answers: Yes, and use auto mode (or auto-accept edits), Yes, manually approve edits, or say what to change.</li>
 <li><strong>Your sessions</strong>, grouped by what they need, each with its project: which one needs you, which is working, what it said, with bold and lists as on your phone. Reply, or start a new session from the wrist.</li>
 </ul>
 <p><strong>Nothing is approved for you.</strong> By default every prompt waits for a person. If you do not answer on the watch, the ordinary prompt is still there in Claude Code, exactly as it would be without Tapproval.</p>
@@ -69,6 +69,9 @@
 <tr><td>A red notice from <strong>Your computer</strong>, such as <em>The iCloud route is off</em></td><td>The helper found something wrong and says what, in its own words.</td><td>Follow the sentence; <code>--status</code> repeats it as the next step.</td></tr>
 </tbody></table></div>
 <p>For a second watch, tell Claude Code <em>Open Tapproval pairing</em> and open the app within ten minutes.</p>
+
+<h2>Skills from the wrist</h2>
+<p>Under a session's reply field, <strong>More</strong> lists every slash command the computer would accept for that session: the repository's own skills first, then yours, Claude Code's built-ins, and each installed plugin's under the name Claude Code gives them, such as <code>/engineering:debug</code>. Long groups fold to one row with a count, and the three commands you sent most recently sit at the top. The helper reads only the skill files' names and one-line descriptions; it runs nothing itself. A skill that takes an argument lands in the Message field, so you can dictate the rest.</p>
 
 <h2>With your iPhone off</h2>
 <p>Tapproval keeps working. Without its iPhone, Apple lets a watch reach the internet but not your home network, so the watch uses its private travel address, on Wi-Fi or cellular. From helper 1.1.29 that address survives updates and restarts of the helper, and if its connection drops the helper opens a new one by itself. After your Mac itself restarts, the address changes, and the watch learns the new one through your iCloud.</p>

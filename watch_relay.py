@@ -362,9 +362,16 @@ def advertise_txt(port):
     return txt
 
 
-def _machine_name():
+def _computer_name():
+    """This computer's own short name, as the watch says it ("Office Mac
+    mini"): the host name's first label, dashes as spaces. Empty when the
+    host has none."""
     import socket
-    host = socket.gethostname().split(".")[0].replace("-", " ")
+    return socket.gethostname().split(".")[0].replace("-", " ")
+
+
+def _machine_name():
+    host = _computer_name()
     return ("Tapproval on %s" % host) if host else "Tapproval"
 
 
@@ -652,10 +659,10 @@ def _self_update():
 
     Only ever touches an install that is a git checkout — the one made by
     install.sh. A plugin install belongs to Claude Code, which manages its
-    own updates, and must not be rewritten underneath it. Every failure is
-    silent and harmless: a machine that cannot reach GitHub, a clone with
-    local edits, no git at all — the relay simply starts what is already
-    there. Never raises, never blocks a session.
+    own updates, and must not be rewritten underneath it. A failure never
+    stops anything — the relay simply starts what is already there — but
+    one that will not pass by itself is said: see ``_pull_update``. Never
+    raises, never blocks a session.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     if not os.path.isdir(os.path.join(here, ".git")):
@@ -675,23 +682,55 @@ def _self_update():
                     RELAY_LOG)
 
 
+# What a pull says when the network, not the checkout, is the problem.
+# Those pass by themselves within the hour; everything else — a clone that
+# has diverged, local edits in the way — fails the same way every hour,
+# forever, and the machine runs old rules without a word.
+_TRANSIENT_PULL_ERRORS = (
+    "could not resolve host", "unable to access", "could not read from remote",
+    "timed out", "failed to connect", "connection refused", "connection reset",
+    "early eof", "network is unreachable", "returned error: 5")
+
+
+def _pull_is_stuck(returncode, stderr):
+    """True when a failed pull will keep failing until someone acts."""
+    if returncode == 0:
+        return False
+    text = (stderr or "").lower()
+    return not any(marker in text for marker in _TRANSIENT_PULL_ERRORS)
+
+
 def _pull_update():
     """The pull itself, synchronous, for the detached ``--update`` process.
-    Returns True if the checkout moved. Never raises."""
+    Returns True if the checkout moved. Never raises.
+
+    A pull that cannot succeed until someone acts is told to the running
+    relay (``/admin/update-stuck``), which records a condition the watch
+    shows; the first pull that succeeds withdraws it. It used to be
+    ignored outright, and the stamp is written before the pull, so a stuck
+    clone ran old code indefinitely and said nothing anywhere
+    (2026-10-14 tech-debt audit)."""
     here = os.path.dirname(os.path.abspath(__file__))
     # One guard around everything, including reading the results: the
     # promise is "never raises", and narrow excepts made it false once.
     try:
         before = subprocess.run(["git", "-C", here, "rev-parse", "HEAD"],
                                 capture_output=True, text=True, timeout=10)
-        subprocess.run(["git", "-C", here, "pull", "--ff-only", "--quiet"],
-                       capture_output=True, text=True, timeout=60)
+        pull = subprocess.run(["git", "-C", here, "pull", "--ff-only", "--quiet"],
+                              capture_output=True, text=True, timeout=60)
         after = subprocess.run(["git", "-C", here, "rev-parse", "HEAD"],
                                capture_output=True, text=True, timeout=10)
         moved = (before.returncode == 0 and after.returncode == 0
                  and before.stdout.strip() != after.stdout.strip())
+        stuck = _pull_is_stuck(pull.returncode, pull.stderr)
+        why = (pull.stderr or "").strip().splitlines()[-1:] or [""]
     except Exception:
         return False
+    if stuck:
+        print("relay: the helper cannot update itself: %s" % why[0], file=sys.stderr)
+        _admin_call("/admin/update-stuck", timeout=2)
+    elif pull.returncode == 0:
+        _admin_call("/admin/update-unstuck", timeout=2)
     if moved:
         print("relay: helper updated to the latest published version",
               file=sys.stderr)
@@ -1624,37 +1663,100 @@ _SKILLS_CACHE = {}          # cwd -> (expires, rows)
 SKILLS_CACHE_SECONDS = 60.0
 
 
-def _frontmatter_description(path):
-    """The one-line ``description:`` from a skill or command file's
-    frontmatter — the sentence its author wrote for exactly this use —
-    or the first line of prose when there is none. Stdlib only: the
-    frontmatter is a handful of ``key: value`` lines, not full YAML."""
+def _frontmatter(path):
+    """The handful of frontmatter keys the wrist uses from a skill or
+    command file — ``description`` (the sentence its author wrote for
+    exactly this use, or the first line of prose when there is none),
+    ``argument-hint`` (what to say after the name) and ``user-invocable``
+    (``false`` keeps a skill out of the slash menu, so out of the More
+    list too). Stdlib only: the frontmatter is ``key: value`` lines, not
+    full YAML. Never raises; an unreadable file is an empty dict."""
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
             lines = handle.read(20000).split("\n")
     except OSError:
-        return ""
+        return {}
+    found = {}
     if lines and lines[0].strip() == "---":
         for line in lines[1:]:
             if line.strip() == "---":
                 break
-            if line.startswith("description:"):
-                return " ".join(line[len("description:"):].strip().strip("'\"").split())[:300]
-    for line in lines:
-        text = line.strip()
-        if text and not text.startswith(("---", "#", "name:")):
-            return text[:300]
-    return ""
+            key, sep, value = line.partition(":")
+            if sep and key.strip() in ("description", "argument-hint", "user-invocable"):
+                found[key.strip()] = " ".join(value.strip().strip("'\"").split())[:300]
+    if not found.get("description"):
+        for line in lines:
+            text = line.strip()
+            if text and not text.startswith(("---", "#", "name:")):
+                found["description"] = text[:300]
+                break
+    return found
+
+
+def _skill_roots(cwd, home):
+    """Where this machine keeps skills and commands, as (root, source,
+    plugin) rows, nearest first for the project.
+
+    The project's own `.claude` and every one between `cwd` and the
+    repository root (a worktree lists the main checkout's skills, as
+    Claude Code does from 2.1.277); the user's; and each plugin's. A
+    plugin lives in one of two places: the install registry
+    (`installed_plugins.json`), or the folder the desktop app syncs an
+    organisation's plugins into (`plugins/synced/<org>_<user>/<plugin>/`),
+    whose folder name may carry a `~g2`-style suffix the slash name
+    does not. `plugins/marketplaces/` is a catalogue cache, not an
+    install, and is never read: on 2026-10-15 it held 127 skill files
+    nobody had enabled."""
+    roots = []
+    if cwd:
+        seen = set()
+        here = os.path.abspath(cwd)
+        stop = os.path.abspath(project_root(here) or here)
+        while True:
+            if here in seen:
+                break
+            seen.add(here)
+            roots.append((os.path.join(here, ".claude"), "project", None))
+            if here == stop or os.path.dirname(here) == here:
+                break
+            here = os.path.dirname(here)
+    roots.append((os.path.join(home, ".claude"), "user", None))
+    plugins_dir = os.path.join(home, ".claude", "plugins")
+    try:
+        with open(os.path.join(plugins_dir, "installed_plugins.json"),
+                  encoding="utf-8") as handle:
+            registry = json.load(handle).get("plugins", {})
+    except (OSError, ValueError):
+        registry = {}
+    for key, entries in registry.items():
+        for entry in (entries if isinstance(entries, list) else [entries]):
+            path = entry.get("installPath") if isinstance(entry, dict) else None
+            if path:
+                roots.append((path, "plugin", _plugin_name(str(key).split("@", 1)[0])))
+    for synced in sorted(glob.glob(os.path.join(plugins_dir, "synced", "*", "*"))):
+        bucket, plugin = os.path.basename(os.path.dirname(synced)), os.path.basename(synced)
+        if bucket.startswith(".") or plugin.startswith(".") or not os.path.isdir(synced):
+            continue
+        roots.append((synced, "plugin", _plugin_name(plugin)))
+    return roots
+
+
+def _plugin_name(folder):
+    """`engineering~g2` is invoked as `/engineering:…`."""
+    return re.sub(r"~g\d+$", "", folder)
 
 
 def known_skills(cwd=None, home=None, now=None):
     """Every slash command this machine can answer for a session in
-    ``cwd``: the read-only built-ins, the user's own skills and commands,
-    the project's, and each installed plugin's. One row per name, with
-    the description its file carries, so the watch lists a skill only
-    where it exists and describes it in its author's words rather than
-    in ours. A minute's cache per directory: the More list opens far
-    less often than the session list polls.
+    ``cwd``: the read-only built-ins, the project's skills and commands
+    (and its repository's, from a worktree), the user's own, and each
+    installed plugin's under the name the CLI gives them,
+    ``/<plugin>:<skill>``. One row per name, with the description its
+    file carries, so the watch lists a skill only where it exists and
+    describes it in its author's words rather than in ours. A skill
+    marked ``user-invocable: false`` is not a slash command and is not
+    listed. A minute's cache per directory: the More list opens far less
+    often than the session list polls.
 
     Not every skill listed will do what a headless run can — one that
     writes gets a refusal — but a command the CLI does not know now
@@ -1669,30 +1771,27 @@ def known_skills(cwd=None, home=None, now=None):
         return hit[1]
     found = {}
     for name, description in SKILL_BUILTINS.items():
-        found[name] = (description, "builtin")
-    roots = [(os.path.join(home, ".claude"), "user")]
-    if cwd:
-        roots.append((os.path.join(cwd, ".claude"), "project"))
-    try:
-        with open(os.path.join(home, ".claude", "plugins", "installed_plugins.json"),
-                  encoding="utf-8") as handle:
-            registry = json.load(handle).get("plugins", {})
-    except (OSError, ValueError):
-        registry = {}
-    for entries in registry.values():
-        for entry in (entries if isinstance(entries, list) else [entries]):
-            path = entry.get("installPath") if isinstance(entry, dict) else None
-            if path:
-                roots.append((path, "plugin"))
-    for root, source in roots:
-        for skill in glob.glob(os.path.join(root, "skills", "*", "SKILL.md")):
-            name = os.path.basename(os.path.dirname(skill))
-            found.setdefault(name, (_frontmatter_description(skill), source))
-        for command in glob.glob(os.path.join(root, "commands", "*.md")):
-            name = os.path.splitext(os.path.basename(command))[0]
-            found.setdefault(name, (_frontmatter_description(command), source))
-    rows = [{"name": "/" + name, "description": desc, "source": source}
-            for name, (desc, source) in sorted(found.items())]
+        found[name] = {"description": description, "source": "builtin", "plugin": None,
+                       "argument_hint": None}
+    for root, source, plugin in _skill_roots(cwd, home):
+        files = [(os.path.basename(os.path.dirname(f)), f)
+                 for f in glob.glob(os.path.join(root, "skills", "*", "SKILL.md"))]
+        commands_dir = os.path.join(root, "commands")
+        for f in glob.glob(os.path.join(commands_dir, "**", "*.md"), recursive=True):
+            # commands/a/b.md is /a:b — a folder is a namespace.
+            relative = os.path.relpath(f, commands_dir)[:-3]
+            files.append((":".join(relative.split(os.sep)), f))
+        for name, path in files:
+            if plugin:
+                name = "%s:%s" % (plugin, name)
+            if name in found:
+                continue
+            meta = _frontmatter(path)
+            if meta.get("user-invocable", "").lower() == "false":
+                continue
+            found[name] = {"description": meta.get("description", ""), "source": source,
+                           "plugin": plugin, "argument_hint": meta.get("argument-hint") or None}
+    rows = [dict(name="/" + name, **meta) for name, meta in sorted(found.items())]
     _SKILLS_CACHE[key] = (now + SKILLS_CACHE_SECONDS, rows)
     return rows
 
@@ -2736,6 +2835,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             "/admin/pair-reset": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
             "/admin/rotate": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
             "/admin/update-deferred": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
+            "/admin/update-stuck": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
+            "/admin/update-unstuck": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
         },
     }
 
@@ -2862,6 +2963,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                              "helper_date": (_PROVENANCE or (None, None))[1],
                              "conditions": conditions(),
                              "agents": wired_agents(),
+                             # The watch says this, not "Mac" (2026-10-15).
+                             "name": _computer_name(),
                              "paired_ever": getattr(self.auth, "paired_ever", True)})
         else:
             self._send_json({"ok": True})
@@ -2875,7 +2978,9 @@ class RelayHandler(BaseHTTPRequestHandler):
         # skill's own words. Without a session it is the user's set.
         prefix = (query.get("session_id") or [""])[0][:64]
         _, cwd = resolve_session(prefix) if prefix else (None, None)
-        self._send_json({"skills": known_skills(cwd)})
+        # The repository's name captions the "its own" group on the wrist.
+        project = os.path.basename(project_root(cwd).rstrip("/")) if cwd else None
+        self._send_json({"skills": known_skills(cwd), "project": project or None})
 
     def _get_sessions(self, path, query):
         waiting = {card["session_id"] for card in self.queue.pending() if card.get("session_id")}
@@ -3095,6 +3200,19 @@ class RelayHandler(BaseHTTPRequestHandler):
                 "this one the next time Claude Code starts with no card "
                 "waiting.", tone="in_hand")
             self._send_json({"ok": True})
+        elif path == "/admin/update-stuck":
+            # The hourly pull failed in a way the next one will repeat (a
+            # diverged clone, local edits in the way). Fixed wording, no
+            # body: what git said goes to the log, not to the wrist.
+            note_condition(
+                "stuck",
+                "The helper on this computer can no longer update itself, so "
+                "it will miss fixes. Ask Claude Code to reinstall Tapproval's "
+                "helper.")
+            self._send_json({"ok": True})
+        elif path == "/admin/update-unstuck":
+            clear_condition("stuck")
+            self._send_json({"ok": True})
         elif path == "/admin/rotate":
             secret = self.auth.rotate()
             _rotate_tunnel_prefix(secret)
@@ -3128,14 +3246,30 @@ def _live_tunnel_secret(fallback):
     return getattr(_TUNNEL_HANDLER, "required_token", None) or fallback
 
 
+# Held while the tunnel's secret and the address that carries it change
+# together. The announce thread used to write the address with the secret
+# it was started with: a rotation during its wait found no address yet to
+# rewrite, and the address handed out afterwards carried a secret the
+# listener no longer answered (2026-10-14 tech-debt audit).
+_TUNNEL_URL_LOCK = threading.RLock()
+
+
+def _publish_tunnel_url(base, fallback):
+    """Set TUNNEL_URL to ``base`` plus the secret the listener answers now."""
+    global TUNNEL_URL
+    with _TUNNEL_URL_LOCK:
+        TUNNEL_URL = "%s/t/%s" % (base, _live_tunnel_secret(fallback))
+
+
 def _rotate_tunnel_prefix(secret):
     """Point the live tunnel listener at the new secret path."""
     global TUNNEL_URL
-    if _TUNNEL_HANDLER is not None:
-        _TUNNEL_HANDLER.required_token = secret
-    if TUNNEL_URL:
-        base = TUNNEL_URL.split("/t/")[0]
-        TUNNEL_URL = "%s/t/%s" % (base, secret)
+    with _TUNNEL_URL_LOCK:
+        if _TUNNEL_HANDLER is not None:
+            _TUNNEL_HANDLER.required_token = secret
+        if TUNNEL_URL:
+            base = TUNNEL_URL.split("/t/")[0]
+            TUNNEL_URL = "%s/t/%s" % (base, secret)
 
 
 def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, queue=None, token=None,
@@ -3866,7 +4000,6 @@ def start_tunnel(port, token):
     The process is registered for cleanup at exit so a relay restart never
     leaves an orphan tunnel running.
     """
-    global TUNNEL_URL
     binary = _cloudflared()
     if not binary:
         note_condition(
@@ -3877,7 +4010,7 @@ def start_tunnel(port, token):
     adopted = _adoptable_tunnel(port)
     if adopted and _tunnel_answers_soon(adopted["url"], token,
                                         tries=TUNNEL_ADOPT_TRIES):
-        TUNNEL_URL = "%s/t/%s" % (adopted["url"], token)
+        _publish_tunnel_url(adopted["url"], token)
         clear_condition("tunnel")
         _reap_stale_tunnels(port, keep=adopted["pid"])
         print("relay: tunnel adopted %s — the travel address is unchanged"
@@ -3911,7 +4044,6 @@ def start_tunnel(port, token):
         os.close(log_fd)                # the child has its own copy
 
     def announce():
-        global TUNNEL_URL
         deadline = time.monotonic() + TUNNEL_ANNOUNCE_WAIT
         while time.monotonic() < deadline:
             try:
@@ -3935,7 +4067,7 @@ def start_tunnel(port, token):
                         tone="in_hand")
                 else:
                     clear_condition("tunnel")
-                TUNNEL_URL = "%s/t/%s" % (match.group(0), token)
+                _publish_tunnel_url(match.group(0), token)
                 print("relay: tunnel new %s (%s)" % (match.group(0), reason),
                       file=sys.stderr)
                 print("relay: off-Wi-Fi tunnel up — the watch learns this "

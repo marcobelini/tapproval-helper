@@ -830,6 +830,39 @@ class TestCardFacts:
         assert value.startswith("…") and value.endswith("handlers.py")
         assert len(value) <= 24
 
+    def test_values_arrive_whole(self):
+        """2026-10-15: "Text should not be cut off in cards". At 32
+        characters the project id lost its middle and a path its head —
+        the very part a person checks before tapping Allow."""
+        path = "/Users/someone/Developer/very/deep/tree/src/api/handlers.py"
+        card = crc.wrist_card("SomeFutureTool",
+                              {"projectId": self.DESIGN["projectId"],
+                               "path": path,
+                               "title": "Rename every widget in the "
+                                        "design system to its new name"},
+                              Risk.MEDIUM)
+        assert card["facts"] == [
+            ["project", self.DESIGN["projectId"]], ["path", path],
+            ["title", "Rename every widget in the design system to its "
+                      "new name"]]
+
+    def test_the_longest_facts_still_fit_the_relays_body(self):
+        huge = {key: "x" * 5000 for key in ("project", "path", "title")}
+        card = crc.wrist_card("SomeFutureTool", huge, Risk.MEDIUM)
+        assert all(len(v) == crc.FACT_CHARS for _, v in card["facts"])
+        assert len(json.dumps(card).encode()) < watch_relay.MAX_BODY / 4
+
+    @pytest.mark.private_layout
+    def test_the_card_screen_wraps_facts_and_the_list_does_not(self):
+        swift = Path(__file__).with_name("WatchApp").joinpath(
+            "Tapproval", "Cards.swift").read_text()
+        assert "FactLines(facts: facts, size: 14, wraps: true)" in swift
+        assert "FactLines(facts: facts, size: 12)" in swift
+        body = swift[swift.index("struct FactLines"):swift.index("struct CardDetail")]
+        wrapped, listed = body.split("} else {")
+        assert ".lineLimit(" not in wrapped and ".truncationMode(" not in wrapped
+        assert ".lineLimit(1)" in listed
+
     def test_short_string_lists_are_spelled_out(self):
         assert crc._fact_value(["a", "b"], 32) == "a, b"
         assert crc._fact_value([], 32) == "none"
@@ -1339,6 +1372,39 @@ class TestTestsNeverReachTheRealLaunchd:
         assert crc._launch_agent_is_real()
         monkeypatch.setenv("CLAUDE_LAUNCH_AGENT_PATH", "/tmp/x.plist")
         assert not crc._launch_agent_is_real()
+
+
+class TestTheLoginJobIsOnlyClaimedWhenLaunchdTookIt:
+    """The installer dropped launchctl's answer, so a bootstrap that
+    failed still printed "the relay wakes again at login" (2026-10-14
+    tech-debt audit). Every path here is faked: no test touches launchd."""
+
+    def _install(self, monkeypatch, tmp_path, answers):
+        calls = []
+        replies = iter(answers)
+        monkeypatch.setattr(crc.sys, "platform", "darwin")
+        monkeypatch.setattr(crc, "_relay_path", lambda: __file__)
+        monkeypatch.setattr(crc, "_launch_agent_path", lambda: str(tmp_path / "agent.plist"))
+        monkeypatch.setattr(crc, "_launch_agent_is_real", lambda: True)
+        monkeypatch.setattr(crc, "_launchctl",
+                            lambda *args: calls.append(args[0]) or next(replies))
+        monkeypatch.setattr("time.sleep", lambda seconds: None)
+        return crc.install_launch_agent(), calls
+
+    def test_a_bootstrap_that_fails_twice_is_not_claimed(self, monkeypatch, tmp_path, capsys):
+        ok, calls = self._install(monkeypatch, tmp_path, [False, False, False])
+        assert ok is False
+        assert calls == ["bootout", "bootstrap", "bootstrap"]
+        assert "will not wake by itself" in capsys.readouterr().err
+
+    def test_a_bootstrap_that_succeeds_on_the_retry_is_claimed(self, monkeypatch, tmp_path):
+        ok, calls = self._install(monkeypatch, tmp_path, [False, False, True])
+        assert ok is True and calls == ["bootout", "bootstrap", "bootstrap"]
+
+    def test_a_job_that_was_not_loaded_is_fine(self, monkeypatch, tmp_path):
+        """bootout of an unloaded job fails; that is the first install."""
+        ok, calls = self._install(monkeypatch, tmp_path, [False, True])
+        assert ok is True and calls == ["bootout", "bootstrap"]
 
 
 class TestPipeHandling:
@@ -2768,78 +2834,232 @@ class TestAnUpdateKeepsTheAwayAddress:
 class TestTheBridgeSigns:
     """The Mac bridge proved its key by sending it, in X-Tapproval-Token,
     and so kept the relay accepting a key sent in the clear from every
-    caller. It signs now, with the watch's scheme, through one function;
-    that it signs correctly was checked by compiling Bridge/Signing.swift
-    against a relay (2026-09-30), and this holds the shape."""
+    caller. It signs now, through one function in the file the watch
+    compiles too (Shared/RelaySigning.swift); TestSigningVectors holds the
+    bytes, and this holds the bridge's shape."""
 
-    def _source(self, name):
-        path = os.path.join(_ROOT, "WatchApp", "Bridge", name)
+    def _source(self, *parts):
+        path = os.path.join(_ROOT, "WatchApp", *parts)
         if not os.path.isfile(path):
             pytest.skip("no Mac bridge in this layout")
         with open(path, encoding="utf-8") as handle:
             return handle.read()
 
     def test_the_bridge_never_sends_its_key(self):
-        source = self._source("main.swift") + self._source("Signing.swift")
+        source = (self._source("Bridge", "main.swift")
+                  + self._source("Shared", "RelaySigning.swift"))
         assert 'forHTTPHeaderField: "X-Tapproval-Token"' not in source
 
     def test_every_relay_call_goes_through_the_signer(self):
-        main = self._source("main.swift")
+        main = self._source("Bridge", "main.swift")
         # One call to the session: the one inside relayData(for:).
         assert main.count("relaySession.data(") == 1, (
             "a relay call that skips relayData(for:) goes out unsigned")
         assert "relaySession.data(for: RelaySigning.signed(" in main
 
-    def test_the_signature_is_the_relays_own(self):
-        """The message is built as sign_request builds it, query included:
-        a drift here is a bridge whose every /decision is refused."""
-        signing = self._source("Signing.swift")
-        assert ("[method.uppercased(), path, query, String(stamp), nonce, bodyHash]"
-                in signing)
-        assert '"X-Tapproval-Signature"' in signing
-        assert '"v2 \\(stamp) \\(nonce) \\(mac)"' in signing
+    def test_the_bridge_signs_v2(self):
+        """v1 leaves the query out, so a signed `?id=A` could be replayed as
+        `?id=B`; the bridge was the last caller still sending it."""
+        signing = self._source("Shared", "RelaySigning.swift")
+        signed = signing[signing.index("static func signed("):]
+        signed = signed[:signed.index("\n    }\n")]
+        assert "v2: true" in signed and "v2: false" not in signed
 
-    def test_the_compiled_signer_passes_the_relays_own_check(self, tmp_path):
-        """Not the shape but the fact: Signing.swift compiled, its headers
-        verified by verify_signature — and a query changed on the way is
-        refused, which is what v2 exists for (2026-10-10 debt pass)."""
+
+def _signing_vectors():
+    path = os.path.join(_ROOT, "WatchApp", "Shared", "signing-vectors.json")
+    if not os.path.isfile(path):
+        pytest.skip("no watch app in this layout")
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+@pytest.mark.private_layout
+class TestSigningVectors:
+    """One signing implementation for the watch and the bridge, checked
+    against bytes the relay makes. Each kept its own copy until 2026-10-15
+    (debt item 8); a drift in either is a device whose every request is
+    refused, or a watch that trusts an answer it should not. The vectors are
+    the relay's: the first test regenerates them, the second runs them
+    through the shared Swift file, compiled alone."""
+
+    def test_the_relay_still_makes_every_vector(self):
+        v = _signing_vectors()
+        key, nonce, stamp = v["key"], v["nonce"], v["stamp"]
+        for s in v["signatures"]:
+            assert watch_relay.sign_request(
+                key, s["method"], s["path"], stamp, nonce, s["body"].encode("utf-8"),
+                s["query"]) == s["mac"], s["name"]
+            header = "%s %d %s %s" % ("v1" if s["query"] is None else "v2",
+                                      stamp, nonce, s["mac"])
+            with watch_relay._NONCE_LOCK:
+                watch_relay._SEEN_NONCES.clear()
+            assert watch_relay.verify_signature(
+                header, s["method"], s["path"], s["body"].encode("utf-8"), [key],
+                now=stamp, query=s["query"] or "")[0] == key, s["name"]
+        for p in v["proofs"]:
+            assert watch_relay.relay_proof(key, p["nonce"]) == p["proof"]
+        for p in v["proofs2"]:
+            assert watch_relay.relay_proof2(
+                key, nonce, p["status"], p["body"].encode("utf-8")) == p["proof2"]
+        for p in v["seals"]:
+            assert watch_relay.seal(key, nonce, p["secret"]) == p["sealed"]
+        with watch_relay._NONCE_LOCK:
+            watch_relay._SEEN_NONCES.clear()
+
+    def test_the_vectors_cover_both_versions_and_every_proof(self):
+        v = _signing_vectors()
+        queries = [s["query"] for s in v["signatures"]]
+        assert None in queries and "" in queries
+        assert any(q and "%" in q for q in queries), "a percent-encoded query"
+        assert any(s["body"] for s in v["signatures"])
+        assert v["proofs"] and v["proofs2"] and v["seals"]
+
+    def test_the_shared_swift_file_makes_every_vector(self, tmp_path):
+        """Not the shape but the bytes: RelaySigning.swift compiled on its
+        own, every vector through it, plus the bridge's signed request
+        verified by verify_signature with a changed query refused."""
         import shutil
         import subprocess
-        signing = self._source("Signing.swift")
+        source = os.path.join(_ROOT, "WatchApp", "Shared", "RelaySigning.swift")
+        v = _signing_vectors()
         if not shutil.which("swiftc"):
             pytest.skip("no Swift compiler on this machine")
         driver = tmp_path / "main.swift"   # top-level code lives only in main.swift
         driver.write_text(
             'import Foundation\n'
             'let a = CommandLine.arguments\n'
+            'let v = try! JSONSerialization.jsonObject(\n'
+            '    with: Data(contentsOf: URL(fileURLWithPath: a[1]))) as! [String: Any]\n'
+            'let key = v["key"] as! String, nonce = v["nonce"] as! String\n'
+            'let stamp = v["stamp"] as! Int\n'
+            'var out: [String: Any] = [:]\n'
+            'out["signatures"] = (v["signatures"] as! [[String: Any]]).map { s in\n'
+            '    RelaySigning.signature(key: key, method: s["method"] as! String,\n'
+            '        path: s["path"] as! String, query: s["query"] as? String,\n'
+            '        stamp: stamp, nonce: nonce,\n'
+            '        body: Data((s["body"] as! String).utf8)) }\n'
+            'out["proofs"] = (v["proofs"] as! [[String: Any]]).map {\n'
+            '    RelaySigning.proof(key: key, nonce: $0["nonce"] as! String) }\n'
+            'out["proofs2"] = (v["proofs2"] as! [[String: Any]]).map {\n'
+            '    RelaySigning.proof2(key: key, nonce: nonce, status: $0["status"] as! Int,\n'
+            '        body: Data(($0["body"] as! String).utf8)) }\n'
+            'out["unsealed"] = (v["seals"] as! [[String: Any]]).map {\n'
+            '    RelaySigning.unseal($0["sealed"] as! String, key: key, nonce: nonce) ?? "" }\n'
             'var r = URLRequest(url: URL(string: a[2])!)\n'
-            'r.httpMethod = a[3]\n'
-            'r.httpBody = a[4].isEmpty ? nil : Data(a[4].utf8)\n'
-            'let s = RelaySigning.signed(r, key: a[1])\n'
-            'print(s.value(forHTTPHeaderField: "X-Tapproval-Signature") ?? "")\n')
-        (tmp_path / "Signing.swift").write_text(signing)
+            'r.httpMethod = "GET"\n'
+            'out["signed"] = RelaySigning.signed(r, key: key)\n'
+            '    .value(forHTTPHeaderField: "X-Tapproval-Signature") ?? ""\n'
+            'out["unkeyed"] = RelaySigning.signed(r, key: "")\n'
+            '    .value(forHTTPHeaderField: "X-Tapproval-Signature") ?? ""\n'
+            'print(String(data: try! JSONSerialization.data(withJSONObject: out),\n'
+            '             encoding: .utf8)!)\n')
+        shutil.copy(source, tmp_path / "RelaySigning.swift")
         binary = tmp_path / "signer"
         built = subprocess.run(
-            ["swiftc", "-O", "-o", str(binary), str(tmp_path / "Signing.swift"),
+            ["swiftc", "-O", "-o", str(binary), str(tmp_path / "RelaySigning.swift"),
              str(driver)], capture_output=True, text=True, timeout=300)
         assert built.returncode == 0, built.stderr[-2000:]
-        key = "k" * 32
+        vectors = os.path.join(_ROOT, "WatchApp", "Shared", "signing-vectors.json")
+        ran = subprocess.run([str(binary), vectors,
+                              "http://127.0.0.1:8977/thread?id=A%20B&n=2"],
+                             capture_output=True, text=True, timeout=30)
+        assert ran.returncode == 0, ran.stderr[-2000:]
+        got = json.loads(ran.stdout)
+        wrong = [s["name"] for i, s in enumerate(v["signatures"])
+                 if i >= len(got["signatures"]) or got["signatures"][i] != s["mac"]]
+        assert wrong == [] and len(got["signatures"]) == len(v["signatures"]), wrong
+        assert got["proofs"] == [p["proof"] for p in v["proofs"]]
+        assert got["proofs2"] == [p["proof2"] for p in v["proofs2"]]
+        assert got["unsealed"] == [p["secret"] for p in v["seals"]]
+        key = v["key"]
+        assert got["signed"].startswith("v2 ")
+        assert got["unkeyed"] == ""
+        try:
+            assert watch_relay.verify_signature(
+                got["signed"], "GET", "/thread", b"", [key], query="id=A%20B&n=2")[0] == key
+            assert watch_relay.verify_signature(
+                got["signed"], "GET", "/thread", b"", [key], query="id=B")[0] is None
+        finally:
+            with watch_relay._NONCE_LOCK:
+                watch_relay._SEEN_NONCES.clear()
 
-        def header(url, method="GET", body=""):
-            return subprocess.run([str(binary), key, url, method, body],
-                                  capture_output=True, text=True,
-                                  timeout=30).stdout.strip()
+    def test_no_swift_file_signs_on_its_own(self):
+        """The drift this item closed: an HMAC built anywhere but the shared
+        file is a second implementation waiting to disagree."""
+        root = os.path.join(_ROOT, "WatchApp")
+        if not os.path.isdir(root):
+            pytest.skip("no watch app in this layout")
+        shared = os.path.join(root, "Shared", "RelaySigning.swift")
+        assert os.path.isfile(shared)
+        others = []
+        for folder, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in ("build", ".build")]
+            for name in files:
+                path = os.path.join(folder, name)
+                if not name.endswith(".swift") or path == shared:
+                    continue
+                with open(path, encoding="utf-8") as handle:
+                    text = handle.read()
+                if ("HMAC<" in text or '"tapproval-proof' in text
+                        or '"tapproval-seal' in text):
+                    others.append(os.path.relpath(path, root))
+        assert others == [], others
 
-        signed = header("http://127.0.0.1:8977/thread?id=A%20B&n=2")
-        assert signed.startswith("v2 ")
-        assert watch_relay.verify_signature(
-            signed, "GET", "/thread", b"", [key], query="id=A%20B&n=2")[0] == key
-        replayed = header("http://127.0.0.1:8977/thread?id=A")
-        assert watch_relay.verify_signature(
-            replayed, "GET", "/thread", b"", [key], query="id=B")[0] is None
-        posted = header("http://127.0.0.1:8977/decision", "POST", '{"id":"x"}')
-        assert watch_relay.verify_signature(
-            posted, "POST", "/decision", b'{"id":"x"}', [key], query="")[0] == key
+    def test_the_watch_and_the_bridge_compile_the_same_file(self):
+        """One PBXFileReference, in both targets' Sources."""
+        path = os.path.join(_ROOT, "WatchApp", "Tapproval.xcodeproj", "project.pbxproj")
+        if not os.path.isfile(path):
+            pytest.skip("no watch app in this layout")
+        with open(path, encoding="utf-8") as handle:
+            project = handle.read()
+        refs = re.findall(r"(\w+) /\* RelaySigning\.swift \*/ = \{isa = PBXFileReference;"
+                          r"[^}]*path = Shared/RelaySigning\.swift;", project)
+        assert len(refs) == 1, refs
+        builds = re.findall(r"(\w+) /\* RelaySigning\.swift in Sources \*/ = "
+                            r"\{isa = PBXBuildFile; fileRef = %s" % refs[0], project)
+        assert len(builds) == 2, builds
+        phases = re.findall(r"/\* Sources \*/ = \{\s*isa = PBXSourcesBuildPhase;"
+                            r"[^}]*?files = \(([^)]*)\)", project)
+        holding = [p for p in phases if any(b in p for b in builds)]
+        assert len(holding) == 2
+        assert any("RelayModel.swift in Sources" in p for p in holding)
+        assert any("main.swift in Sources" in p for p in holding)
+
+
+@pytest.mark.private_layout
+class TestThePairingKeyIsInTheKeychain:
+    """The watch's pairing key lived in UserDefaults and iCloud's key-value
+    store, beside learned addresses (tech-debt item 6). It is a credential:
+    the Keychain holds it now, and nothing writes it back to the old home
+    but the fallback for a Keychain that refuses, which is UserDefaults
+    alone, never iCloud."""
+
+    def _source(self, name):
+        path = os.path.join(_ROOT, "WatchApp", "Tapproval", name)
+        if not os.path.isfile(path):
+            pytest.skip("no watch app in this layout")
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_the_key_is_not_kept_with_the_settings(self):
+        model = self._source("RelayModel.swift")
+        assert 'recall("relayToken")' not in model
+        assert 'persist(relayToken' not in model
+        assert "PairingKey.load(" in model and "PairingKey.save(" in model
+
+    def test_the_keychain_item_stays_on_this_watch(self):
+        store = self._source("KeyStore.swift")
+        assert "kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly" in store
+        assert "kSecAttrSynchronizable" not in store
+        assert "kSecAttrAccessGroup" not in store
+
+    def test_the_fallback_never_reaches_icloud(self):
+        store = self._source("KeyStore.swift")
+        save = store[store.index("static func save("):]
+        save = save[:save.index("\n    }\n")]
+        assert "NSUbiquitousKeyValueStore" not in save
+        assert "fallback?.set(value, forKey: oldName)" in save
 
 
 @pytest.mark.private_layout
@@ -3341,6 +3561,27 @@ class TestTheTravelAddressSurvivesARestart:
         assert saved == {"pid": 5151, "url": fresh, "port": 8978}
         assert oct(os.stat(self.state).st_mode & 0o777) == "0o600"
 
+    def test_a_rotation_while_the_tunnel_opens_is_in_the_address_it_announces(self, monkeypatch):
+        """The announce thread wrote the address with the secret it was
+        started with. A rotation during its wait found no address yet to
+        rewrite, so the one handed out carried a secret the listener no
+        longer answered. Rotate at the last moment before the write."""
+        monkeypatch.setattr(watch_relay, "_cloudflared", lambda: "/usr/bin/true")
+        monkeypatch.setattr(watch_relay, "_adoptable_tunnel", lambda port: None)
+        monkeypatch.setattr(watch_relay, "_reap_stale_tunnels", lambda port, keep=None: None)
+
+        class Listener:
+            required_token = "tok"
+        monkeypatch.setattr(watch_relay, "_TUNNEL_HANDLER", Listener)
+        monkeypatch.setattr(watch_relay, "_remember_tunnel",
+                            lambda *a, **k: watch_relay._rotate_tunnel_prefix("rotated"))
+        fresh = "https://rotate-race.trycloudflare.com"
+        _fake_cloudflared(monkeypatch, fresh)
+        watch_relay.start_tunnel(8978, "tok")
+        _wait_until(lambda: watch_relay.TUNNEL_URL, what="the tunnel address")
+        assert watch_relay.TUNNEL_URL == fresh + "/t/rotated"
+        assert Listener.required_token == "rotated"
+
     def test_the_record_goes_where_the_tunnel_was_started(self, monkeypatch, tmp_path):
         """2026-10-01: three relay restarts, three new addresses, each
         "none to adopt". The record on the owner's Mac held pid 5151 and
@@ -3683,11 +3924,16 @@ class TestDescriptionHeadlines:
                               Risk.HIGH, 64, 80)
         assert "Delete" in card["headline"]
 
-    def test_long_descriptions_still_fit_the_face(self):
+    def test_long_descriptions_and_commands_arrive_whole(self):
+        # Not cut to fit the face (2026-10-15, owner: "Text should not be
+        # cut off in cards"): the card screen scrolls and the list row
+        # clamps itself. The command is what an Allow approves.
+        command = "gh api repos/o/r/pulls --paginate --jq " + "'.[] | .x' " * 40
         card = crc.wrist_card(
-            "Bash", {"command": "x", "description": "y" * 200},
-            Risk.LOW, 64, 80)
-        assert len(card["headline"]) <= 64
+            "Bash", {"command": command, "description": "y " * 100},
+            Risk.LOW)
+        assert card["headline"] == ("y " * 100).strip()
+        assert card["detail"] == " ".join(command.split())
 
     def test_blank_description_is_ignored(self):
         card = crc.wrist_card("Bash", {"command": "git push", "description": "   "},
@@ -5116,9 +5362,31 @@ class TestTheMoreListIsWhatThisMachineCanAnswer:
         plugin = tmp_path / "plugins" / "eng" / "skills" / "incident"
         plugin.mkdir(parents=True)
         (plugin / "SKILL.md").write_text("---\ndescription: Runs an incident.\n---\n")
+        # The same plugin ships a code-review of its own: /eng:code-review,
+        # not the built-in's name.
+        (tmp_path / "plugins" / "eng" / "skills" / "code-review").mkdir()
+        (tmp_path / "plugins" / "eng" / "skills" / "code-review" / "SKILL.md").write_text(
+            "---\ndescription: The plugin's review.\nargument-hint: \"[pr-number]\"\n---\n")
         (home / ".claude" / "plugins").mkdir()
         (home / ".claude" / "plugins" / "installed_plugins.json").write_text(json.dumps(
             {"version": 2, "plugins": {"eng@x": [{"installPath": str(tmp_path / "plugins" / "eng")}]}}))
+        # An organisation's plugins, synced by the desktop app: the folder
+        # carries a ~g2 the slash name does not, and one skill is for
+        # Claude alone.
+        synced = home / ".claude" / "plugins" / "synced" / "org_user" / "smb~g2"
+        (synced / "skills" / "payroll").mkdir(parents=True)
+        (synced / "skills" / "payroll" / "SKILL.md").write_text("---\ndescription: Prepares payroll.\n---\n")
+        (synced / "skills" / "router").mkdir()
+        (synced / "skills" / "router" / "SKILL.md").write_text(
+            "---\ndescription: Internal.\nuser-invocable: false\n---\n")
+        (synced / "commands" / "money").mkdir(parents=True)
+        (synced / "commands" / "money" / "close.md").write_text("Closes the month.\n")
+        (home / ".claude" / "plugins" / "synced" / ".bucket-old" / "ghost" / "skills" / "ghost").mkdir(parents=True)
+        (home / ".claude" / "plugins" / "synced" / ".bucket-old" / "ghost" / "skills" / "ghost" / "SKILL.md").write_text("---\ndescription: Stale.\n---\n")
+        # The marketplace catalogue: skills nobody enabled.
+        decoy = home / ".claude" / "plugins" / "marketplaces" / "official" / "plugins" / "shiny" / "skills" / "shiny"
+        decoy.mkdir(parents=True)
+        (decoy / "SKILL.md").write_text("---\ndescription: Not installed.\n---\n")
         project = tmp_path / "proj"
         (project / ".claude" / "skills" / "deploy").mkdir(parents=True)
         (project / ".claude" / "skills" / "deploy" / "SKILL.md").write_text("---\ndescription: Ships it.\n---\n")
@@ -5127,12 +5395,44 @@ class TestTheMoreListIsWhatThisMachineCanAnswer:
     def test_every_source_is_listed_in_its_own_words(self, tmp_path):
         home, project = self._machine(tmp_path)
         rows = {r["name"]: r for r in watch_relay.known_skills(project, home=home, now=1.0)}
-        assert rows["/debug"] == {"name": "/debug", "description": "Digs into why the last thing failed.", "source": "user"}
+        assert rows["/debug"] == {"name": "/debug", "description": "Digs into why the last thing failed.",
+                                  "source": "user", "plugin": None, "argument_hint": None}
         assert rows["/standup"]["description"] == "Write today's standup from the log."
-        assert rows["/incident"]["source"] == "plugin"
+        assert rows["/eng:incident"]["source"] == "plugin"      # the CLI's name, not the bare one
         assert rows["/deploy"]["source"] == "project"
         assert rows["/code-review"]["source"] == "builtin" and rows["/security-review"]["source"] == "builtin"
         assert "/verify" not in rows                        # never existed; never listed
+
+    def test_a_plugin_skill_is_named_the_way_the_cli_invokes_it(self, tmp_path):
+        # /code-review from a plugin is /eng:code-review. Listed bare it
+        # collided with the built-in, and setdefault hid whichever came
+        # second — a row the wrist offered that the CLI did not know.
+        home, project = self._machine(tmp_path)
+        rows = {r["name"]: r for r in watch_relay.known_skills(project, home=home, now=3.0)}
+        assert rows["/code-review"]["source"] == "builtin"
+        assert rows["/eng:code-review"] == {
+            "name": "/eng:code-review", "description": "The plugin's review.",
+            "source": "plugin", "plugin": "eng", "argument_hint": "[pr-number]"}
+        assert rows["/eng:incident"]["plugin"] == "eng"
+        assert rows["/deploy"]["plugin"] is None and rows["/deploy"]["argument_hint"] is None
+
+    def test_an_organisations_synced_plugins_are_listed_and_the_catalogue_is_not(self, tmp_path):
+        home, project = self._machine(tmp_path)
+        rows = {r["name"]: r for r in watch_relay.known_skills(project, home=home, now=4.0)}
+        assert rows["/smb:payroll"]["plugin"] == "smb"            # ~g2 dropped
+        assert rows["/smb:money:close"]["description"] == "Closes the month."   # a folder is a namespace
+        assert "/smb:router" not in rows                          # user-invocable: false
+        assert "/ghost:ghost" not in rows                         # a .bucket the app left behind
+        assert not any("shiny" in name for name in rows)         # marketplaces/ is a catalogue
+
+    def test_a_worktree_lists_the_repositorys_own_skills(self, tmp_path):
+        # Claude Code (2.1.277) reads the main checkout's skills from a
+        # worktree without its own; a session there must see /deploy.
+        home, project = self._machine(tmp_path)
+        worktree = os.path.join(project, ".claude", "worktrees", "feature-x")
+        os.makedirs(worktree)
+        names = [r["name"] for r in watch_relay.known_skills(worktree, home=home, now=5.0)]
+        assert "/deploy" in names
 
     def test_a_project_without_its_own_skills_still_gets_the_users(self, tmp_path):
         home, _ = self._machine(tmp_path)
@@ -5148,6 +5448,7 @@ class TestTheMoreListIsWhatThisMachineCanAnswer:
             assert status == 200
             assert any(r["name"] == "/code-review" for r in body["skills"])
             assert all(r["name"].startswith("/") and "description" in r for r in body["skills"])
+            assert "project" in body                      # None without a session; the repo's name with one
         finally:
             server.shutdown()
             server.server_close()
@@ -5371,8 +5672,8 @@ def live_relay():
 
 class TestQuestionCards:
     """AskUserQuestion renders as the question with the phone's exact
-    option labels — and a wrist answer travels back as the one hook
-    channel that can carry words: a deny whose reason is the answer."""
+    option labels, one card per question — and the wrist's answers go
+    back as the terminal's do: the call allowed with ``answers`` filled in."""
 
     EVENT_INPUT = {"questions": [{
         "question": "Lige/ulige uger findes allerede — hvordan udvides?",
@@ -5396,25 +5697,57 @@ class TestQuestionCards:
             'Kun "skifter hver anden uge"',
         ]
 
+    def test_a_long_question_reaches_the_wrist_whole(self):
+        # The question is the thing being answered: the phone shows all of
+        # it, and a wrist that cut it at 128 characters asked for a choice
+        # whose reasons had been dropped (2026-10-15, "The design…").
+        question = " ".join(["Decision 1 of 4: the home screen has two doors"]
+                            + ["and this sentence explains why both stay"] * 9
+                            + ["Keep both colours?"])
+        assert len(question) > 300
+        card = crc.wrist_card("AskUserQuestion",
+                              {"questions": [{"question": question}]},
+                              Risk.MEDIUM, 64, 80)
+        assert card["headline"] == question
+
+    def test_a_runaway_question_is_still_capped(self):
+        # Whole, but not unbounded: the headline also rides in the push
+        # notification, which Apple caps at 4 KB.
+        card = crc.wrist_card("AskUserQuestion",
+                              {"questions": [{"question": "x " * 5000}]},
+                              Risk.MEDIUM, 64, 80)
+        assert len(card["headline"]) == crc.TEXT_CHARS
+        assert card["headline"].endswith("…")
+
+    def test_a_question_is_still_redacted(self):
+        secret = "ghp_" + "a" * 40
+        card = crc.wrist_card("AskUserQuestion",
+                              {"questions": [{"question": "Use %s?" % secret}]},
+                              Risk.MEDIUM, 64, 80)
+        assert secret not in card["headline"]
+
     def test_malformed_questions_fail_soft(self):
         card = crc.wrist_card("AskUserQuestion", {"questions": "junk"},
                               Risk.MEDIUM, 64, 80)
         assert card["headline"] == "Claude has a question"
         assert "options" not in card
 
-    def test_answer_travels_back_as_the_deny_reason(self, live_relay,
-                                                    tmp_path, monkeypatch):
+    TWO_QUESTIONS = {"questions": [
+        {"question": "Which library?", "header": "Library", "multiSelect": False,
+         "options": [{"label": "date-fns", "description": "a"},
+                     {"label": "Luxon", "description": "b"}]},
+        {"question": "Which features?", "header": "Features", "multiSelect": True,
+         "options": [{"label": "Parsing", "description": "c"},
+                     {"label": "Time zones", "description": "d"},
+                     {"label": "Formatting", "description": "e"}]},
+    ]}
+
+    @staticmethod
+    def _run_hook(tool_input, port, tmp_path, monkeypatch, wait="10", agent=None):
         import io
-        port, queue = live_relay
-
-        def answer_first_card():
-            cards = _wait_until(queue.pending, what="the question's card")
-            queue.decide(cards[0]["id"], "answer", answer="Del hele ugen i to")
-
-        threading.Thread(target=answer_first_card, daemon=True).start()
         monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
         monkeypatch.setenv("CLAUDE_RISK_RELAY", "http://127.0.0.1:%d" % port)
-        monkeypatch.setenv("CLAUDE_RISK_RELAY_WAIT", "10")
+        monkeypatch.setenv("CLAUDE_RISK_RELAY_WAIT", wait)
         monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "a.jsonl"))
         monkeypatch.setenv("CLAUDE_SETTINGS_PATH",
                            str(tmp_path / "user-settings.json"))
@@ -5422,12 +5755,195 @@ class TestQuestionCards:
         monkeypatch.delenv("CLAUDE_RISK_AUTO_ALLOW", raising=False)
         out = io.StringIO()
         crc.run_hook(stdin=io.StringIO(json.dumps(
-            {"tool_name": "AskUserQuestion",
-             "tool_input": self.EVENT_INPUT})), stdout=out)
-        result = json.loads(out.getvalue())["hookSpecificOutput"]
+            {"tool_name": "AskUserQuestion", "session_id": "s",
+             "tool_input": tool_input})), stdout=out, agent=agent)
+        return json.loads(out.getvalue())["hookSpecificOutput"]
+
+    @staticmethod
+    def _answer_in_turn(queue, labels, seen=None):
+        """The wearer, answering each card as it arrives."""
+        def wearer():
+            answered = set()
+            for label in labels:
+                card = _wait_until(
+                    lambda: [c for c in queue.pending() if c["id"] not in answered],
+                    what="the next question's card")[0]
+                if seen is not None:
+                    seen.append(card)
+                answered.add(card["id"])
+                queue.decide(card["id"], "answer", answer=label)
+        threading.Thread(target=wearer, daemon=True).start()
+
+    def test_an_answer_is_given_as_the_terminal_gives_it(self, live_relay,
+                                                         tmp_path, monkeypatch):
+        """The terminal answers AskUserQuestion by running it with
+        ``answers`` filled in (2.1.300: input schema ``answers``, keyed by
+        the question's text), and Claude reads "Your questions have been
+        answered". A deny whose reason was the label read to Claude as a
+        refusal; an allow without updatedInput is dropped for a tool that
+        needs the user (runHooks guard, #563)."""
+        port, queue = live_relay
+        self._answer_in_turn(queue, ["Del hele ugen i to"])
+        result = self._run_hook(self.EVENT_INPUT, port, tmp_path, monkeypatch)
+        assert _behavior(result) == "allow"
+        updated = result["decision"]["updatedInput"]
+        assert updated["questions"] == self.EVENT_INPUT["questions"], \
+            "the shown fields go back unchanged, or Claude Code refuses the answer"
+        assert updated["answers"] == {
+            self.EVENT_INPUT["questions"][0]["question"]: "Del hele ugen i to"}
+
+    def test_every_question_reaches_the_wrist(self, live_relay, tmp_path,
+                                              monkeypatch):
+        """2026-10-15: a call with two questions put only the first on the
+        wrist, and Claude took one label for the whole answer."""
+        port, queue = live_relay
+        seen = []
+        self._answer_in_turn(queue, ["Luxon", "Time zones"], seen)
+        result = self._run_hook(self.TWO_QUESTIONS, port, tmp_path, monkeypatch)
+        assert _behavior(result) == "allow"
+        assert result["decision"]["updatedInput"]["answers"] == {
+            "Which library?": "Luxon", "Which features?": "Time zones"}
+        assert [c["options"] for c in seen] == [
+            ["date-fns", "Luxon"], ["Parsing", "Time zones", "Formatting"]]
+        assert seen[0]["headline"] == "1 of 2 · Which library?"
+        assert seen[1]["headline"] == "2 of 2 · Which features?"
+
+    def test_a_question_left_unanswered_leaves_all_of_them_to_the_terminal(
+            self, live_relay, tmp_path, monkeypatch):
+        """Half an answer is not an answer: the terminal asks them all."""
+        port, queue = live_relay
+        self._answer_in_turn(queue, ["Luxon"])
+        result = self._run_hook(self.TWO_QUESTIONS, port, tmp_path, monkeypatch,
+                                wait="1.5")
+        assert _behavior(result) == "escalate"
+
+    def test_codex_keeps_the_answer_in_words(self, live_relay, tmp_path,
+                                             monkeypatch):
+        """Codex was never shown to take updatedInput; it keeps the deny
+        whose reason is the answer — now every answer."""
+        port, queue = live_relay
+        self._answer_in_turn(queue, ["Luxon", "Time zones"])
+        result = self._run_hook(self.TWO_QUESTIONS, port, tmp_path, monkeypatch,
+                                agent="codex")
         assert _behavior(result) == "deny"
-        assert "Del hele ugen i to" in _decision_message(result)
-        assert "answered from their watch" in _decision_message(result)
+        message = _decision_message(result)
+        assert "answered from their watch" in message
+        assert '"Which library?"="Luxon"' in message
+        assert '"Which features?"="Time zones"' in message
+
+    def test_one_card_per_question(self):
+        cards = crc.question_cards({"headline": "x", "fingerprint": "f"},
+                                   self.TWO_QUESTIONS, 64, 80)
+        assert [c["headline"] for c in cards] == [
+            "1 of 2 · Which library?", "2 of 2 · Which features?"]
+        assert all(c["fingerprint"] == "f" for c in cards), \
+            "each card is the same call, so the relay can withdraw it"
+        assert crc.wrist_card("AskUserQuestion", self.TWO_QUESTIONS,
+                              Risk.MEDIUM, 64, 80)["headline"] == "1 of 2 · Which library?"
+
+    def test_the_cards_share_one_wait(self):
+        """Two questions must not wait twice as long as the hook may live."""
+        waits = []
+
+        def ask(card, policy, project=None):
+            waits.append(policy["relay_wait"])
+            time.sleep(0.2)
+            return "answer", card["options"][0]
+
+        verdict, answers = crc.ask_questions(
+            {}, self.TWO_QUESTIONS, {"relay_wait": 10.0}, ask=ask)
+        assert verdict == "answer" and len(answers) == 2
+        assert waits[0] == 10.0 and waits[1] < 9.9
+
+    def test_a_deny_on_any_card_denies_the_call(self):
+        replies = iter([("answer", "Luxon"), ("deny", None)])
+        verdict, answers = crc.ask_questions(
+            {}, self.TWO_QUESTIONS, {"relay_wait": 10.0},
+            ask=lambda card, policy, project=None: next(replies))
+        assert (verdict, answers) == ("deny", None)
+
+    def test_a_card_that_comes_back_unanswered_stops_the_rest(self):
+        asked = []
+
+        def ask(card, policy, project=None):
+            asked.append(card)
+            return "none", None
+
+        assert crc.ask_questions({}, self.TWO_QUESTIONS, {"relay_wait": 10.0},
+                                 ask=ask) == ("none", None)
+        assert len(asked) == 1
+
+    # Claude Code 2.1.300's extended form (behind a feature flag): a
+    # question of kind "text" or "number" carries no options. The wrist
+    # can only choose, so it has no answer to give one.
+    TYPED = {"questions": [
+        {"question": "What should the branch be called?", "header": "Branch",
+         "kind": "text"}]}
+    MIXED = {"questions": [
+        TWO_QUESTIONS["questions"][0],
+        {"question": "How many retries?", "header": "Retries", "kind": "number"}]}
+
+    @staticmethod
+    def _eager_wearer(queue):
+        """A wearer who answers every card that arrives: the first option,
+        or Allow on a card without options. Returns the cards seen."""
+        seen, stop = [], threading.Event()
+
+        def wearer():
+            while not stop.is_set():
+                for card in queue.pending():
+                    if card["id"] in [c["id"] for c in seen]:
+                        continue
+                    seen.append(card)
+                    if card.get("options"):
+                        queue.decide(card["id"], "answer", answer=card["options"][0])
+                    else:
+                        queue.decide(card["id"], "allow")
+                time.sleep(0.02)
+        threading.Thread(target=wearer, daemon=True).start()
+        return seen, stop
+
+    @pytest.mark.parametrize("asked", ["TYPED", "MIXED"])
+    def test_a_question_without_options_stays_in_the_terminal(
+            self, asked, live_relay, tmp_path, monkeypatch):
+        """2026-10-15: a typed question went to the wrist as an Allow/Deny
+        card, and the Allow went back with no answers — which Claude Code
+        drops for AskUserQuestion (runHooks wants updatedInput), so the
+        wearer's tap did nothing. No card is sent for a call holding such
+        a question, not even its other questions: half an answer is not an
+        answer, and the terminal asks them all."""
+        port, queue = live_relay
+        seen, stop = self._eager_wearer(queue)
+        try:
+            result = self._run_hook(getattr(self, asked), port, tmp_path,
+                                    monkeypatch, wait="1.5")
+        finally:
+            stop.set()
+        assert _behavior(result) == "escalate"
+        assert seen == [], "no card reaches the wrist"
+        entry = json.loads(log_lines(tmp_path / "a.jsonl")[-1])
+        assert entry["watch"] == "skipped-typed-answer"
+        assert entry["effective"] == "escalate", \
+            "the prompt is at the Mac, so the dashboard still counts it there"
+
+    def test_ask_questions_never_asks_a_typed_question(self):
+        asked = []
+
+        def ask(card, policy, project=None):
+            asked.append(card)
+            return "answer", (card.get("options") or ["x"])[0]
+
+        for tool_input in (self.TYPED, self.MIXED, {"questions": "junk"}):
+            assert crc.ask_questions({}, tool_input, {"relay_wait": 10.0},
+                                     ask=ask) == ("none", None)
+        assert asked == []
+
+    def test_an_allow_is_not_an_answer(self):
+        """A bare Allow on a question card goes back without answers and
+        Claude Code drops it. It leaves the question to the terminal."""
+        assert crc.ask_questions(
+            {}, self.EVENT_INPUT, {"relay_wait": 10.0},
+            ask=lambda card, policy, project=None: ("allow", None)) == ("none", None)
 
 
 class TestThePlanCard:
@@ -5446,7 +5962,7 @@ class TestThePlanCard:
                               Risk.MEDIUM)
         assert card["kind"] == "question" and card["plan_card"] is True
         assert card["headline"] == "Plan: Roll out shared working principles"
-        assert card["options"] == ["Approve & auto mode"]
+        assert card["options"] == ["Yes, auto-accept edits", "Yes, manually approve edits"]
         assert "ExitPlanMode" not in card["headline"]
         lines = card["plan"].splitlines()
         assert "• Sync CLAUDE.md into every repo" in lines, "markers gone, lines kept"
@@ -5458,19 +5974,125 @@ class TestThePlanCard:
         assert len(card["plan"]) <= crc.PLAN_CHARS + 2
         assert card["plan"].endswith(" …")
 
-    def test_the_wrist_offers_only_what_the_phone_offers(self):
-        """2026-10-14, a photo of the phone: two answers to a plan, "Approve
-        & auto mode" and "Suggest edits". The wrist had three buttons beside
-        the edits, two of which the phone never shows. The one option is
-        the approval; the edits are the plan screen's own field."""
+    def test_a_plan_of_ordinary_length_arrives_whole(self):
+        # 2026-10-15: plans were cut at 2400 characters, mid-step.
+        steps = "".join("- Step %d: change the thing and check it\n" % n
+                        for n in range(100))
+        assert len(steps) > 4000
+        card = crc.wrist_card("ExitPlanMode", {"plan": "# Title\n" + steps},
+                              Risk.MEDIUM)
+        assert card["plan"].endswith("• Step 99: change the thing and check it")
+        assert "…" not in card["plan"]
+
+    def test_a_long_title_is_the_whole_headline(self):
+        title = "Make every card on the wrist carry its whole text " * 4
+        card = crc.wrist_card("ExitPlanMode",
+                              {"plan": "# %s\n\n- one step" % title.strip()},
+                              Risk.MEDIUM)
+        assert card["headline"] == "Plan: " + title.strip()
+        assert card["plan"] == "• one step", "said once, not twice"
+
+    def test_the_biggest_card_still_fits_the_relays_body(self, live_relay,
+                                                         monkeypatch):
+        # Two copies of a plan at the cap, in a script where every letter
+        # is three bytes: it must still reach the relay, or the card is
+        # lost and only the ordinary prompt appears.
+        port, queue = live_relay
+        card = crc.wrist_card("ExitPlanMode",
+                              {"plan": "# 計画\n" + "語語語語語語語語語 " * 1000},
+                              Risk.MEDIUM)
+        assert len(card["plan"]) > crc.PLAN_CHARS - 20
+        threading.Thread(
+            target=lambda: queue.decide(
+                _wait_until(queue.pending, what="the plan card")[0]["id"],
+                "deny"),
+            daemon=True).start()
+        verdict, _ = crc.ask_watch(
+            card, {"relay": "http://127.0.0.1:%d" % port, "relay_wait": 10})
+        assert verdict == "deny"
+
+    def test_the_wrist_offers_the_terminals_rows(self):
+        """#560 (owner, 2026-10-15): a card answers as the terminal does.
+        Claude Code 2.1.300's plan dialog on a Mac with auto mode reads
+        "Yes, and use auto mode", "Yes, manually approve edits", and a
+        text row labelled "No, keep planning", which is the plan screen's
+        edits field. Until then the wrist copied the phone's
+        "Approve & auto mode" (#511)."""
+        card = crc.wrist_card("ExitPlanMode", {"plan": self.PLAN}, Risk.MEDIUM,
+                              auto_mode=True)
+        assert card["options"] == ["Yes, and use auto mode", "Yes, manually approve edits"]
+        assert card["detail"] == ("Yes, and use auto mode · Yes, manually approve edits"
+                                  " · No, keep planning")
+        assert [crc.plan_decision(o) for o in card["options"]] == [
+            ("allow", "", "auto"), ("allow", "", "default")]
+
+    def test_without_auto_mode_the_first_row_accepts_edits(self):
+        """The dialog's first Yes is "Yes, auto-accept edits" where auto
+        mode is not available — and that row works everywhere, so it is
+        what the card offers when nothing says auto is there."""
         card = crc.wrist_card("ExitPlanMode", {"plan": self.PLAN}, Risk.MEDIUM)
-        assert card["options"] == ["Approve & auto mode"]
-        assert card["detail"] == "Approve & auto mode · Suggest edits"
-        assert crc.plan_decision(card["options"][0]) == ("allow", "", "auto")
+        assert card["options"] == ["Yes, auto-accept edits", "Yes, manually approve edits"]
+        assert crc.plan_decision(card["options"][0]) == ("allow", "", "acceptEdits")
+
+    def test_rows_no_hook_can_give_are_never_offered(self):
+        """Clear context, bypass permissions and Ultraplan are terminal rows
+        a hook cannot answer with (or, for bypass, cannot know is there)."""
+        for auto in (True, False):
+            options = " ".join(crc.wrist_card("ExitPlanMode", {"plan": self.PLAN},
+                                              Risk.MEDIUM, auto_mode=auto)["options"])
+            for word in ("clear context", "BYPASS", "Ultraplan"):
+                assert word.lower() not in options.lower()
+
+    def test_a_plan_titled_plan_is_not_said_twice(self):
+        """#560's end-to-end check, 2026-10-15: "Plan: Plan: create
+        marker.txt" on the wrist."""
+        card = crc.wrist_card("ExitPlanMode", {"plan": "# Plan: create marker.txt\n\n1. Write it"},
+                              Risk.MEDIUM)
+        assert card["headline"] == "Plan: create marker.txt"
+        assert not card["plan"].startswith("Plan:"), "the title is the headline, not said twice"
 
     def test_an_empty_plan_still_asks(self):
         card = crc.wrist_card("ExitPlanMode", {}, Risk.MEDIUM)
         assert card["headline"] == "Claude has a plan" and card["options"]
+
+
+class TestThePlanKnowsWhetherAutoModeIsThere:
+    """The terminal shows "Yes, and use auto mode" only where auto mode is
+    available, and decides that from state no hook can read (2.1.300). The
+    card goes on positive evidence only: the transcript's
+    ``permissionMode``, or user settings making auto the default."""
+
+    def _transcript(self, tmp_path, *modes):
+        path = tmp_path / "t.jsonl"
+        path.write_text("".join(json.dumps({"type": "user", "permissionMode": m}) + "\n"
+                                for m in modes), encoding="utf-8")
+        return str(path)
+
+    @pytest.fixture(autouse=True)
+    def _no_user_settings(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+
+    def test_a_session_that_has_been_in_auto_mode_has_it(self, tmp_path):
+        assert crc.auto_mode_seen({"transcript_path": self._transcript(tmp_path, "auto", "plan")})
+
+    def test_a_session_never_in_auto_mode_is_not_assumed_to_have_it(self, tmp_path):
+        assert not crc.auto_mode_seen({"transcript_path": self._transcript(tmp_path, "default", "plan")})
+        assert not crc.auto_mode_seen({})
+        assert not crc.auto_mode_seen({"transcript_path": str(tmp_path / "missing.jsonl")})
+
+    def test_auto_as_the_default_mode_counts(self, tmp_path):
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"permissions": {"defaultMode": "auto"}}), encoding="utf-8")
+        assert crc.auto_mode_seen({})
+
+    def test_the_hook_builds_the_card_from_that_evidence(self, tmp_path):
+        event = {"tool_name": "ExitPlanMode", "tool_input": {"plan": "# Ship it"},
+                 "transcript_path": self._transcript(tmp_path, "auto", "plan")}
+        _, _, card = crc.build_response(event, {"mode": "enforce"})
+        assert card["options"][0] == "Yes, and use auto mode"
+        event["transcript_path"] = self._transcript(tmp_path, "plan")
+        _, _, card = crc.build_response(event, {"mode": "enforce"})
+        assert card["options"][0] == "Yes, auto-accept edits"
 
 
 class TestThePlanComesFromItsFile:
@@ -5547,11 +6169,17 @@ class TestThePlanComesFromItsFile:
                              {"transcript_path": str(transcript)}).startswith("# Given")
 
     @pytest.mark.parametrize("said,behavior,mode,words", [
+        ("Yes, and use auto mode", "allow", "auto", ""),
+        ("Yes, auto-accept edits", "allow", "acceptEdits", ""),
+        ("Yes, manually approve edits", "allow", "default", ""),
+        # A card shown before the helper updated, answered after.
         ("Approve & auto mode", "allow", "auto", ""),
         ("Suggest edits: drop step two", "deny", None, "drop step two"),
         ("drop step two", "deny", None, "drop step two"),
+        # Never a guess: an unknown row keeps planning, with its words.
+        ("Yes, and switch to bypass", "deny", None, "Yes, and switch to bypass"),
     ])
-    def test_each_answer_means_what_the_phone_means(self, said, behavior, mode, words):
+    def test_each_answer_means_what_the_terminal_means(self, said, behavior, mode, words):
         got = crc.plan_decision(said)
         assert got[0] == behavior and got[2] == mode
         assert words in got[1]
@@ -5563,7 +6191,7 @@ class TestThePlanComesFromItsFile:
 
         def answer_first_card():
             cards = _wait_until(queue.pending, what="the plan's card")
-            queue.decide(cards[0]["id"], "answer", answer="Approve & auto mode")
+            queue.decide(cards[0]["id"], "answer", answer="Yes, and use auto mode")
 
         threading.Thread(target=answer_first_card, daemon=True).start()
         monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
@@ -5577,8 +6205,12 @@ class TestThePlanComesFromItsFile:
         crc.run_hook(stdin=io.StringIO(json.dumps(
             {"tool_name": "ExitPlanMode", "tool_input": {"plan": self.PLAN}})), stdout=out)
         result = json.loads(out.getvalue())["hookSpecificOutput"]
-        assert result["decision"] == {"behavior": "allow", "updatedPermissions": [
-            {"type": "setMode", "mode": "auto", "destination": "session"}]}
+        # updatedInput is what makes Claude Code take the approval at all:
+        # without it the CLI keeps its plan dialog open (#560).
+        assert result["decision"] == {
+            "behavior": "allow", "updatedInput": {"plan": self.PLAN},
+            "updatedPermissions": [
+                {"type": "setMode", "mode": "auto", "destination": "session"}]}
 
 class TestThePlanKeepsItsFormatting:
     """2026-10-11, on the owner's wrist: a plan card lost its bold, and its
@@ -7309,6 +7941,24 @@ class TestPermissionDecisionShape:
         assert "updatedPermissions" not in crc._permission_output(
             "deny", "no", mode="auto")["decision"]
 
+    def test_an_allow_that_ends_a_dialog_carries_the_call_it_allows(self):
+        """Claude Code 2.1.300 drops a hook's allow for a tool that needs
+        the user — ExitPlanMode — unless it carries updatedInput
+        (runHooks: `if(!L.updatedInput&&e.requiresUserInteraction?.())
+        return null`), and keeps its dialog open. That is how every wrist
+        approval of a plan went nowhere until #560 (2026-10-15)."""
+        assert crc._permission_output("allow", mode="default",
+                                      updated_input={"plan": "x"})["decision"] == {
+            "behavior": "allow", "updatedInput": {"plan": "x"},
+            "updatedPermissions": [
+                {"type": "setMode", "mode": "default", "destination": "session"}]}
+        assert crc._permission_output("allow", updated_input={})["decision"] == {
+            "behavior": "allow", "updatedInput": {}}
+        assert "updatedInput" not in crc._permission_output(
+            "allow", updated_input="not a dict")["decision"]
+        assert "updatedInput" not in crc._permission_output(
+            "deny", "no", updated_input={"plan": "x"})["decision"]
+
     def test_escalation_sends_no_decision_at_all(self):
         """Saying nothing is what leaves the question with the human."""
         assert crc._permission_output("escalate") == {
@@ -8511,7 +9161,16 @@ class TestTheWristAnswersAHeadlessSend:
         Risk = crc.Risk
         decide = staticmethod(crc.decide)
         plan_decision = staticmethod(crc.plan_decision)
-        PLAN_APPROVE_AUTO = crc.PLAN_APPROVE_AUTO
+
+        @staticmethod
+        def ask_questions(*args, **kwargs):
+            return crc.ask_questions(*args, **kwargs)
+        questions_need_typing = staticmethod(crc.questions_need_typing)
+        PERMISSION_MODES = crc.PERMISSION_MODES
+
+        @staticmethod
+        def auto_mode_seen(event):
+            return False
 
         def load_policy(self):
             policy = {"relay": self.relay, "relay_wait": 6.0, "mode": "enforce"}
@@ -8522,7 +9181,7 @@ class TestTheWristAnswersAHeadlessSend:
             self.asked.append(event)
             return {"risk": self.risk, "project": "acme"}
 
-        def wrist_card(self, tool, tool_input, risk):
+        def wrist_card(self, tool, tool_input, risk, auto_mode=False):
             return {"headline": tool, "tier": risk.name,
                     "plan_card": tool == "ExitPlanMode"}
 
@@ -8533,18 +9192,50 @@ class TestTheWristAnswersAHeadlessSend:
     def test_a_question_answered_on_the_wrist_carries_the_answer(self):
         """The answer was thrown away and the run told "your watch did not
         answer in time" — for a question the user had answered
-        (2026-09-30 review). The hook's channel for words is a deny with
-        the answer as its reason; this uses the same one."""
-        out = wpt.decide("AskUserQuestion", {"questions": [{"question": "Which?"}]},
+        (2026-09-30 review). It goes back as the hook's does: the call
+        allowed with its answers, which 2.1.300's admitter for a
+        permission-prompt tool accepts (only answers added)."""
+        asked = {"questions": [{"question": "Which?", "options": [
+            {"label": "The first one"}, {"label": "The second one"}]}]}
+        out = wpt.decide("AskUserQuestion", asked,
                          crc=self._Fake("answer", answer="The second one"))
+        assert out["behavior"] == "allow"
+        assert out["updatedInput"] == dict(asked, answers={"Which?": "The second one"})
+
+    def test_every_question_is_answered_on_the_wrist(self):
+        asked = {"questions": [
+            {"question": "Which?", "options": [{"label": "A"}, {"label": "B"}]},
+            {"question": "When?", "options": [{"label": "Now"}, {"label": "Later"}]}]}
+        fake = self._Fake("answer")
+        replies = iter(["B", "Later"])
+        fake.ask_watch = lambda card, policy, project=None: ("answer", next(replies))
+        out = wpt.decide("AskUserQuestion", asked, crc=fake)
+        assert out["updatedInput"]["answers"] == {"Which?": "B", "When?": "Later"}
+
+    def test_a_typed_question_is_not_sent_to_the_wrist(self):
+        """A question without options (2.1.300's kind "text"/"number") has
+        no answer the wrist can give: an Allow went back as an allow with
+        no answers. A headless run has no terminal to leave it to, so it
+        is refused with a reason Claude can act on, and no card is sent."""
+        asked = {"questions": [{"question": "Branch name?", "kind": "text"}]}
+        fake = self._Fake("allow")
+        out = wpt.decide("AskUserQuestion", asked, crc=fake)
         assert out["behavior"] == "deny"
-        assert "The second one" in out["message"]
-        assert "did not answer" not in out["message"]
+        assert "options" in out["message"]
+        assert fake.asked_the_watch is False
 
     def test_a_plan_approved_on_the_wrist_goes_ahead(self):
         out = wpt.decide("ExitPlanMode", {"plan": "x"},
-                         crc=self._Fake("answer", answer=crc.PLAN_APPROVE_AUTO))
-        assert out["behavior"] == "allow"
+                         crc=self._Fake("answer", answer=crc.PLAN_MANUAL))
+        assert out["behavior"] == "allow" and out["updatedInput"] == {"plan": "x"}
+
+    def test_a_plan_approved_on_the_wrist_takes_its_rows_mode(self):
+        """The mode was dropped here, so "Approve & auto mode" from a
+        wrist-sent run left the session as it was."""
+        out = wpt.decide("ExitPlanMode", {"plan": "x"},
+                         crc=self._Fake("answer", answer=crc.PLAN_ACCEPT_EDITS))
+        assert out["updatedPermissions"] == [
+            {"type": "setMode", "mode": "acceptEdits", "destination": "session"}]
 
     def test_shadow_mode_never_auto_allows_here_either(self):
         """The hook allows nothing in shadow mode; this applied the
@@ -9348,6 +10039,16 @@ class TestRelayRoutes:
         # loopback is credentialed: the details come with it
         assert "version" in body and "pending" in body
 
+    def test_health_names_the_computer_to_a_credentialed_caller(self, relay, monkeypatch):
+        """The watch says the computer's own name, not "Mac" (2026-10-15):
+        Bonjour tells it the name on the home Wi-Fi only, so /health says
+        it too, for a watch that reaches the computer from away. Paired
+        callers only, like every other detail here."""
+        import socket
+        monkeypatch.setattr(socket, "gethostname", lambda: "Office-Mac-mini.local")
+        base, _, _ = relay
+        assert self._call(base + "/health")[1]["name"] == "Office Mac mini"
+
     def test_health_names_the_alert_route_once_the_bridge_polls(self, relay):
         """The watch can only promise a buzz when something will deliver
         one: /health says so, and a bridge poll is what makes it true."""
@@ -9710,7 +10411,8 @@ class TestLocalMeansLocal:
             server.server_close()
 
     @pytest.mark.parametrize("path", ["/admin/rotate", "/admin/pair-reset",
-                                      "/admin/pair-relight", "/admin/update-deferred"])
+                                      "/admin/pair-relight", "/admin/update-deferred",
+                                      "/admin/update-stuck", "/admin/update-unstuck"])
     def test_acting_on_the_relay_takes_the_key_file(self, relay, monkeypatch, path):
         _server, base, auth = relay
         monkeypatch.setattr(watch_relay, "_rotate_tunnel_prefix", lambda secret: None)
@@ -10596,6 +11298,53 @@ class TestTheReleaseToolsSayWhenAStepFailed:
             "a failed export went on to commit, print Done and distribute"
 
     @pytest.mark.private_layout
+    def test_a_failed_archive_stops_the_deploy_even_when_its_folder_exists(self, tmp_path):
+        """The archive's status went through "| grep … || true", so only a
+        missing folder stopped the deploy. Run the real block against an
+        xcodebuild that fails but leaves the folder, as a half-built
+        archive does."""
+        script = self._read(os.path.join("WatchApp", "deploy-testflight.sh"))
+        block = script[script.index('echo "==> Archiving container'):
+                       script.index('echo "==> Uploading to App Store Connect"')]
+        fake = tmp_path / "bin"
+        fake.mkdir()
+        (fake / "xcodebuild").write_text(
+            '#!/bin/bash\nwhile [ $# -gt 0 ]; do [ "$1" = -archivePath ] && mkdir -p "$2"; shift; done\n'
+            'echo "error: Signing for TapprovalContainer requires a profile"\n'
+            'echo "** ARCHIVE FAILED **"\nexit 65\n')
+        (fake / "xcodebuild").chmod(0o755)
+        (tmp_path / "build").mkdir()
+        prelude = ('set -euo pipefail\nBUILD_NUMBER=7\nARCHIVE=build/Tapproval-7.xcarchive\n'
+                   'EXTRA_ARGS=(X=1)\nSIGNING_SHA=ABC\n')
+        run = subprocess.run(["bash", "-c", prelude + block], cwd=tmp_path,
+                             env={**os.environ, "PATH": "%s:%s" % (fake, os.environ["PATH"])},
+                             capture_output=True, text=True, timeout=30)
+        assert (tmp_path / "build" / "Tapproval-7.xcarchive").is_dir()
+        assert run.returncode != 0, "a failed archive went on to the upload"
+        assert "ARCHIVE FAILED" in run.stderr
+        assert "requires a profile" in run.stderr, "the real error was not shown"
+
+    @pytest.mark.private_layout
+    @pytest.mark.parametrize("answer, goes_on", [(1, False), (2, True), (0, True)])
+    def test_a_closed_release_train_stops_the_deploy_before_a_build_number(
+            self, tmp_path, answer, goes_on):
+        """A build under a version Apple has approved is refused at the
+        upload and burns its number; the bump was held only by memory.
+        Run the real block with a checker that answers closed (1), could
+        not ask (2) or open (0)."""
+        script = self._read(os.path.join("WatchApp", "deploy-testflight.sh"))
+        block = script[script.index("# A released train closes"):script.index("\nmkdir -p build")]
+        fake = tmp_path / "ascpy"
+        fake.write_text("#!/bin/bash\nexit %d\n" % answer)
+        fake.chmod(0o755)
+        run = subprocess.run(
+            ["bash", "-c", 'set -euo pipefail\nASCPY="%s"\n%s\necho REACHED-BUILD-NUMBER\n'
+             % (fake, block)], capture_output=True, text=True, timeout=30)
+        assert ("REACHED-BUILD-NUMBER" in run.stdout) is goes_on
+        assert (run.returncode == 0) is goes_on
+        assert ("WARNING" in run.stderr) is (answer == 2), "could-not-ask is said, not fatal"
+
+    @pytest.mark.private_layout
     def test_the_deploy_signs_with_the_certificate_its_profiles_name(self):
         """A second "Apple Distribution" certificate on the keychain search
         list (another project's EAS build, 2026-10-01) won the name, and
@@ -10801,6 +11550,181 @@ def _ci_files(*names):
 
 
 @pytest.mark.private_layout
+class TestEveryCiVerdictCarriesItsTime:
+    """CI took sixteen minutes on 2026-10-15 and its summary said nothing
+    about where. Every verdict now carries the wall time since the one
+    before it, and the summary its total."""
+
+    def _record_functions(self):
+        (local,) = _ci_files("ci-local.sh")
+        start = local.index("LAST_MARK=$SECONDS")
+        end = local.index("\n}\n", local.index("record() {")) + 3
+        return local, local[start:end]
+
+    def test_a_verdict_says_how_long_it_took(self):
+        import subprocess
+        _, functions = self._record_functions()
+        script = (functions + "\nPASSED=(); FAILED=()\n"
+                  "SECONDS=0; LAST_MARK=0; SECONDS=125; record 0 'watch flows'\n"
+                  "SECONDS=130; record 1 'ruff'\n")
+        out = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                             timeout=30).stdout.splitlines()
+        assert out[0] == "    PASS watch flows 2m05s", out
+        assert out[1] == "    FAIL ruff 0m05s", out
+
+    def test_no_verdict_bypasses_the_clock(self):
+        local, functions = self._record_functions()
+        rest = local.replace(functions, "")
+        assert "PASSED+=(" not in rest and "FAILED+=(" not in rest, (
+            "a verdict recorded outside record() would carry no time")
+
+    def test_the_summary_gives_the_total(self):
+        local, _ = self._record_functions()
+        assert re.search(r'say "Summary \(\$\(\(SECONDS / 60\)\)m', local)
+
+
+@pytest.mark.private_layout
+class TestSupersededRunsAreCancelled:
+    """CI runs on one Mac, and every push used to queue a full run behind
+    every other: 87 runs on 2026-10-14, results 2-4 hours after a push.
+    A run a newer commit on the same ref has replaced is cancelled; a
+    release branch keeps every run."""
+
+    def _block(self):
+        (workflow,) = _ci_files(".github/workflows/tests.yml")
+        block = re.search(r"^concurrency:\n((?:  .*\n)+)", workflow, re.MULTILINE)
+        assert block, "no workflow-level concurrency block"
+        return block.group(1)
+
+    def test_one_run_per_ref(self):
+        group = re.search(r"^  group: (.+)$", self._block(), re.MULTILINE)
+        assert group and "${{ github.ref }}" in group.group(1), (
+            "the group must be per ref: one per PR, one for main")
+
+    def test_a_newer_commit_cancels_the_older_run(self):
+        cancel = re.search(r"^  cancel-in-progress: (.+)$", self._block(), re.MULTILINE)
+        assert cancel, "superseded runs would still queue and run in full"
+        assert cancel.group(1) != "false"
+
+    def test_a_release_branch_keeps_every_run(self):
+        cancel = re.search(r"^  cancel-in-progress: (.+)$", self._block(), re.MULTILINE)
+        assert cancel and "refs/heads/release/" in cancel.group(1), (
+            "a release build that may ship must never be cancelled")
+        assert cancel.group(1).startswith("${{ !startsWith(")
+
+    def test_a_pr_that_closes_cancels_its_waiting_run(self):
+        """A merged PR never gets a newer push, so its queued run used to
+        wait its turn and then test code main was already testing: five of
+        nine queued runs on 2026-10-15. Its `closed` event joins the group
+        and cancels it; the default types must stay, or no PR is tested."""
+        (workflow,) = _ci_files(".github/workflows/tests.yml")
+        on = workflow.split("\non:\n", 1)[1].split("\n\n", 1)[0]
+        types = re.search(r"^    types: \[([^\]]+)\]$", on, re.MULTILINE)
+        assert types, "pull_request lists no types; closed would not start a run"
+        listed = {t.strip() for t in types.group(1).split(",")}
+        assert listed == {"opened", "synchronize", "reopened", "closed"}, listed
+
+    def test_the_closing_run_takes_no_runner(self):
+        (workflow,) = _ci_files(".github/workflows/tests.yml")
+        jobs = re.findall(r"^  (\w[\w-]*):\n((?:    .*\n|\n)*)",
+                          workflow.split("\njobs:\n", 1)[1], re.MULTILINE)
+        assert len(jobs) >= 4, [name for name, _ in jobs]
+        for name, body in jobs:
+            guard = re.search(r"^    if: (.+)$", body, re.MULTILINE)
+            assert guard and "github.event.action != 'closed'" in guard.group(1), (
+                "%s would run for a PR that has already closed" % name)
+
+
+@pytest.mark.private_layout
+class TestCiRunsWhatTheChangeCanBreak:
+    """ci-scope.sh: a pull request that touches nothing under WatchApp/ or
+    in CI's own files leaves out the watch flows and the purchase tests
+    (about ten of CI's sixteen minutes); anything else, or anything it
+    cannot tell, runs everything. Checked on real merge commits."""
+
+    def _scope(self, tmp_path, changed, event="pull_request", merge=True):
+        import shutil
+        import subprocess
+        _ci_files("ci-scope.sh")
+        repo = tmp_path / "repo"
+        repo.mkdir(parents=True)
+        shutil.copy(os.path.join(_ROOT, "ci-scope.sh"), repo / "ci-scope.sh")
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+
+        def git(*args):
+            subprocess.run(["git", "-c", "init.defaultBranch=main", *args], cwd=repo,
+                           env=env, check=True, capture_output=True)
+
+        git("init", "-q")
+        (repo / "README.md").write_text("base\n")
+        git("add", "-A")
+        git("commit", "-qm", "base")
+        git("checkout", "-qb", "pr")
+        for path in changed:
+            target = repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Appended, not replaced: ci-scope.sh changing itself must still run.
+            with open(target, "a", encoding="utf-8") as handle:
+                handle.write("\n# changed\n")
+        git("add", "-A")
+        git("commit", "-qm", "pr")
+        if merge:
+            git("checkout", "-q", "main")
+            (repo / "other.txt").write_text("main moved on\n")
+            git("add", "-A")
+            git("commit", "-qm", "main")
+            git("merge", "-q", "--no-ff", "pr", "-m", "merge")
+        run_env = {k: v for k, v in env.items() if not k.startswith("GITHUB_")}
+        if event:
+            run_env["GITHUB_EVENT_NAME"] = event
+        done = subprocess.run(["bash", str(repo / "ci-scope.sh")], cwd=repo, env=run_env,
+                              capture_output=True, text=True, timeout=30)
+        assert done.returncode == 0, done.stderr
+        return done.stdout.strip(), done.stderr
+
+    def test_a_python_only_change_is_light(self, tmp_path):
+        scope, why = self._scope(tmp_path, ["watch_relay.py", "test_x.py"])
+        assert scope == "light", why
+        assert "not needed" in why
+
+    def test_a_docs_only_change_is_light(self, tmp_path):
+        assert self._scope(tmp_path, ["README.md2", "helper/docs/index.html"])[0] == "light"
+
+    def test_a_watch_change_runs_everything(self, tmp_path):
+        scope, why = self._scope(tmp_path, ["watch_relay.py", "WatchApp/Tapproval/X.swift"])
+        assert scope == "full" and "WatchApp/Tapproval/X.swift" in why
+
+    def test_a_change_to_ci_itself_runs_everything(self, tmp_path):
+        for path in ("ci-local.sh", "ci-scope.sh", ".github/workflows/tests.yml"):
+            assert self._scope(tmp_path / path.replace("/", "_"), [path])[0] == "full", path
+
+    def test_a_push_runs_everything(self, tmp_path):
+        """main and release branches are always tested in full."""
+        assert self._scope(tmp_path, ["watch_relay.py"], event="push")[0] == "full"
+
+    def test_a_run_by_hand_runs_everything(self, tmp_path):
+        assert self._scope(tmp_path, ["watch_relay.py"], event=None)[0] == "full"
+
+    def test_no_merge_commit_runs_everything(self, tmp_path):
+        """A shallow or odd checkout cannot say what the PR changed."""
+        scope, why = self._scope(tmp_path, ["watch_relay.py"], merge=False)
+        assert scope == "full" and "merge commit" in why
+
+    def test_ci_local_says_what_it_left_out(self):
+        (local,) = _ci_files("ci-local.sh")
+        assert "SCOPE=$(./ci-scope.sh)" in local
+        assert local.count('NOT_NEEDED+=(') == 2, "the flows and the purchase tests"
+        assert "NOT RUN %s (scope light" in local
+
+    def test_the_checkout_is_deep_enough_to_see_the_base(self):
+        (workflow,) = _ci_files(".github/workflows/tests.yml")
+        for job in ("mini", "build-watch"):
+            body = workflow.split("\n  %s:\n" % job, 1)[1]
+            body = body[:body.find("\n\n  ")] if "\n\n  " in body else body
+            assert "fetch-depth: 2" in body, job
+
+
 class TestTheLocalFallbackRunsWhatCiRuns:
     """`ci-local.sh` is the proof when GitHub will not run the workflow.
 
@@ -10847,8 +11771,30 @@ class TestTheLocalFallbackRunsWhatCiRuns:
         matrix = re.search(r'python:\s*\[([^\]]+)\]', workflow).group(1)
         versions = re.findall(r'"([\d.]+)"', matrix)
         assert versions, "the matrix should name interpreters"
-        loop = re.search(r'for version in ([^;]+); do', local).group(1).split()
-        assert loop == versions, (loop, versions)
+        every = re.search(r'^  PYTHONS="([^"]+)"$', local, re.MULTILINE).group(1).split()
+        assert every == versions, (every, versions)
+
+    def test_the_interpreters_run_at_once_and_each_is_judged(self):
+        workflow, local = self._files()
+        block = local[local.index('for version in $PYTHONS; do'):]
+        assert "&\n" in block[:400], "each interpreter in the background"
+        assert 'wait "${PY_PIDS[$i]}"' in local
+        assert 'record "$code" "pytest $version$note"' in local
+
+    def test_pytest_runs_alongside_the_watch_jobs_and_is_still_judged(self):
+        """Waiting for pytest before the watch jobs put 80-90 s in front of
+        every run, half of a light one (2026-10-15). It now runs while they
+        do, and is judged before the summary: started but never waited for
+        would be a matrix nobody reads."""
+        _, local = self._files()
+        watch = local.index("# --- the watch app")
+        summary = local.index('say "Summary (')
+        alone = local.index('[ "$WHICH" = pytest ] && judge_pytest')
+        everything = local.index('[ "$WHICH" = all ] && judge_pytest')
+        assert alone < watch, "on its own, pytest is judged at once"
+        assert watch < everything < summary, (
+            "in a full run, judged after the watch jobs and before the summary")
+        assert "ran alongside" in local, "the summary says why its time is short"
 
     SHELLCHECK = "git ls-files -z '*.sh' ':!:design/**' | xargs -0 shellcheck"
 
@@ -10886,9 +11832,23 @@ class TestTheLocalFallbackRunsWhatCiRuns:
         "CODE_SIGNING_ALLOWED=NO",
     ])
     def test_the_watch_job_runs_the_same_xcodebuild(self, fragment):
-        workflow, local = self._files()
-        assert fragment in workflow, "the workflow changed; update ci-local.sh too"
-        assert fragment in local, fragment
+        """One copy now: the hosted job calls ci-local.sh watch."""
+        _, local = self._files()
+        assert fragment in local.split("# --- the watch app", 1)[1], fragment
+
+    def test_the_hosted_watch_job_is_the_local_one(self):
+        """The hosted job was a hand-written copy that compiled and tested
+        but left out the flows, the skip allowlist and the purchase tests,
+        so a fallback to GitHub would have checked less than CI and said
+        nothing (2026-10-14 tech-debt audit). It calls the script instead,
+        and holds nothing of its own that could drift again."""
+        workflow, _ = self._files()
+        job = workflow.split("\n  build-watch:\n", 1)[1]
+        job = job.split("\n  ", 1)[0] if re.search(r"\n  \w", job) else job
+        runs = re.findall(r"^\s*- run: (.+)$", job, re.MULTILINE)
+        assert runs == ["./ci-local.sh watch"], runs
+        assert "xcodebuild" not in job
+        assert "vars.CI_RUNNER != 'self-hosted'" in job, "still only the fallback"
 
     def test_the_dependency_refusal_is_checked_in_both(self):
         workflow, local = self._files()
@@ -10896,10 +11856,7 @@ class TestTheLocalFallbackRunsWhatCiRuns:
             assert name in workflow and name in local, name
 
     def test_both_read_the_watch_compile_for_swift6_warnings(self):
-        workflow, local = self._files()
-        assert 'WatchApp/swift6-warnings.sh "$RUNNER_TEMP/watch-tests.log"' in workflow
-        assert 'tee "$RUNNER_TEMP/watch-tests.log"' in workflow
-        assert "set -o pipefail" in workflow, "tee must not swallow a failing test run"
+        _, local = self._files()
         watch = local.split("# --- the watch app", 1)[1]
         assert 'WatchApp/swift6-warnings.sh "$WATCH_LOG"' in watch
         assert watch.index("swift6-warnings.sh") < watch.index('rm -f "$WATCH_LOG"'), (
@@ -11151,6 +12108,152 @@ class TestCiCanBeMovedToThisMacAndBack:
             "switching to a runner nobody registered queues every job forever")
 
 
+class TestWatchSimulatorsAreChosenBySize:
+    """watch-flows.sh named its faces by model (SE 3, Ultra 3) and runs
+    inside CI; Xcode's lineup moves on every year (Series 12 and Ultra 4
+    arrived beside them), and a named type that is gone fails the job.
+    The helper reads the newest runtime's supported types instead
+    (2026-10-14 tech-debt audit)."""
+
+    RUNTIMES = {"runtimes": [
+        {"platform": "watchOS", "isAvailable": True, "supportedDeviceTypes": [
+            {"name": "Apple Watch Series 9 (41mm)", "identifier": "old-41"}]},
+        {"platform": "iOS", "isAvailable": True, "supportedDeviceTypes": [
+            {"name": "iPhone 18", "identifier": "phone"}]},
+        {"platform": "watchOS", "isAvailable": True, "supportedDeviceTypes": [
+            {"name": "Apple Watch Series 13 (43mm)", "identifier": "s13-43"},
+            {"name": "Apple Watch Ultra 5 (50mm)", "identifier": "u5-50"},
+            {"name": "Apple Watch Ultra 4 (49mm)", "identifier": "u4-49"},
+            {"name": "Apple Watch SE 4 (41mm)", "identifier": "se4-41"},
+            {"name": "Apple Watch SE 3 (41mm)", "identifier": "se3-41"}]},
+    ]}
+
+    def _helper(self, tmp_path, want):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        (tmp_path / "runtimes.json").write_text(json.dumps(self.RUNTIMES))
+        fake = bin_dir / "xcrun"
+        fake.write_text('#!/bin/sh\ncat "%s"\n' % (tmp_path / "runtimes.json"))
+        fake.chmod(0o755)
+        return subprocess.run(
+            [os.path.join(_ROOT, "WatchApp", "sim-devtype.sh"), want],
+            env=dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"])),
+            capture_output=True, text=True, timeout=30)
+
+    @pytest.mark.private_layout
+    @pytest.mark.parametrize("want, picked", [
+        ("smallest", "se4-41\tApple Watch SE 4 (41mm)"),     # newest model of the smallest size
+        ("largest", "u5-50\tApple Watch Ultra 5 (50mm)"),
+        ("43mm", "s13-43\tApple Watch Series 13 (43mm)"),
+    ])
+    def test_a_renamed_lineup_still_gives_the_two_ends(self, tmp_path, want, picked):
+        run = self._helper(tmp_path, want)
+        assert (run.returncode, run.stdout.strip()) == (0, picked), run.stderr
+
+    @pytest.mark.private_layout
+    def test_a_size_the_runtime_cannot_run_is_an_error_not_a_guess(self, tmp_path):
+        run = self._helper(tmp_path, "38mm")
+        assert run.returncode != 0 and "38 mm" in run.stderr
+
+    @pytest.mark.private_layout
+    def test_the_flows_name_no_watch_model(self):
+        script = open(os.path.join(_ROOT, "WatchApp", "watch-flows.sh"), encoding="utf-8").read()
+        code = "\n".join(line for line in script.splitlines() if not line.lstrip().startswith("#"))
+        assert not re.search(r"(SE|Ultra|Series)[ -]\d+[ -(]*\d+mm", code), \
+            "a model name ages out with the next Xcode"
+        assert "./sim-devtype.sh" in code
+
+    def _flows(self, tmp_path, fail_face=None):
+        """watch-flows.sh itself, against a stand-in Xcode whose test runs
+        take two seconds each and say when they started and stopped."""
+        import shutil
+        app = tmp_path / "WatchApp"
+        app.mkdir()
+        for name in ("watch-flows.sh", "sim-devtype.sh"):
+            shutil.copy(os.path.join(_ROOT, "WatchApp", name), app / name)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (tmp_path / "runtimes.json").write_text(json.dumps(self.RUNTIMES))
+        events = tmp_path / "events"
+        (bin_dir / "xcrun").write_text(
+            '#!/bin/bash\n'
+            'case "$*" in\n'
+            '  *" -j"*|*"--json"*|*" -j "*) cat "%s" ;;\n'
+            '  "simctl list runtimes") echo "com.apple.CoreSimulator.SimRuntime.watchOS-26-5" ;;\n'
+            '  "simctl list devices available")\n'
+            '    echo "    Tapproval Flows 41mm (AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA) (Shutdown)"\n'
+            '    echo "    Tapproval Flows 50mm (BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB) (Shutdown)" ;;\n'
+            '  *) exit 1 ;;\n'
+            'esac\n' % (tmp_path / "runtimes.json"))
+        (bin_dir / "xcodebuild").write_text(
+            '#!/bin/bash\n'
+            'dest=$(printf "%%s\\n" "$@" | grep -m1 "^id=")\n'
+            'case "$1" in\n'
+            '  build-for-testing) echo build >> "%s"; echo "** TEST BUILD SUCCEEDED **" ;;\n'
+            '  test-without-building)\n'
+            '    echo "start $dest $(date +%%s)" >> "%s"; sleep 2\n'
+            '    echo "end $dest $(date +%%s)" >> "%s"\n'
+            '    if [ "$dest" = "id=$FAIL_UDID" ]; then echo "** TEST FAILED **"; exit 65; fi\n'
+            '    echo "** TEST SUCCEEDED **" ;;\n'
+            '  *) echo "unexpected: $1" >> "%s"; exit 2 ;;\n'
+            'esac\n' % (events, events, events, events))
+        for fake in bin_dir.iterdir():
+            fake.chmod(0o755)
+        env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]))
+        if fail_face:
+            env["FAIL_UDID"] = fail_face
+        run = subprocess.run(["bash", str(app / "watch-flows.sh")], env=env,
+                             capture_output=True, text=True, timeout=60)
+        return run, events.read_text().splitlines()
+
+    @pytest.mark.private_layout
+    def test_the_flows_build_once_and_run_both_faces_at_once(self, tmp_path):
+        """One face after the other took 9.6 of CI's 16 minutes; the two
+        runs now overlap, from one build (2026-10-15)."""
+        run, events = self._flows(tmp_path)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert events.count("build") == 1, events
+        starts = [int(e.split()[-1]) for e in events if e.startswith("start")]
+        ends = [int(e.split()[-1]) for e in events if e.startswith("end")]
+        assert len(starts) == 2 and len(ends) == 2, events
+        assert max(starts) < min(ends), "the second face waited for the first: %s" % events
+        assert run.stdout.count("TEST SUCCEEDED") == 2
+
+    @pytest.mark.private_layout
+    def test_one_failing_face_fails_the_run_and_is_named(self, tmp_path):
+        run, _ = self._flows(tmp_path, fail_face="BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")
+        assert run.returncode == 1
+        out = run.stdout
+        assert "TEST FAILED" in out and "TEST SUCCEEDED" in out
+        # The failure sits under its own face's heading, not the other's.
+        assert out.index("50mm") < out.index("TEST FAILED")
+
+
+def _doc_paragraphs(path):
+    """(first line number, text) for each paragraph of a markdown file,
+    its lines joined. Prose is wrapped at about 72 columns, so a guard
+    that read line by line missed "1.6.1, live" / "since 2026-10-14"
+    split across two lines in CLAUDE.md. A list item, table row or
+    heading starts a paragraph of its own."""
+    with open(path, encoding="utf-8") as handle:
+        lines = handle.read().split("\n")
+    start, chunk = 1, []
+    for number, line in enumerate(lines, 1):
+        stripped = line.strip()
+        starts_block = stripped.startswith(("- ", "* ", "|", "#")) or re.match(r"\d+\. ", stripped)
+        if not stripped or (starts_block and chunk):
+            if chunk:
+                yield start, " ".join(chunk)
+            chunk = []
+            if not stripped:
+                continue
+        if not chunk:
+            start = number
+        chunk.append(stripped)
+    if chunk:
+        yield start, " ".join(chunk)
+
+
 class TestTheDocumentsDoNotRestateTheReviewState:
     """APP_STORE.md → "What is still outstanding" is the one place that
     says which version is live and which is in review. On 2026-09-28 four
@@ -11162,8 +12265,11 @@ class TestTheDocumentsDoNotRestateTheReviewState:
     row (~~) is a record, not a claim."""
 
     OWNER = {"APP_STORE.md", "CHANGELOG.md"}
+    # Any major version: "1\.\d+" was blind to 2.0 from the day the
+    # marketing version reached it (2026-10-14 tech-debt audit).
     STATES = re.compile(
-        r"\b1\.\d+(?:\.\d+)?\b[^\n.]{0,40}\b(is live|is in (?:App (?:Store )?)?review"
+        r"\b\d+\.\d+(?:\.\d+)?\b[^\n.]{0,40}\b(is live|(?:has been |,? )live since"
+        r"|is in (?:App (?:Store )?)?review|is waiting at Apple"
         r"|is `?WAITING_FOR_REVIEW|is on the App Store)", re.I)
 
     def test_only_app_store_md_says_what_is_live_or_in_review(self):
@@ -11172,10 +12278,10 @@ class TestTheDocumentsDoNotRestateTheReviewState:
             if (not rel.endswith(".md") or rel in self.OWNER
                     or rel.startswith("design/")):
                 continue
-            with open(os.path.join(_ROOT, rel), encoding="utf-8") as handle:
-                for number, line in enumerate(handle, 1):
-                    if "~~" not in line and self.STATES.search(line):
-                        offenders.append("%s:%d: %s" % (rel, number, line.strip()[:80]))
+            for number, text in _doc_paragraphs(os.path.join(_ROOT, rel)):
+                found = "~~" not in text and self.STATES.search(text)
+                if found:
+                    offenders.append("%s:%d: %s" % (rel, number, found.group(0)[:80]))
         assert not offenders, ("say it in APP_STORE.md, not here:\n"
                                + "\n".join(offenders))
 
@@ -11185,6 +12291,11 @@ class TestTheDocumentsDoNotRestateTheReviewState:
         "and 1.3 is `WAITING_FOR_REVIEW` again, at the back of the queue",
         # Slipped past an earlier pattern into CLAUDE.md on 2026-10-01.
         "- **1.4 is in App Store review**, submitted 2026-10-01 after the owner",
+        # Missed until 2026-10-14: a 2.x version, and the "live since" form.
+        "**2.0 is in App Review**, submitted by the owner",
+        "the $5 unlock (approved and on sale since 2026-10-11; 1.6.1, live since 2026-10-14)",
+        "1.1 has been live since 2026-09-22 (build 126, free) in 135 territories.",
+        "2.0 is waiting at Apple while TestFlight goes on ahead",
     ])
     def test_the_guard_catches_the_sentences_that_went_stale(self, sentence):
         assert self.STATES.search(sentence), sentence
@@ -11192,9 +12303,17 @@ class TestTheDocumentsDoNotRestateTheReviewState:
     @pytest.mark.parametrize("sentence", [
         "- **Do not touch a version while it is in review.** A build swap puts it",
         "**Use when:** a version is `WAITING_FOR_REVIEW` and a newer build has",
+        "1.1 went live on 2026-09-22 (build 126, free) in 135 territories.",
     ])
     def test_rules_about_review_are_not_status(self, sentence):
         assert not self.STATES.search(sentence), sentence
+
+    def test_a_sentence_wrapped_over_two_lines_is_still_read(self, tmp_path):
+        doc = tmp_path / "doc.md"
+        doc.write_text("Intro.\n\n- **1.6 sells the unlock** (on sale since 2026-10-11; 1.6.1, live\n"
+                       "  since 2026-10-14, carried the fix)\n- next item\n")
+        found = [(n, self.STATES.search(t)) for n, t in _doc_paragraphs(str(doc))]
+        assert [n for n, m in found if m] == [3]
 
 
 class TestTheDocumentsDoNotRestateTheBuildNumber:
@@ -11210,9 +12329,11 @@ class TestTheDocumentsDoNotRestateTheBuildNumber:
     # "build 108 is on TestFlight / on every tester's watch", "is at 108".
     # History may name a build ("build 106 retired", "shipped build 108
     # with it") — those are dated facts, not claims about now.
+    # Any build number, not only 100–199: the next hundred was one
+    # deploy away when this was found (2026-10-14 tech-debt audit).
     RESTATES = re.compile(
-        r"\b(reads|is at|as build|is build|current build is|newest build is|latest build is)\s+1\d\d\b"
-        r"|\bbuild\s+1\d\d\b[^\n.]{0,50}\b(is on TestFlight|is on every|is live|is current|is the newest|is the latest)",
+        r"\b(reads|is at|as build|is build|current build is|newest build is|latest build is)\s+\d{2,4}\b(?!\s*%)"
+        r"|\bbuild\s+\d{2,4}\b[^\n.]{0,50}\b(is on TestFlight|is on every|is live|is current|is the newest|is the latest)",
         re.I)
 
     def test_no_tracked_document_restates_the_current_build(self):
@@ -11220,10 +12341,10 @@ class TestTheDocumentsDoNotRestateTheBuildNumber:
         for rel in _tracked_files(_ROOT):
             if not rel.endswith(".md"):
                 continue
-            with open(os.path.join(_ROOT, rel), encoding="utf-8") as handle:
-                for number, line in enumerate(handle, 1):
-                    if self.RESTATES.search(line):
-                        offenders.append("%s:%d: %s" % (rel, number, line.strip()[:80]))
+            for number, text in _doc_paragraphs(os.path.join(_ROOT, rel)):
+                found = self.RESTATES.search(text)
+                if found:
+                    offenders.append("%s:%d: %s" % (rel, number, found.group(0)[:80]))
         assert not offenders, "these restate WatchApp/BUILD_NUMBER in prose:\n" + "\n".join(offenders)
 
     @pytest.mark.parametrize("sentence", [
@@ -11233,6 +12354,8 @@ class TestTheDocumentsDoNotRestateTheBuildNumber:
         "| nothing — build 108 is on every tester's watch now | owner |",
         "`BUILD_NUMBER` reads 108 — the script commits the bump",
         "`WatchApp/BUILD_NUMBER` reads 108 — that file, not this list, is the",
+        "`BUILD_NUMBER` reads 201 — the script commits the bump",
+        "on TestFlight as build 1042 since",
     ])
     def test_the_guard_catches_every_sentence_the_documents_actually_used(self, sentence):
         """Replayed against the lines the tidy removed. A guard that
@@ -11243,6 +12366,7 @@ class TestTheDocumentsDoNotRestateTheBuildNumber:
         "retired build 106: 200",
         "after it had shipped build 108 with it. The likeliest reason",
         "Done: 108 on 2026-09-04 (the 1.1 code), 109 on 2026-09-07",
+        "the conversion rate is at 15% of visitors",
     ])
     def test_history_is_allowed_to_name_a_build(self, sentence):
         assert not self.RESTATES.search(sentence), sentence
@@ -11310,7 +12434,8 @@ class TestTheReportingItselfIsChecked:
     # a key that is not here fails the first test below, which is the
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
-    VOCABULARY = {"bonjour", "bridge", "claude", "codex", "crash", "helper", "port", "signin", "tunnel", "update"}
+    VOCABULARY = {"bonjour", "bridge", "claude", "codex", "crash", "helper", "port", "signin",
+                  "stuck", "tunnel", "update"}
 
     @staticmethod
     def _module_source(name):
@@ -11673,6 +12798,53 @@ class TestSilentFailuresStayLoud:
             server.shutdown()
             server.server_close()
 
+    def test_a_stuck_update_reaches_health_and_a_good_pull_withdraws_it(self, fresh_auth):
+        """A clone that cannot fast-forward used to fail every hour in
+        silence while the machine ran old rules. The updater now tells the
+        relay, and the first pull that succeeds takes it back."""
+        server, _queue = watch_relay.serve(port=0, auth=_known_watch(fresh_auth))
+        _serve(server)
+        try:
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            status, body = relay_call(base + "/admin/update-stuck",
+                                      token="bootstraptoken", method="POST")
+            assert (status, body) == (200, {"ok": True})
+            _status, body = relay_call(base + "/health", token="devicetoken")
+            assert [c["key"] for c in body["conditions"]] == ["stuck"]
+            stuck = body["conditions"][0]
+            assert stuck["tone"] == "needs_you", "it will not resolve by itself"
+            assert "git" not in stuck["detail"].lower(), "written for the wrist"
+            relay_call(base + "/admin/update-unstuck", token="bootstraptoken", method="POST")
+            _status, body = relay_call(base + "/health", token="devicetoken")
+            assert body["conditions"] == []
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    @pytest.mark.parametrize("returncode, stderr, said", [
+        (128, "fatal: Not possible to fast-forward, aborting.", "/admin/update-stuck"),
+        (1, "error: Your local changes to the following files would be overwritten by merge:",
+         "/admin/update-stuck"),
+        (1, "fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com",
+         None),
+        (128, "ssh: connect to host github.com port 22: Operation timed out", None),
+        (0, "", "/admin/update-unstuck"),
+    ])
+    def test_the_updater_says_a_pull_that_will_keep_failing(self, monkeypatch, returncode,
+                                                            stderr, said):
+        calls = []
+        heads = iter(["aaa\n", "aaa\n"])
+
+        def fake_run(command, **_kwargs):
+            if "pull" in command:
+                return subprocess.CompletedProcess(command, returncode, "", stderr)
+            return subprocess.CompletedProcess(command, 0, next(heads), "")
+        monkeypatch.setattr(watch_relay.subprocess, "run", fake_run)
+        monkeypatch.setattr(watch_relay, "_admin_call",
+                            lambda path, timeout=5: calls.append(path) or {"ok": True})
+        assert watch_relay._pull_update() is False
+        assert calls == ([said] if said else []), "a network blip is not news"
+
     def test_an_admin_path_the_handler_does_not_know_is_a_404(self, fresh_auth, monkeypatch):
         """The chain used to end in `else: rotate`, so a route added to
         ROUTES without a handler branch rotated the key and opened the
@@ -11851,8 +13023,8 @@ def test_the_two_ci_workflows_share_their_test_steps():
     public = os.path.join(HELPER_DIR, ".github", "workflows", "tests.yml")
     if not os.path.isfile(private):
         pytest.skip("no private workflow in this layout")
-    def python_steps(path):
-        """The pytest job, without the line that says where it runs.
+    def python_steps(path, job="pytest"):
+        """A job, without the line that says where it runs.
 
         It used to be "every line before shellcheck", which also covered
         the header and any job declared above pytest — so adding the
@@ -11861,13 +13033,20 @@ def test_the_two_ci_workflows_share_their_test_steps():
         the steps are what must match; the runner is deliberately private.
         """
         lines = open(path, encoding="utf-8").read().split("\n")
-        start = lines.index("  pytest:")
+        start = lines.index("  %s:" % job)
         rest = lines[start + 1:]
         end = next((i for i, line in enumerate(rest)
                     if line.startswith("  ") and not line.startswith("   ")), len(rest))
         return [line for line in rest[:end]
                 if "vars.CI_RUNNER" not in line and "runs-on:" not in line]
     assert python_steps(private) == python_steps(public)
+    # The lint job too, by its run lines (comments may differ): the public
+    # copy named two scripts by hand and ran no ruff at all, the shape the
+    # private workflow had already banned (2026-10-14 tech-debt audit).
+    def runs(path):
+        return [line.strip() for line in python_steps(path, "shellcheck")
+                if line.strip().startswith("- run:") or line.strip().startswith("- uses:")]
+    assert runs(private) == runs(public)
 
 
 @pytest.mark.private_layout
@@ -13412,3 +14591,61 @@ class TestCardsAnsweredAtTheDeskLeave:
         assert result["decision"] == "none"
         assert result["elapsed"] < 12
         assert queue.pending() == []
+
+
+class TestTheAgentMarkIsReadable:
+    """The CC/CX mark under a session's tile (owner, 2026-10-15). At a fixed
+    7 pt in the secondary grey it was the one label in the row that ignored
+    the wearer's text size, and on a watch set to large text it all but
+    vanished. It follows `.scaled`, like the rest of the row, in a grey
+    bright enough to read."""
+
+    def _mark(self):
+        path = os.path.join(_ROOT, "WatchApp", "Tapproval", "Sessions.swift")
+        if not os.path.isfile(path):
+            pytest.skip("no watch app in this layout")
+        with open(path, encoding="utf-8") as handle:
+            source = handle.read()
+        block = re.search(r"Text\(AgentMark\.letters\(session\.agent\)\)(.*?)"
+                          r"\.accessibilityIdentifier\(\"agentMark\"\)", source, re.S)
+        assert block, "the agent mark is not where this test looks for it"
+        return block.group(1)
+
+    def test_the_mark_follows_the_text_size(self):
+        mark = self._mark()
+        assert ".scaled(" in mark
+        assert ".font(.system(size:" not in mark
+
+    def test_the_mark_is_not_the_faint_grey(self):
+        assert ".foregroundStyle(.secondary)" not in self._mark()
+
+
+class TestTheWatchNamesTheComputer:
+    """The watch says the computer's own name, or "your PC", never "Mac"
+    (owner, 2026-10-15): the helper also runs on Linux, and a wearer whose
+    computer is not a Mac was told to go to one. The few strings left are
+    true only of a Mac, and are named here."""
+
+    ALLOWED = {
+        "new sessions need a Mac",          # the relay's status key, matched
+        "Starting sessions needs a Mac.",   # the wrist opens macOS Terminal
+        "Tapproval on Marco’s Mac Mini",    # the demo's computer (2026-09-18)
+        "Marco's Mac Mini",
+    }
+
+    def test_no_user_facing_string_says_mac(self):
+        root = os.path.join(_ROOT, "WatchApp", "Tapproval")
+        if not os.path.isdir(root):
+            pytest.skip("no watch app in this layout")
+        found = []
+        for name in sorted(os.listdir(root)):
+            if not name.endswith(".swift"):
+                continue
+            with open(os.path.join(root, name), encoding="utf-8") as handle:
+                for number, line in enumerate(handle, 1):
+                    if line.lstrip().startswith("//"):
+                        continue
+                    for literal in re.findall(r'"((?:[^"\\\n]|\\.)*)"', line):
+                        if re.search(r"\bMac\b", literal) and literal not in self.ALLOWED:
+                            found.append("%s:%d %s" % (name, number, literal))
+        assert not found, "\n".join(found)

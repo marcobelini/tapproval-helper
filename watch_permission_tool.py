@@ -87,8 +87,20 @@ def decide(tool_name, tool_input, crc=None, cwd=None):
             return {"behavior": "allow", "updatedInput": tool_input}
         if verdict == "deny":
             return deny(reason or "Blocked by your Tapproval policy.")
-        card = crc.wrist_card(tool_name, tool_input, result["risk"])
-        verdict, answer = crc.ask_watch(card, policy)
+        if tool_name == "AskUserQuestion" and crc.questions_need_typing(tool_input):
+            # The wrist only chooses, and this run has no terminal to leave
+            # a typed answer to: say so, so Claude can ask it another way.
+            return deny("This question wants a typed answer, and the watch "
+                        "can only choose among options. Ask it again with "
+                        "options to choose from.")
+        card = crc.wrist_card(tool_name, tool_input, result["risk"],
+                              auto_mode=(tool_name == "ExitPlanMode"
+                                         and crc.auto_mode_seen({})))
+        if tool_name == "AskUserQuestion":
+            verdict, answer = crc.ask_questions(card, tool_input, policy,
+                                                ask=crc.ask_watch)
+        else:
+            verdict, answer = crc.ask_watch(card, policy)
     except Exception as error:                          # never a stack trace
         return deny("Tapproval could not ask your watch (%s). Answer this at "
                     "the keyboard." % error)
@@ -96,12 +108,23 @@ def decide(tool_name, tool_input, crc=None, cwd=None):
         # The wrist answered a question or a plan. This was thrown away and
         # the run told the watch had not answered (2026-09-30 review).
         if card.get("plan_card"):
-            behavior, message, _mode = crc.plan_decision(answer)
+            behavior, message, mode = crc.plan_decision(answer)
             if behavior == "allow":
-                return {"behavior": "allow", "updatedInput": tool_input}
+                # The row's mode, as the terminal's would set it; a
+                # permission-prompt tool's allow takes updatedPermissions
+                # like a hook's (2.1.300, FMe).
+                allowed = {"behavior": "allow", "updatedInput": tool_input}
+                if mode in crc.PERMISSION_MODES:
+                    allowed["updatedPermissions"] = [
+                        {"type": "setMode", "mode": mode, "destination": "session"}]
+                return allowed
             return deny(message)
-        # The hook's channel for words: a deny whose reason is the answer,
-        # on which Claude proceeds.
+        # Every question answered: the call goes ahead with its answers,
+        # as the hook's does. 2.1.300's admitter for a permission-prompt
+        # tool takes exactly this — the shown input plus "answers".
+        if isinstance(answer, dict):
+            return {"behavior": "allow",
+                    "updatedInput": dict(tool_input, answers=answer)}
         return deny("The user answered from their watch: %s" % answer)
     if verdict == "allow":
         return {"behavior": "allow", "updatedInput": tool_input}
