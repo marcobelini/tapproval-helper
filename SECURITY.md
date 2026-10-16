@@ -41,8 +41,9 @@ longer. A problem that is not yet fixed is not described in public.
   redacted) and stays on your computer.
 - **Cards travel through your own private iCloud or an encrypted tunnel**
   when you are away from home, in transit only.
-- **On the iCloud route, your Apple ID is the key.** With the optional Mac
-  bridge, the watch learns its first key from your private iCloud, and
+- **On the iCloud route, your Apple ID is the key.** With the Mac bridge
+  the helper installs on a Mac, the watch learns its first key from your
+  private iCloud, and
   answers can travel back the same way. Anyone who controls your Apple ID
   could therefore answer a prompt. Protect it with two-factor
   authentication. A second key stored beside the first would add nothing,
@@ -54,6 +55,36 @@ longer. A problem that is not yet fixed is not described in public.
   switch to accept edits for this session. Never to your user or shared
   project settings, never on a CRITICAL card, and never anything Base cannot
   read word for word.
+
+## The Mac bridge
+
+On a Mac, the helper installs a small app, the bridge, which copies each
+waiting card into your own private iCloud and carries your answers back.
+It holds the helper's key file and mirrors the device key into that same
+private database, which only your Apple Account can read.
+
+- **What is trusted, in order.** The SHA-256 in `bridge.json`, for the
+  zip that ships inside the helper in `bridge/` (nothing is downloaded from
+  anywhere else);
+  a code requirement that `codesign` checks: Apple's chain, a Developer ID
+  Application certificate, team `K2RX2Y5896` and bundle id
+  `app.tapproval.bridge`; and Gatekeeper's "Notarized Developer ID". A
+  copy that fails any of these is thrown away, and the bridge already
+  there keeps running.
+- **Not reproducible.** The bridge is built, signed and notarized on the
+  developer's Mac, so a copy cannot be rebuilt bit for bit from the source
+  in `bridge/`. The source is published so it can be read; the signature
+  and Apple's notarization are what tie a download to that developer.
+- **Check a copy by hand:**
+
+  ```bash
+  shasum -a 256 ~/.tapproval/bridge/TapprovalBridge-*.zip   # compare with bridge.json
+  codesign -dv ~/.tapproval/bridge-app/TapprovalBridge.app   # TeamIdentifier=K2RX2Y5896
+  spctl -a -t exec -vv ~/.tapproval/bridge-app/TapprovalBridge.app  # Notarized Developer ID
+  ```
+
+- **Turning it off.** `--install --no-bridge` removes it and keeps it out;
+  `uninstall.sh` removes it with everything else.
 
 ## Design rules we will not trade away
 

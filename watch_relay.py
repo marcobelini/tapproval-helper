@@ -65,10 +65,14 @@ TUNNEL_PORT = 8978
 # written any more. The function that used to create it went with the
 # single-token design, and was the last write-then-chmod left in the tree.
 AUTH_FILE = os.path.expanduser("~/.tapproval-auth.json")
-# The Mac bridge mirrors the key into the owner's private iCloud database,
-# where only the owner's Apple ID can read it. Where it is installed a watch
-# pairs through iCloud, and the network pairing door is never needed.
-BRIDGE_APP = os.path.expanduser("~/.tapproval-bridge/TapprovalBridge.app")
+# The Mac bridge mirrors the key into the user's private iCloud database,
+# where only that Apple Account can read it. Where it is installed a watch
+# on the same account pairs through iCloud; the first-run door still opens,
+# for a watch on another account (see Auth.__init__).
+BRIDGE_APP = os.path.expanduser("~/.tapproval/bridge-app/TapprovalBridge.app")
+# Where it lived until 2026-10-16 (bridge_install.legacy_dir()): still a
+# bridge until the first install into the new place retires it.
+LEGACY_BRIDGE_APP = os.path.expanduser("~/.tapproval-bridge/TapprovalBridge.app")
 # Bumped whenever the wire contract or the auth rules change, so a running
 # relay from before an update can be recognised — and replaced — instead of
 # quietly serving the old rules forever (see ensure_running).
@@ -229,7 +233,17 @@ def helper_provenance(here=None):
     if here is None:
         _PROVENANCE = found
     return found
-MAX_BODY = 64 * 1024   # nobody's wrist card is 64KB
+MAX_BODY = 256 * 1024   # a wrist message of SEND_CHARS in any script, with room
+ANSWER_CHARS = 2000   # a wrist answer's words; ClaudeRiskClassifier.ANSWER_CHARS
+# The most of one message sent from the wrist (/say, /new). Longer is
+# refused with the count, never cut: until 2026-10-16 the cap was 500 and
+# silent, and a dictated brief lost its second half. The watch carries the
+# same number (RelayModel.sendChars) and refuses before sending; the thread
+# view keeps a user turn of this length whole (watch_dashboard.TURN_CHARS),
+# so the echo of a long message still finds its turn. The ceiling behind
+# this one is the transcript reader's bound on one line (32768), and the
+# suite holds the chain.
+SEND_CHARS = 30000
 
 VALID_DECISIONS = ("allow", "deny", "answer", "always", "dont_ask")
 
@@ -443,7 +457,6 @@ def _loopback_json(path, data=None, timeout=5, port=None, headers=None):
     """One request to the relay on this machine: the parsed JSON reply, or
     None for any failure at all — no relay, a slow one, a bad body. GET
     without ``data``, POST with it."""
-    import urllib.request
     request = urllib.request.Request(
         "http://127.0.0.1:%d%s" % (port or DEFAULT_PORT, path), data=data,
         method="POST" if data is not None else "GET",
@@ -682,6 +695,79 @@ def _self_update():
                     RELAY_LOG)
 
 
+# The Mac bridge is pinned by bridge.json, which a pull may move. Checking
+# costs a file read; the download it may start never blocks a session, and
+# a failing one is retried at most this often.
+_BRIDGE_RETRY_EVERY = 3600.0
+
+
+def _maybe_update_bridge():
+    """Start a detached ``--bridge-update`` when this helper pins a bridge
+    version this Mac does not have (route B, #378). Never raises, never
+    blocks a session: the download and the checks happen in the child."""
+    try:
+        import bridge_install
+        if bridge_install.state(bridge_install.read_pin()) != "install":
+            return False
+        stamp = os.path.join(bridge_install.bridge_dir(), ".last-attempt")
+        try:
+            if time.time() - os.path.getmtime(stamp) < _BRIDGE_RETRY_EVERY:
+                return False
+        except OSError:
+            pass
+        os.makedirs(bridge_install.bridge_dir(), exist_ok=True)
+        with open(stamp, "w") as handle:
+            handle.write(str(int(time.time())))
+        log = os.path.join(bridge_install.bridge_dir(), "install.log")
+    except Exception:
+        return False
+    return not _spawn_detached(
+        [sys.executable, os.path.abspath(__file__), "--bridge-update"], log)
+
+
+def _bridge_heard_from(wait=None, sleep=time.sleep):
+    """After a new bridge is loaded: did the relay hear from it?
+
+    /health says "bridge" while the bridge polled in the last
+    BRIDGE_ALIVE_SECONDS, which the bridge it replaced may still have done.
+    So wait that long first, then give the new one until the relay's own
+    silence limit."""
+    sleep(CardQueue.BRIDGE_ALIVE_SECONDS + 5)
+    end = time.time() + (wait if wait is not None else BRIDGE_SILENT_SECONDS)
+    while True:
+        health = _probe_relay(timeout=2) or {}
+        if health.get("alert_route") == "bridge":
+            return True
+        if time.time() >= end:
+            return False
+        sleep(5)
+
+
+def run_bridge_update():
+    """The detached half of ``_maybe_update_bridge``: install the pinned
+    bridge unless a card is waiting, and tell the relay how it went."""
+    import bridge_install
+    pin = bridge_install.read_pin()
+    if bridge_install.state(pin) != "install":
+        return 0
+    running = _probe_relay()
+    if running is not None and running.get("pending"):
+        # A restart of the bridge while a card waits could cost that card
+        # its buzz. The next session start tries again.
+        print("bridge: update deferred — a card is waiting", file=sys.stderr)
+        return 0
+    wait = _bridge_heard_from if running is not None else None
+    try:
+        version = bridge_install.install(pin, wait_for_bridge=wait)
+    except (bridge_install.InstallError, OSError) as error:
+        print("bridge: not installed — %s" % error, file=sys.stderr)
+        _admin_call("/admin/bridge-failed", timeout=2)
+        return 1
+    print("bridge: %s installed" % version, file=sys.stderr)
+    _admin_call("/admin/bridge-ok", timeout=2)
+    return 0
+
+
 # What a pull says when the network, not the checkout, is the problem.
 # Those pass by themselves within the hour; everything else — a clone that
 # has diverged, local edits in the way — fails the same way every hour,
@@ -753,7 +839,10 @@ def _serving_older_code(running):
             # the blocking path of a session start, and a relay that says
             # nothing about itself is answered by leaving it alone.
             return False
-        installed = helper_provenance(os.path.dirname(os.path.abspath(__file__)))[0]
+        # Read from .git, with no subprocess on this blocking path; git is
+        # asked only when the files cannot say (a worktree's .git is a file).
+        here = os.path.dirname(os.path.abspath(__file__))
+        installed = _head_commit(here) or helper_provenance(here)[0]
     except Exception:
         return False
     # By prefix: git may abbreviate to more than seven characters, and an
@@ -775,6 +864,7 @@ def ensure_running(updated=False):
     """
     if not updated:
         _self_update()
+    _maybe_update_bridge()
     running = _probe_relay()
     if running is None and _port_in_use(DEFAULT_PORT):
         # Held but silent: a busy relay, most likely (its /health can wait
@@ -850,8 +940,7 @@ def ensure_running(updated=False):
               % (DEFAULT_PORT, RELAY_LOG), file=sys.stderr)
         return 0
     log_path = RELAY_LOG
-    _rotate_log(log_path)
-    error = _spawn_detached(
+    error = _spawn_detached(                     # which rotates the log
         [sys.executable, os.path.abspath(__file__),
          "--host", "0.0.0.0", "--tunnel"], log_path)
     if error:
@@ -1066,14 +1155,15 @@ class CardQueue:
         try:
             seconds_ago = float(seconds_ago)
         except (TypeError, ValueError):
-            return
+            return False
         # A negative age is clock skew or a buggy reporter — fail closed.
         if not 0 <= seconds_ago <= self.WATCH_PRESENT_SECONDS:
-            return
+            return False
         with self._lock:
             seen = time.monotonic() - seconds_ago
             if self.last_poll is None or seen > self.last_poll:
                 self.last_poll = seen
+        return True
 
     def watch_seen_seconds_ago(self):
         with self._lock:
@@ -1105,12 +1195,30 @@ class CardQueue:
                       "waiting (the computer already handed it back)"
                       % (decision, card_id), file=sys.stderr)
                 return False
+            if card_id in self._decisions:
+                # The first answer is final: a second tap, or a second
+                # watch, must not overwrite what the hook is about to read
+                # (2026-10-16 review, S13).
+                print("relay: refused %s for %s — that card is already "
+                      "answered (%s)" % (decision, card_id,
+                                         self._decisions[card_id][0]),
+                      file=sys.stderr)
+                return False
+            card = self._pending[card_id]
+            if decision in ("always", "dont_ask") and (
+                    card.get("tier") == "CRITICAL" or not card.get("can_always")):
+                # A lasting grant only where the wrist offered one: never
+                # on CRITICAL, never where Claude Code made no suggestion
+                # (2026-10-16 review, S5).
+                print("relay: refused %s for %s — this card offers no "
+                      "lasting grant" % (decision, card_id), file=sys.stderr)
+                return False
             # "answer" carries the chosen option label for question cards
             # — several, one per line, on a multi-select card — or a plan's
-            # edits. The hook keeps 600 characters (ask_watch); this kept
-            # 200, which four labels or a dictated edit can pass.
+            # edits. The hook keeps ANSWER_CHARS (ask_watch); this kept
+            # 200, then 600, which four long labels can pass (2026-10-16).
             self._decisions[card_id] = (decision,
-                                        str(answer)[:600] if answer else None)
+                                        str(answer)[:ANSWER_CHARS] if answer else None)
             self._lock.notify_all()
         print("relay: accepted %s for %s" % (decision, card_id),
               file=sys.stderr)
@@ -1123,7 +1231,7 @@ class CardQueue:
 # imported; tests reach the rest through watch_dashboard.
 from watch_dashboard import (  # noqa: E402
     activity_summary, card_session_title, recap_summary, _find_transcript, image_bytes,
-    _json_object, _message_of, _parse_thread, prewarm_threads, _read_appended,
+    _json_object, _message_of, _parse_thread, _read_appended,
     project_root, prompts_at_the_mac, recent_sessions, resolve_session,
     session_registry, session_state, shape, thread_tool_id, thread_wake_at,
     transcript_origin, transcripts_newest_first,
@@ -1443,6 +1551,13 @@ def _applescript_literal(text):
     return json.dumps(str(text), ensure_ascii=False)
 
 
+def too_long(text):
+    """The status for a wrist message over SEND_CHARS: the count and the
+    limit, so the wearer knows how much to cut. The watch shows these
+    words as they are (capitalised), so they read as a sentence."""
+    return "too long: %d characters, the most is %d" % (len(text), SEND_CHARS)
+
+
 def _run_osascript(script, timeout=4):
     """(ok, stdout or the reason it failed). Never raises."""
     try:
@@ -1620,9 +1735,11 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
     is what a 14 pt thread on a wrist wants. Returns a short status
     string; never raises and never blocks the caller.
     """
-    text = " ".join(str(text or "").split())[:500]
+    text = " ".join(str(text or "").split())
     if not text:
         return "empty"
+    if len(text) > SEND_CHARS:
+        return too_long(text)
     registry = session_registry()
     session_id, cwd = resolve_session(prefix, projects_dir, registry=registry)
     if not session_id:
@@ -1697,6 +1814,27 @@ def _frontmatter(path):
                 found["description"] = text[:300]
                 break
     return found
+
+
+def required_argument(hint):
+    """The argument-hint, when the command needs something said after its
+    name; None when every part of it is optional.
+
+    The watch puts a row with a hint into the Message field instead of
+    sending it, so the person can add the words. For "[optional note]"
+    there is nothing they must add, and the tap that only filled a field
+    above the list, out of sight, read as /wrap-up not working
+    (2026-10-16). A part in square brackets is optional, by the usual
+    reading of a usage line; anything else — "<question>", a bare word —
+    still asks for words."""
+    hint = " ".join(str(hint or "").split())
+    rest = hint
+    while True:
+        shorter = re.sub(r"\[[^\[\]]*\]", "", rest)
+        if shorter == rest:
+            break
+        rest = shorter
+    return hint if rest.strip() else None
 
 
 def _skill_roots(cwd, home):
@@ -1796,7 +1934,8 @@ def known_skills(cwd=None, home=None, now=None):
             if meta.get("user-invocable", "").lower() == "false":
                 continue
             found[name] = {"description": meta.get("description", ""), "source": source,
-                           "plugin": plugin, "argument_hint": meta.get("argument-hint") or None}
+                           "plugin": plugin,
+                           "argument_hint": required_argument(meta.get("argument-hint"))}
     rows = [dict(name="/" + name, **meta) for name, meta in sorted(found.items())]
     _SKILLS_CACHE[key] = (now + SKILLS_CACHE_SECONDS, rows)
     return rows
@@ -1829,10 +1968,16 @@ def known_projects(projects_dir=None, limit=25):
     seen, rows = set(), []
     home = os.path.realpath(os.path.expanduser("~"))
     scratch = tuple(os.path.realpath(p) + os.sep for p in SCRATCH_ROOTS)
+    checked = set()
     for mtime, path, _, _ in transcripts_newest_first(projects_dir):
         cwd, entry_point = transcript_origin(path)
         if not cwd or entry_point == shape("entrypoint.sdk_cli"):
             continue
+        # Thousands of transcripts share a handful of folders, and a folder
+        # gets the same answer every time: work out its repository once.
+        if cwd in checked:
+            continue
+        checked.add(cwd)
         root = project_root(cwd)
         if root in seen or not os.path.isdir(root):
             continue
@@ -1863,9 +2008,11 @@ def start_session(path, text, projects_dir=None, platform=None):
     a Terminal that will not open (no one logged in at the screen — the
     usual reason). Never raises, never blocks longer than a few seconds.
     """
-    text = " ".join(str(text or "").split())[:500]
+    text = " ".join(str(text or "").split())
     if not text:
         return "empty"
+    if len(text) > SEND_CHARS:
+        return too_long(text)
     if text[:1] in ("!", "#"):
         # As in type_into_session: first in Claude Code's prompt, `!` runs
         # the rest as a shell command with no card, and `#` writes memory.
@@ -1998,8 +2145,9 @@ class _PromptResolver:
             return False
 
     def _located(self):
-        """Find the session transcript — once, and not on every 5s wake
-        when it is missing, since that walks every project directory."""
+        """Find the session transcript — once, and when it is missing not
+        on every probe but every RETRY_SECONDS, since that walks every
+        project directory."""
         if self.path is not None:
             return True
         if time.monotonic() < self.retry_at:
@@ -2014,7 +2162,7 @@ class _PromptResolver:
         """Every transcript this card's answer could appear in.
 
         Subagents start after the card does, so this is rescanned — cheaply,
-        on the same 5s clock — rather than fixed at the first look.
+        on the probe's clock — rather than fixed at the first look.
         """
         paths = [self.path]
         directory, name = os.path.split(self.path)
@@ -2800,6 +2948,9 @@ class RelayHandler(BaseHTTPRequestHandler):
     #   local      only a process on this machine: the hook, the bridge,
     #              the --pair / --rotate-token commands. Never the network,
     #              because a forged card harvests a real tap.
+    #   key_file   signed (v2) with the bootstrap from the 0600 key file:
+    #              this user, not merely this machine — and only a signed
+    #              request gets the proof the hook requires of its answer.
 
     ROUTES = {
         "GET": {
@@ -2820,8 +2971,16 @@ class RelayHandler(BaseHTTPRequestHandler):
         },
         "POST": {
             "/enroll": ("_post_enroll", dict(auth=False, lan_only=True)),
-            "/card": ("_post_card", dict(local=True, lan_only=True)),
+            # key_file: loopback is any process of any user here, and the
+            # hook believes only an answer that proves the key back (S1).
+            "/card": ("_post_card", dict(local=True, lan_only=True, key_file=True)),
             "/heartbeat": ("_post_heartbeat", dict(local=True, lan_only=True)),
+            # The bridge saying whether this Mac's iCloud account can carry
+            # cards at all. admin: the key file, which the bridge signs
+            # with. Loopback alone is any process, and "noAccount" from
+            # one would reopen the door at the next --rotate-token.
+            "/bridge-status": ("_post_bridge_status",
+                               dict(local=True, admin=True, lan_only=True)),
             # token, like /say: a command Claude runs is a local process,
             # and it must not open sessions of its own on this machine.
             "/new": ("_post_new", dict(token=True, no_simulator=True)),
@@ -2843,6 +3002,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             "/admin/update-deferred": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
             "/admin/update-stuck": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
             "/admin/update-unstuck": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
+            "/admin/bridge-failed": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
+            "/admin/bridge-ok": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
         },
     }
 
@@ -2887,6 +3048,12 @@ class RelayHandler(BaseHTTPRequestHandler):
             # the watch, or rotating its key, takes the key file too
             # (2026-10-05 review). /admin/pair-open answers without it,
             # but opens a window that asks at the Mac first.
+            self._send_json({"error": "the key file is required"}, 403)
+            return
+        if rules.get("key_file") and not (self._proves_bootstrap()
+                                          and getattr(self, "_signed_nonce", None)):
+            # Signed, not merely sent: the reply's proof is what the hook
+            # checks, and only a signed request gets one.
             self._send_json({"error": "the key file is required"}, 403)
             return
         if rules.get("token") and not self._proves_key():
@@ -2990,9 +3157,7 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def _get_sessions(self, path, query):
         waiting = {card["session_id"] for card in self.queue.pending() if card.get("session_id")}
-        rows = recent_sessions(waiting=waiting)
-        prewarm_threads([row["session_id"] for row in rows])
-        self._send_json({"sessions": rows})
+        self._send_json({"sessions": recent_sessions(waiting=waiting)})
 
     def _get_activity(self, path, query):
         self._send_json(activity_summary())
@@ -3173,6 +3338,14 @@ class RelayHandler(BaseHTTPRequestHandler):
             return
         accepted = self.queue.decide(card_id, decision,
                                      answer=(body or {}).get("answer"))
+        # The bridge, signing with the key file, hands on an answer a
+        # watch wrote to iCloud: a watch on this Apple Account holds the
+        # key, so the machine is paired. Without this an iCloud-only watch
+        # never shut the first-run door (D2), and it reopened at every
+        # session start.
+        if (accepted and self._is_local_process() and self._proves_bootstrap()
+                and hasattr(self.auth, "note_device_seen")):
+            self.auth.note_device_seen()
         self._send_json({"ok": accepted})
 
     def _post_admin(self, path, query):
@@ -3223,6 +3396,20 @@ class RelayHandler(BaseHTTPRequestHandler):
         elif path == "/admin/update-unstuck":
             clear_condition("stuck")
             self._send_json({"ok": True})
+        elif path == "/admin/bridge-failed":
+            # The detached --bridge-update could not install the pinned
+            # bridge. Fixed wording, no body, like update-stuck: why goes
+            # to the bridge's install.log, not to the wrist.
+            note_condition(
+                "bridge_install",
+                "Tapproval could not set up its iCloud bridge on this "
+                "computer, so your watch may not buzz while Tapproval is "
+                "closed. It tries again within the hour while Claude Code "
+                "runs.")
+            self._send_json({"ok": True})
+        elif path == "/admin/bridge-ok":
+            clear_condition("bridge_install")
+            self._send_json({"ok": True})
         elif path == "/admin/rotate":
             secret = self.auth.rotate()
             _rotate_tunnel_prefix(secret)
@@ -3236,12 +3423,26 @@ class RelayHandler(BaseHTTPRequestHandler):
             # a branch here used to fall through to a key rotation.
             self._send_json({"error": "unknown admin route"}, 404)
 
+    def _post_bridge_status(self, path, query):
+        # What the bridge's CKContainer.accountStatus() said, at its start
+        # and whenever it changes. Anything but "available" means iCloud
+        # carries nothing for this Mac, so a closed watch cannot buzz.
+        body = self._read_json() or {}
+        self._send_json({"ok": note_bridge_icloud(body.get("icloud"))})
+
     def _post_heartbeat(self, path, query):
         # The bridge relays the watch's CloudKit heartbeat: how many
         # seconds ago the watch last checked iCloud. Main server only —
         # never through the public tunnel.
         body = self._read_json() or {}
-        self.queue.note_watch_indirect(body.get("watch_seen_seconds_ago"))
+        seen = self.queue.note_watch_indirect(body.get("watch_seen_seconds_ago"))
+        # A watch checking this account's iCloud holds the key mirrored
+        # there: paired, for the first-run door, as a direct poll would be.
+        # Only from the key file's holder, the bridge: shutting the door is
+        # the safe direction, but a stray local process is still no witness.
+        if (seen and self._proves_bootstrap()
+                and hasattr(self.auth, "note_device_seen")):
+            self.auth.note_device_seen()
         self._send_json({"ok": True})
 
 
@@ -3503,7 +3704,12 @@ class Auth:
         # every relay start (here) and every --ensure (relight), not
         # forever: long enough to install the watch app, short enough that
         # a laptop left on café Wi-Fi is not handing out keys all afternoon.
-        if not self.paired_ever and not icloud_carries_the_key():
+        # A bridge does not keep it shut any more (route B, D2): installed
+        # on every Mac, it may sit on an Apple Account the watch does not
+        # use, and then iCloud never brings the key. The door asks at the
+        # Mac first, and shuts the moment a watch shows a key
+        # (note_device_seen), whichever way it came.
+        if not self.paired_ever:
             self._window_until = time.time() + PAIR_FIRST_WINDOW_SECONDS
             self._window_asks = True
 
@@ -3722,7 +3928,7 @@ class Auth:
         PAIR_FIRST_WINDOW_SECONDS. A no-op once anything has paired, so a
         session start can never reopen a paired machine's door."""
         with self._lock:
-            if self.paired_ever or icloud_carries_the_key():
+            if self.paired_ever:
                 return self._window_until
             if self.window_open() and not self._window_asks:
                 # The owner's own --pair window is open; a session start
@@ -3825,9 +4031,46 @@ class Auth:
             self.save()
 
 
+# What the bridge last said of this Mac's iCloud account (/bridge-status):
+# None until a bridge that reports it has spoken, which every bridge before
+# route B never does.
+_BRIDGE_ICLOUD = None
+_ICLOUD_STATUSES = ("available", "noAccount", "restricted",
+                    "couldNotDetermine", "temporarilyUnavailable")
+
+
+def note_bridge_icloud(status):
+    """Record the bridge's iCloud account status, and say so on the wrist
+    when it cannot carry cards. False for a value that is not one of
+    CloudKit's, which changes nothing."""
+    global _BRIDGE_ICLOUD
+    if status not in _ICLOUD_STATUSES:
+        return False
+    _BRIDGE_ICLOUD = status
+    if status == "available":
+        clear_condition("icloud_off")
+    else:
+        note_condition(
+            "icloud_off",
+            "iCloud is not available to Tapproval on this computer, so your "
+            "watch cannot buzz while Tapproval is closed. Check that this "
+            "Mac is signed in to iCloud with the Apple Account your watch "
+            "uses.")
+    return True
+
+
+def bridge_installed():
+    """Is a Mac bridge installed on this computer, in either place?"""
+    return os.path.isdir(BRIDGE_APP) or os.path.isdir(LEGACY_BRIDGE_APP)
+
+
 def icloud_carries_the_key():
-    """Is the Mac bridge installed here, so a watch pairs through iCloud?"""
-    return os.path.isdir(BRIDGE_APP)
+    """Does the Mac bridge carry the key through iCloud here?
+
+    Installed, and not known to be without an iCloud account: a bridge
+    that has never reported (one from before /bridge-status) counts, as it
+    always did; one that reported anything but "available" does not."""
+    return bridge_installed() and _BRIDGE_ICLOUD in (None, "available")
 
 
 def _token_matches(given, expected):
@@ -3947,7 +4190,7 @@ def _tunnel_answers(url, token):
             status, ctype = reply.status, reply.headers.get("Content-Type", "")
     except urllib.error.HTTPError as error:
         status = error.code
-        ctype = (error.headers or {}).get("Content-Type", "") if error.headers else ""
+        ctype = error.headers.get("Content-Type", "") if error.headers else ""
     except Exception:
         return False
     return status in (200, 401, 403) and "json" in (ctype or "")
@@ -4111,7 +4354,7 @@ def check_bridge(queue, started, now=None):
     True when all is well (or no bridge is installed here)."""
     now = time.monotonic() if now is None else now
     last = queue.last_bridge_poll
-    if not icloud_carries_the_key():
+    if not bridge_installed():
         clear_condition("bridge")
         return True
     if last is None and now - started < BRIDGE_SILENT_SECONDS:
@@ -4323,6 +4566,8 @@ def _build_parser():
                         help="start the relay in the background if it is "
                              "not already running, then exit")
     parser.add_argument("--update", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--bridge-update", action="store_true",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--pair", action="store_true",
                         help="open a short pairing window so a new watch can "
                              "connect, then exit")
@@ -4563,6 +4808,8 @@ def main(argv=None):
         if _pull_update():
             ensure_running(updated=True)
         return 0
+    if args.bridge_update:
+        return run_bridge_update()
     if args.pair or args.pair_reset or args.rotate_token:
         return run_admin(args)
 

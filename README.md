@@ -157,9 +157,11 @@ log was deliberately left in place.
   data carries a key that belongs to one device, whichever network it
   arrives on — LAN, tailnet or the travel tunnel. Only processes on the
   computer itself are exempt, which is what lets Claude Code hand a prompt
-  to the bridge without ceremony. Your watch gets its key through your own
-  private iCloud, so it never appears on screen and a stranger on the same
-  café Wi-Fi has no way to ask for it. (Earlier versions trusted anything
+  to the bridge without ceremony. On a Mac, your watch gets its key through
+  your own private iCloud, so it never appears on screen; elsewhere, through
+  the first pairing window, which asks at the computer before any key
+  leaves. Either way, a stranger on the same café Wi-Fi has no way to get
+  it. (Earlier versions trusted anything
   on your local network; that was fine at home and wrong everywhere else,
   and it is fixed.) The travel address is a secret path *and* needs the
   key: seeing the URL is not holding the key. One honest limit remains: a

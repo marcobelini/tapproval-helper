@@ -23,6 +23,16 @@ if [ -d "$DIR/.git" ]; then
     mv "$DIR" "$DIR.superseded-$(date +%Y%m%d-%H%M%S)"
     git clone -q --depth 1 "$REPO" "$DIR"
   fi
+elif [ -d "$DIR" ]; then
+  # A folder that is not a checkout. Where the helper came as a Claude Code
+  # plugin, the Mac bridge (bridge-app/) already lives here, and git clone
+  # refuses a folder that is not empty: make it a checkout in place, keeping
+  # what is there. The repository's .gitignore names bridge-app/.
+  git -C "$DIR" init -q
+  git -C "$DIR" remote add origin "$REPO" 2>/dev/null \
+    || git -C "$DIR" remote set-url origin "$REPO"
+  git -C "$DIR" fetch -q --depth 1 origin main
+  git -C "$DIR" checkout -q -f -B main --track origin/main
 else
   git clone -q --depth 1 "$REPO" "$DIR"
 fi

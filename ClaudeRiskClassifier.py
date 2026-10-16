@@ -71,10 +71,10 @@ from collections import Counter
 from datetime import datetime, timezone
 from enum import IntEnum
 
-# argparse, shlex, shutil and tempfile are imported where they are used.
-# They serve the installer and the CLI only, and this module is a hook
-# that starts once per tool call: the four together cost about a fifth of
-# the process's wall time, on a path that never touches them.
+# argparse, shutil and tempfile are imported where they are used. They
+# serve the installer and the CLI only, and this module is a hook that
+# starts once per tool call, on a path that never touches them. (shlex is
+# imported above: the classifier itself splits commands with it.)
 
 __all__ = [
     "Risk",
@@ -103,7 +103,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.57"
+__version__ = "1.1.58"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -118,6 +118,13 @@ RELAY_WAIT_SECONDS = 86400
 # The relay listens here; watch_relay.DEFAULT_PORT says the same, but this
 # file must stand alone, so the number is written once more, once.
 RELAY_PORT = 8977
+# The relay's key file (watch_relay.AUTH_FILE), this user's, mode 0600. The
+# hook signs each card with its bootstrap and believes only an answer that
+# proves the same key: anything else that answers on RELAY_PORT — a
+# squatter while the relay restarts — is not the relay (2026-10-16
+# review, S1). CLAUDE_RISK_AUTH_FILE points an isolated relay's hook at
+# that relay's own file.
+AUTH_FILE = os.path.expanduser("~/.tapproval-auth.json")
 
 # The wrist card's two budgets. DEFAULT_POLICY quotes these, and the policy
 # file may override them; wrist_card() falls back to them when it does not.
@@ -925,7 +932,6 @@ def _unwrapped(segment):
     if lead in _SHELL_KEYWORDS:
         return " ".join(words[1:]) or None
     if lead in _SHELLS:
-        import shlex
         try:
             args = shlex.split(" ".join(words[1:]))
         except ValueError:
@@ -955,27 +961,28 @@ def _unwrapped(segment):
     return None
 
 
-# Read-only tools with a spelling that writes a file or runs a command.
-# Checked before the tool is waved through as a read: each of these read
-# SAFE until 2026-09-25, and --quiet would have allowed them.
+# Read-only tools with a spelling that writes a file or runs a command,
+# each a test that takes the segment. Checked before the tool is waved
+# through as a read: each of these read SAFE until 2026-09-25, and --quiet
+# would have allowed them.
 READ_TOOL_ESCAPES = {
     "awk": re.compile(r"system\s*\(|\|\s*[\"']|\|&|>{1,2}\s*[\"']|getline\s*<"
-                      r"|(^|\s)(-f\s*\S|--file\b)"),
-    "rg": re.compile(r"(^|\s)--pre(=|\s)"),
-    "find": re.compile(r"(^|\s)-(fprint0?|fprintf|fls|execdir|ok|okdir)(\s|$)"),
-    "tree": re.compile(r"(^|\s)(-o|--output)(\s|=)"),
-    "sort": re.compile(r"(^|\s)(-o|--output)(\s|=)|(^|\s)-o\S|--compress-program"),
+                      r"|(^|\s)(-f\s*\S|--file\b)").search,
+    "rg": re.compile(r"(^|\s)--pre(=|\s)").search,
+    "find": re.compile(r"(^|\s)-(fprint0?|fprintf|fls|execdir|ok|okdir)(\s|$)").search,
+    "tree": re.compile(r"(^|\s)(-o|--output)(\s|=)").search,
+    "sort": re.compile(r"(^|\s)(-o|--output)(\s|=)|(^|\s)-o\S|--compress-program").search,
     # sed's own commands write (`w file`, `s/a/b/w file`) and run (`e`).
     "sed": re.compile(r"(^|\s)--in-place\b|(^|[\s;{}'\"/\d$])[wW]\s+\S"
-                      r"|(^|[\s;{}'\"/\d$])e(\s|['\";]|$)"),
+                      r"|(^|[\s;{}'\"/\d$])e(\s|['\";]|$)").search,
     # Setting the clock or the machine's name, not reading them.
-    "date": re.compile(r"(^|\s)(-s|--set)\b|(^|\s)\d{6,}(\s|$)"),
+    "date": re.compile(r"(^|\s)(-s|--set)\b|(^|\s)\d{6,}(\s|$)").search,
     "hostname": lambda segment: any(not w.startswith("-") for w in _tokens(segment)[1:]),
     "uniq": lambda segment: len([w for w in _tokens(segment)[1:]
                                  if not w.startswith("-") and not w.isdigit()]) >= 2,
-    "security": re.compile(r"\b(list|default|login)-keychains?\b[^|;&]*\s-[sd]\b"),
-    "yq": re.compile(r"(^|\s)(-i|--inplace)(\s|$)"),
-    "git": re.compile(r"(^|\s)--output(=|\s)"),
+    "security": re.compile(r"\b(list|default|login)-keychains?\b[^|;&]*\s-[sd]\b").search,
+    "yq": re.compile(r"(^|\s)(-i|--inplace)(\s|$)").search,
+    "git": re.compile(r"(^|\s)--output(=|\s)").search,
 }
 for _awk in ("gawk", "nawk", "mawk"):
     READ_TOOL_ESCAPES[_awk] = READ_TOOL_ESCAPES["awk"]
@@ -1043,8 +1050,7 @@ def classify_bash(command):
         token = os.path.basename(_first_token(segment)).lower()
 
         escape = READ_TOOL_ESCAPES.get(token)
-        if escape is not None and (escape.search(segment) if hasattr(escape, "search")
-                                   else escape(segment)):
+        if escape is not None and escape(segment):
             bump("read-tool-writes-or-runs", Risk.MEDIUM)
 
         if any(name not in HARMLESS_ENV and not name.startswith("LC_")
@@ -1406,6 +1412,28 @@ def _fit(text, limit):
     return text[: limit - 1] + "…"
 
 
+def _fit_lines(text, limit):
+    """_fit that keeps the text's own line breaks: a question asked in two
+    paragraphs, or a here-document, is not one run-on line (owner,
+    2026-10-16). Spaces still collapse within a line, and a run of blank
+    lines becomes one. Credentials are stripped here too."""
+    kept, blank = [], False
+    for line in redact_secrets(str(text or "")).splitlines():
+        line = " ".join(line.split())
+        if line:
+            kept.append(line)
+            blank = False
+        elif kept and not blank:
+            kept.append("")
+            blank = True
+    text = "\n".join(kept).strip()
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return text[:limit]
+    return text[: limit - 1] + "…"
+
+
 def _short_targets(raw, budget):
     """Render path arguments compactly — basenames when the full path is long."""
     targets = [t for t in raw.split() if not t.startswith("-")]
@@ -1594,11 +1622,11 @@ PLAN_AUTO = "Yes, and use auto mode"
 PLAN_ACCEPT_EDITS = "Yes, auto-accept edits"
 PLAN_MANUAL = "Yes, manually approve edits"
 PLAN_KEEP = "No, keep planning"
+# The phone's words, on a card shown before 1.1.53 and still waiting when
+# the helper updated.
+PLAN_AUTO_PHONE = "Approve & auto mode"
 PLAN_MODES = {PLAN_AUTO: "auto", PLAN_ACCEPT_EDITS: "acceptEdits",
-              PLAN_MANUAL: "default",
-              # The phone's words, on a card shown before 1.1.53 and still
-              # waiting when the helper updated.
-              "Approve & auto mode": "auto"}
+              PLAN_MANUAL: "default", PLAN_AUTO_PHONE: "auto"}
 PLAN_EDITS = "Suggest edits:"     # the wire prefix for dictated edits; every
                                   # watch sold sends it, so it never changes
 
@@ -1637,13 +1665,23 @@ AGENT_ANSWERS = {
 # Anything this cannot validate or word gives no row: the watch then keeps
 # its old "Always allow for this session", which writes nothing.
 DONT_ASK_DESTINATIONS = frozenset(("localSettings", "session"))
-FILE_TOOLS = frozenset(("Write", "Edit", "MultiEdit", "NotebookEdit"))
 ACCEPT_EDITS_WORDS = ("accept edits (auto-approve file edits and common "
                       "file commands)")
 DONT_ASK_MAX_ITEMS = 8           # the terminal drops a row naming more
 DONT_ASK_MAX_CHARS = 160         # … or one whose words run longer (Bash)
-# Two copies travel (plain and marked), inside the relay's 64 KB body.
-PLAN_CHARS = 6000
+# Two copies travel (plain and marked), inside the relay's 64 KB body:
+# 8000 is what still fits at three bytes a letter
+# (test_the_biggest_card_still_fits_the_relays_body). Raised from 6000 on
+# 2026-10-16 (owner: no plan is cut that could be carried).
+PLAN_CHARS = 8000
+# A wrist answer's words: up to four whole option labels, one per line,
+# or a plan's dictated edits. 600 cut the fourth of four long labels, and
+# a cut label is no longer one of the options (2026-10-16). The relay
+# keeps the same (watch_relay.ANSWER_CHARS).
+ANSWER_CHARS = 2000
+# What a plan cut at PLAN_CHARS says at its end, instead of a bare " …"
+# that read as the plan's own last step.
+PLAN_CONTINUES = "The rest of the plan is on your computer."
 # The modes Claude Code's validator accepts for setMode (2.1.280).
 PERMISSION_MODES = frozenset(
     "acceptEdits auto bypassPermissions default dontAsk plan".split())
@@ -1796,18 +1834,22 @@ def _read_plan_file(path, inside=None):
         return ""
 
 
-def _transcript_plan_path(transcript_path):
-    """The newest plan file the session's transcript names. Claude Code
-    records it as ``attachment.planFilePath`` while plan mode is on."""
+def _transcript_tail(transcript_path):
+    """The last TRANSCRIPT_TAIL bytes of a transcript, as text, or "" when
+    it cannot be read."""
     try:
         with open(transcript_path, "rb") as handle:
             handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - TRANSCRIPT_TAIL))
-            tail = handle.read().decode("utf-8", "replace")
+            handle.seek(max(0, handle.tell() - TRANSCRIPT_TAIL))
+            return handle.read().decode("utf-8", "replace")
     except (OSError, TypeError, ValueError):
         return ""
-    for line in reversed(tail.splitlines()):
+
+
+def _transcript_plan_path(transcript_path):
+    """The newest plan file the session's transcript names. Claude Code
+    records it as ``attachment.planFilePath`` while plan mode is on."""
+    for line in reversed(_transcript_tail(transcript_path).splitlines()):
         if '"planFilePath"' not in line:
             continue
         try:
@@ -1871,14 +1913,7 @@ def auto_mode_seen(event):
     transcript = (event or {}).get("transcript_path")
     if not transcript:
         return False
-    try:
-        with open(transcript, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            handle.seek(max(0, handle.tell() - TRANSCRIPT_TAIL))
-            tail = handle.read().decode("utf-8", "replace")
-    except (OSError, TypeError, ValueError):
-        return False
-    for line in tail.splitlines():
+    for line in _transcript_tail(transcript).splitlines():
         if '"permissionMode"' not in line:
             continue
         try:
@@ -1949,14 +1984,26 @@ def _plan_fit(text, limit=PLAN_CHARS, marks=False):
         for mark in ("**", "~~", "`"):
             while cut.count(mark) % 2:
                 cut = cut[:cut.rfind(mark)].rstrip()
-    return cut + " …"
+    return cut + "\n\n" + PLAN_CONTINUES
 
 
-def plan_decision(chosen):
+def plan_decision(chosen, options=None):
     """What a wrist answer to a plan card means for the hook:
-    (behavior, message, mode)."""
+    (behavior, message, mode).
+
+    With ``options`` (the card's own rows), a Yes the card did not offer
+    is no answer at all — behavior None, and the terminal asks: a card
+    that offered "auto-accept edits" must not be answered into auto mode
+    (2026-10-16 review, S13). The phone's old "Approve & auto mode" counts
+    as the auto row it was."""
     said = " ".join(str(chosen or "").split())
     if said in PLAN_MODES:
+        if options is not None:
+            offered = {" ".join(str(o).split()) for o in options}
+            if PLAN_AUTO in offered:
+                offered.add(PLAN_AUTO_PHONE)
+            if said not in offered:
+                return None, "", None
         return "allow", "", PLAN_MODES[said]
     edits = said[len(PLAN_EDITS):].strip() if said.startswith(PLAN_EDITS) else said
     return ("deny", "The user asks for changes to the plan, from their "
@@ -2027,6 +2074,24 @@ def _questions(tool_input):
     return found or [("", [], False)]
 
 
+def _question_parts(tool_input):
+    """Each question's heading and its options' explanations, in step with
+    _questions (same questions, same options, same order). Both were
+    dropped until 2026-10-16, so the wrist offered bare names where the
+    terminal says what each one means."""
+    questions = (tool_input or {}).get("questions") if isinstance(tool_input, dict) else None
+    found = []
+    for entry in (questions if isinstance(questions, list) else [])[:4]:
+        if not isinstance(entry, dict):
+            continue
+        found.append((str(entry.get("header") or ""), [
+            str(o.get("description") or "")
+            for o in (entry.get("options") or [])
+            if isinstance(o, dict) and o.get("label")
+        ][:4]))
+    return found
+
+
 def questions_need_typing(tool_input):
     """Whether an AskUserQuestion call holds a question the wrist cannot
     answer: one without options to choose from. Claude Code 2.1.300's
@@ -2050,20 +2115,27 @@ def question_cards(card, tool_input, headline_chars=HEADLINE_CHARS,
     a watch older than that field taps one, which is still an answer.
     """
     found = _questions(tool_input)
+    parts = _question_parts(tool_input)
     cards = []
     for index, (question, options, multi) in enumerate(found):
-        question = " ".join(question.split()) or "Claude has a question"
+        question = _fit_lines(question, TEXT_CHARS) or "Claude has a question"
         if len(found) > 1:
             question = "%d of %d · %s" % (index + 1, len(found), question)
         one = dict(card, kind="question",
-                   headline=_fit(question, TEXT_CHARS),
+                   headline=_fit_lines(question, TEXT_CHARS),
                    detail=_fit(" · ".join(options), detail_chars))
-        one.pop("options", None)
-        one.pop("multi_select", None)
+        for key in ("options", "multi_select", "question_header", "option_details"):
+            one.pop(key, None)
+        header, details = parts[index] if index < len(parts) else ("", [])
+        if _fit(header, TEXT_CHARS):
+            one["question_header"] = _fit(header, TEXT_CHARS)
         if options:
             one["options"] = options
             if multi:
                 one["multi_select"] = True
+            details = [_fit_lines(d, TEXT_CHARS) for d in details]
+            if any(details) and len(details) == len(options):
+                one["option_details"] = details
         cards.append(one)
     return cards
 
@@ -2093,7 +2165,7 @@ def wrist_card(tool, tool_input, risk,
         described = " ".join(str(tool_input.get("description") or "").split())
         headline = (_fit(described, TEXT_CHARS) if described
                     else _bash_headline(command, headline_chars))
-        detail = _fit(command, detail_chars)
+        detail = _fit_lines(command, detail_chars)
     elif tool == "apply_patch":
         # Codex's file edit: the same card a Write or Edit gets.
         files = patch_files(tool_input.get("command", ""))
@@ -2165,6 +2237,8 @@ def load_policy(env=None):
         policy["relay"] = env["CLAUDE_RISK_RELAY"]
     if env.get("CLAUDE_RISK_AUTO_ALLOW"):
         policy["auto_allow_at_or_below"] = env["CLAUDE_RISK_AUTO_ALLOW"]
+    if env.get("CLAUDE_RISK_AUTH_FILE"):
+        policy["auth_file"] = env["CLAUDE_RISK_AUTH_FILE"]
     if env.get("CLAUDE_RISK_RELAY_WAIT"):
         try:
             policy["relay_wait"] = float(env["CLAUDE_RISK_RELAY_WAIT"])
@@ -2330,16 +2404,6 @@ def repository_name(cwd):
     return (os.path.basename(root) if root else None) or folder
 
 
-def _project_name(cwd):
-    """The repository the session works in, by name (repository_name).
-
-    Deliberately a name, not the full path: enough to break a report down
-    per project, without writing directory structure into a log that gets
-    read aloud.
-    """
-    return repository_name(cwd)
-
-
 def _card_fingerprint(tool, tool_input):
     """Stable identity of the actual request, never of its display text.
 
@@ -2440,7 +2504,10 @@ def build_response(event, policy, agent=None):
     audit = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "session_id": (event or {}).get("session_id"),
-        "project": _project_name((event or {}).get("cwd")),
+        # A name, not the full path: enough to break a report down per
+        # project, without writing directory structure into a log that
+        # gets read aloud.
+        "project": repository_name((event or {}).get("cwd")),
         "tool_use_id": (event or {}).get("tool_use_id"),
         "tool": result["tool"],
         "tier": risk.name,
@@ -2457,26 +2524,69 @@ def build_response(event, policy, agent=None):
     return response, audit, card
 
 
+def _relay_wait(policy):
+    """The policy's relay_wait in seconds, 6.0 when unset or unreadable."""
+    try:
+        return float(policy.get("relay_wait", 6.0))
+    except (TypeError, ValueError):
+        return 6.0
+
+
+def _relay_key(policy):
+    """The bootstrap out of the relay's key file, or "" when there is none
+    to read: no key, no card (the relay refuses an unsigned one)."""
+    path = os.path.expanduser(str(policy.get("auth_file") or AUTH_FILE))
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return str(json.load(handle).get("bootstrap") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+# The relay's own signing (watch_relay.sign_request, v2, and relay_proof2),
+# written once more here: importing the relay costs the hook 0.4-1.5 s on
+# every prompt. TestTheHookSignsAsTheRelayChecks holds the two equal.
+def _relay_signature(key, method, path, stamp, nonce, body, query=""):
+    import hmac
+    message = "\n".join([method.upper(), path, query, str(stamp), nonce,
+                         hashlib.sha256(body or b"").hexdigest()])
+    return hmac.new(key.encode("utf-8"), message.encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _relay_proof2(key, nonce, status, body):
+    import hmac
+    message = "tapproval-proof2\n%s\n%d\n%s" % (
+        nonce, int(status), hashlib.sha256(body or b"").hexdigest())
+    return hmac.new(key.encode("utf-8"), message.encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
 def ask_watch(card, policy, project=None):
     """Offer an escalated card to the watch relay. Returns the verdict.
 
     "allow" and "deny" are a human's answer arriving from the watch — this
     is not auto-allowing, so it applies to any tier, CRITICAL included.
     Everything else — relay down, timeout, malformed reply, unexpected
-    decision string — collapses to "none" and the normal prompt appears.
-    Never raises.
+    decision string, no key file, an answer without the relay's proof —
+    collapses to "none" and the normal prompt appears. Never raises.
     """
+    import hmac
+    import time
     import urllib.error
+    import urllib.parse
     import urllib.request
+    import uuid
 
     relay = str(policy.get("relay") or "").strip().rstrip("/")
     if not relay.startswith(("http://", "https://")):
         return "none", None
-    try:
-        wait = float(policy.get("relay_wait", 6.0))
-    except (TypeError, ValueError):
-        wait = 6.0
-    wait = max(0.0, min(wait, float(RELAY_WAIT_SECONDS)))
+    key = _relay_key(policy)
+    if not key:
+        print("ClaudeRiskClassifier: no relay key file, so no card",
+              file=sys.stderr)
+        return "none", None
+    wait = max(0.0, min(_relay_wait(policy), float(RELAY_WAIT_SECONDS)))
 
     payload = dict(card)
     if project:
@@ -2485,21 +2595,34 @@ def ask_watch(card, policy, project=None):
     # cost six bytes a letter against the relay's 64 KB body.
     body = json.dumps({"card": payload, "wait": wait},
                       ensure_ascii=False).encode("utf-8")
+    url = relay + "/card"
+    stamp, nonce = int(time.time()), uuid.uuid4().hex
+    mac = _relay_signature(key, "POST", urllib.parse.unquote(
+        urllib.parse.urlsplit(url).path), stamp, nonce, body)
     request = urllib.request.Request(
-        relay + "/card", data=body,
-        headers={"Content-Type": "application/json"})
+        url, data=body,
+        headers={"Content-Type": "application/json",
+                 "X-Tapproval-Signature": "v2 %d %s %s" % (stamp, nonce, mac)})
     try:
         with urllib.request.urlopen(request, timeout=wait + 3.0) as reply:
-            answer = json.loads(reply.read().decode("utf-8"))
+            raw = reply.read()
+            status = reply.status
+            proof = reply.headers.get("X-Tapproval-Proof2") or ""
+        answer = json.loads(raw.decode("utf-8"))
     except Exception as error:
         print("ClaudeRiskClassifier: watch relay unavailable (%s)" % error,
               file=sys.stderr)
+        return "none", None
+    if not hmac.compare_digest(proof, _relay_proof2(key, nonce, status, raw)):
+        # Something answered on the relay's port without the relay's key.
+        print("ClaudeRiskClassifier: the answer did not prove the relay's "
+              "key, so the terminal asks", file=sys.stderr)
         return "none", None
     if not isinstance(answer, dict):
         return "none", None
     decision = answer.get("decision")
     if decision == "answer" and answer.get("answer"):
-        return "answer", str(answer["answer"])[:600]
+        return "answer", str(answer["answer"])[:ANSWER_CHARS]
     if decision == "allow" and answer.get("dont_ask") is True:
         # The terminal's "don't ask again", tapped on a watch that showed
         # its words (card["always_label"]).
@@ -2524,10 +2647,7 @@ def ask_questions(card, tool_input, policy, project=None, ask=None):
     if questions_need_typing(tool_input):
         return "none", None
     ask = ask or ask_watch
-    try:
-        wait = float(policy.get("relay_wait", 6.0))
-    except (TypeError, ValueError):
-        wait = 6.0
+    wait = _relay_wait(policy)
     deadline = time.monotonic() + wait
     answers = {}
     questions = _questions(tool_input)
@@ -2639,7 +2759,7 @@ def dont_ask_row(event):
         if len(label) > DONT_ASK_MAX_CHARS:
             return None
         return label, kept
-    if tool in FILE_TOOLS:
+    if tool in WRITE_TOOLS:
         if not all(_valid_update(u) and u["type"] in ("setMode", "addDirectories")
                    and u["destination"] == "session" for u in raw):
             return None
@@ -2821,6 +2941,21 @@ def _shared_settings_env():
     return env
 
 
+def _plan_input(event, card):
+    """The input a plan's allow must carry, or None for any other card.
+
+    ExitPlanMode is a tool the CLI marks as needing the user, and it drops
+    a hook's allow without updatedInput for such a tool, keeping its dialog
+    open (_permission_output). So every yes to a plan carries the call's
+    own input, unchanged — a row (#560), and since #578 the Allow button
+    of a watch that predates the rows and a "don't ask again" that falls
+    back to allowing once, which were yeses nothing answered."""
+    if not card.get("plan_card"):
+        return None
+    tool_input = event.get("tool_input")
+    return tool_input if isinstance(tool_input, dict) else {}
+
+
 def run_hook(stdin=None, stdout=None, agent=None):
     """Hook mode: read the event from stdin, write the decision to stdout.
 
@@ -2885,13 +3020,16 @@ def run_hook(stdin=None, stdout=None, agent=None):
                 # terminal's row names, or keep planning with the user's
                 # words. The approval carries the call's own input, unchanged,
                 # or Claude Code ignores it (_permission_output).
-                behavior, message, mode = plan_decision(chosen)
-                audit["effective"] = behavior
+                behavior, message, mode = plan_decision(chosen, card.get("options") or [])
                 audit["answer"] = chosen
-                tool_input = event.get("tool_input")
-                response["hookSpecificOutput"] = _permission_output(
-                    behavior, message, mode=mode,
-                    updated_input=tool_input if isinstance(tool_input, dict) else {})
+                if behavior is None:
+                    # A row this card never offered: the terminal asks.
+                    audit["watch"] = "unoffered-answer"
+                else:
+                    audit["effective"] = behavior
+                    response["hookSpecificOutput"] = _permission_output(
+                        behavior, message, mode=mode,
+                        updated_input=_plan_input(event, card))
             elif verdict == "answer" and isinstance(chosen, dict) and agent != "codex":
                 # Every question answered on the wrist: the call goes ahead
                 # with the answers filled in, as the terminal's dialog runs
@@ -2915,17 +3053,25 @@ def run_hook(stdin=None, stdout=None, agent=None):
             elif verdict == "dont_ask":
                 # The terminal's row: allow, and apply what it would apply.
                 # Re-derived from this same event, never taken from the
-                # watch; a row that cannot be rebuilt allows this once.
+                # watch; a row that cannot be rebuilt allows this once. So
+                # does one the card never showed, and any CRITICAL card:
+                # a lasting rule is written only where the wrist offered
+                # those very words (2026-10-16 review, S5).
                 row = dont_ask_row(event)
+                if (audit["tier"] == Risk.CRITICAL.name or not row
+                        or row[0] != card.get("always_label")):
+                    row = None
                 audit["effective"] = "allow"
                 if row:
                     audit["updates"] = row[1]
                 response["hookSpecificOutput"] = _permission_output(
-                    "allow", updated_permissions=row[1] if row else None)
+                    "allow", updated_permissions=row[1] if row else None,
+                    updated_input=_plan_input(event, card))
             elif verdict in ("allow", "deny"):
                 audit["effective"] = verdict
                 response["hookSpecificOutput"] = _permission_output(
-                    verdict, "Denied from the watch.")
+                    verdict, "Denied from the watch.",
+                    updated_input=_plan_input(event, card))
         write_audit(audit, policy)
     except Exception as error:  # fail closed to the human, never crash the session
         print("ClaudeRiskClassifier: %s" % error, file=sys.stderr)
@@ -3273,7 +3419,6 @@ def _split_assignments(parts):
 
 def _manifest_hook(wiring):
     """Our PermissionRequest handler in a hooks manifest: (env, timeout)."""
-    import shlex
     for handler in _settings_handlers(wiring):
         try:
             parts = shlex.split(str(handler.get("command", "")),
@@ -3554,7 +3699,6 @@ def _codex_hook_hash(event_label, matcher, handler):
     normalizes to its type, command, timeout (600 when unset), async, and
     statusMessage only when set. Checked against three real hashes from
     Codex 0.162 on 2026-10-14."""
-    import hashlib
     normal = {"type": "command", "command": str(handler.get("command", "")),
               "timeout": max(1, int(handler.get("timeout") or 600)),
               "async": bool(handler.get("async", False))}
@@ -3605,11 +3749,6 @@ def codex_hook_trusted():
     return any(stored.get(section) == current for section, current in ours)
 
 
-def _codex_handlers(data):
-    return [h for entry in ((data.get("hooks") or {}).get("PermissionRequest") or [])
-            for h in entry.get("hooks", []) if _is_our_hook(h)]
-
-
 def install_codex():
     """Wire the hook into Codex's hooks.json, if Codex is used here.
 
@@ -3626,7 +3765,7 @@ def install_codex():
         return None
     entries = data.setdefault("hooks", {}).setdefault("PermissionRequest", [])
     changed = _sync_hook(entries, _codex_command(), "*", os.path.basename(__file__))
-    for handler in _codex_handlers(data):
+    for handler in _settings_handlers(data):
         if handler.get("timeout") != WATCH_HOOK_TIMEOUT:
             handler["timeout"] = WATCH_HOOK_TIMEOUT
             changed = True
@@ -3657,13 +3796,16 @@ def uninstall_codex():
     return True
 
 
-def run_install(then_watch=False):
+def run_install(then_watch=False, bridge=None):
     """Register this script as a PermissionRequest hook. Safe to re-run.
 
     ``then_watch`` is set when --watch is on the same command line: the
     closing paragraph below would otherwise promise "shadow mode, work
     normally for a week" three lines before --watch prints "Wrist
     approvals are ON" — the installer said both, in that order.
+
+    ``bridge`` is --bridge (True), --no-bridge (False) or neither (None,
+    which keeps whatever the user chose before): see `_bridge_step`.
     """
     found = _settings_or_explain()
     if found is None:
@@ -3687,6 +3829,7 @@ def run_install(then_watch=False):
     # before it existed get it the next time anything runs --install.
     agent = bool(relay_command) and install_launch_agent()
     codex = install_codex()
+    closed = _bridge_step(bridge)
 
     if not changed:
         print("Already installed, and the paths are correct.")
@@ -3694,6 +3837,8 @@ def run_install(then_watch=False):
         print("  Command  : %s" % command)
         if agent:
             print("  Reboot   : the relay wakes again at login")
+        if closed:
+            print(closed)
         _say_codex(codex)
         print("  Nothing to do.")
         return 0
@@ -3710,6 +3855,8 @@ def run_install(then_watch=False):
         print("  Reboot   : the relay wakes again at login")
     if backup:
         print("  Backup   : %s" % backup)
+    if closed:
+        print(closed)
     _say_codex(codex)
     if then_watch:
         return 0
@@ -3721,6 +3868,54 @@ def run_install(then_watch=False):
     print("Next: start a new Claude Code session, work normally for a week,")
     print("then run this script again with --report.")
     return 0
+
+
+def _bridge_step(choice=None):
+    """--install's part in the Mac bridge (route B, #378): the line to
+    print, or None when there is nothing to say yet.
+
+    The bridge mirrors each card into the user's own iCloud, which is what
+    makes a closed watch buzz. It is installed on every Mac that can run
+    it, unless the user said --no-bridge; ``choice`` is that flag (False),
+    --bridge (True), or neither (None: keep the earlier choice).
+    """
+    try:
+        import bridge_install
+    except Exception:
+        return None
+    if not bridge_install.mac_supported():
+        return ("  Closed watch : buzzing with Tapproval closed needs a Mac "
+                "(macOS 13 or later). Here, cards reach the watch while "
+                "Tapproval is open on it.")
+    if choice is False:
+        bridge_install.set_off(True)
+        bridge_install.remove()
+        return ("  Closed watch : off (--no-bridge). Cards reach the watch "
+                "while Tapproval is open on it.")
+    if choice is True:
+        bridge_install.set_off(False)
+    pin = bridge_install.read_pin()
+    state = bridge_install.state(pin)
+    if state == "off":
+        return ("  Closed watch : off. --install --bridge turns it on.")
+    if state == "hand-built":
+        return "  Closed watch : a hand-built bridge is here, left as it is"
+    if state == "no-pin":
+        return None
+    if state == "current":
+        return ("  Closed watch : buzzes through your own iCloud (bridge %s)"
+                % pin["version"])
+    try:
+        bridge_install.install(pin)
+    except bridge_install.InstallError as error:
+        return ("  Closed watch : the iCloud bridge could not be installed "
+                "(%s). It tries again when Claude Code next starts." % error)
+    except OSError as error:
+        return ("  Closed watch : the iCloud bridge could not be installed "
+                "(%s). It tries again when Claude Code next starts."
+                % error.strerror)
+    return ("  Closed watch : buzzes through your own iCloud (bridge %s, "
+            "just installed)" % pin["version"])
 
 
 def _say_codex(codex):
@@ -3782,6 +3977,8 @@ def run_uninstall():
             print("Not in settings; the login job was removed.")
         else:
             print("Not installed — nothing to remove.")
+        if _remove_bridge():
+            print("The Mac bridge and its login job were removed.")
         return 0
 
     if not hooks:
@@ -3792,13 +3989,50 @@ def run_uninstall():
     backup = _backup(path)
     _write_settings(path, data)
     remove_launch_agent()
+    bridge_gone = _remove_bridge()
 
     print("Removed. Your other settings were left untouched.")
+    if bridge_gone:
+        print("  Bridge   : the Mac bridge and its login job are gone")
     print("  Settings : %s" % path)
     if backup:
         print("  Backup   : %s" % backup)
     print("  The audit log was left in place; delete it yourself if you want it gone.")
     return 0
+
+
+def _bridge_status_line(health):
+    """--status's word on the Mac bridge, which makes a closed watch buzz."""
+    try:
+        import bridge_install
+    except Exception:
+        return None
+    if not bridge_install.mac_supported():
+        return ("Closed watch  : needs a Mac \u2014 here, cards arrive while "
+                "Tapproval is open")
+    if os.path.exists(bridge_install.off_marker()):
+        return "Closed watch  : off (--no-bridge)"
+    version = bridge_install.installed_version()
+    if version is None:
+        return ("Closed watch  : no Mac bridge yet \u2014 cards arrive while "
+                "Tapproval is open")
+    heard = (health or {}).get("alert_route") == "bridge"
+    return "Closed watch  : bridge %s, %s" % (
+        version, "running" if heard else "not heard from by the relay")
+
+
+def _remove_bridge():
+    """Take the Mac bridge out with the rest: True when there was one."""
+    try:
+        import bridge_install
+    except Exception:
+        return False
+    if not bridge_install.mac_supported():
+        return False
+    if not (os.path.exists(bridge_install.app_path())
+            or os.path.exists(bridge_install.agent_path())):
+        return False
+    return bridge_install.remove()
 
 
 def _human_duration(seconds):
@@ -3952,7 +4186,6 @@ def check_command(command):
     instead, so the failure is silent and the log quietly stops growing.
     Returns a list of human-readable problems; empty means healthy.
     """
-    import shlex
     import shutil
     problems = []
     try:
@@ -4011,13 +4244,7 @@ def status_facts():
 
 def _relay_health():
     """The running relay's /health, or None when nothing answers."""
-    try:
-        import urllib.request
-        with urllib.request.urlopen(RELAY_URL + "/health",
-                                    timeout=1) as reply:
-            return json.loads(reply.read())
-    except Exception:
-        return None
+    return _relay_json("/health")
 
 
 def _relay_json(path, timeout=1):
@@ -4136,7 +4363,7 @@ def run_status():
         print("Relay hook    : starts itself with every Claude Code session")
     else:
         print("Relay hook    : not wired \u2014 re-run --install to add it")
-    codex_wired = bool(os.path.exists(_codex_hooks_path()) and _codex_handlers(
+    codex_wired = bool(os.path.exists(_codex_hooks_path()) and _settings_handlers(
         _read_settings_quietly(_codex_hooks_path())))
     if codex_wired:
         print("Codex         : wired; Codex runs it once approved in codex, /hooks")
@@ -4152,6 +4379,9 @@ def run_status():
         print("Reboot        : no login wake-up \u2014 the relay waits for"
               " the first session; re-run --install to add it")
     health = f["relay_health"]
+    closed = _bridge_status_line(health)
+    if closed:
+        print(closed)
     tunnel = _relay_json("/tunnel") if health is not None else None
     away = _away_answers((tunnel or {}).get("url")) if tunnel else None
     for line in connection_lines(health, tunnel, away):
@@ -4177,6 +4407,12 @@ def run_status():
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    # The hook's own call — no arguments, or Codex's ``--agent codex`` —
+    # skips argparse: it runs once per tool call and would never use it.
+    if not argv or (len(argv) == 2 and argv[0] == "--agent"
+                    and argv[1] in ("claude", "codex")):
+        return _guarded(run_hook, agent=argv[1] if argv else None)
     import argparse
     parser = argparse.ArgumentParser(
         description="Risk triage for Claude Code permission prompts.",
@@ -4205,10 +4441,19 @@ def main(argv=None):
                         help="send risky prompts to the watch, in every session")
     parser.add_argument("--no-watch", action="store_true",
                         help="stop sending prompts to the watch (back to shadow)")
-    args = parser.parse_args(argv)
+    parser.add_argument("--no-bridge", action="store_true",
+                        help="with --install: leave out (or remove) the Mac "
+                             "bridge that lets a closed watch buzz through "
+                             "your iCloud")
+    parser.add_argument("--bridge", action="store_true",
+                        help="with --install: put the Mac bridge back after "
+                             "--no-bridge")
+    return _guarded(_dispatch, parser.parse_args(argv))
 
+
+def _guarded(run, *args, **kwargs):
     try:
-        return _dispatch(args)
+        return run(*args, **kwargs)
     except BrokenPipeError:
         # Someone piped us into `head` or quit `less` early. Not an error.
         try:
@@ -4220,7 +4465,9 @@ def main(argv=None):
 
 def _dispatch(args):
     if args.install:
-        code = run_install(then_watch=args.watch)
+        code = run_install(then_watch=args.watch,
+                           bridge=(False if args.no_bridge
+                                   else True if args.bridge else None))
         if code or not args.watch:
             return code
         print("")

@@ -53,6 +53,13 @@ def deny(message):
     return {"behavior": "deny", "message": message}
 
 
+def allow(crc, tool_input, mode=None):
+    """An allow, built by the classifier's one decision builder
+    (``_permission_output``), as the hook's are."""
+    return crc._permission_output("allow", mode=mode,
+                                  updated_input=tool_input)["decision"]
+
+
 def decide(tool_name, tool_input, crc=None, cwd=None):
     """Ask the wrist about one tool call. Returns the permission decision.
 
@@ -84,7 +91,7 @@ def decide(tool_name, tool_input, crc=None, cwd=None):
         if verdict == "allow" and str(policy.get("mode", "shadow")).lower() != "enforce":
             verdict = "escalate"
         if verdict == "allow":
-            return {"behavior": "allow", "updatedInput": tool_input}
+            return allow(crc, tool_input)
         if verdict == "deny":
             return deny(reason or "Blocked by your Tapproval policy.")
         if tool_name == "AskUserQuestion" and crc.questions_need_typing(tool_input):
@@ -93,7 +100,19 @@ def decide(tool_name, tool_input, crc=None, cwd=None):
             return deny("This question wants a typed answer, and the watch "
                         "can only choose among options. Ask it again with "
                         "options to choose from.")
-        card = crc.wrist_card(tool_name, tool_input, result["risk"],
+        shown = tool_input
+        if tool_name == "ExitPlanMode" and not tool_input.get("plan"):
+            # As the hook does (build_response): the plan sits in a file,
+            # and a card without it read "Claude has a plan" with nothing
+            # to read (#578, 2026-10-16). Claude Code hands this tool only
+            # tool_name, input and tool_use_id — no transcript path
+            # (2.1.301, read 2026-10-16) — so the plan is found from the
+            # input alone: the `plan` 2.1.295+ injects from disk, else the
+            # `planFilePath` it names, read inside the plans folder. A
+            # plan neither leads to stays unread, and the wrist still
+            # decides. The call itself goes ahead unchanged.
+            shown = dict(tool_input, plan=crc.plan_text(tool_input))
+        card = crc.wrist_card(tool_name, shown, result["risk"],
                               auto_mode=(tool_name == "ExitPlanMode"
                                          and crc.auto_mode_seen({})))
         if tool_name == "AskUserQuestion":
@@ -108,29 +127,29 @@ def decide(tool_name, tool_input, crc=None, cwd=None):
         # The wrist answered a question or a plan. This was thrown away and
         # the run told the watch had not answered (2026-09-30 review).
         if card.get("plan_card"):
-            behavior, message, mode = crc.plan_decision(answer)
+            behavior, message, mode = crc.plan_decision(answer, card.get("options") or [])
+            if behavior is None:
+                # A row the card never offered: nothing is guessed, and
+                # there is no terminal to leave it to.
+                return deny("Your watch answered with a choice this plan did "
+                            "not offer. Nothing was run.")
             if behavior == "allow":
                 # The row's mode, as the terminal's would set it; a
                 # permission-prompt tool's allow takes updatedPermissions
                 # like a hook's (2.1.300, FMe).
-                allowed = {"behavior": "allow", "updatedInput": tool_input}
-                if mode in crc.PERMISSION_MODES:
-                    allowed["updatedPermissions"] = [
-                        {"type": "setMode", "mode": mode, "destination": "session"}]
-                return allowed
+                return allow(crc, tool_input, mode)
             return deny(message)
         # Every question answered: the call goes ahead with its answers,
         # as the hook's does. 2.1.300's admitter for a permission-prompt
         # tool takes exactly this — the shown input plus "answers".
         if isinstance(answer, dict):
-            return {"behavior": "allow",
-                    "updatedInput": dict(tool_input, answers=answer)}
+            return allow(crc, dict(tool_input, answers=answer))
         return deny("The user answered from their watch: %s" % answer)
     # A permission-prompt tool is not sent Claude Code's suggestions, so its
     # cards carry no "don't ask again" row; a "dont_ask" that arrives anyway
     # allows this once.
     if verdict in ("allow", "dont_ask"):
-        return {"behavior": "allow", "updatedInput": tool_input}
+        return allow(crc, tool_input)
     if verdict == "deny":
         return deny("You denied this on your watch.")
     return deny("Your watch did not answer in time, and a message sent from "

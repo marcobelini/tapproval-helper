@@ -12,6 +12,8 @@ echo "  2. Stop the local relay"
 echo "  3. Delete ~/.tapproval, the relay's log and its update stamp"
 echo "  4. Forget the paired watch (~/.tapproval-token, ~/.tapproval-auth.json)"
 echo "     — after a reinstall, pair it again from Settings"
+echo "  5. On a Mac, stop the iCloud bridge and remove its login job (the"
+echo "     bridge itself lives in ~/.tapproval and goes with it)"
 echo "  Your audit log stays, so your own history remains yours."
 echo ""
 
@@ -27,6 +29,16 @@ pkill -f "watch_relay.py" 2>/dev/null || true
 # The travel tunnel outlives a relay on purpose, so a restart keeps its
 # address; an uninstall must stop it, or a public URL would outlive Tapproval.
 pkill -f "cloudflared tunnel.*127.0.0.1:8978" 2>/dev/null || true
+# The Mac bridge (route B, #378), here as well as in --uninstall: a plugin
+# install answers --uninstall with "use /plugin uninstall" and removes
+# nothing, and the bridge must not outlive the helper that installed it.
+# Its job is stopped first: the app itself lives in ~/.tapproval/bridge-app,
+# removed just below, and ~/.tapproval-bridge is where it lived before.
+if [ "$(uname -s)" = "Darwin" ]; then
+  launchctl bootout "gui/$(id -u)/com.tapproval.bridge" 2>/dev/null || true
+  rm -f "$HOME/Library/LaunchAgents/com.tapproval.bridge.plist"
+fi
+rm -rf "$HOME/.tapproval-bridge"
 rm -rf "$HOME/.tapproval"
 # Everything else the relay writes beside its directory. Left behind, the
 # pairing outlived the install it belonged to — a "clean exit" that kept

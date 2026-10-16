@@ -177,7 +177,11 @@ def _json_object(line):
 
 
 def _message_of(entry):
-    """An entry's message, as a dict whatever the line held."""
+    """An entry's message, as a dict whatever the line held — and none at
+    all for a copy of a request, whose `message` repeats a turn the
+    transcript already holds (record.request_copy)."""
+    if entry.get("type") == shape("record.request_copy"):
+        return {}
     message = entry.get("message")
     return message if isinstance(message, dict) else {}
 
@@ -230,23 +234,8 @@ def usage_summary(projects_dir=None, now=None):
         "models": {},
         "measured": True,
     }
-    paths = []
-    try:
-        for project in os.listdir(root):
-            pdir = os.path.join(root, project)
-            if not os.path.isdir(pdir):
-                continue
-            for entry in os.listdir(pdir):
-                if not entry.endswith(".jsonl"):
-                    continue
-                path = os.path.join(pdir, entry)
-                try:
-                    if os.path.getmtime(path) >= day_start:
-                        paths.append(path)
-                except OSError:
-                    continue
-    except OSError:
-        return totals
+    paths = [path for mtime, path, _, _ in transcripts_newest_first(root)
+             if mtime >= day_start]
 
     with _USAGE_LOCK:
         for stale in set(_USAGE_FILES) - set(paths):
@@ -508,6 +497,21 @@ def transcripts_newest_first(projects_dir=None):
 # Seen means seen: each date is a transcript on this machine that contained
 # it, not a date from documentation.
 UPSTREAM_SHAPES = {
+    "record.request_copy":
+        ("api-request-blob", "A copy of what was sent to the model, from "
+         "Claude Code 2.1.301: its message repeats a turn already in the "
+         "transcript, and read as one it doubled every thread.", "2026-10-16"),
+    "review.summary":
+        ("summary", "Each finding /code-review prints, from Claude Code "
+         "2.1.301, as a JSON list in its output: summary, with file and "
+         "line beside it.", "2026-10-16"),
+    "tag.local_command_stderr":
+        ("<local-command-stderr>", "A slash command that failed inside the "
+         "CLI, written as a user line, not a system one: /security-review "
+         "without an origin to compare against.", "2026-10-16"),
+    "key.is_meta":
+        ("isMeta", "Marks a user line the CLI wrote, not the person: a "
+         "skill's whole SKILL.md after its slash command.", "2026-10-16"),
     "system.subtype.local_command":
         ("local_command", "A slash command the CLI answered itself; its "
          "output is a system line, not an assistant turn.", "2026-10-11"),
@@ -681,11 +685,37 @@ def _system_text(entry):
             value = value.get("content")
         if isinstance(value, str) and value.strip():
             inner = "\n".join(m.group(1) for m in _TAGGED_OUT.finditer(value))
-            text = plain_text((inner or value)[:32768])
-            if len(text) > 12000:
-                text = text[:12000].rsplit(" ", 1)[0] + " …"
+            text = plain_text(_findings_as_lines((inner or value)[:32768]))
+            if len(text) > TURN_CHARS:
+                text = text[:TURN_CHARS].rsplit(" ", 1)[0] + " …"
             return text
     return ""
+
+
+_JSON_FENCE = re.compile(r"```json[ \t]*\n(.*?)\n```", re.S)
+
+
+def _findings_as_lines(text):
+    """A review's JSON findings as one line each — "calc.py:2 — what is
+    wrong" — in place of the block. Any other code is left for
+    plain_text to box: only a list whose every item carries a summary
+    is a review's findings."""
+    def lines(match):
+        try:
+            found = json.loads(match.group(1))
+        except ValueError:
+            return match.group(0)
+        key = shape("review.summary")
+        if not (isinstance(found, list) and found
+                and all(isinstance(f, dict) and f.get(key) for f in found)):
+            return match.group(0)
+        out = []
+        for f in found:
+            where = ":".join(str(p) for p in (f.get("file"), f.get("line")) if p not in (None, ""))
+            summary = " ".join(str(f[key]).split())
+            out.append("- %s — %s" % (where, summary) if where else "- " + summary)
+        return "\n".join(out)
+    return _JSON_FENCE.sub(lines, text)
 
 
 # What a thread notice can be, so the watch can draw each as what it is:
@@ -721,6 +751,10 @@ _IMAGES = OrderedDict()      # ref -> (media_type, base64 str)
 IMAGE_CACHE_MAX = 24
 IMAGE_CACHE_BYTES = 24 * 1024 * 1024
 IMAGE_MAX_BYTES = 6 * 1024 * 1024        # one picture; a watch shows less
+# The most of one turn the thread view carries, cut at a word and marked.
+# A wrist-sent message (watch_relay.SEND_CHARS) must fit in it whole, or
+# the watch's echo of a long message would never find its own turn.
+TURN_CHARS = 32000
 
 
 def remember_image(part):
@@ -861,7 +895,7 @@ def _session_meta(path, scan_lines=600):
                 if cwd is None and entry.get("cwd"):
                     cwd = entry["cwd"]
                 message = _message_of(entry)
-                if message.get("role") != "user":
+                if message.get("role") != "user" or entry.get(shape("key.is_meta")):
                     continue
                 turns += 1
                 if opening is not None:
@@ -876,6 +910,9 @@ def _session_meta(path, scan_lines=600):
     return cwd, opening, turns
 
 
+_AUDIT_PATH_MEMO = (None, None)   # (what it was read from, the path)
+
+
 def _audit_log_path():
     """Where the audit log lives — the hook's answer, not a second one.
 
@@ -883,15 +920,30 @@ def _audit_log_path():
     was not, so a user who moved their log saw a permanently empty Today
     screen with nothing to explain it. Ask the classifier when it is
     importable (the normal deployment) and fall back to the same default.
+
+    Polled every few seconds, so the answer is kept until what it was read
+    from changes — the config file named, that file's age, and the home
+    folder — rather than reloading the whole policy on every poll.
     """
+    global _AUDIT_PATH_MEMO
     explicit = os.environ.get("CLAUDE_RISK_AUDIT_LOG")
     if explicit:
         return os.path.expanduser(explicit)
+    config = os.environ.get("CLAUDE_RISK_CONFIG")
+    try:
+        age = os.stat(os.path.expanduser(config)).st_mtime_ns if config else None
+    except OSError:
+        age = None
+    key = (config, age, os.path.expanduser("~"))
+    if _AUDIT_PATH_MEMO[0] == key:
+        return _AUDIT_PATH_MEMO[1]
     try:
         from ClaudeRiskClassifier import _audit_path, load_policy
-        return _audit_path(load_policy())
+        path = _audit_path(load_policy())
     except Exception:
         return os.path.expanduser("~/.claude/risk-audit.jsonl")
+    _AUDIT_PATH_MEMO = (key, path)
+    return path
 
 
 # What one silenced prompt is worth in seconds of somebody's attention.
@@ -1109,6 +1161,14 @@ _TRANSCRIPT_PATHS = {}   # prefix -> path, validated with exists()
 _TRANSCRIPT_PATHS_MAX = 4096
 
 
+def _remember_transcript(prefix, path):
+    """Memoise where a session's transcript is, for _find_transcript."""
+    with _CACHE_LOCK:
+        _TRANSCRIPT_PATHS[prefix] = path
+        while len(_TRANSCRIPT_PATHS) > _TRANSCRIPT_PATHS_MAX:
+            _TRANSCRIPT_PATHS.pop(next(iter(_TRANSCRIPT_PATHS)), None)
+
+
 def _find_transcript(prefix, projects_dir=None):
     """Path of the transcript whose session id starts with ``prefix``.
     None when there is no match. Memoised — the watch resolves the same
@@ -1128,10 +1188,7 @@ def _find_transcript(prefix, projects_dir=None):
                 if entry.endswith(".jsonl") and entry.startswith(prefix):
                     path = os.path.join(pdir, entry)
                     if projects_dir is None:
-                        with _CACHE_LOCK:
-                            _TRANSCRIPT_PATHS[prefix] = path
-                            while len(_TRANSCRIPT_PATHS) > _TRANSCRIPT_PATHS_MAX:
-                                _TRANSCRIPT_PATHS.pop(next(iter(_TRANSCRIPT_PATHS)), None)
+                        _remember_transcript(prefix, path)
                     return path
     except OSError:
         pass
@@ -1228,7 +1285,7 @@ def blocks(markdown, always=False):
 
 def _flatten_line(line, keep_inline=False):
     """One Markdown line reduced to what it says: the one list of rules
-    plain_text and _flatten_lines both apply. They were two copies of the
+    plain_text and _marked_lines both apply. They were two copies of the
     same thirteen substitutions, and a rule added to one would have made
     the wrist show the same reply two ways. ``keep_inline`` leaves code,
     emphasis and strike marks for a caller that styles them itself."""
@@ -1308,20 +1365,6 @@ def _marked_lines(lines):
     return "\n".join(out)
 
 
-def _flatten_lines(lines, keep_inline=False):
-    """``plain_text``'s line pass over lines already stripped of fences."""
-    out = []
-    for line in lines:
-        if not line.strip() or _MD_HR.match(line) or _MD_TABLE_SEP.match(line):
-            if not line.strip() and out and out[-1]:
-                out.append("")
-            continue
-        out.append(_flatten_line(line, keep_inline).strip())
-    while out and not out[-1]:
-        out.pop()
-    return "\n".join(out)
-
-
 def plain_text(markdown):
     """Flatten Markdown to the plain, line-structured text a watch can show.
 
@@ -1371,8 +1414,9 @@ def plain_text(markdown):
 
 
 # How many turns the watch's thread view shows — the ONE number the
-# /thread handler, session_thread and the prewarmer all share, so a
-# pre-warmed state can never hold a different depth than what is served.
+# /thread handler, session_thread and the session list all share, so a
+# state warmed by the list can never hold a different depth than what is
+# served.
 THREAD_TURN_LIMIT = 14
 
 
@@ -1539,46 +1583,6 @@ def _thread_lock(path):
         return _THREAD_LOCKS.setdefault(path, threading.Lock())
 
 
-_last_prewarm = 0.0
-
-# Warm the first screen's worth — the sessions a wrist can actually tap
-# without scrolling far.
-PREWARM_SESSIONS = 6
-
-
-def prewarm_threads(session_ids):
-    """Parse the visible sessions' transcripts BEFORE anyone opens them.
-
-    The seconds of "Loading…" on first open are the cold full-file parse.
-    The user's watch just fetched the session LIST — the sessions they
-    can tap are known, so warm those states now, in the background, at
-    most once per half minute. Smart, not chatty: an all-warm list costs
-    a few dict lookups and no thread, and the warm state then serves
-    every later poll incrementally.
-    """
-    global _last_prewarm
-    now = time.monotonic()
-    if now - _last_prewarm < 30.0:
-        return
-    _last_prewarm = now
-
-    cold = [sid for sid in session_ids[:PREWARM_SESSIONS]
-            if _TRANSCRIPT_PATHS.get(sid) not in _THREAD_STATE]
-    if not cold:
-        return
-
-    def warm():
-        for session_id in cold:
-            try:
-                path = _find_transcript(session_id)
-                if path and path not in _THREAD_STATE:
-                    _parse_thread(path, THREAD_TURN_LIMIT)
-            except Exception:
-                continue
-
-    threading.Thread(target=warm, daemon=True).start()
-
-
 def _fresh_thread_state():
     return {"offset": 0, "turns": [], "launched": set(),
             "finished": set(), "running_tool": None, "running_tool_id": None,
@@ -1604,8 +1608,8 @@ def _thread_state_for(path):
     Evicting under the map guard, and dropping each transcript's lock
     with its state. A thread mid-parse holds its OWN path lock, not this
     one, so evicting its dict left it accumulating into an orphan — and
-    the next poll cold-parsed from byte zero, which is the "Loading…" the
-    prewarmer exists to prevent. The lock map also grew one entry per
+    the next poll cold-parsed from byte zero, which is the "Loading…" a
+    warm state exists to prevent. The lock map also grew one entry per
     transcript, forever, in a process that runs for weeks.
     """
     state = _THREAD_STATE.get(path)
@@ -1829,6 +1833,8 @@ def _thread_line(state, line, limit):
         return
     if role not in ("user", "assistant"):
         return
+    if role == "user" and entry.get(shape("key.is_meta")):
+        return
     text, part, pictures = _message_parts(message.get("content"))
     tool, tool_description = "", ""
     if part is not None:
@@ -1861,6 +1867,14 @@ def _thread_line(state, line, limit):
         state["turns"].append({"role": "user", "kind": "text", "text": command,
                                "desc": "", "at": entry.get("timestamp", "")})
         return
+    # A command that failed inside the CLI says so as a user line in a
+    # tag, which the "<" rule below would drop: the wrist then showed the
+    # command and nothing after it. It is the CLI's fault line — a notice.
+    if role == "user" and lead.startswith(shape("tag.local_command_stderr")):
+        said = _system_text({"content": lead})
+        if said:
+            state["turns"].append(_notice(said, "error", entry))
+        return
     if not lead and pictures:
         # A turn that is only a picture: give it words, so a watch that
         # cannot show the picture still says one arrived.
@@ -1886,12 +1900,13 @@ def _thread_line(state, line, limit):
     # The watch shows the FULL text of a message, like the phone — a 2KB
     # cap here once cut a real reply mid-sentence on the wrist. Bound the
     # WORK, not the sentence: flatten up to 32KB of raw input and keep up
-    # to 12KB flattened (far beyond any real reply); if something truly
+    # to TURN_CHARS flattened (far beyond any real reply, and the whole of
+    # the longest message the wrist may send); if something truly
     # enormous is ever cut, cut at a word and say so.
     raw_text = text
     text = (plain_text(str(text)[:32768]) if kind == "text" else lead)
-    if len(text) > 12000:
-        text = text[:12000].rsplit(" ", 1)[0] + " …"
+    if len(text) > TURN_CHARS:
+        text = text[:TURN_CHARS].rsplit(" ", 1)[0] + " …"
     if role == "assistant" and kind == "text":
         fact = _last_github_fact(text)
         if fact:
@@ -2108,7 +2123,10 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
     live = live_sessions()
     registry = session_registry()
     if not include_idle:
-        found = [f for f in found if f[3] in live]
+        # A card waiting on the wrist keeps its session listed even when
+        # the liveness check missed its process: cards live only inside
+        # sessions on the watch, so a card with no row has nowhere to be.
+        found = [f for f in found if f[3] in live or f[3] in waiting]
         # Mirror the phone: when Remote Control has any session, the phone
         # lists exactly those, so the wrist does too. A watch whose owner
         # never turned Remote Control on still sees every live session.
@@ -2120,7 +2138,8 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
             found = [f for f in found
                      if f[3] not in registry or registry[f[3]]["bridged"]
                      or f[3] in waiting]
-    found = found[:limit]
+    # The cap keeps the list short, never a card's session out of it.
+    found = found[:limit] + [f for f in found[limit:] if f[3] in waiting]
     at_mac = prompts_at_the_mac()
     sessions = []
     for mtime, path, project, session_id in found:
@@ -2134,6 +2153,12 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
         if not name:
             name = project.rstrip("-").rsplit("-", 1)[-1] or project
         running_tasks, running_tool, github = _thread_activity(path)
+        if projects_dir is None:
+            # The row's short id is what the watch opens the thread by, so
+            # that first open finds the transcript without walking every
+            # project folder — and the thread state is already warm, parsed
+            # just now for this row.
+            _remember_transcript(session_id[:12], path)
         wake_at = (_THREAD_STATE.get(path) or {}).get("wake_at")
         state, reason = session_state(
             max(0, int(time.time() - mtime)), running_tool, running_tasks,

@@ -29,7 +29,7 @@
 <p>A small helper on your computer, Tapproval Base, sees what Claude Code asks permission for: the command, or the file and what would be written to it. For the session list it also reads Claude Code's transcripts on that computer. It sends a short card to your watch and prints your answer back to Claude Code. There is no server of ours, no account and no telemetry. Cards take one of three routes:</p>
 <ul>
 <li><strong>Your own network.</strong> Watch and computer talk directly.</li>
-<li><strong>Your own iCloud, if you install the Mac bridge.</strong> Cards pass through CloudKit's private database, which belongs to your Apple ID. We cannot read it.</li>
+<li><strong>Your own iCloud, on a Mac.</strong> The helper installs a small bridge there, and cards pass through CloudKit's private database, which belongs to your Apple ID. We cannot read it. Installing with <code>--no-bridge</code> leaves it out.</li>
 <li><strong>An encrypted tunnel, if you turn on the travel connection.</strong> Traffic passes through Cloudflare and is not stored there. The address is secret, but it is only an address: every request must still prove a device key.</li>
 </ul>
 <p>The <a href="privacy.html">privacy policy</a> has the same routes, with what each part stores.</p>
@@ -38,10 +38,13 @@
 <ul>
 <li><strong>It approves nothing on its own by default.</strong> Allowing the harmless tiers automatically is something you switch on. A CRITICAL call is never auto-allowed, whatever the setting.</li>
 <li><strong>It fails closed.</strong> Anything it cannot parse, reach or judge ends with the ordinary prompt in your terminal, exactly as if Tapproval were not installed.</li>
-<li><strong>Only a process on your own computer is let in without a key</strong>, and even that process can post a card but never answer one, so a command Claude runs cannot approve its own prompt. Being on the same Wi-Fi counts for nothing: on a café network, that is a room full of strangers.</li>
+<li><strong>Only a process on your own computer is let in without a key</strong>, and even that process can never answer a card, so a command Claude runs cannot approve its own prompt. Posting a card takes the helper's key file, and the hook believes only an answer that proves the same key, so a program that grabs the helper's port while it restarts cannot answer for it. Being on the same Wi-Fi counts for nothing: on a café network, that is a room full of strangers.</li>
 <li><strong>A current watch never sends its key.</strong> Every App Store version from 1.4 signs each request. Each signature can be used once. The helper proves itself in its answer, and the watch keeps an address only from an answer carrying that proof.</li>
 <li><strong>Standard-library Python only.</strong> The helper installs no third-party packages, so there is no dependency tree to trust.</li>
 </ul>
+
+<h2>The Mac bridge</h2>
+<p>On a Mac the helper installs a small app that copies waiting cards into your private iCloud and carries answers back. It ships inside the helper itself, so nothing is downloaded from anywhere else, and it is installed only when three checks agree: the file's SHA-256 matches the one pinned in the helper's own code, the signature is the developer's Developer ID (team K2RX2Y5896, bundle id app.tapproval.bridge), and Apple has notarized it. A copy that fails any check is thrown away. Its source is published in the helper's repository. It is built and signed on the developer's Mac, so it cannot be rebuilt bit for bit from that source: the signature and Apple's notarization are what tie it to the developer.</p>
 
 <h2>What it does not protect against</h2>
 <ul>
@@ -81,6 +84,7 @@
 <p><strong>What was wrong.</strong> Before this, a watch proved itself by sending its key with each request, and it trusted any helper that answered on the right address.</p>
 <p><strong>Who could have used it.</strong> Someone able to read the traffic, or to answer in the helper's place on your network, could have learned the key.</p>
 <p><strong>The fix.</strong> Requests are signed and good once, and the helper proves itself in every answer. A Mac with the iCloud bridge never offers a key on the network. The network pairing door hands out a revocable device key rather than the main one. Watches from before signing (the App Store's 1.3 and earlier) still send the key, so the helper still accepts it from them. Every App Store version since 1.4 (2 October 2026) signs; accepting a sent key ends once watches on 1.3 have had time to update. <a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.21">Release notes</a>.</p>
+<p><strong>Since 16 October 2026.</strong> The iCloud bridge is meant for every Mac, and a Mac's Apple Account need not be the watch's. So a Mac that has never paired opens the network door whether or not it has the bridge. The door still asks at the Mac before any key leaves, and it shuts as soon as a watch shows up, over the network or through iCloud.</p>
 
 <h3>Before the first public release, August–September 2026</h3>
 <ul>

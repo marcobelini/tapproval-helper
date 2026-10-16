@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 import glob
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -39,6 +40,7 @@ import urllib.error
 import uuid
 import urllib.request
 
+import bridge_install
 import crash_report
 import watch_permission_tool as wpt
 import watch_relay
@@ -224,6 +226,31 @@ def relay_call(url, token=None, method="GET", body=None):
 
 
 
+def signed_call(url, key, body=None, method="POST"):
+    """One call signed v2 with ``key``, as the hook signs /card: (status,
+    parsed body, raw body, nonce, the reply's X-Tapproval-Proof2)."""
+    import uuid
+    from urllib.parse import urlsplit
+    data = json.dumps(body or {}).encode()
+    stamp, nonce = int(time.time()), uuid.uuid4().hex
+    split = urlsplit(url)
+    mac = watch_relay.sign_request(key, method, split.path, stamp, nonce, data,
+                                   query=split.query)
+    request = urllib.request.Request(url, data=data, method=method, headers={
+        "Content-Type": "application/json",
+        "X-Tapproval-Signature": "v2 %d %s %s" % (stamp, nonce, mac)})
+    try:
+        with urllib.request.urlopen(request, timeout=5) as reply:
+            raw, status, headers = reply.read(), reply.status, reply.headers
+    except urllib.error.HTTPError as error:
+        raw, status, headers = error.read(), error.code, error.headers
+    try:
+        parsed = _json.loads(raw.decode())
+    except ValueError:
+        parsed = {}
+    return status, parsed, raw, nonce, headers.get("X-Tapproval-Proof2")
+
+
 @pytest.fixture(autouse=True)
 def _no_real_home_files(tmp_path, monkeypatch):
     """No test may read or write the owner's own Tapproval files.
@@ -240,6 +267,10 @@ def _no_real_home_files(tmp_path, monkeypatch):
     monkeypatch.setattr(crash_report, "KEY_FILE", str(home / "no-resend-key"))
     crash_report._reset_for_tests()
     monkeypatch.setattr(watch_relay, "AUTH_FILE", str(home / "auth.json"))
+    # The hook signs each card with that same file's key: the suite's own,
+    # never the owner's (the env var reaches a hook run as a subprocess).
+    monkeypatch.setattr(crc, "AUTH_FILE", str(home / "auth.json"))
+    monkeypatch.setenv("CLAUDE_RISK_AUTH_FILE", str(home / "auth.json"))
     monkeypatch.setattr(watch_relay, "RELAY_LOG", str(home / "relay.log"))
     monkeypatch.setattr(watch_relay, "SAY_LOG", str(home / "say.log"))
     # And no test may read the owner's own Claude Code transcripts. Routes
@@ -270,6 +301,22 @@ def _no_real_bridge(tmp_path, monkeypatch):
     network pairing door opens. Tests say which world they are in; the
     default is a machine without it, where the door is the only way in."""
     monkeypatch.setattr(watch_relay, "BRIDGE_APP", str(tmp_path / "no-bridge.app"))
+    monkeypatch.setattr(watch_relay, "LEGACY_BRIDGE_APP", str(tmp_path / "no-legacy-bridge.app"))
+    monkeypatch.setattr(watch_relay, "_BRIDGE_ICLOUD", None)
+    # And the installer (route B): its home, its login job and its pin are
+    # temporary, launchd is never touched (an overridden agent path turns
+    # it off), and no command it runs reaches the real system. A repository
+    # that pins a bridge must not make the suite download it.
+    home = tmp_path / "bridge-home"
+    monkeypatch.setenv("TAPPROVAL_BRIDGE_DIR", str(home))
+    monkeypatch.setenv("TAPPROVAL_BRIDGE_LEGACY_DIR", str(tmp_path / "legacy-bridge-home"))
+    monkeypatch.setenv("TAPPROVAL_BRIDGE_AGENT_PATH",
+                       str(tmp_path / "com.tapproval.bridge.plist"))
+    monkeypatch.setenv("TAPPROVAL_BRIDGE_PIN", str(tmp_path / "no-bridge.json"))
+
+    def no_commands(command, timeout=60):
+        raise AssertionError("a test ran %r for real" % (command,))
+    monkeypatch.setattr(bridge_install, "RUN", no_commands)
 
 
 @pytest.fixture(autouse=True)
@@ -749,9 +796,11 @@ class TestWristCard:
         assert card["headline"].strip()
 
     def test_headline_has_no_newlines(self):
+        # The headline is one line (it is also the notification's text);
+        # the command keeps its own lines (owner, 2026-10-16).
         card = crc.wrist_card("Bash", {"command": "line one\nline two\nline three"}, Risk.LOW)
         assert "\n" not in card["headline"]
-        assert "\n" not in card["detail"]
+        assert card["detail"] == "line one\nline two\nline three"
 
     def test_rm_headline_is_human_readable(self):
         card = crc.wrist_card("Bash", {"command": "rm -rf build"}, Risk.HIGH)
@@ -853,6 +902,28 @@ class TestCardFacts:
         assert len(json.dumps(card).encode()) < watch_relay.MAX_BODY / 4
 
     @pytest.mark.private_layout
+    def test_every_answer_is_a_target_a_finger_can_hit(self):
+        """Design change 2 (the owner, 2026-10-16): 38 pt in a thread's foot,
+        44 pt on the card's own screen, from one table. A minHeight typed
+        as a bare number beside an answer is how "Always allow" ended up
+        22 pt tall."""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "WatchApp", "Tapproval", "Cards.swift")
+        if not os.path.isfile(path):
+            pytest.skip("no watch app in this layout")
+        source = open(path, encoding="utf-8").read()
+        table = re.search(r"enum AnswerTarget \{(.*?)\n\}", source, re.S).group(1)
+        assert "static let foot: CGFloat = 38" in table
+        assert "static let screen: CGFloat = 44" in table
+        answers = source[source.index("struct DecisionButtons"):source.index("struct PendingCard")]
+        heights = re.findall(r"minHeight: ([^)\n]+)", answers)
+        assert heights, "no answer heights found"
+        for height in heights:
+            assert "AnswerTarget" in height, "an answer's height is a bare number: %s" % height
+        assert answers.count("AnswerTarget.secondaryGap") == 2, \
+            "No, keep planning and Always allow each sit a gap below the coloured answers"
+
+    @pytest.mark.private_layout
     def test_the_card_screen_wraps_facts_and_the_list_does_not(self):
         swift = Path(__file__).with_name("WatchApp").joinpath(
             "Tapproval", "Cards.swift").read_text()
@@ -862,6 +933,41 @@ class TestCardFacts:
         wrapped, listed = body.split("} else {")
         assert ".lineLimit(" not in wrapped and ".truncationMode(" not in wrapped
         assert ".lineLimit(1)" in listed
+
+    @pytest.mark.private_layout
+    def test_an_answer_is_never_cut_where_it_is_chosen(self):
+        """#580 made the answer rows wrap, and the multi-select rewrite the
+        same evening dropped it unnoticed: in a thread's foot the plan's two
+        Yes rows were back to "Yes, and use a…" (owner, 2026-10-16). An
+        option's text must grow downwards, never be clipped."""
+        swift = Path(__file__).with_name("WatchApp").joinpath(
+            "Tapproval", "Cards.swift").read_text()
+        option = swift[swift.index("Text(option)"):]
+        option = option[:option.index(".frame(maxWidth")]
+        assert ".fixedSize(horizontal: false, vertical: true)" in option
+        assert ".lineLimit(" not in option and ".truncationMode(" not in option
+
+    @pytest.mark.private_layout
+    def test_the_tier_badge_on_the_card_screen_is_never_cut_or_wrapped(self):
+        """#622: on a 40 mm face at XXL the card screen's capsule read
+        "QUESTIO / N". The list's tier has been held to one line since
+        2026-09-24; the card screen's badge must be too, and the heading
+        chip and the "↓ Answers" jump give way instead — each to a line of
+        its own, so that two unbreakable chips never share a row they
+        cannot both fit."""
+        swift = Path(__file__).with_name("WatchApp").joinpath(
+            "Tapproval", "Cards.swift").read_text()
+        detail = swift[swift.index("struct CardDetail"):]
+        badge = detail[detail.index("private var badge: some View"):]
+        badge = badge[:badge.index(".background(")]
+        assert ".lineLimit(1)" in badge
+        assert ".fixedSize()" in badge
+        header = detail[detail.index("ViewThatFits(in: .horizontal)"):]
+        header = header[:header.index("placeLine")]
+        # Three ways to lay the row out: all on one line, the chip on its
+        # own line, and the jump on its own line too.
+        assert header.count("badge\n") == 3
+        assert header.count("jumpButton(proxy)") == 3
 
     def test_short_string_lists_are_spelled_out(self):
         assert crc._fact_value(["a", "b"], 32) == "a, b"
@@ -1451,7 +1557,7 @@ class TestProjectAttribution:
         (None, None),
     ])
     def test_project_name_edge_cases(self, cwd, expected):
-        assert crc._project_name(cwd) == expected
+        assert crc.repository_name(cwd) == expected
 
     def test_only_the_basename_is_logged(self, tmp_path):
         """The log must not carry directory structure."""
@@ -1564,8 +1670,9 @@ class TestWatchRelayBridge:
 
     @pytest.fixture
     def relay(self):
-
-        server, queue = watch_relay.serve(port=0)
+        # A real Auth on the suite's key file: the hook signs with it, and
+        # a relay with no key would refuse every card.
+        server, queue = watch_relay.serve(port=0, auth=watch_relay.Auth())
         _serve(server)
         url = "http://127.0.0.1:%d" % server.server_address[1]
         yield url, queue
@@ -1881,6 +1988,49 @@ class TestASessionHasOneState:
         assert (row["state"], row["state_reason"]) == ("idle", "")
 
 
+class TestTheDashboardRemembersWhatItRead:
+    """Polled every few seconds, so what does not change is read once."""
+
+    def test_the_session_list_remembers_where_each_transcript_is(self, tmp_path,
+                                                                 monkeypatch):
+        """Opening a session from the list finds its transcript without
+        walking every project folder: the list just read it."""
+        import watch_dashboard as wd
+        projects = TestASessionHasOneState()._session(
+            tmp_path, monkeypatch, TestASessionHasOneState.TOOL)
+        monkeypatch.setattr(wd, "CLAUDE_PROJECTS", projects)
+        monkeypatch.setattr(wd, "_TRANSCRIPT_PATHS", {})
+        row = wd.recent_sessions()[0]
+        assert row["session_id"] in wd._TRANSCRIPT_PATHS
+
+        def no_walking(*args):
+            raise AssertionError("walked the project folders")
+        monkeypatch.setattr(wd.os, "listdir", no_walking)
+        found = wd._find_transcript(row["session_id"])
+        assert found and found.endswith("cccc3333.jsonl")
+
+    def test_the_audit_log_path_follows_a_changed_config(self, tmp_path, monkeypatch):
+        """Kept between polls, but never past a change to the policy file
+        it came from."""
+        import watch_dashboard as wd
+        monkeypatch.delenv("CLAUDE_RISK_AUDIT_LOG")
+        config = tmp_path / "policy.json"
+        config.write_text(json.dumps({"audit_log": str(tmp_path / "one.jsonl")}))
+        monkeypatch.setenv("CLAUDE_RISK_CONFIG", str(config))
+        loads = []
+        real = crc.load_policy
+        monkeypatch.setattr(crc, "load_policy", lambda: loads.append(1) or real())
+        assert wd._audit_log_path() == str(tmp_path / "one.jsonl")
+        assert wd._audit_log_path() == str(tmp_path / "one.jsonl")
+        assert len(loads) == 1, "the policy was reloaded on an unchanged poll"
+        config.write_text(json.dumps({"audit_log": str(tmp_path / "two.jsonl")}))
+        later = time.time() + 5
+        os.utime(config, (later, later))
+        assert wd._audit_log_path() == str(tmp_path / "two.jsonl")
+        assert len(loads) == 2
+        crc.configure_site_rules({})
+
+
 class TestRelaySessions:
     def test_lists_sessions_newest_first(self, tmp_path, monkeypatch):
         import time as _time
@@ -1939,9 +2089,11 @@ class TestRelayTunnelToken:
         base, _ = tokened
         hidden = [(m, p) for m, routes in watch_relay.RelayHandler.ROUTES.items()
                   for p, (_, rules) in routes.items() if rules.get("lan_only")]
-        assert {"/pair", "/enroll", "/card", "/heartbeat", "/tunnel"} <= {p for _, p in hidden}
+        assert {"/pair", "/enroll", "/card", "/heartbeat", "/bridge-status",
+                "/tunnel"} <= {p for _, p in hidden}
         assert all(p.startswith("/admin/") or p in ("/pair", "/enroll", "/card",
-                                                     "/heartbeat", "/tunnel")
+                                                     "/heartbeat", "/bridge-status",
+                                                     "/tunnel")
                    for _, p in hidden)
         for method, path in hidden:
             status, _ = relay_call(base + "/t/s3cret" + path, method=method)
@@ -2136,6 +2288,7 @@ class TestSelfStartingRelay:
         monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: {
             "version": watch_relay.RELAY_VERSION, "pending": 0,
             "helper_commit": "15642ba"})
+        monkeypatch.setattr(watch_relay, "_head_commit", lambda root: "8720a1b")
         monkeypatch.setattr(watch_relay, "helper_provenance",
                             lambda here=None: ("8720a1b", "2026-09-18T22:40:00+02:00"))
         stopped = []
@@ -2158,6 +2311,7 @@ class TestSelfStartingRelay:
         monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: {
             "version": watch_relay.RELAY_VERSION, "pending": 1,
             "helper_commit": "15642ba"})
+        monkeypatch.setattr(watch_relay, "_head_commit", lambda root: "8720a1b")
         monkeypatch.setattr(watch_relay, "helper_provenance",
                             lambda here=None: ("8720a1b", "x"))
         monkeypatch.setattr(watch_relay, "_admin_call", lambda path, timeout=2: {"ok": True})
@@ -2180,6 +2334,7 @@ class TestSelfStartingRelay:
         monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: {
             "version": watch_relay.RELAY_VERSION, "pending": 0,
             "paired_ever": True, "helper_commit": serving})
+        monkeypatch.setattr(watch_relay, "_head_commit", lambda root: installed)
         monkeypatch.setattr(watch_relay, "helper_provenance",
                             lambda here=None: (installed, "x"))
         stopped = []
@@ -2851,11 +3006,20 @@ class TestTheBridgeSigns:
         assert 'forHTTPHeaderField: "X-Tapproval-Token"' not in source
 
     def test_every_relay_call_goes_through_the_signer(self):
+        """Since the bridge checks the relay's proof (2026-10-16 review,
+        S10) it signs in provenData, which keeps the nonce it needs for
+        that: relayData hands it the session, and nothing calls the
+        session itself."""
         main = self._source("Bridge", "main.swift")
-        # One call to the session: the one inside relayData(for:).
-        assert main.count("relaySession.data(") == 1, (
+        assert main.count(".data(for:") == 1, (
             "a relay call that skips relayData(for:) goes out unsigned")
-        assert "relaySession.data(for: RelaySigning.signed(" in main
+        proven = main.split("func provenData(", 1)[1].split("\n}\n", 1)[0]
+        assert "try await session.data(for: signed)" in proven
+        assert "RelaySigning.header(key: key, request: request, nonce: nonce," in proven
+        assert "v2: true" in proven and "v2: false" not in proven
+        relay_data = main.split("func relayData(", 1)[1].split("\n}\n", 1)[0]
+        assert ("provenData(for: request, key: bootstrapToken(), session: relaySession)"
+                in relay_data)
 
     def test_the_bridge_signs_v2(self):
         """v1 leaves the query out, so a signed `?id=A` could be replayed as
@@ -3078,11 +3242,13 @@ class TestAnICloudCardIsTheWholeCard:
               "can_always": "canAlways", "session_title": "sessionTitle",
               "plan_marked": "planMarked", "allow_label": "allowLabel",
               "deny_label": "denyLabel", "agent": "agent",
-              "multi_select": "multiSelect"}
+              "multi_select": "multiSelect", "question_header": "questionHeader",
+              "option_details": "optionDetails"}
     # Fields the watch reads only from the relay, on purpose, each with its
     # reason. Production refuses a record with a field it does not know, so
     # the bridge may write one only after it is deployed there (CLAUDE.md);
     # moving it to FIELDS is that decision. plan_marked moved on 2026-10-12.
+    # question_header and option_details moved on 2026-10-16.
     RELAY_ONLY = set()
 
     def _read(self, *parts):
@@ -3153,7 +3319,8 @@ class TestTheBridgeReadsTheWholeCard:
             "session_id": "s-1", "can_always": True, "session_title": "Release",
             "plan_marked": "**1.** Delete", "allow_label": "Yes, proceed",
             "deny_label": "No, continue without running it",
-            "agent": "codex", "multi_select": True}
+            "agent": "codex", "multi_select": True,
+            "question_header": "Auth method", "option_details": ["a", "b"]}
 
     def _read(self, *parts):
         path = os.path.join(_ROOT, "WatchApp", *parts)
@@ -3226,7 +3393,7 @@ class TestTheBridgeIsWatched:
 
     @pytest.fixture(autouse=True)
     def _clean(self, monkeypatch):
-        monkeypatch.setattr(watch_relay, "icloud_carries_the_key", lambda: True)
+        monkeypatch.setattr(watch_relay, "bridge_installed", lambda: True)
         watch_relay.clear_condition("bridge")
         self.queue = watch_relay.CardQueue()
         yield
@@ -3258,7 +3425,7 @@ class TestTheBridgeIsWatched:
             now=1000.0 + watch_relay.BRIDGE_SILENT_SECONDS + 1)
 
     def test_no_bridge_installed_is_not_a_fault(self, monkeypatch):
-        monkeypatch.setattr(watch_relay, "icloud_carries_the_key", lambda: False)
+        monkeypatch.setattr(watch_relay, "bridge_installed", lambda: False)
         watch_relay.note_condition("bridge", "stale")
         assert watch_relay.check_bridge(self.queue, started=0.0, now=10_000.0)
         assert self._said() == []
@@ -3936,6 +4103,13 @@ class TestDescriptionHeadlines:
         assert card["headline"] == ("y " * 100).strip()
         assert card["detail"] == " ".join(command.split())
 
+    def test_a_commands_line_breaks_survive(self):
+        # A here-document read as one run-on line; its lines are what an
+        # Allow approves (owner, 2026-10-16).
+        command = "cat > notes.txt <<'EOF'\nfirst line\nsecond   line\nEOF"
+        card = crc.wrist_card("Bash", {"command": command}, Risk.MEDIUM)
+        assert card["detail"] == "cat > notes.txt <<'EOF'\nfirst line\nsecond line\nEOF"
+
     def test_blank_description_is_ignored(self):
         card = crc.wrist_card("Bash", {"command": "git push", "description": "   "},
                               Risk.HIGH, 64, 80)
@@ -4113,6 +4287,64 @@ class TestSessionReplies:
         assert seen["cmd"][2] == "abc12345"
         assert seen["cmd"][-3:] == ["-p", "--", "run the tests"]
         assert seen["cwd"] == "/x/proj"
+
+    def test_a_long_message_reaches_the_session_whole(self, tmp_path, monkeypatch):
+        """Until 2026-10-16 a wrist message was cut at 500 characters with
+        nothing said: a dictated brief lost its second half and Claude
+        answered the first. The cap is one named number, far above a
+        wrist's longest dictation, and a message up to it arrives whole."""
+        self._session(tmp_path)
+        seen = {}
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _: "/usr/bin/claude")
+        monkeypatch.setattr(watch_relay.subprocess, "Popen",
+                            lambda cmd, **kw: seen.update(cmd=cmd) or object())
+        brief = ("ord " * 2000).strip()                 # ~8000 characters
+        assert len(brief) > 500
+        assert watch_relay.say_to_session(
+            "abc123", brief, projects_dir=str(tmp_path)) == "sent"
+        assert seen["cmd"][-1] == brief, "the message was cut or changed"
+        longest = "x" * watch_relay.SEND_CHARS
+        assert watch_relay.say_to_session(
+            "abc123", longest, projects_dir=str(tmp_path)) == "sent"
+        assert seen["cmd"][-1] == longest
+
+    def test_a_message_over_the_cap_is_refused_with_the_count_not_cut(self, tmp_path, monkeypatch):
+        """Over the cap, nothing is sent and the words say by how much: a
+        cut message answers a question nobody asked, and the wearer never
+        learns which half Claude read. The watch keeps the draft on a
+        refusal, so the words are there to shorten."""
+        self._session(tmp_path)
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _: "/usr/bin/claude")
+        monkeypatch.setattr(watch_relay.subprocess, "Popen",
+                            lambda *a, **k: pytest.fail("an over-long message was sent"))
+        over = "x" * (watch_relay.SEND_CHARS + 5)
+        status = watch_relay.say_to_session("abc123", over, projects_dir=str(tmp_path))
+        assert status == "too long: %d characters, the most is %d" % (
+            watch_relay.SEND_CHARS + 5, watch_relay.SEND_CHARS)
+        assert status[0].islower() and not status.endswith(".")   # the watch capitalises and ends it
+
+    @pytest.mark.private_layout
+    def test_the_send_cap_fits_everything_downstream(self, tmp_path):
+        """The watch refuses in the relay's form, so it carries the same
+        number; the thread view must keep a user turn of that length whole,
+        or the echo never finds its turn; and the body limit must admit it
+        in any script (four bytes a character at worst)."""
+        swift = Path(__file__).with_name("WatchApp").joinpath(
+            "Tapproval", "RelayModel.swift").read_text(encoding="utf-8")
+        found = re.search(r"static let sendChars = ([\d_]+)", swift)
+        assert found, "RelayModel.sendChars is gone"
+        assert int(found.group(1).replace("_", "")) == watch_relay.SEND_CHARS
+        assert watch_relay.SEND_CHARS <= watch_dashboard.TURN_CHARS
+        assert watch_relay.SEND_CHARS * 4 < watch_relay.MAX_BODY
+        assert watch_relay.SEND_CHARS >= 10000, "a brief from the wrist may be very long"
+        # Behaviour, not arithmetic: the longest message the relay accepts
+        # comes back out of the transcript as one whole user turn.
+        longest = " ".join(["ord"] * (watch_relay.SEND_CHARS // 4))[:watch_relay.SEND_CHARS].strip()
+        _write_transcript(tmp_path, "-p", "long1.jsonl", [
+            {"cwd": "/x", "message": {"role": "user", "content": longest}},
+        ])
+        turns = watch_dashboard.session_thread("long1", projects_dir=str(tmp_path))
+        assert [t["text"] for t in turns if t["role"] == "user"] == [longest]
 
     def _spawned(self, tmp_path, monkeypatch, **kwargs):
         self._session(tmp_path)
@@ -4382,6 +4614,105 @@ class TestTheWristSaysWhatThePhoneSays:
                 handle.write(json.dumps(line) + "\n")
         watch_dashboard._THREAD_STATE.pop(str(path), None)
         return watch_dashboard._parse_thread(str(path), limit)
+
+    # Claude Code 2.1.301 (seen 2026-10-16) writes a copy of each request
+    # into the transcript: "api-request-blob" lines whose `message` repeats
+    # turns already recorded. Read as turns they doubled the wrist's
+    # thread — the command, then the first reply, each twice — and a copied
+    # tool_use would revive a "running" tool that had already finished.
+    WRAP_UP = [
+        {"type": "user", "timestamp": "2026-10-16T13:38:16Z",
+         "message": {"role": "user", "content":
+                     "<command-message>wrap-up</command-message>\n"
+                     "<command-name>/wrap-up</command-name>"}},
+        # The skill's body, injected by the CLI: nobody typed it.
+        {"type": "user", "isMeta": True, "timestamp": "2026-10-16T13:38:16Z",
+         "message": {"role": "user", "content": [
+             {"type": "text", "text": "Base directory for this skill: /h/.claude/skills/"
+                                      "wrap-up\n\n# Wrap up this session\n\nGoal: ..."}]}},
+        {"type": "api-request-blob", "hash": "a1",
+         "message": {"role": "user", "content": [{"type": "text", "text": "/wrap-up"}]}},
+        {"type": "assistant", "timestamp": "2026-10-16T13:38:21Z",
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "Taking stock."}]}},
+        {"type": "assistant", "timestamp": "2026-10-16T13:38:22Z",
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "id": "t1", "name": "Bash",
+              "input": {"command": "git status", "description": "Check the tree"}}]}},
+        {"type": "user", "timestamp": "2026-10-16T13:38:23Z",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "t1", "content": "clean"}]}},
+        {"type": "api-request-blob", "hash": "a2",
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "Taking stock."},
+             {"type": "tool_use", "id": "t1", "name": "Bash",
+              "input": {"command": "git status", "description": "Check the tree"}}]}},
+        {"type": "assistant", "timestamp": "2026-10-16T13:38:30Z",
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "Safe to archive."}]}},
+    ]
+
+    def test_a_request_copy_is_not_a_turn(self, tmp_path):
+        turns, _running, tool = self._thread(tmp_path, self.WRAP_UP)
+        said = [(t["role"], t["kind"], t["text"]) for t in turns]
+        assert said == [("user", "text", "/wrap-up"),
+                        ("assistant", "text", "Taking stock."),
+                        ("assistant", "tool", "Ran Check the tree"),
+                        ("assistant", "text", "Safe to archive.")], said
+        assert tool is None, "a copied tool_use revived a finished tool"
+
+    def test_a_skills_injected_body_is_not_the_persons_message(self, tmp_path):
+        turns, _, _ = self._thread(tmp_path, self.WRAP_UP[:2])
+        assert [t["text"] for t in turns] == ["/wrap-up"]
+
+    def test_a_code_reviews_findings_reach_the_wrist_as_lines(self, tmp_path):
+        # Claude Code 2.1.301 answers /code-review itself and prints the
+        # findings as a JSON block. The wrist made every code block
+        # "[code]", so the review read as its scope sentence and nothing
+        # else: the bug it found never reached the watch (2026-10-16).
+        findings = [
+            {"file": "calc.py", "line": 2, "summary": "add() subtracts instead of adding.",
+             "failure_scenario": "add(2, 3) returns -1."},
+            {"file": "calc.py", "line": 1, "summary": "No test covers it.",
+             "failure_scenario": "The bug ships."}]
+        stdout = ("<local-command-stdout>The review scope is calc.py.\n\n```json\n%s\n```"
+                  "</local-command-stdout>" % json.dumps(findings, indent=2))
+        turns, _, _ = self._thread(tmp_path, [
+            {"type": "user", "message": {"role": "user", "content": "/code-review"}},
+            {"type": "system", "subtype": "local_command", "content": stdout}])
+        notice = turns[-1]
+        assert notice["kind"] == "notice" and "[code]" not in notice["text"], notice
+        assert "calc.py:2 — add() subtracts instead of adding." in notice["text"]
+        assert "calc.py:1 — No test covers it." in notice["text"]
+        assert notice["text"].startswith("The review scope is calc.py.")
+
+    def test_a_command_that_failed_says_so(self, tmp_path):
+        # /security-review in a repository without origin: the CLI writes
+        # its failure as a user line in <local-command-stderr>, and every
+        # "<" line was skipped, so the wrist showed the command and then
+        # nothing at all (2026-10-16).
+        turns, _, _ = self._thread(tmp_path, [
+            {"type": "user", "message": {"role": "user", "content":
+                "<command-name>/security-review</command-name>\n"
+                "<command-message>security-review</command-message>"}},
+            {"type": "user", "message": {"role": "user", "content":
+                "<local-command-stderr>Shell command failed for pattern \"!`git log "
+                "origin/HEAD...`\": [stderr]\nfatal: ambiguous argument "
+                "'origin/HEAD...'</local-command-stderr>"}}])
+        assert [(t["kind"], t.get("tone")) for t in turns] == [("text", None), ("notice", "error")]
+        assert turns[1]["text"].startswith("Shell command failed")
+        assert "<local-command" not in turns[1]["text"]
+
+    def test_other_code_in_a_notice_is_still_a_box(self, tmp_path):
+        stdout = "<local-command-stdout>Ran:\n\n```json\n{\"a\": 1}\n```</local-command-stdout>"
+        turns, _, _ = self._thread(tmp_path, [
+            {"type": "system", "subtype": "local_command", "content": stdout}])
+        assert "[code]" in turns[-1]["text"]
+
+    def test_the_session_list_does_not_count_request_copies(self, tmp_path):
+        import watch_dashboard
+        assert watch_dashboard._message_of(self.WRAP_UP[2]) == {}
+        assert watch_dashboard._message_of(self.WRAP_UP[0])["role"] == "user"
 
     def _tool(self, name, description=None):
         use = {"type": "tool_use", "name": name, "input": {}}
@@ -5404,6 +5735,20 @@ class TestTheMoreListIsWhatThisMachineCanAnswer:
         assert rows["/code-review"]["source"] == "builtin" and rows["/security-review"]["source"] == "builtin"
         assert "/verify" not in rows                        # never existed; never listed
 
+    def test_only_a_needed_argument_holds_the_tap_back(self):
+        # A hint makes the watch fill its Message field rather than send.
+        # /wrap-up's "[optional note, ...]" did that, out of sight above the
+        # list, and the command never left the wrist (2026-10-16).
+        assert watch_relay.required_argument(
+            "[optional note, e.g. 'leave PR #12 open']") is None
+        assert watch_relay.required_argument("[pr-number]") is None
+        assert watch_relay.required_argument("[a] [b [c]]") is None
+        assert watch_relay.required_argument(None) is None
+        assert watch_relay.required_argument("") is None
+        assert watch_relay.required_argument("<question>") == "<question>"
+        assert watch_relay.required_argument("<file> [--fix]") == "<file> [--fix]"
+        assert watch_relay.required_argument("pr-number") == "pr-number"
+
     def test_a_plugin_skill_is_named_the_way_the_cli_invokes_it(self, tmp_path):
         # /code-review from a plugin is /eng:code-review. Listed bare it
         # collided with the built-in, and setdefault hid whichever came
@@ -5413,7 +5758,7 @@ class TestTheMoreListIsWhatThisMachineCanAnswer:
         assert rows["/code-review"]["source"] == "builtin"
         assert rows["/eng:code-review"] == {
             "name": "/eng:code-review", "description": "The plugin's review.",
-            "source": "plugin", "plugin": "eng", "argument_hint": "[pr-number]"}
+            "source": "plugin", "plugin": "eng", "argument_hint": None}
         assert rows["/eng:incident"]["plugin"] == "eng"
         assert rows["/deploy"]["plugin"] is None and rows["/deploy"]["argument_hint"] is None
 
@@ -5514,9 +5859,9 @@ class TestSlashCommandsReachTheWrist:
     def test_only_something_enormous_is_cut_and_it_says_so(self):
         huge = {"type": "system", "subtype": "local_command",
                 "content": "<local-command-stdout>%s</local-command-stdout>"
-                           % ("word " * 5000)}
+                           % ("word " * (watch_dashboard.TURN_CHARS // 5 + 2000))}
         said = watch_dashboard._system_text(huge)
-        assert len(said) <= 12002 and said.endswith(" …"), (len(said), said[-10:])
+        assert len(said) <= watch_dashboard.TURN_CHARS + 2 and said.endswith(" …"), (len(said), said[-10:])
 
     def test_an_unknown_command_is_a_notice_not_silence(self, tmp_path):
         _write_transcript(tmp_path, "-p", "recap2.jsonl", [
@@ -5663,7 +6008,7 @@ def live_relay():
     Shared by every hook-through-relay test so the env handling and the
     server teardown cannot drift apart between copies."""
     queue = watch_relay.CardQueue()
-    server, _ = watch_relay.serve("127.0.0.1", 0, queue=queue)
+    server, _ = watch_relay.serve("127.0.0.1", 0, queue=queue, auth=watch_relay.Auth())
     _serve(server)
     queue.pending(from_watch=True)
     yield server.server_address[1], queue
@@ -5697,6 +6042,32 @@ class TestQuestionCards:
             "Del hele ugen i to",
             'Kun "skifter hver anden uge"',
         ]
+
+    def test_a_question_carries_its_heading_and_every_explanation(self):
+        # Claude gives each answer a line saying what it means, and the
+        # question a heading; the helper dropped both, so the wrist offered
+        # bare names (owner, 2026-10-16: no part of a question is cut).
+        card = crc.wrist_card("AskUserQuestion", self.EVENT_INPUT,
+                              Risk.MEDIUM, 64, 80)
+        assert card["question_header"] == "Uger"
+        assert card["option_details"] == ["x", "y", "z"]
+        long = "This explains the choice at length. " * 20
+        card = crc.wrist_card("AskUserQuestion", {"questions": [{
+            "question": "Which?", "options": [
+                {"label": "A", "description": long}, {"label": "B"}]}]},
+            Risk.MEDIUM, 64, 80)
+        assert card["option_details"] == [long.strip(), ""], "whole, and in step"
+        assert "question_header" not in card
+        bare = crc.wrist_card("AskUserQuestion", {"questions": [{
+            "question": "Which?", "options": [{"label": "A"}, {"label": "B"}]}]},
+            Risk.MEDIUM, 64, 80)
+        assert "option_details" not in bare, "nothing to show, nothing sent"
+
+    def test_a_questions_line_breaks_survive(self):
+        card = crc.wrist_card("AskUserQuestion", {"questions": [{
+            "question": "First line\nSecond   line\n\n\n\nThird",
+            "options": [{"label": "A"}]}]}, Risk.MEDIUM, 64, 80)
+        assert card["headline"] == "First line\nSecond line\n\nThird"
 
     def test_a_long_question_reaches_the_wrist_whole(self):
         # The question is the thing being answered: the phone shows all of
@@ -6036,9 +6407,21 @@ class TestThePlanCard:
         assert not card["plan"].startswith("Roll out"), "the title is the headline, not said twice"
 
     def test_a_long_plan_is_capped_on_a_word(self):
-        card = crc.wrist_card("ExitPlanMode", {"plan": "word " * 2000}, Risk.MEDIUM)
-        assert len(card["plan"]) <= crc.PLAN_CHARS + 2
-        assert card["plan"].endswith(" …")
+        # Cut only past what the relay can carry, and then said in words:
+        # a bare " …" read as the plan's own last step (owner, 2026-10-16).
+        card = crc.wrist_card("ExitPlanMode", {"plan": "word " * 4000}, Risk.MEDIUM)
+        for field in ("plan", "plan_marked"):
+            text = card.get(field) or card["plan"]
+            assert text.endswith("\n\n" + crc.PLAN_CONTINUES), field
+            assert len(text) <= crc.PLAN_CHARS + len(crc.PLAN_CONTINUES) + 2
+
+    def test_a_plan_of_a_thousand_words_and_more_arrives_whole(self):
+        steps = "".join("- Step %d: change the thing and check it twice\n" % n
+                        for n in range(160))
+        assert len(steps) > 7000
+        card = crc.wrist_card("ExitPlanMode", {"plan": "# Title\n" + steps},
+                              Risk.MEDIUM)
+        assert card["plan"].endswith("• Step 159: change the thing and check it twice")
 
     def test_a_plan_of_ordinary_length_arrives_whole(self):
         # 2026-10-15: plans were cut at 2400 characters, mid-step.
@@ -6260,6 +6643,8 @@ class TestThePlanComesFromItsFile:
             queue.decide(cards[0]["id"], "answer", answer="Yes, and use auto mode")
 
         threading.Thread(target=answer_first_card, daemon=True).start()
+        # A session that can use auto mode: the card offers its row.
+        monkeypatch.setattr(crc, "auto_mode_seen", lambda event: True)
         monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
         monkeypatch.setenv("CLAUDE_RISK_RELAY", "http://127.0.0.1:%d" % port)
         monkeypatch.setenv("CLAUDE_RISK_RELAY_WAIT", "10")
@@ -6347,9 +6732,10 @@ class TestThePlanKeepsItsFormatting:
             assert "\n" in card[field], "redaction keeps the lines"
 
     def test_the_cap_never_leaves_a_mark_open(self):
-        plan = "# Long\n" + "**word** and more " * 400
+        plan = "# Long\n" + "**word** and more " * 600
         marked = self.card(plan)["plan_marked"]
-        assert len(marked) <= crc.PLAN_CHARS + 2 and marked.endswith(" …")
+        assert len(marked) <= crc.PLAN_CHARS + len(crc.PLAN_CONTINUES) + 2
+        assert marked.endswith("\n\n" + crc.PLAN_CONTINUES)
         assert marked.count("**") % 2 == 0 and marked.count("`") % 2 == 0
 
     def test_one_reading_of_a_line_on_both_sides_of_the_mac(self):
@@ -7020,8 +7406,18 @@ class TestEveryPress:
         CLAUDE.md: CRITICAL must never be auto-allowed."""
         port, queue = live_relay
         command = "git push --force origin main && rm -rf / --no-preserve-root"
-        self._press(queue, "always")
+        refused = []
+
+        def always_then_allow():
+            cards = _wait_until(lambda: queue.pending(from_watch=True), what="a card")
+            # The watch offers no third button on CRITICAL, and the relay
+            # takes none (2026-10-16 review, S5): the card stays up.
+            refused.append(queue.decide(cards[0]["id"], "always"))
+            queue.decide(cards[0]["id"], "allow")
+
+        threading.Thread(target=always_then_allow, daemon=True).start()
         first = self._hook(port, tmp_path, command=command)
+        assert refused == [False]
         assert _behavior(first) == "allow"      # the tap itself is human
         # The identical CRITICAL ask again: no silent replay allowed.
         self._press(queue, "deny")
@@ -7388,6 +7784,27 @@ class TestSeveralLabelsFitTheRelay:
         thread.join(5)
         assert result["answer"] == labels
 
+    def test_four_very_long_labels_are_kept_whole(self):
+        """At 600 characters the fourth of four long labels was cut, and a
+        cut label is no longer one of the question's options."""
+        queue = watch_relay.CardQueue()
+        queue.pending(from_watch=True)
+        result = {}
+        labels = "\n".join(("Option %d " % n) + "x" * 400 for n in range(4))
+        assert len(labels) > 1600
+
+        def submit():
+            _, result["decision"], result["answer"] = queue.submit(
+                {"tier": "MEDIUM", "headline": "q", "detail": "q"}, wait=5)
+
+        thread = threading.Thread(target=submit, daemon=True)
+        thread.start()
+        _wait_until(queue.pending, what="the card to be queued")
+        assert queue.decide(queue.pending()[0]["id"], "answer", answer=labels)
+        thread.join(5)
+        assert result["answer"] == labels
+        assert crc.ANSWER_CHARS >= len(labels)
+
 
 class TestEmptyAnswerRefused:
     def test_answer_with_no_words_is_refused(self):
@@ -7679,12 +8096,17 @@ class TestAlwaysMirrorsThePhone:
                 "tool": "Bash", "session_id": "s1",
                 "fingerprint": "abc123", "can_always": False}
 
+        refused = []
+
         def press_always():
             cards = _wait_until(queue.pending, what="the card to press always on")
-            queue.decide(cards[0]["id"], "always")
+            # Refused outright now (S5); the allow after it is this once.
+            refused.append(queue.decide(cards[0]["id"], "always"))
+            queue.decide(cards[0]["id"], "allow")
 
         threading.Thread(target=press_always, daemon=True).start()
         _, decision, _ = queue.submit(dict(card), wait=10)
+        assert refused == [False]
         assert decision == "allow"        # this once — a human tapped
         # The identical ask again must NOT be answered from a grant.
         started = _time.monotonic()
@@ -7767,7 +8189,8 @@ class TestFullTextReachesTheWrist:
         assert turns[-1]["text"].endswith("SLUT")
 
     def test_the_truly_enormous_is_cut_at_a_word_and_says_so(self, tmp_path):
-        enormous = ("ord " * 5000).strip()          # ~20000 chars
+        import watch_dashboard
+        enormous = ("ord " * (watch_dashboard.TURN_CHARS // 4 + 2000)).strip()
         _write_transcript(tmp_path, "-p", "longmsg02.jsonl", [
             {"cwd": "/x", "message": {"role": "user", "content": "go"}},
             {"message": {"role": "assistant", "content": [
@@ -7777,7 +8200,7 @@ class TestFullTextReachesTheWrist:
                                             projects_dir=str(tmp_path))
         turns, _, _ = watch_relay._parse_thread(path, 14)
         text = turns[-1]["text"]
-        assert len(text) <= 12002
+        assert len(text) <= watch_dashboard.TURN_CHARS + 2
         assert text.endswith(" …")
         assert not text[:-2].endswith("or")   # cut at the word boundary
 
@@ -8248,6 +8671,31 @@ class TestPermissionDecisionShape:
         assert decision["behavior"] == verdict
         if expected:
             assert decision == expected
+
+    @pytest.mark.parametrize("verdict", ["allow", "dont_ask"])
+    def test_a_plain_allow_on_a_plan_card_carries_the_calls_input(
+            self, verdict, tmp_path, monkeypatch):
+        """ExitPlanMode is a tool the CLI marks as needing the user, and it
+        drops a hook's allow without updatedInput for such a tool, keeping
+        its dialog open (2.1.300–2.1.301, runHooks). The plan rows carry
+        the input since #560; the Allow button of a watch that predates
+        the rows, and a "don't ask again" that falls back to allowing
+        once, did not — a yes that nothing answered (#578's second note)."""
+        import io
+        monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
+        monkeypatch.setenv("CLAUDE_RISK_RELAY", "http://127.0.0.1:8977")
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "a.jsonl"))
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+        monkeypatch.delenv("CLAUDE_RISK_CONFIG", raising=False)
+        monkeypatch.delenv("CLAUDE_RISK_AUTO_ALLOW", raising=False)
+        monkeypatch.setattr(crc, "ask_watch", lambda *a, **k: (verdict, None))
+        tool_input = {"plan": "# Move the bridge\n- Step one"}
+        out = io.StringIO()
+        crc.run_hook(stdin=io.StringIO(json.dumps(
+            {"tool_name": "ExitPlanMode", "cwd": str(tmp_path),
+             "tool_input": tool_input})), stdout=out)
+        decision = json.loads(out.getvalue())["hookSpecificOutput"]["decision"]
+        assert decision == {"behavior": "allow", "updatedInput": tool_input}
 
 
 class TestSubagentCardsRetract:
@@ -8849,9 +9297,21 @@ class TestTheHelperSaysWhereItsCodeIsFrom:
         assert watch_relay._head_commit(str(tmp_path / "h")) == sha
 
     def test_git_abbreviating_differently_is_not_a_move(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "_head_commit", lambda root: None)
         monkeypatch.setattr(watch_relay, "helper_provenance",
                             lambda here=None: ("b58337a", "x"))
         assert not watch_relay._serving_older_code({"helper_commit": "b58337a9"})
+        assert watch_relay._serving_older_code({"helper_commit": "15642ba"})
+
+    def test_the_commit_is_read_from_the_files_without_running_git(self, monkeypatch):
+        """A session start waits on this check: the commit comes from .git
+        itself, and git (which has a 20-second timeout) is not run when
+        the files answer."""
+        full = "8720a1b" + "0" * 33
+        monkeypatch.setattr(watch_relay, "_head_commit", lambda root: full)
+        monkeypatch.setattr(watch_relay, "helper_provenance",
+                            lambda here=None: pytest.fail("ran git"))
+        assert not watch_relay._serving_older_code({"helper_commit": "8720a1b"})
         assert watch_relay._serving_older_code({"helper_commit": "15642ba"})
 
     def test_main_reads_the_receipt_before_serving(self):
@@ -9409,12 +9869,15 @@ class TestTheWristAnswersAHeadlessSend:
         Risk = crc.Risk
         decide = staticmethod(crc.decide)
         plan_decision = staticmethod(crc.plan_decision)
+        # The real reader: the point of the plan tests is that the plan
+        # is found from what the CLI hands this tool, not from a stub.
+        plan_text = staticmethod(crc.plan_text)
 
         @staticmethod
         def ask_questions(*args, **kwargs):
             return crc.ask_questions(*args, **kwargs)
         questions_need_typing = staticmethod(crc.questions_need_typing)
-        PERMISSION_MODES = crc.PERMISSION_MODES
+        _permission_output = staticmethod(crc._permission_output)
 
         @staticmethod
         def auto_mode_seen(event):
@@ -9430,11 +9893,15 @@ class TestTheWristAnswersAHeadlessSend:
             return {"risk": self.risk, "project": "acme"}
 
         def wrist_card(self, tool, tool_input, risk, auto_mode=False):
-            return {"headline": tool, "tier": risk.name,
+            card = {"headline": tool, "tier": risk.name,
                     "plan_card": tool == "ExitPlanMode"}
+            if card["plan_card"]:
+                card["options"] = crc.plan_options(auto_mode)
+            return card
 
         def ask_watch(self, card, policy, project=None):
             self.asked_the_watch = True
+            self.card = card                      # what the wrist was shown
             return self.verdict, self.answer
 
     def test_a_question_answered_on_the_wrist_carries_the_answer(self):
@@ -9485,6 +9952,59 @@ class TestTheWristAnswersAHeadlessSend:
         out = wpt.decide("ExitPlanMode", {"plan": "x"},
                          crc=self._Fake("answer", answer=crc.PLAN_MANUAL))
         assert out["behavior"] == "allow" and out["updatedInput"] == {"plan": "x"}
+
+    def _plans(self, tmp_path, monkeypatch):
+        """A plans folder of our own: plan_text reads only inside it."""
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        plans = tmp_path / "plans"
+        plans.mkdir()
+        return plans
+
+    def test_a_headless_plan_card_carries_the_plan(self, tmp_path, monkeypatch):
+        """Claude Code calls ExitPlanMode with the plan in a file; the hook
+        reads it (build_response), and this tool built the card without
+        it, so a wrist-sent run's plan read "Claude has a plan" with
+        nothing to read (#578, 2026-10-16).
+
+        The CLI hands a permission-prompt tool ``tool_name``, ``input`` and
+        ``tool_use_id`` and nothing else — no transcript path (2.1.301,
+        read 2026-10-16) — so the plan can only be found from the input:
+        the ``plan`` 2.1.295+ injects from disk, or the ``planFilePath``
+        it names, read from the plans folder. This is the second shape,
+        through the real reader and the real card."""
+        plans = self._plans(tmp_path, monkeypatch)
+        path = plans / "fuzzy-allen.md"
+        path.write_text("# Move the bridge\n\n- Step one\n- Step two\n")
+        fake = self._Fake("answer", answer=crc.PLAN_MANUAL)
+        fake.wrist_card = crc.wrist_card
+        out = wpt.decide("ExitPlanMode", {"planFilePath": str(path)}, crc=fake)
+        assert fake.card["plan_card"]
+        assert fake.card["headline"] == "Plan: Move the bridge"
+        assert fake.card["plan"] == "• Step one\n• Step two"
+        assert out["behavior"] == "allow"
+        assert out["updatedInput"] == {"planFilePath": str(path)}, \
+            "the call goes ahead as Claude made it, the plan not copied in"
+
+    @pytest.mark.parametrize("tool_input", [
+        {},                                    # no plan file yet
+        {"planFilePath": "elsewhere.md"},      # outside the plans folder
+    ])
+    def test_a_headless_plan_that_cannot_be_read_still_waits_for_the_wrist(
+            self, tool_input, tmp_path, monkeypatch):
+        """Nothing is guessed: with no transcript to fall back on, a plan
+        the input does not lead to is shown as "Claude has a plan", and
+        the wrist still decides — this tool never allows on its own."""
+        self._plans(tmp_path, monkeypatch)
+        (tmp_path / "elsewhere.md").write_text("# Not this one\n- step\n")
+        if "planFilePath" in tool_input:
+            tool_input = {"planFilePath": str(tmp_path / "elsewhere.md")}
+        fake = self._Fake("deny")
+        fake.wrist_card = crc.wrist_card
+        out = wpt.decide("ExitPlanMode", tool_input, crc=fake)
+        assert fake.asked_the_watch
+        assert fake.card["headline"] == "Claude has a plan"
+        assert "Not this one" not in json.dumps(fake.card)
+        assert out["behavior"] == "deny"
 
     def test_a_plan_approved_on_the_wrist_takes_its_rows_mode(self):
         """The mode was dropped here, so "Approve & auto mode" from a
@@ -10121,6 +10641,23 @@ class TestNewSessionFromTheWatch:
             shlex.quote(str(tmp_path / "acme")),
             shlex.quote(watch_relay.BRIEF_REPLY_SETTINGS), shlex.quote(text))
 
+    def test_a_long_first_message_opens_the_session_whole(self, tmp_path, monkeypatch):
+        """The first message of a new session was cut at 500 characters too
+        (2026-10-16). It travels in a shell line, quoted, and arrives as
+        one argument, however long."""
+        import shlex
+        brief = ("ord " * 2000).strip()
+        status, _calls, shell_line, _lines = self._start(tmp_path, monkeypatch, text=brief)
+        assert status == "started"
+        words = shlex.split(shell_line.split("&& ", 1)[1])
+        assert words[-1] == brief
+
+    def test_a_first_message_over_the_cap_opens_nothing_and_says_why(self, tmp_path, monkeypatch):
+        over = "x" * (watch_relay.SEND_CHARS + 1)
+        status, calls, _line, _lines = self._start(tmp_path, monkeypatch, text=over)
+        assert status.startswith("too long: %d characters" % (watch_relay.SEND_CHARS + 1))
+        assert "open" not in calls and "osascript" not in calls
+
     def test_a_session_started_from_the_wrist_answers_in_the_concise_style(
             self, tmp_path, monkeypatch):
         """A reply sent into a session was already asked for in Claude
@@ -10271,7 +10808,7 @@ class TestRelayRoutes:
             for path, (name, rules) in routes.items():
                 assert callable(getattr(handler, name)), (method, path)
                 assert set(rules) <= {"auth", "lan_only", "local", "admin", "token",
-                                      "no_simulator"}, path
+                                      "no_simulator", "key_file"}, path
 
     def test_the_two_pairing_routes_are_the_only_ones_without_auth(self):
         open_routes = {(m, p) for m, routes in watch_relay.RelayHandler.ROUTES.items()
@@ -10419,8 +10956,8 @@ class TestRelayRoutes:
         assert status == 200 and body["url"] == "https://t.example"
 
     def test_a_malformed_card_is_refused_before_anything_waits(self, relay):
-        base, _, _ = relay
-        status, body = self._call(base + "/card", method="POST", body={"nope": 1})
+        base, _, auth = relay
+        status, body = signed_call(base + "/card", auth.bootstrap, {"nope": 1})[:2]
         assert status == 400 and "card" in body["error"]
 
     def test_a_malformed_decision_is_refused(self, relay):
@@ -10457,9 +10994,15 @@ class TestRelayRoutes:
         device = auth.issue_device("watch-1")
         assert self._call(base + "/decision", token=device, method="POST",
                           body={"id": "ghost", "decision": "allow"})[0] == 200
-        # Posting a card from loopback still needs nothing (400: bad body,
-        # which means it got past the door).
-        assert self._call(base + "/card", method="POST", body={"nope": 1})[0] == 400
+        # Posting a card takes the key file too, signed (2026-10-16 review,
+        # S1): loopback alone, the key merely sent, or a device's key is
+        # refused; signed with the bootstrap gets past the door (400: bad
+        # body).
+        assert self._call(base + "/card", method="POST", body={"nope": 1})[0] == 403
+        assert self._call(base + "/card", token=auth.bootstrap, method="POST",
+                          body={"nope": 1})[0] == 403
+        assert signed_call(base + "/card", device, {"nope": 1})[0] == 403
+        assert signed_call(base + "/card", auth.bootstrap, {"nope": 1})[0] == 400
 
     def test_the_heartbeat_records_the_watchs_presence(self, relay):
         base, queue, _ = relay
@@ -10669,7 +11212,9 @@ class TestLocalMeansLocal:
 
     @pytest.mark.parametrize("path", ["/admin/rotate", "/admin/pair-reset",
                                       "/admin/pair-relight", "/admin/update-deferred",
-                                      "/admin/update-stuck", "/admin/update-unstuck"])
+                                      "/admin/update-stuck", "/admin/update-unstuck",
+                                      "/admin/bridge-failed", "/admin/bridge-ok",
+                                      "/bridge-status"])
     def test_acting_on_the_relay_takes_the_key_file(self, relay, monkeypatch, path):
         _server, base, auth = relay
         monkeypatch.setattr(watch_relay, "_rotate_tunnel_prefix", lambda secret: None)
@@ -10953,6 +11498,34 @@ class TestConnectingToAnExistingSession:
         assert ids() == ["phone-1"], "the phone's list, as before"
         assert ids(waiting={"term-1"}) == ["phone-1", "term-1"], "but a card needs somewhere to go"
 
+    def test_a_session_with_a_waiting_card_is_listed_past_the_cap(self, tmp_path, monkeypatch):
+        """Cards live only inside sessions on the wrist, so the session a
+        card came from is always a row — the thirteenth included."""
+        import watch_dashboard
+        sids = ["s%02d" % n for n in range(14)]
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {s: "Terminal" for s in sids})
+        monkeypatch.setattr(watch_dashboard, "session_registry", lambda: {})
+        for n, sid in enumerate(sids):
+            path = _write_transcript(tmp_path, "-p", sid + ".jsonl", [{"cwd": "/x/proj", "message": {"role": "user", "content": "start " + sid}}])
+            os.utime(path, (1_000_000 + n, 1_000_000 + n))   # s13 newest, s00 oldest
+        def ids(**k):
+            return [s["session_id"] for s in watch_relay.recent_sessions(projects_dir=str(tmp_path), **k)]
+        assert "s00" not in ids(), "twelve rows, newest first"
+        assert len(ids(waiting={"s00"})) == 13 and ids(waiting={"s00"})[-1] == "s00", \
+            "but the oldest is listed when a card waits on it"
+
+    def test_a_session_with_a_waiting_card_is_listed_without_a_live_process(self, tmp_path, monkeypatch):
+        """A card means something is asking; a liveness check that missed
+        its process must not leave the card with no row to live in."""
+        import watch_dashboard
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_dashboard, "session_registry", lambda: {})
+        _write_transcript(tmp_path, "-p", "quiet-1.jsonl", [{"cwd": "/x/proj", "message": {"role": "user", "content": "hi"}}])
+        rows = watch_relay.recent_sessions(projects_dir=str(tmp_path), waiting={"quiet-1"})
+        assert [s["session_id"] for s in rows] == ["quiet-1"]
+        assert rows[0]["live"] is False, "listed, not claimed live"
+        assert watch_relay.recent_sessions(projects_dir=str(tmp_path)) == [], "no card, no row"
+
     def test_typing_into_a_terminal_is_off_until_proved(self, monkeypatch):
         called = []
         monkeypatch.setattr(watch_relay, "session_is_waiting", lambda sid: called.append(1) or True)
@@ -11214,21 +11787,27 @@ class TestFirstPairingIsAWindow:
         assert _REAL_ASK_OWNER_TO_PAIR("192.168.1.9") is allowed
         assert "192.168.1.9" in seen[0] and 'default button "Don\'t Allow"' in seen[0]
 
-    def test_a_mac_with_the_icloud_bridge_never_opens_the_network_door(self, tmp_path, monkeypatch):
-        """Where the bridge mirrors the key into iCloud, a watch pairs
-        through the owner's Apple ID. Opening the network door as well, for
-        half an hour at every session start, handed a key to anyone on the
-        same Wi-Fi (2026-09-25 review)."""
+    def test_a_fresh_mac_with_a_bridge_still_opens_the_door_but_asks_first(
+            self, tmp_path, monkeypatch):
+        """Route B (D2) installs the bridge on every Mac, and a Mac's Apple
+        Account need not be the watch's: then iCloud never brings the key,
+        and a shut door meant no way in at all. So a never-paired Mac opens
+        the first-run door with or without a bridge. What the 2026-09-25
+        review guarded stays guarded: that door asks at the Mac before a
+        key leaves, so a stranger on the same Wi-Fi gets nothing (the
+        suite's dialog answers no)."""
         bridge = tmp_path / "TapprovalBridge.app"
         bridge.mkdir()
         monkeypatch.setattr(watch_relay, "BRIDGE_APP", str(bridge))
         auth = watch_relay.Auth(path=str(tmp_path / "auth.json"))
         auth.save = lambda: None
         assert not auth.paired_ever
-        assert not auth.window_open()
+        assert auth.window_open() and auth._window_asks
+        assert auth.claim_window("192.168.1.9") is None, "not without the Mac's yes"
+        auth.note_device_seen()
+        assert not auth.window_open(), "a watch with the iCloud key shuts it"
         auth.relight()
-        assert not auth.window_open(), "a session start does not open it either"
-        assert auth.claim_window("192.168.1.9") is None
+        assert not auth.window_open(), "and a session start keeps it shut"
 
     def test_a_watch_that_pairs_through_icloud_shuts_the_door(self, fresh_auth):
         """It presents the mirrored key and never enrols; the relay learns
@@ -11374,6 +11953,66 @@ class TestTheChangelogPageNeverGoesBlank:
         result, page = self._run(tmp_path, "echo '[]'\n")
         assert page == "the page we had"
         assert "NOT re-rendered" in result.stderr
+
+
+@pytest.mark.private_layout
+class TestTheBridgeIsPublishedWithItsHelper:
+    """Route B (#378) puts the bridge on every Mac, so its source goes to
+    the helper's public repository with the helper that installs it. The
+    list in sync-helper.sh is the bridge target's own: a source file added
+    to the target and not to the list would ship code nobody can read."""
+
+    def _read(self, *parts):
+        path = os.path.join(_ROOT, *parts)
+        if not os.path.isfile(path):
+            pytest.skip("%s lives in the product repo only" % path)
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_the_published_list_is_the_bridge_targets_sources(self):
+        script = self._read("sync-helper.sh")
+        listed = re.search(r'^BRIDGE_SOURCES="([^"]*)"', script, re.M).group(1).split()
+        project = self._read("WatchApp", "Tapproval.xcodeproj", "project.pbxproj")
+        target = re.search(r"/\* TapprovalBridge \*/ = \{\s*isa = PBXNativeTarget;"
+                           r"[\s\S]*?(\w+) /\* Sources \*/", project).group(1)
+        phase = re.search(r"%s /\* Sources \*/ = \{[\s\S]*?files = \(([\s\S]*?)\);"
+                          % target, project).group(1)
+        compiled = set(re.findall(r"/\* (\S+\.swift) in Sources \*/", phase))
+        assert compiled, "found no sources for the bridge target"
+        assert {os.path.basename(p) for p in listed if p.endswith(".swift")} == compiled
+        assert "WatchApp/Bridge/Bridge.entitlements" in listed
+        for path in listed:
+            assert os.path.isfile(os.path.join(_ROOT, path)), path
+        assert 'cp $BRIDGE_SOURCES "$CLONE/bridge/"' in script
+        # The signed bridge ships beside its source, and a pin naming a zip
+        # the tree does not hold stops the sync instead of shipping a helper
+        # that installs nothing.
+        copy = script.index('cp "$PINNED_ZIP" "$CLONE/$PINNED_ZIP"')
+        assert script.index('[ ! -f "$PINNED_ZIP" ]') < copy
+        assert script.index('cp $BRIDGE_SOURCES "$CLONE/bridge/"') < copy
+
+
+class TestTheChangelogIsTheHelpersOwn:
+    """The changelog page lists published releases only: drafts and
+    prereleases are left out."""
+
+    def test_drafts_and_prereleases_are_left_out(self):
+        path = os.path.join(_ROOT, "render-changelog.py")
+        if not os.path.isfile(path):
+            pytest.skip("render-changelog.py lives in the product repo only")
+        sys.path.insert(0, _ROOT)
+        try:
+            spec = importlib.util.spec_from_file_location("render_changelog", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        finally:
+            sys.path.remove(_ROOT)
+        kept = mod.published([
+            {"tag_name": "v1.1.58", "published_at": "2026-10-17"},
+            {"tag_name": "v1.1.59", "published_at": "2026-10-19", "draft": True},
+            {"tag_name": "v1.1.57", "published_at": "2026-10-16", "prerelease": True},
+            {"tag_name": "v1.1.56", "published_at": "2026-10-15"}])
+        assert [r["tag_name"] for r in kept] == ["v1.1.58", "v1.1.56"]
 
 
 class TestTheSiteHasOnePageFrame:
@@ -12034,6 +12673,33 @@ class TestCiRunsWhatTheChangeCanBreak:
 
 
 @pytest.mark.private_layout
+class TestATapTriesEveryRoute:
+    """#601 (a user's report, 2026-10-15): at the edge of the home Wi-Fi a
+    tap failed with "Couldn't reach" while the away address would have
+    carried it. The polls looked for cards over every route; the tap went
+    only over the one used last. decide() must post through deliverTap,
+    which races the routes as the polls do, never through the one route."""
+
+    def _decide(self):
+        swift = Path(__file__).with_name("WatchApp").joinpath(
+            "Tapproval", "RelayModel.swift").read_text()
+        start = swift.index("    func decide(_ card: WristCard")
+        return swift[start:swift.index("\n    }\n", start)]
+
+    def test_a_tap_goes_through_the_route_race(self):
+        body = self._decide()
+        assert "deliverTap(" in body
+        assert 'postJSON("decision", body)' not in body, "a tap over one route only"
+
+    def test_the_not_sent_notice_says_what_helps(self):
+        swift = Path(__file__).with_name("WatchApp").joinpath(
+            "Tapproval", "RelayModel.swift").read_text()
+        start = swift.index("static func notSentNotice")
+        notice = swift[start:swift.index("\n    }\n", start)]
+        assert "On weak Wi-Fi, try turning the watch's Wi-Fi off." in notice
+
+
+@pytest.mark.private_layout
 class TestEveryTestRunSaysWhyItEnded:
     """A test host that is killed or never starts fails no assertion: the
     run ends "0 failures … TEST FAILED", and the filter each step prints
@@ -12522,13 +13188,45 @@ class TestWatchSimulatorsAreChosenBySize:
             "a model name ages out with the next Xcode"
         assert "./sim-devtype.sh" in code
 
+    def _udid(self, tmp_path, name):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        (bin_dir / "xcrun").write_text(
+            '#!/bin/bash\n'
+            '[ "$*" = "simctl list devices available" ] || exit 1\n'
+            'echo "-- watchOS 26.5 --"\n'
+            'echo "    Tapproval Flows 41mm Extra (CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC) (Shutdown)"\n'
+            'echo "    Tapproval Flows 41mm (AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA) (Shutdown)"\n'
+            'echo "    Tapproval Flows 41mm (DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD) (Booted)"\n')
+        (bin_dir / "xcrun").chmod(0o755)
+        return subprocess.run(
+            [os.path.join(_ROOT, "WatchApp", "sim-udid.sh"), name],
+            env=dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"])),
+            capture_output=True, text=True, timeout=30)
+
+    @pytest.mark.private_layout
+    def test_a_simulator_is_found_by_its_whole_name(self, tmp_path):
+        """One helper for the five lookups the watch scripts each spelled
+        out: the first device with exactly this name, never one whose name
+        merely starts the same."""
+        run = self._udid(tmp_path, "Tapproval Flows 41mm")
+        assert run.stdout == "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA\n", run.stderr
+        assert self._udid(tmp_path, "Tapproval Flows 50mm").stdout == ""
+
+    @pytest.mark.private_layout
+    def test_the_watch_scripts_look_simulators_up_in_one_place(self):
+        for name in ("watch-flows.sh", "watch-shots.sh", "demo-film.sh"):
+            script = open(os.path.join(_ROOT, "WatchApp", name), encoding="utf-8").read()
+            assert "simctl list devices available" not in script, name
+            assert "./sim-udid.sh" in script, name
+
     def _flows(self, tmp_path, fail_face=None):
         """watch-flows.sh itself, against a stand-in Xcode whose test runs
         take two seconds each and say when they started and stopped."""
         import shutil
         app = tmp_path / "WatchApp"
         app.mkdir()
-        for name in ("watch-flows.sh", "sim-devtype.sh"):
+        for name in ("watch-flows.sh", "sim-devtype.sh", "sim-udid.sh"):
             shutil.copy(os.path.join(_ROOT, "WatchApp", name), app / name)
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
@@ -12793,8 +13491,8 @@ class TestTheReportingItselfIsChecked:
     # a key that is not here fails the first test below, which is the
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
-    VOCABULARY = {"bonjour", "bridge", "claude", "codex", "crash", "helper", "port", "signin",
-                  "stuck", "tunnel", "update"}
+    VOCABULARY = {"bonjour", "bridge", "bridge_install", "claude", "codex", "crash", "helper",
+                  "icloud_off", "port", "signin", "stuck", "tunnel", "update"}
 
     @staticmethod
     def _module_source(name):
@@ -15008,3 +15706,887 @@ class TestTheWatchNamesTheComputer:
                         if re.search(r"\bMac\b", literal) and literal not in self.ALLOWED:
                             found.append("%s:%d %s" % (name, number, literal))
         assert not found, "\n".join(found)
+
+
+class TestTheHookBelievesOnlyItsRelay:
+    """2026-10-16 review, S1: the hook posted /card with no key and took
+    whatever answered on 127.0.0.1:8977 at its word. During a relay
+    restart any process of any user could hold that port and answer
+    "allow" to a CRITICAL card. The hook now signs each card with the key
+    file's bootstrap and believes only an answer carrying the relay's
+    proof over it; the relay refuses a card that is not so signed. Every
+    miss — no key file, no proof, a wrong proof — is "none": the terminal
+    prompt stands."""
+
+    CARD = {"tier": "CRITICAL", "headline": "rm -rf /", "detail": "x"}
+
+    def _squatter(self, proof_key=None):
+        """Something else on the relay's port: answers every /card with
+        an allow, and with a proof made from ``proof_key`` if given."""
+        import http.server
+        seen = []
+
+        class Squat(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                seen.append(self.headers.get("X-Tapproval-Signature"))
+                reply = json.dumps({"id": "x", "decision": "allow"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(reply)))
+                if proof_key:
+                    nonce = (seen[-1] or "v2 0 n m").split()[2]
+                    self.send_header("X-Tapproval-Proof2", watch_relay.relay_proof2(
+                        proof_key, nonce, 200, reply))
+                self.end_headers()
+                self.wfile.write(reply)
+                del body
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Squat)
+        _serve(server)
+        return server, seen
+
+    def _key_file(self, tmp_path, key="the-real-bootstrap"):
+        path = tmp_path / "key.json"
+        path.write_text(json.dumps({"version": 1, "bootstrap": key}))
+        return str(path)
+
+    def test_an_allow_from_a_squatter_is_no_answer(self, tmp_path):
+        server, seen = self._squatter()
+        try:
+            policy = dict(crc.DEFAULT_POLICY, relay_wait=2.0,
+                          relay="http://127.0.0.1:%d" % server.server_address[1],
+                          auth_file=self._key_file(tmp_path))
+            assert crc.ask_watch(self.CARD, policy) == ("none", None)
+            assert seen and seen[0].startswith("v2 "), "the card went signed"
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_proof_made_with_another_key_is_no_answer(self, tmp_path):
+        server, _ = self._squatter(proof_key="a-key-of-its-own")
+        try:
+            policy = dict(crc.DEFAULT_POLICY, relay_wait=2.0,
+                          relay="http://127.0.0.1:%d" % server.server_address[1],
+                          auth_file=self._key_file(tmp_path))
+            assert crc.ask_watch(self.CARD, policy) == ("none", None)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_the_holder_of_the_key_is_believed(self, tmp_path):
+        """The positive control: the same fake, given the key, is taken at
+        its word — so the two refusals above are the proof's doing."""
+        server, _ = self._squatter(proof_key="the-real-bootstrap")
+        try:
+            policy = dict(crc.DEFAULT_POLICY, relay_wait=2.0,
+                          relay="http://127.0.0.1:%d" % server.server_address[1],
+                          auth_file=self._key_file(tmp_path))
+            assert crc.ask_watch(self.CARD, policy) == ("allow", None)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_no_key_file_sends_no_card(self, tmp_path):
+        server, seen = self._squatter(proof_key="the-real-bootstrap")
+        try:
+            policy = dict(crc.DEFAULT_POLICY, relay_wait=2.0,
+                          relay="http://127.0.0.1:%d" % server.server_address[1],
+                          auth_file=str(tmp_path / "missing.json"))
+            assert crc.ask_watch(self.CARD, policy) == ("none", None)
+            assert seen == []
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_the_hook_signs_as_the_relay_checks(self):
+        """The hook carries its own copy of the relay's signing, because
+        importing the relay costs it 0.4-1.5 s a prompt. Held equal here."""
+        body = "{\"card\": {\"headline\": \"Æblegrød\"}}".encode("utf-8")
+        assert crc._relay_signature("k", "POST", "/card", 1700000000, "n" * 32, body) == \
+            watch_relay.sign_request("k", "POST", "/card", 1700000000, "n" * 32, body,
+                                     query="")
+        assert crc._relay_proof2("k", "n" * 32, 200, body) == \
+            watch_relay.relay_proof2("k", "n" * 32, 200, body)
+
+    def test_the_relay_hears_the_hook_and_proves_itself(self, live_relay):
+        port, queue = live_relay
+
+        def allow_first():
+            cards = _wait_until(lambda: queue.pending(from_watch=True), what="a card")
+            queue.decide(cards[0]["id"], "allow")
+
+        threading.Thread(target=allow_first, daemon=True).start()
+        policy = dict(crc.DEFAULT_POLICY, relay_wait=5.0,
+                      relay="http://127.0.0.1:%d" % port)
+        assert crc.ask_watch(self.CARD, policy) == ("allow", None)
+
+    def test_an_old_hook_against_this_relay_asks_at_the_terminal(self, live_relay):
+        """Upgrade order, one way: a hook from before signing posts its card
+        bare. The relay refuses it, and that hook's every failure was
+        already "none"."""
+        port, queue = live_relay
+        status, _ = relay_call("http://127.0.0.1:%d/card" % port, method="POST",
+                               body={"card": dict(self.CARD), "wait": 1})
+        assert status == 403
+        assert queue.pending() == []
+
+    def test_this_hook_against_an_older_relay_still_works(self, live_relay, monkeypatch):
+        """Upgrade order, the other way: a relay from before this change
+        does not demand the signature on /card, but it verifies any
+        signature it is sent (credentials() includes the bootstrap) and
+        proves its answer, so a new hook keeps its wrist."""
+        port, queue = live_relay
+        routes = dict(watch_relay.RelayHandler.ROUTES["POST"])
+        routes["/card"] = ("_post_card", dict(local=True, lan_only=True))
+        monkeypatch.setitem(watch_relay.RelayHandler.ROUTES, "POST", routes)
+
+        def deny_first():
+            cards = _wait_until(lambda: queue.pending(from_watch=True), what="a card")
+            queue.decide(cards[0]["id"], "deny")
+
+        threading.Thread(target=deny_first, daemon=True).start()
+        policy = dict(crc.DEFAULT_POLICY, relay_wait=5.0,
+                      relay="http://127.0.0.1:%d" % port)
+        assert crc.ask_watch(self.CARD, policy) == ("deny", None)
+
+    def test_the_key_file_can_be_named_for_an_isolated_relay(self, tmp_path):
+        policy = crc.load_policy({"CLAUDE_RISK_AUTH_FILE": str(tmp_path / "k.json")})
+        assert policy["auth_file"] == str(tmp_path / "k.json")
+
+
+class TestALastingGrantOnlyWhereOffered:
+    """2026-10-16 review, S5: "don't ask again" became a lasting allow rule
+    for any tier, whatever the card had shown. The hook now writes one
+    only for a card that carried those very words and is not CRITICAL;
+    anything else allows this once. The relay refuses always/dont_ask
+    outright for a CRITICAL card or one Claude Code made no suggestion for."""
+
+    PY = TestDontAskAgainIsTheTerminals.PY
+
+    def _run(self, monkeypatch, tmp_path, command, strip_label=False):
+        import io
+        monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
+        monkeypatch.setenv("CLAUDE_RISK_RELAY", "http://127.0.0.1:1")
+        monkeypatch.setattr(crc, "ask_watch", lambda card, policy, project=None:
+                            ("dont_ask", None))
+        if strip_label:
+            real = crc.build_response
+
+            def without_label(*args, **kwargs):
+                response, audit, card = real(*args, **kwargs)
+                card.pop("always_label", None)
+                return response, audit, card
+            monkeypatch.setattr(crc, "build_response", without_label)
+        out = io.StringIO()
+        crc.run_hook(stdin=io.StringIO(json.dumps({
+            "tool_name": "Bash", "session_id": "s1", "cwd": "/w/proj",
+            "tool_input": {"command": command},
+            "permission_suggestions": self.PY})), stdout=out)
+        return json.loads(out.getvalue())["hookSpecificOutput"]["decision"]
+
+    def test_the_control_writes_the_rule(self, monkeypatch, tmp_path):
+        assert self._run(monkeypatch, tmp_path, "python3 -c 'print(41+1)'") == {
+            "behavior": "allow", "updatedPermissions": self.PY}
+
+    def test_critical_allows_once_and_writes_nothing(self, monkeypatch, tmp_path):
+        assert self._run(monkeypatch, tmp_path, "rm -rf / --no-preserve-root") == {
+            "behavior": "allow"}
+
+    def test_a_card_that_showed_no_words_writes_nothing(self, monkeypatch, tmp_path):
+        assert self._run(monkeypatch, tmp_path, "python3 -c 'print(41+1)'",
+                         strip_label=True) == {"behavior": "allow"}
+
+    @pytest.mark.parametrize("decision", ["always", "dont_ask"])
+    @pytest.mark.parametrize("card", [
+        {"tier": "CRITICAL", "can_always": True},
+        {"tier": "HIGH", "can_always": False},
+        {"tier": "HIGH"},
+    ])
+    def test_the_relay_refuses_a_grant_the_card_never_offered(self, decision, card):
+        queue, result = watch_relay.CardQueue(), []
+        waiter = threading.Thread(target=lambda: result.append(queue.submit(
+            dict(card, headline="x", detail="x"), wait=5)), daemon=True)
+        waiter.start()
+        card_id = _wait_until(queue.pending, what="the card")[0]["id"]
+        assert queue.decide(card_id, decision) is False
+        assert queue.decide(card_id, "deny") is True, "the card is still up"
+        waiter.join(5)
+        assert result[0][1] == "deny"
+
+    def test_the_relay_takes_one_where_it_was_offered(self):
+        queue = watch_relay.CardQueue()
+
+        def press():
+            cards = _wait_until(queue.pending, what="the card")
+            queue.decide(cards[0]["id"], "dont_ask")
+
+        threading.Thread(target=press, daemon=True).start()
+        _, answer, _ = queue.submit({"tier": "HIGH", "can_always": True,
+                                     "headline": "x", "detail": "x"}, wait=5)
+        assert answer == "dont_ask"
+
+
+class TestTheFirstAnswerIsFinal:
+    """2026-10-16 review, S13: a second answer to a card overwrote the
+    first until the hook read it, and a plan answer was mapped to a mode
+    without asking whether the card had offered that row."""
+
+    def test_a_second_answer_is_refused(self, capsys):
+        queue, result = watch_relay.CardQueue(), []
+        card_id = None
+        # Both taps land before the waiting hook reads either: the lock is
+        # held across them, as two watches answering at once would race.
+        with queue._lock:
+            waiter = threading.Thread(target=lambda: result.append(queue.submit(
+                {"tier": "HIGH", "headline": "x", "detail": "x"}, wait=5)), daemon=True)
+            waiter.start()
+            while card_id is None:
+                queue._lock.wait(0.02)
+                card_id = next(iter(queue._pending), None)
+            assert queue.decide(card_id, "deny") is True
+            assert queue.decide(card_id, "allow") is False
+        waiter.join(5)
+        assert result[0][1] == "deny"
+        assert "already answered" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("said,options,behavior", [
+        (crc.PLAN_AUTO, crc.plan_options(False), None),
+        (crc.PLAN_AUTO_PHONE, crc.plan_options(False), None),
+        (crc.PLAN_ACCEPT_EDITS, crc.plan_options(True), None),
+        (crc.PLAN_MANUAL, [], None),
+        (crc.PLAN_AUTO, crc.plan_options(True), "allow"),
+        (crc.PLAN_AUTO_PHONE, crc.plan_options(True), "allow"),
+        (crc.PLAN_ACCEPT_EDITS, crc.plan_options(False), "allow"),
+        (crc.PLAN_EDITS + " drop step two", crc.plan_options(False), "deny"),
+    ])
+    def test_a_plan_answer_must_be_one_the_card_offered(self, said, options, behavior):
+        assert crc.plan_decision(said, options)[0] == behavior
+
+    def test_the_hook_leaves_an_unoffered_row_to_the_terminal(self, monkeypatch, tmp_path):
+        import io
+        monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
+        monkeypatch.setenv("CLAUDE_RISK_RELAY", "http://127.0.0.1:1")
+        monkeypatch.setattr(crc, "auto_mode_seen", lambda event: False)
+        monkeypatch.setattr(crc, "ask_watch", lambda card, policy, project=None:
+                            ("answer", crc.PLAN_AUTO))
+        out = io.StringIO()
+        crc.run_hook(stdin=io.StringIO(json.dumps(
+            {"tool_name": "ExitPlanMode", "tool_input": {"plan": "# Plan\n- one"}})),
+            stdout=out)
+        assert _behavior(json.loads(out.getvalue())) == "escalate"
+
+    def test_a_headless_run_refuses_an_unoffered_row(self):
+        fake = TestTheWristAnswersAHeadlessSend._Fake("answer", answer=crc.PLAN_AUTO)
+        out = wpt.decide("ExitPlanMode", {"plan": "x"}, crc=fake)
+        assert out["behavior"] == "deny"
+
+
+# ---- Route B: the helper installs the Mac bridge (#378) ---------------------
+
+def _bridge_zip_pin(payload=b"pretend zip of TapprovalBridge.app", version="1.0.0",
+                    **changes):
+    """A pin as release-bridge.sh writes it, with its zip in bridge/ beside
+    the suite's own pin file (the fixture's temporary TAPPROVAL_BRIDGE_PIN):
+    the helper's layout, in a folder no real install reads."""
+    root = os.path.dirname(os.environ["TAPPROVAL_BRIDGE_PIN"])
+    file = "bridge/TapprovalBridge-%s.zip" % version
+    os.makedirs(os.path.join(root, "bridge"), exist_ok=True)
+    with open(os.path.join(root, file), "wb") as handle:
+        handle.write(payload)
+    pin = {"version": version, "file": file,
+           "sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload),
+           "team": "K2RX2Y5896", "identifier": "app.tapproval.bridge",
+           "path": os.path.join(root, file)}
+    pin.update(changes)
+    return pin
+
+
+def _write_pin(pin):
+    """bridge.json as the helper ships it, where the suite's pin points."""
+    with open(os.environ["TAPPROVAL_BRIDGE_PIN"], "w", encoding="utf-8") as handle:
+        json.dump({k: v for k, v in pin.items() if k != "path"}, handle)
+
+
+# Taken before any fixture stands in for them.
+_REAL_MAC_SUPPORTED = bridge_install.mac_supported
+_REAL_BRIDGE_APP = watch_relay.BRIDGE_APP
+
+
+def _make_app(path, version):
+    import plistlib
+    contents = os.path.join(path, "Contents")
+    os.makedirs(os.path.join(contents, "MacOS"), exist_ok=True)
+    with open(os.path.join(contents, "Info.plist"), "wb") as handle:
+        plistlib.dump({"CFBundleShortVersionString": version}, handle)
+
+
+class _FakeMac:
+    """ditto, codesign and spctl as a Developer ID, notarized bridge would
+    answer them, each answer changeable to the failure a test is about."""
+
+    def __init__(self, version="1.0.0"):
+        self.version = version
+        self.verify = 0
+        # What the app is signed with; the requirement codesign is asked
+        # to test must name exactly this, as the real one does.
+        self.team, self.ident, self.developer_id = "K2RX2Y5896", "app.tapproval.bridge", True
+        self.gatekeeper = (0, "x: accepted\nsource=Notarized Developer ID")
+        self.ran = []
+
+    def __call__(self, command, timeout=60):
+        self.ran.append(command[0])
+        if command[0] == "ditto":
+            _make_app(os.path.join(command[-1], "TapprovalBridge.app"), self.version)
+            return 0, ""
+        if command[:2] == ["codesign", "--verify"]:
+            if self.verify:
+                return self.verify, "invalid signature"
+            req = command[command.index("-R") + 1]
+            met = (req.startswith("=anchor apple generic")
+                   and self.developer_id
+                   and '[subject.OU] = "%s"' % self.team in req
+                   and 'identifier "%s"' % self.ident in req)
+            return (0, "") if met else (3, "failed to satisfy specified code requirement(s)")
+        if command[0] == "spctl":
+            return self.gatekeeper
+        if command[0] == "launchctl":
+            raise AssertionError("launchd must not be touched with the agent path overridden")
+        raise AssertionError("unexpected command %r" % (command,))
+
+
+class TestTheHelperInstallsTheMacBridge:
+    """Route B (#378): every Mac running the helper gets the notarized
+    Developer ID bridge, so a closed watch buzzes through iCloud. What
+    reaches the Mac is trusted only after the pinned hash, the team's
+    signature and Apple's notarization all agree; anything else is thrown
+    away and the bridge already there keeps running."""
+
+    @pytest.fixture(autouse=True)
+    def _a_mac(self, monkeypatch):
+        monkeypatch.setattr(bridge_install, "mac_supported", lambda *a, **k: True)
+        self.mac = _FakeMac()
+        monkeypatch.setattr(bridge_install, "RUN", self.mac)
+
+    def _install(self, pin=None, payload=b"pretend zip of TapprovalBridge.app", **kw):
+        return bridge_install.install(pin or _bridge_zip_pin(payload), **kw)
+
+    # -- the pin ------------------------------------------------------------
+
+    def test_a_good_pin_is_read_and_names_the_zip_beside_it(self):
+        pin = _bridge_zip_pin()
+        _write_pin(pin)
+        assert bridge_install.read_pin() == pin
+        assert pin["path"] == os.path.join(
+            os.path.dirname(os.environ["TAPPROVAL_BRIDGE_PIN"]),
+            "bridge", "TapprovalBridge-1.0.0.zip")
+
+    @pytest.mark.parametrize("change", [
+        {"file": "bridge/../../evil/TapprovalBridge-1.0.0.zip"},
+        {"file": "/etc/TapprovalBridge-1.0.0.zip"},
+        {"file": "TapprovalBridge-1.0.0.zip"},
+        {"file": "bridge/TapprovalBridge-9.9.9.zip"},
+        {"file": "bridge/TapprovalBridge-1.0.0.dmg"},
+        {"file": None},
+        {"url": "https://example.com/TapprovalBridge-1.0.0.zip", "file": None},
+        {"sha256": "abc"},
+        {"size": bridge_install.MAX_BYTES + 1},
+        {"size": True},
+        {"version": "1.0"},
+        {"team": "someone"},
+        {"identifier": "app; rm -rf ~"},
+    ])
+    def test_a_pin_of_the_wrong_shape_pins_nothing(self, tmp_path, change):
+        path = tmp_path / "bridge.json"
+        pin = _bridge_zip_pin(**change)
+        pin.pop("path")
+        path.write_text(json.dumps(pin))
+        assert bridge_install.read_pin(str(path)) is None
+
+    def test_no_pin_file_pins_nothing(self, tmp_path):
+        assert bridge_install.read_pin(str(tmp_path / "absent.json")) is None
+
+    def test_the_pin_override_counts_only_inside_a_test_run(self, monkeypatch):
+        """The pin is the trust anchor: an environment variable must not
+        point a real install at another file."""
+        assert bridge_install.pin_path() == os.environ["TAPPROVAL_BRIDGE_PIN"]
+        monkeypatch.setattr(bridge_install, "_running_under_test", lambda: False)
+        assert bridge_install.pin_path() == os.path.join(_ROOT, "bridge.json")
+
+    def test_the_requirement_names_apple_developer_id_team_and_bundle(self):
+        req = bridge_install.requirement(_bridge_zip_pin())
+        assert req.startswith("=anchor apple generic"), "text, not a file path"
+        assert "1.2.840.113635.100.6.2.6" in req and "1.2.840.113635.100.6.1.13" in req
+        assert '[subject.OU] = "K2RX2Y5896"' in req and 'identifier "app.tapproval.bridge"' in req
+
+    def test_the_helper_pins_its_bridge_beside_itself(self, monkeypatch):
+        """The pin and its zip travel together, inside the helper."""
+        monkeypatch.delenv("TAPPROVAL_BRIDGE_PIN")
+        assert bridge_install.pin_path() == os.path.join(_ROOT, "bridge.json")
+
+    # -- what this computer needs --------------------------------------------
+
+    @pytest.mark.parametrize("name, version, supported", [
+        ("linux", "", False), ("darwin", "12.7.6", False), ("darwin", "13.0", True),
+        ("darwin", "26.1", True), ("darwin", "", False)])
+    def test_only_a_mac_new_enough_for_the_bridge_gets_one(self, name, version, supported):
+        assert _REAL_MAC_SUPPORTED(name, version) is supported
+
+    def test_the_states(self):
+        pin = _bridge_zip_pin()
+        assert bridge_install.state(None) == "no-pin"
+        assert bridge_install.state(pin) == "install"
+        _make_app(bridge_install.app_path(), "1.0.0")
+        assert bridge_install.state(pin) == "current"
+        assert bridge_install.state(_bridge_zip_pin(version="1.0.1")) == "install"
+        open(bridge_install.hand_built_marker(), "w").close()
+        assert bridge_install.state(pin) == "hand-built"
+        bridge_install.set_off(True)
+        assert bridge_install.state(pin) == "off"
+
+    # -- installing ---------------------------------------------------------
+
+    def test_a_good_bridge_is_installed_with_its_login_job(self):
+        import plistlib
+        assert self._install() == "1.0.0"
+        assert bridge_install.installed_version() == "1.0.0"
+        with open(bridge_install.agent_path(), "rb") as handle:
+            job = plistlib.load(handle)
+        assert job["Label"] == "com.tapproval.bridge"
+        assert job["ProgramArguments"] == [os.path.join(
+            bridge_install.app_path(), "Contents", "MacOS", "TapprovalBridge")]
+        assert job["RunAtLoad"] is True and job["KeepAlive"] is True
+        assert job["StandardErrorPath"].endswith("bridge.log")
+        assert self.mac.ran.count("codesign") == 1 and "spctl" in self.mac.ran
+        leftovers = [n for n in os.listdir(bridge_install.bridge_dir())
+                     if n.startswith("staging-")]
+        assert leftovers == [], "the copy and its unpacking are cleaned up"
+
+    @pytest.mark.parametrize("spoil", [
+        "hash", "size", "short", "team", "identifier", "not developer id", "signature",
+        "not notarized", "version"])
+    def test_any_failed_check_leaves_the_bridge_that_was_there(self, spoil):
+        _make_app(bridge_install.app_path(), "0.9.0")
+        payload = b"pretend zip of TapprovalBridge.app"
+        pin = _bridge_zip_pin(payload)
+        if spoil == "hash":
+            pin["sha256"] = hashlib.sha256(b"something else").hexdigest()
+        elif spoil == "size":
+            pin["size"] = len(payload) - 1
+        elif spoil == "short":
+            pin["size"] = len(payload) + 1
+        elif spoil == "team":
+            self.mac.team = "ABCDE12345"
+        elif spoil == "identifier":
+            self.mac.ident = "com.example.other"
+        elif spoil == "not developer id":
+            self.mac.developer_id = False
+        elif spoil == "signature":
+            self.mac.verify = 1
+        elif spoil == "not notarized":
+            self.mac.gatekeeper = (3, "x: rejected\nsource=Unnotarized Developer ID")
+        elif spoil == "version":
+            self.mac.version = "0.0.1"
+        with pytest.raises(bridge_install.InstallError):
+            bridge_install.install(pin)
+        assert bridge_install.installed_version() == "0.9.0"
+        assert not os.path.exists(bridge_install.agent_path())
+
+    def test_a_new_bridge_that_stays_silent_is_swapped_back(self):
+        _make_app(bridge_install.app_path(), "0.9.0")
+        with pytest.raises(bridge_install.InstallError) as refused:
+            self._install(wait_for_bridge=lambda: False)
+        assert "previous one is back" in str(refused.value)
+        assert bridge_install.installed_version() == "0.9.0"
+
+    def test_a_login_job_launchd_refuses_puts_the_old_bridge_back(self, monkeypatch):
+        _make_app(bridge_install.app_path(), "0.9.0")
+        monkeypatch.setattr(bridge_install, "load_agent", lambda: False)
+        with pytest.raises(bridge_install.InstallError) as refused:
+            self._install()
+        assert "previous one is back" in str(refused.value)
+        assert bridge_install.installed_version() == "0.9.0"
+
+    def test_a_first_install_that_fails_after_the_swap_leaves_nothing(self, monkeypatch):
+        """Half-installed, it would read as "current" and never be retried."""
+        monkeypatch.setattr(bridge_install, "load_agent", lambda: False)
+        with pytest.raises(bridge_install.InstallError):
+            self._install()
+        assert bridge_install.installed_version() is None
+        assert not os.path.exists(bridge_install.agent_path())
+        assert bridge_install.state(_bridge_zip_pin()) == "install"
+
+    def test_a_new_bridge_that_is_heard_from_stays(self):
+        _make_app(bridge_install.app_path(), "0.9.0")
+        assert self._install(wait_for_bridge=lambda: True) == "1.0.0"
+        assert bridge_install.installed_version("%s.previous" % bridge_install.app_path()) \
+            == "0.9.0", "one backup is kept"
+
+    def test_a_zip_missing_from_the_helper_installs_nothing(self):
+        _make_app(bridge_install.app_path(), "0.9.0")
+        pin = _bridge_zip_pin()
+        os.remove(pin["path"])
+        with pytest.raises(bridge_install.InstallError) as refused:
+            bridge_install.install(pin)
+        assert "could not be read" in str(refused.value)
+        assert bridge_install.installed_version() == "0.9.0"
+
+    def test_nothing_is_fetched_from_anywhere(self):
+        """One package (the owner's decision, 2026-10-16): the installer
+        has no network code to go wrong, or to be pointed elsewhere."""
+        with open(bridge_install.__file__, encoding="utf-8") as handle:
+            src = handle.read()
+        assert "urllib" not in src and "://" not in src
+
+    def test_removing_takes_the_app_and_its_login_job(self):
+        self._install()
+        assert bridge_install.remove()
+        assert not os.path.exists(bridge_install.app_path())
+        assert not os.path.exists(bridge_install.agent_path())
+
+    # -- the classifier's --install, --no-bridge and --uninstall -------------
+
+    def test_install_says_the_truth_off_a_mac(self, monkeypatch):
+        monkeypatch.setattr(bridge_install, "mac_supported", lambda *a, **k: False)
+        line = crc._bridge_step(None)
+        assert "needs a Mac" in line and "open" in line
+        assert not os.path.exists(bridge_install.bridge_dir())
+
+    def test_install_with_nothing_pinned_says_nothing(self):
+        assert crc._bridge_step(None) is None
+
+    def test_install_puts_the_pinned_bridge_in(self):
+        _write_pin(_bridge_zip_pin())
+        assert "just installed" in crc._bridge_step(None)
+        assert "buzzes through your own iCloud (bridge 1.0.0)" in crc._bridge_step(None)
+
+    def test_no_bridge_removes_it_and_keeps_it_out(self):
+        self._install()
+        assert "off" in crc._bridge_step(False)
+        assert not os.path.exists(bridge_install.app_path())
+        assert bridge_install.state(_bridge_zip_pin()) == "off"
+        assert "--bridge" in crc._bridge_step(None), "a plain re-install keeps the choice"
+        crc._bridge_step(True)
+        assert bridge_install.state(_bridge_zip_pin()) == "install"
+
+    def test_the_flags_reach_the_installer(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(crc, "run_install",
+                            lambda then_watch=False, bridge=None: seen.append(bridge) or 1)
+        crc.main(["--install", "--no-bridge"])
+        crc.main(["--install", "--bridge"])
+        crc.main(["--install"])
+        assert seen == [False, True, None]
+
+    def test_uninstall_removes_the_bridge(self):
+        self._install()
+        assert crc._remove_bridge()
+        assert not os.path.exists(bridge_install.app_path())
+        assert not crc._remove_bridge(), "nothing left the second time"
+
+    # -- the relay keeps it current -------------------------------------------
+
+    def _pinned(self, tmp_path, monkeypatch, payload=b"pretend zip of TapprovalBridge.app"):
+        _write_pin(_bridge_zip_pin(payload))
+
+    def test_a_session_start_spawns_the_update_once_an_hour(self, tmp_path, monkeypatch):
+        self._pinned(tmp_path, monkeypatch)
+        spawned = []
+        monkeypatch.setattr(watch_relay, "_spawn_detached",
+                            lambda command, log, cwd=None: spawned.append(command) or "")
+        assert watch_relay._maybe_update_bridge()
+        assert spawned[0][-1] == "--bridge-update"
+        assert not watch_relay._maybe_update_bridge(), "retried at most hourly"
+        assert len(spawned) == 1
+
+    def test_a_session_start_with_the_bridge_current_spawns_nothing(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "_spawn_detached",
+                            lambda *a, **k: pytest.fail("spawned with nothing to do"))
+        assert not watch_relay._maybe_update_bridge()
+
+    def test_a_waiting_card_defers_the_update(self, tmp_path, monkeypatch):
+        self._pinned(tmp_path, monkeypatch)
+        monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: {"pending": 1})
+        monkeypatch.setattr(watch_relay, "_admin_call",
+                            lambda *a, **k: pytest.fail("nothing to report yet"))
+        assert watch_relay.run_bridge_update() == 0
+        assert bridge_install.installed_version() is None
+
+    def test_the_update_reports_how_it_went(self, tmp_path, monkeypatch):
+        self._pinned(tmp_path, monkeypatch)
+        said = []
+        monkeypatch.setattr(watch_relay, "_admin_call", lambda path, timeout=5: said.append(path))
+        monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: None)
+        self.mac.gatekeeper = (3, "rejected")
+        assert watch_relay.run_bridge_update() == 1
+        self.mac.gatekeeper = (0, "accepted\nsource=Notarized Developer ID")
+        assert watch_relay.run_bridge_update() == 0
+        assert said == ["/admin/bridge-failed", "/admin/bridge-ok"]
+        assert bridge_install.installed_version() == "1.0.0"
+
+    def test_the_relay_waits_for_a_fresh_poll(self, monkeypatch):
+        """/health says "bridge" for BRIDGE_ALIVE_SECONDS after the old
+        bridge's last poll; only a poll after that counts."""
+        slept = []
+        answers = iter([{}, {"alert_route": "bridge"}])
+        monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: next(answers))
+        assert watch_relay._bridge_heard_from(wait=60, sleep=slept.append)
+        assert slept[0] > watch_relay.CardQueue.BRIDGE_ALIVE_SECONDS
+
+    def test_a_bridge_never_heard_from_is_a_failure(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: None)
+        assert not watch_relay._bridge_heard_from(wait=0, sleep=lambda s: None)
+
+    # -- what the wrist is told -------------------------------------------------
+
+    def test_a_failed_install_reaches_health_and_a_good_one_withdraws_it(self, fresh_auth):
+        server, _queue = watch_relay.serve(port=0, auth=_known_watch(fresh_auth))
+        _serve(server)
+        try:
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            status, body = relay_call(base + "/admin/bridge-failed",
+                                      token="bootstraptoken", method="POST")
+            assert (status, body) == (200, {"ok": True})
+            _status, body = relay_call(base + "/health", token="devicetoken")
+            said = [c for c in body["conditions"] if c["key"] == "bridge_install"]
+            assert said and said[0]["tone"] == "needs_you"
+            assert "install.log" not in said[0]["detail"], "written for the wrist"
+            relay_call(base + "/admin/bridge-ok", token="bootstraptoken", method="POST")
+            _status, body = relay_call(base + "/health", token="devicetoken")
+            assert [c for c in body["conditions"] if c["key"] == "bridge_install"] == []
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_mac_without_icloud_is_said_and_stops_carrying_the_key(
+            self, fresh_auth, tmp_path, monkeypatch):
+        bridge = tmp_path / "TapprovalBridge.app"
+        bridge.mkdir()
+        monkeypatch.setattr(watch_relay, "BRIDGE_APP", str(bridge))
+        assert watch_relay.icloud_carries_the_key(), "a bridge that never reported counts"
+        server, _queue = watch_relay.serve(port=0, auth=_known_watch(fresh_auth))
+        _serve(server)
+        try:
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            status, _body = relay_call(base + "/bridge-status", method="POST",
+                                       body={"icloud": "noAccount"})
+            assert status == 403, "loopback alone is any process"
+            assert watch_relay.icloud_carries_the_key()
+            status, body = relay_call(base + "/bridge-status", method="POST",
+                                      token="bootstraptoken", body={"icloud": "noAccount"})
+            assert (status, body) == (200, {"ok": True})
+            assert not watch_relay.icloud_carries_the_key()
+            _status, body = relay_call(base + "/health", token="devicetoken")
+            said = [c for c in body["conditions"] if c["key"] == "icloud_off"]
+            assert said and "Apple Account" in said[0]["detail"]
+            _status, body = relay_call(base + "/bridge-status", method="POST",
+                                       token="bootstraptoken", body={"icloud": "<script>"})
+            assert body == {"ok": False}
+            assert not watch_relay.icloud_carries_the_key(), "nonsense changes nothing"
+            relay_call(base + "/bridge-status", method="POST", token="bootstraptoken",
+                       body={"icloud": "available"})
+            assert watch_relay.icloud_carries_the_key()
+            _status, body = relay_call(base + "/health", token="devicetoken")
+            assert [c for c in body["conditions"] if c["key"] == "icloud_off"] == []
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def _unpaired(self, fresh_auth):
+        auth = fresh_auth
+        auth.bootstrap = "bootstraptoken"
+        assert not auth.paired_ever and auth.window_open()
+        server, queue = watch_relay.serve(port=0, auth=auth)
+        _serve(server)
+        return server, queue, auth, "http://127.0.0.1:%d" % server.server_address[1]
+
+    def test_a_watch_seen_through_icloud_shuts_the_first_run_door(self, fresh_auth):
+        """D2 opens the door on a fresh Mac with a bridge. A watch that
+        only ever reaches it through iCloud must shut it, or it reopens
+        for half an hour at every session start."""
+        server, _queue, auth, base = self._unpaired(fresh_auth)
+        try:
+            relay_call(base + "/heartbeat", method="POST", body={"watch_seen_seconds_ago": 5})
+            assert not auth.paired_ever, "a stray local process is no witness"
+            relay_call(base + "/heartbeat", method="POST", token="bootstraptoken",
+                       body={"watch_seen_seconds_ago": 10_000})
+            assert not auth.paired_ever, "a stale heartbeat is no witness either"
+            relay_call(base + "/heartbeat", method="POST", token="bootstraptoken",
+                       body={"watch_seen_seconds_ago": 5})
+            assert auth.paired_ever and not auth.window_open()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_an_answer_carried_from_icloud_shuts_the_first_run_door(self, fresh_auth,
+                                                                     monkeypatch):
+        server, queue, auth, base = self._unpaired(fresh_auth)
+        try:
+            monkeypatch.setattr(queue, "decide", lambda *a, **k: False)
+            relay_call(base + "/decision", method="POST", token="bootstraptoken",
+                       body={"id": "c1", "decision": "allow"})
+            assert not auth.paired_ever, "an answer nobody took proves nothing"
+            monkeypatch.setattr(queue, "decide", lambda *a, **k: True)
+            relay_call(base + "/decision", method="POST", token="bootstraptoken",
+                       body={"id": "c1", "decision": "allow"})
+            assert auth.paired_ever and not auth.window_open()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    # -- one folder (the owner's decision, 2026-10-16) ---------------------------
+
+    def test_the_bridge_lives_inside_the_helpers_folder(self, monkeypatch):
+        monkeypatch.delenv("TAPPROVAL_BRIDGE_DIR")
+        assert bridge_install.bridge_dir() == os.path.expanduser("~/.tapproval/bridge-app")
+        assert _REAL_BRIDGE_APP == os.path.join(bridge_install.bridge_dir(), "TapprovalBridge.app"), \
+            "the relay and the installer must agree on where it is"
+
+    def test_the_public_repository_ignores_it(self):
+        ignore = os.path.join(_ROOT, "helper", "gitignore")
+        if not os.path.exists(ignore):                    # the public layout
+            ignore = os.path.join(_ROOT, ".gitignore")
+        with open(ignore, encoding="utf-8") as handle:
+            assert "/bridge-app/" in handle.read().split()
+
+    def _legacy(self, *names):
+        old = bridge_install.legacy_dir()
+        for name in names:
+            _make_app(os.path.join(old, name), "0.9.0")
+        return old
+
+    def test_an_install_retires_the_old_place_and_keeps_what_else_is_there(self):
+        old = self._legacy("TapprovalBridge.app", "TapprovalBridge.app.previous",
+                           "TapprovalBridge.app.before-devid")
+        self._install()
+        assert bridge_install.installed_version() == "1.0.0"
+        assert sorted(os.listdir(old)) == ["TapprovalBridge.app.before-devid"], \
+            "the old app goes; someone's backup stays"
+
+    def test_a_failed_install_leaves_the_old_place_running(self):
+        old = self._legacy("TapprovalBridge.app")
+        self.mac.gatekeeper = (3, "rejected")
+        with pytest.raises(bridge_install.InstallError):
+            self._install()
+        assert os.path.isdir(os.path.join(old, "TapprovalBridge.app"))
+
+    def test_a_first_install_that_fails_after_the_swap_hands_the_job_back(self):
+        """On the owner's Mac the bridge runs from the old place under the
+        one login job. A new bridge that never starts must not leave the
+        Mac with none: the job points at the old bridge again."""
+        import plistlib
+        old = self._legacy("TapprovalBridge.app")
+        with pytest.raises(bridge_install.InstallError):
+            self._install(wait_for_bridge=lambda: False)
+        assert os.path.isdir(os.path.join(old, "TapprovalBridge.app"))
+        assert bridge_install.installed_version() is None
+        with open(bridge_install.agent_path(), "rb") as handle:
+            job = plistlib.load(handle)
+        assert job["ProgramArguments"][0].startswith(os.path.join(old, "TapprovalBridge.app"))
+        assert job["StandardErrorPath"] == os.path.join(old, "bridge.log")
+
+    def test_a_hand_built_bridge_in_the_old_place_is_left_alone(self):
+        old = self._legacy("TapprovalBridge.app")
+        open(os.path.join(old, "HAND-BUILT"), "w").close()
+        assert bridge_install.state(_bridge_zip_pin()) == "hand-built"
+
+    def test_removing_takes_the_old_place_too(self):
+        self._legacy("TapprovalBridge.app")
+        self._install()
+        self._legacy("TapprovalBridge.app")
+        assert bridge_install.remove()
+        assert not os.path.exists(os.path.join(bridge_install.legacy_dir(), "TapprovalBridge.app"))
+
+    def test_the_relay_counts_a_bridge_in_either_place(self, tmp_path, monkeypatch):
+        assert not watch_relay.bridge_installed()
+        old = tmp_path / "old" / "TapprovalBridge.app"
+        old.mkdir(parents=True)
+        monkeypatch.setattr(watch_relay, "LEGACY_BRIDGE_APP", str(old))
+        assert watch_relay.bridge_installed(), "the owner's Mac, until the move"
+        assert watch_relay.icloud_carries_the_key(), "so its pairing is as before"
+
+    def test_uninstall_stops_the_bridge_before_deleting_its_folder(self):
+        with open(os.path.join(_ROOT, "uninstall.sh"), encoding="utf-8") as handle:
+            src = handle.read()
+        stop = src.index('launchctl bootout "gui/$(id -u)/com.tapproval.bridge"')
+        assert stop < src.index('rm -rf "$HOME/.tapproval"\n')
+        assert 'rm -rf "$HOME/.tapproval-bridge"' in src
+
+    @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+    def test_install_makes_a_checkout_of_a_folder_that_holds_the_bridge(self, tmp_path):
+        """A plugin user's Mac can have ~/.tapproval holding only the bridge,
+        and git clone refuses a folder that is not empty. install.sh's own
+        checkout block runs here, against a local repository."""
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                   GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+
+        def run(*cmd):
+            return subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / ".gitignore").write_text("/bridge-app/\n")
+        (source / "watch_relay.py").write_text("# helper\n")
+        run("git", "init", "-q", "-b", "main", str(source))
+        run("git", "-C", str(source), "add", ".")
+        run("git", "-C", str(source), "commit", "-q", "-m", "helper")
+        home = tmp_path / ".tapproval"
+        (home / "bridge-app").mkdir(parents=True)
+        (home / "bridge-app" / "marker").write_text("kept")
+        with open(os.path.join(_ROOT, "install.sh"), encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        start = lines.index('if [ -d "$DIR/.git" ]; then')
+        block = "\n".join(lines[start:lines.index("fi", start) + 1])
+        run("bash", "-c", "set -euo pipefail\nDIR=%s\nREPO=%s\n%s"
+            % (shlex.quote(str(home)), shlex.quote("file://" + str(source)), block))
+        assert (home / "watch_relay.py").read_text() == "# helper\n"
+        assert (home / "bridge-app" / "marker").read_text() == "kept"
+        assert run("git", "-C", str(home), "status", "--porcelain").stdout == ""
+        assert run("git", "-C", str(home), "pull", "-q", "--ff-only").returncode == 0, \
+            "the next update is an ordinary pull"
+
+
+class TestEveryCloudKitCallIsBounded:
+    """The watch's CloudKit calls had no timeout and no quality of service:
+    a stuck query held the poll's refreshInFlight for about a minute, and a
+    tap's save had no end (L3, 2026-10-16). `CloudRelay.bounded` configures
+    each call; this holds every call in the watch app to going through it,
+    so the next one added cannot quietly skip it."""
+
+    CALLS = ("records(", "record(for", "save(", "modifySubscriptions(",
+             "deleteRecord(", "fetch(withRecordID", "add(")
+
+    def _sources(self):
+        folder = os.path.join(_ROOT, "WatchApp", "Tapproval")
+        if not os.path.isdir(folder):
+            pytest.skip("no watch app in this layout")
+        for name in sorted(os.listdir(folder)):
+            if name.endswith(".swift"):
+                with open(os.path.join(folder, name), encoding="utf-8") as handle:
+                    yield name, handle.read()
+
+    def test_no_call_reaches_the_database_directly(self):
+        direct = []
+        for name, source in self._sources():
+            for call in self.CALLS:
+                if "database.%s" % call in source:
+                    direct.append("%s: database.%s" % (name, call))
+        assert not direct, direct
+
+    def test_the_bounded_database_is_actually_configured(self):
+        cloud = dict(self._sources())["CloudRelay.swift"]
+        body = cloud.split("func bounded<R>", 1)[1].split("\n    }\n", 1)[0]
+        assert "configuredWith(configuration: operationConfiguration()" in body
+        config = cloud.split("func operationConfiguration()", 1)[1].split("\n    }\n", 1)[0]
+        for setting in ("timeoutIntervalForRequest", "timeoutIntervalForResource",
+                        "qualityOfService = .userInitiated"):
+            assert setting in config, setting
+
+    def test_the_guard_can_fail(self):
+        # Issue #38: a check nobody has seen be false is not a check.
+        source = "let (r, _) = try await database.records(matching: q)"
+        assert any("database.%s" % call in source for call in self.CALLS)
