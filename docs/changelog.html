@@ -23,6 +23,18 @@
 <main class="policy">
 <h1>Changelog</h1>
 <p><em>Every release of Tapproval Base, the helper on your computer, newest first. Starting Claude Code once updates it. Generated from <a href="https://github.com/marcobelini/tapproval-helper/releases">the releases on GitHub</a>, which may already hold a newer one. Security fixes are also explained on <a href="security.html">the security page</a>.</em></p>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.58">1.1.58</a></h2>
+<p><em>2026-10-16</em></p>
+<p><strong>Tapproval Base</strong> is the computer half of Tapproval: it puts Claude Code's permission prompts on your Apple Watch, each marked with its risk, and one tap answers. Nothing is approved for you unless you ask it to be, and a CRITICAL never is.</p>
+<p>Already installed? Starting Claude Code once updates it.</p>
+<h3>Since 1.1.57</h3>
+<ul>
+<li><strong>On a Mac, your watch buzzes with Tapproval closed.</strong> The helper now installs a small iCloud bridge by itself (macOS 13 or later). It passes each card through your own private iCloud, and iCloud wakes the watch even when the app isn't open. The bridge ships inside the helper, signed with the developer's Developer ID and checked by Apple. Before installing it, the helper checks the bridge against the fingerprint pinned in its own code, against that signature, and against Apple's notarization. Your Mac needs to be signed in to iCloud with the Apple Account your watch uses. <code>--install --no-bridge</code> leaves the bridge out, and <code>uninstall.sh</code> removes it with everything else. On Linux, setup says plainly that this needs a Mac.</li>
+<li><strong>Longer messages from the wrist.</strong> A message you send to a session can now be up to 30,000 characters, up from 500. Anything longer is refused with a count, never cut short.</li>
+<li><strong>Shortcuts from the wrist work again</strong> on Claude Code 2.1.301, and their answers read right.</li>
+<li><strong>A plan started from the wrist shows its plan</strong>, and a question, command, plan or answer always arrives whole.</li>
+<li><strong>Safer answers.</strong> The hook believes only its own relay. Each card takes exactly one answer. "Always allow" is written only where Claude Code offered it.</li>
+</ul>
 <h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.57">1.1.57</a></h2>
 <p><em>2026-10-15</em></p>
 <p><strong>Tapproval Base</strong> is the computer half of Tapproval: it puts Claude Code's permission prompts on your Apple Watch, each marked with its risk, and one tap answers. Nothing is approved for you unless you ask it to be, and a CRITICAL never is.</p>
