@@ -46,6 +46,11 @@ Wire it up in ``~/.claude/settings.json``::
       }
     }
 
+(``--install`` writes this for you. With ``--watch`` it also switches to
+enforce mode and raises the timeout to WATCH_HOOK_TIMEOUT, a day and a
+minute, because the hook then waits for the wrist; the plugin's
+hooks/hooks.json carries the same.)
+
 Design rules, in order of importance:
 
 1. **Fail closed to the human.** Anything unrecognised, unparseable or
@@ -103,7 +108,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.58"
+__version__ = "1.1.59"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -236,7 +241,12 @@ SQL_MUTATION = re.compile(
 # Shell operators we split on to classify each segment independently.
 # A lone `&` between words runs the next command too: `echo hi & rm -rf ~`
 # was one segment led by echo (2026-09-30). `2>&1`, `&>` and `|&` are not it.
-SEGMENT_SPLIT = re.compile(r"\s*(?:\|\||&&|;|\||\n|(?<=\s)&(?![&>])(?=\s|$))\s*")
+# A background `&` ends a command wherever it stands: bash runs `echo x&rm
+# -rf ~` as two commands, and requiring a space on both sides let the second
+# one ride along unseen behind a SAFE `echo` (2026-10-19 review). Only the
+# `&` of a redirection (`2>&1`, `>&2`, `<&3`, `&>`) or of `&&` / `|&` is not
+# one. `|&` is a pipe (stderr too), so it splits like `|`.
+SEGMENT_SPLIT = re.compile(r"\s*(?:\|\||&&|\|&|;|\||\n|(?<![<>&|])&(?![&>]))\s*")
 
 # Leading VAR=value assignments before the real command.
 ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
@@ -399,6 +409,8 @@ EFFECT_WORDS = {
 EFFECT_FLAGS = {
     "-D": Effect.DESTROY, "--delete": Effect.DESTROY, "--purge": Effect.DESTROY,
     "--prune": Effect.DESTROY,
+    # find's own spelling of destruction: `-delete`, and `-exec rm`.
+    "-delete": Effect.DESTROY, "-exec": Effect.DESTROY,
 }
 
 # Words that name a credential. Their presence makes the RESOURCE sensitive,
@@ -471,9 +483,6 @@ def _ontology_risk(segment):
     effect = None
     for word in words[1:]:
         named = EFFECT_WORDS.get(word.lower()) or EFFECT_FLAGS.get(word)
-        # `-delete` and `-exec rm` are find's own spelling of destruction.
-        if named is None and word in ("-delete", "-exec"):
-            named = Effect.DESTROY
         if named is not None:
             effect = named if effect is None else max(effect, named)
 
@@ -546,7 +555,9 @@ def phone_would_auto_allow(tool, tool_input):
 
 # Safe unless the pattern matches, in which case the command writes.
 CONDITIONALLY_SAFE = {
-    "sed": re.compile(r"(^|\s)-i\b"),
+    # -i alone or in a cluster: `sed -ri`, `-ni`, `-Ei` and `-ie` (suffix
+    # "e") all edit in place, and read SAFE when only `-i` was matched.
+    "sed": re.compile(r"(^|\s)-[A-Za-z]*i"),
     "ruff": re.compile(r"\b(format|--fix)\b"),
     "npm": re.compile(r"\bnpm\s+(?!test\b|ls\b|list\b|view\b|outdated\b)"),
 }
@@ -633,7 +644,9 @@ SUBCOMMAND_SECOND_LEVEL = {
 # the moment a body field is given, no -X required.
 GH_API_MUTATING = re.compile(
     r"(^|\s)(-X|--method)(\s+|=)?[\"']?(POST|PUT|PATCH|DELETE)"
-    r"|(^|\s)(-f|-F|--field|--raw-field|--input)(\s|=|$)", re.I)
+    # A field switches the request to POST, its value attached or not:
+    # `-ftitle=x` is a POST as surely as `-f title=x`.
+    r"|(^|\s)(-[fF]|--field|--raw-field|--input)", re.I)
 
 
 def _subcommand_risk(segment, token):
@@ -690,7 +703,8 @@ GIT_MEDIUM = frozenset(
 
 # (rule_id, pattern, risk) applied to the whole command line.
 WHOLE_LINE_RULES = [
-    ("pipe-to-shell", re.compile(r"\|\s*(sudo\s+)?(ba|z|k|fi|da)?sh\b"), Risk.CRITICAL),
+    # `|&` pipes stderr too, and is as much a pipe into a shell.
+    ("pipe-to-shell", re.compile(r"\|&?\s*(sudo\s+)?(ba|z|k|fi|da)?sh\b"), Risk.CRITICAL),
     # The same thing through another interpreter, or through a
     # substitution a shell then runs: `curl … | python3`,
     # `sh -c "$(curl …)"`, `bash <(curl …)` all read MEDIUM (2026-09-30).
@@ -863,6 +877,11 @@ def _git_risk(segment):
         if "!" in rest:
             # A `!`-alias stores a shell command that later runs as `git x`.
             return ("git-config-shell-alias", Risk.CRITICAL)
+        if re.search(r"(^|\s)--(unset|unset-all|remove-section|rename-section|replace-all"
+                     r"|add|edit)\b|(^|\s)-e\b", rest):
+            # Deletions and edits name one key or none, so the two-word
+            # rule below read them as reads (2026-10-19 review).
+            return ("git-config-write", Risk.MEDIUM)
         if re.search(r"(^|\s)--(get|get-all|get-regexp|list)\b|(^|\s)-l\b", rest):
             return ("git-read", Risk.SAFE)
         if len([w for w in rest.split() if not w.startswith("-")]) >= 2:
@@ -971,7 +990,10 @@ READ_TOOL_ESCAPES = {
     "rg": re.compile(r"(^|\s)--pre(=|\s)").search,
     "find": re.compile(r"(^|\s)-(fprint0?|fprintf|fls|execdir|ok|okdir)(\s|$)").search,
     "tree": re.compile(r"(^|\s)(-o|--output)(\s|=)").search,
-    "sort": re.compile(r"(^|\s)(-o|--output)(\s|=)|(^|\s)-o\S|--compress-program").search,
+    # -o alone, attached (`-ofile`) or in a cluster (`-uo file`).
+    "sort": re.compile(r"(^|\s)--output(\s|=)|(^|\s)-[A-Za-z]*o|--compress-program").search,
+    # fd runs a command per match (`-x`) or per batch (`-X`).
+    "fd": re.compile(r"(^|\s)(-[A-Za-z]*[xX]|--exec|--exec-batch)(\s|=|$)").search,
     # sed's own commands write (`w file`, `s/a/b/w file`) and run (`e`).
     "sed": re.compile(r"(^|\s)--in-place\b|(^|[\s;{}'\"/\d$])[wW]\s+\S"
                       r"|(^|[\s;{}'\"/\d$])e(\s|['\";]|$)").search,
@@ -981,7 +1003,7 @@ READ_TOOL_ESCAPES = {
     "uniq": lambda segment: len([w for w in _tokens(segment)[1:]
                                  if not w.startswith("-") and not w.isdigit()]) >= 2,
     "security": re.compile(r"\b(list|default|login)-keychains?\b[^|;&]*\s-[sd]\b").search,
-    "yq": re.compile(r"(^|\s)(-i|--inplace)(\s|$)").search,
+    "yq": re.compile(r"(^|\s)-[A-Za-z]*i|(^|\s)--inplace\b").search,
     "git": re.compile(r"(^|\s)--output(=|\s)").search,
 }
 for _awk in ("gawk", "nawk", "mawk"):
@@ -1354,6 +1376,12 @@ def classify(event):
         content = " ".join(
             str(tool_input.get(key, "")) for key in CONTENT_KEYS if tool_input.get(key)
         )
+        # MultiEdit carries its changes as a list of edits: scanned like
+        # Edit's new_string, which they are (2026-10-19 review).
+        edits = tool_input.get("edits")
+        if isinstance(edits, list):
+            content += " " + " ".join(str(e.get("new_string", "")) for e in edits
+                                      if isinstance(e, dict))
         risk, rules = _scan_content(content, risk, rules)
     elif tool in READ_ONLY_TOOLS:
         risk, rules = Risk.SAFE, ["read-only-tool"]
@@ -1522,7 +1550,7 @@ CARD_FACTS = 3
 # Each value travels whole, as a card's question and command do: the card
 # screen wraps it, and a value cut to 32 characters was the part a blind
 # tap needed (2026-10-15). The list row clamps itself to one line. Three of
-# these are 4.5 KB at most, well inside the relay's 64 KB body; the push
+# these are 4.5 KB at most, well inside the relay's 256 KB body; the push
 # notification carries only the headline.
 FACT_CHARS = 1500
 
@@ -1669,8 +1697,8 @@ ACCEPT_EDITS_WORDS = ("accept edits (auto-approve file edits and common "
                       "file commands)")
 DONT_ASK_MAX_ITEMS = 8           # the terminal drops a row naming more
 DONT_ASK_MAX_CHARS = 160         # … or one whose words run longer (Bash)
-# Two copies travel (plain and marked), inside the relay's 64 KB body:
-# 8000 is what still fits at three bytes a letter
+# Two copies travel (plain and marked), inside the relay's 256 KB body,
+# with room to spare at three bytes a letter
 # (test_the_biggest_card_still_fits_the_relays_body). Raised from 6000 on
 # 2026-10-16 (owner: no plan is cut that could be carried).
 PLAN_CHARS = 8000
@@ -2592,7 +2620,7 @@ def ask_watch(card, policy, project=None):
     if project:
         payload["project"] = project
     # UTF-8, not \u escapes: a plan in Danish or Japanese would otherwise
-    # cost six bytes a letter against the relay's 64 KB body.
+    # cost six bytes a letter against the relay's 256 KB body.
     body = json.dumps({"card": payload, "wait": wait},
                       ensure_ascii=False).encode("utf-8")
     url = relay + "/card"
@@ -2928,10 +2956,7 @@ def _shared_settings_env():
     second copy that could disagree. A plugin install keeps its switches
     on its hook's command line instead, so they are read from there.
     """
-    try:
-        data = _read_settings(_settings_path())
-    except ValueError:
-        data = {}
+    data = _read_settings_quietly(_settings_path())
     env = {key: str(value) for key, value in (data.get("env") or {}).items()
            if key.startswith("CLAUDE_RISK_")}
     if not env.get("CLAUDE_RISK_MODE"):
@@ -3566,6 +3591,10 @@ def _backup(path):
 
 
 def _write_settings(path, data):
+    # Through a symlink, to the file it names: replacing the link left a
+    # dotfiles-managed settings.json as two copies, and the next re-link
+    # silently undid --install (2026-10-19 review).
+    path = os.path.realpath(path)
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)

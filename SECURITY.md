@@ -35,12 +35,16 @@ longer. A problem that is not yet fixed is not described in public.
 ## What is known and accepted
 
 - **A process running as you, on your machine, can talk to the local
-  bridge.** Base does not defend against a compromised machine; the loopback
-  exemption is what lets Claude Code hand it a prompt in the first place.
+  relay.** Base does not defend against a compromised machine. The loopback
+  exemption is what lets Claude Code hand it a prompt in the first place,
+  and a prompt also needs the key file, which only your own user account
+  can read: the hook signs each card with it and believes an answer only
+  if it proves the key back.
 - **The audit log records command text** (with credential-shaped fragments
   redacted) and stays on your computer.
 - **Cards travel through your own private iCloud or an encrypted tunnel**
-  when you are away from home, in transit only.
+  when you are away from home. The tunnel carries them in transit only; in
+  iCloud a card waits in your own private database until it is answered.
 - **On the iCloud route, your Apple ID is the key.** With the Mac bridge
   the helper installs on a Mac, the watch learns its first key from your
   private iCloud, and
@@ -48,13 +52,16 @@ longer. A problem that is not yet fixed is not described in public.
   could therefore answer a prompt. Protect it with two-factor
   authentication. A second key stored beside the first would add nothing,
   and a key kept anywhere else would end automatic pairing.
-- **"Don't ask again" on the watch writes what the terminal's would.** The
-  terminal's words appear only where Claude Code itself offers the row, and
-  the tap writes only what that row applies: a rule for the exact command
-  (or the web host) in the project's `.claude/settings.local.json`, or a
-  switch to accept edits for this session. Never to your user or shared
-  project settings, never on a CRITICAL card, and never anything Base cannot
-  read word for word.
+- **Once the watch shows the terminal's row (the helper is ready since
+  1.1.57), "don't ask again" on the watch writes what the terminal's
+  would.** The terminal's words appear only where Claude Code itself
+  offers the row, and the tap writes only what that row applies: a rule
+  for the exact command (or the web host) in the project's
+  `.claude/settings.local.json`, or a switch to accept edits for this
+  session. Never to your user or shared project settings, never on a
+  CRITICAL card, and never anything Base cannot read word for word. Until
+  then the watch offers "Always allow for this session", which the relay
+  remembers until it restarts and which writes nothing.
 
 ## The Mac bridge
 
@@ -79,12 +86,16 @@ private database, which only your Apple Account can read.
 
   ```bash
   shasum -a 256 ~/.tapproval/bridge/TapprovalBridge-*.zip   # compare with bridge.json
+  # on a plugin install the zip is under
+  # ~/.claude/plugins/cache/tapproval/tapproval-helper/*/bridge/
   codesign -dv ~/.tapproval/bridge-app/TapprovalBridge.app   # TeamIdentifier=K2RX2Y5896
   spctl -a -t exec -vv ~/.tapproval/bridge-app/TapprovalBridge.app  # Notarized Developer ID
   ```
 
-- **Turning it off.** `--install --no-bridge` removes it and keeps it out;
-  `uninstall.sh` removes it with everything else.
+- **Turning it off.**
+  `python3 ~/.tapproval/ClaudeRiskClassifier.py --install --no-bridge`
+  removes it and keeps it out; `uninstall.sh` removes it with everything
+  else.
 
 ## Design rules we will not trade away
 

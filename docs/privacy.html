@@ -34,8 +34,9 @@ conversations, or your taps.</p>
   database</em> — storage that belongs to your personal Apple ID. That is what
   lets a closed watch buzz. Apple hosts it; we cannot read it. It is the
   same place your own notes and backups live. If you would rather keep
-  iCloud out of it, install with <code>--no-bridge</code>; cards then reach the watch
-  while the app is open.</li>
+  iCloud out of it, install with
+  <code>python3 ~/.tapproval/ClaudeRiskClassifier.py --install --no-bridge</code>;
+  cards then reach the watch while the app is open.</li>
 <li><strong>Through a tunnel, when you are away from home.</strong> If you turn on the
   travel connection, your computer opens an encrypted Cloudflare tunnel
   so your watch can reach it from anywhere. The traffic passes through;
@@ -43,6 +44,10 @@ conversations, or your taps.</p>
   can ask it anything. The tunnel's address is a secret one. It stays
   the same while your computer runs, and changes when the computer
   restarts.</li>
+<li><strong>A few settings in your own iCloud, from the watch.</strong> The watch keeps
+  the addresses it has learned for your computer, and its own device
+  identifier, in your iCloud key-value storage, so that after a reinstall
+  it finds your computer again.</li>
 </ul>
 <h2>Purchases</h2>
 <p>Tapproval offers an optional $1 tip ("Coffee for the developer") and,
@@ -53,13 +58,18 @@ keeps two facts about purchases, on the watch and in your own iCloud:
 whether this Apple ID has unlocked, and how many free answers it has
 used.</p>
 <h2>What the open-source helper stores locally</h2>
-<p>The helper writes two files on your computer. Neither of them leaves it.</p>
+<p>The helper keeps a few files in your home folder: its logs (the relay's,
+the travel tunnel's, and the output of work you start from the watch),
+the pairing keys for your watch, and the two described below. None of
+them leaves your computer.</p>
 <p><strong>An audit log</strong> — which prompts appeared and how they were answered — so
 the app can show you your day. It records project folder names only:
 never full paths, never file contents.</p>
-<p><strong>A crash record.</strong> If the helper itself fails, it writes down what failed
-before it tries anything else, so that a fault cannot pass unnoticed. This
-one is a programmer's diagnostic rather than a summary, so it holds the
+<p><strong>A crash record.</strong> If the relay, the part of the helper that keeps
+running, fails, it writes down what failed before it tries anything else,
+so that a fault cannot pass unnoticed. A failure in the permission hook
+itself simply leaves the ordinary prompt in your terminal. This one is
+a programmer's diagnostic rather than a summary, so it holds the
 error and the trace of the code that led to it — and a trace does name the
 files the code was running in, which means full paths to them. It does not
 contain your prompts, your code or your conversations. Your watch reports

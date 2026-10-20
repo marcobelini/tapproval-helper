@@ -456,9 +456,13 @@ def transcript_origin(path, scan_lines=60):
     return _stat_cached(_ORIGIN_CACHE, path, read, extra=scan_lines, limit=4096)
 
 
-def transcripts_newest_first(projects_dir=None):
+def transcripts_newest_first(projects_dir=None, only=None):
     """Every transcript on the machine as (mtime, path, folder, session_id),
-    newest first. Never raises."""
+    newest first. Never raises.
+
+    ``only``, a set of session ids, leaves the rest out before they are
+    stat-ed: the session list polls every few seconds and shows a handful
+    of live sessions out of some 900 transcripts on this Mac."""
     root = projects_dir or CLAUDE_PROJECTS
     found = []
     try:
@@ -468,6 +472,8 @@ def transcripts_newest_first(projects_dir=None):
                 continue
             for entry in os.listdir(pdir):
                 if not entry.endswith(".jsonl"):
+                    continue
+                if only is not None and entry[:-6] not in only:
                     continue
                 path = os.path.join(pdir, entry)
                 try:
@@ -596,6 +602,27 @@ UPSTREAM_SHAPES = {
     "part.tool_result":
         ('"tool_result"', "A tool has answered, so nothing is running now.",
          "2026-09-04"),
+    # The parsed forms of a content part's type, as the readers compare
+    # them: the relay matches a card's call to its answer by these, and a
+    # rename upstream would leave every answered-at-the-desk card on the
+    # wrist (2026-10-17 tech-debt review, item 6).
+    "type.tool_use":
+        ("tool_use", "A content part calling a tool; the id it carries "
+         "comes back on the answer.", "2026-10-17"),
+    "type.tool_result":
+        ("tool_result", "A content part answering a tool call, read as the "
+         "parsed type rather than the raw text the line check above uses.",
+         "2026-10-17"),
+    # Read by the hook (ClaudeRiskClassifier.py), which cannot import this
+    # module — it runs on every prompt, and this module imports it — so it
+    # spells them out, and a test holds its spelling to these entries.
+    "key.plan_file_path":
+        ("planFilePath", "Where plan mode keeps the plan: attachment."
+         "planFilePath on a transcript line, and in ExitPlanMode's input.",
+         "2026-10-17"),
+    "key.permission_mode":
+        ("permissionMode", "The mode a turn ran in, on each transcript "
+         "line; the hook watches for \"auto\".", "2026-10-17"),
     "entrypoint.sdk_cli":
         ("sdk-cli", "What a transcript and the session registry call a run "
          "nobody is sitting at: `claude -p`, the Agent SDK, a scheduled "
@@ -647,9 +674,21 @@ _SYSTEM_OPENERS = ("<", shape("text.caveat_opener"), shape("text.request_opener"
 _SYSTEM_REMINDER = re.compile(r"<{0}>.*?</{0}>\s*".format(
     re.escape(shape("tag.system_reminder"))), re.S)
 
-_COMMAND_NAME = re.compile(r"<command-name>\s*(/?[\w:-]+)\s*</command-name>")
-_COMMAND_ARGS = re.compile(r"<command-args>(.*?)</command-args>", re.S)
-_TAGGED_OUT = re.compile(r"<local-command-(?:stdout|stderr)>(.*?)</local-command-(?:stdout|stderr)>", re.S)
+def _tag_pattern(tag, inner, flags=0):
+    """A reader for a tag out of UPSTREAM_SHAPES, so a tag that changes
+    upstream is changed in one place: ``<x>`` opens, ``</x>`` closes,
+    ``inner`` between."""
+    return re.compile(re.escape(tag) + inner + re.escape("</" + tag[1:]), flags)
+
+
+_COMMAND_NAME = _tag_pattern(shape("tag.command_name"), r"\s*(/?[\w:-]+)\s*")
+_COMMAND_ARGS = _tag_pattern(shape("tag.command_args"), r"(.*?)", re.S)
+# A stem, not a whole tag: stdout and stderr share it, so the word and the
+# closing ">" follow it on both ends.
+_STEM = re.escape(shape("tag.local_command_out"))
+_CLOSE_STEM = re.escape("</" + shape("tag.local_command_out")[1:])
+_TAGGED_OUT = re.compile(_STEM + r"(?:stdout|stderr)>(.*?)" + _CLOSE_STEM + r"(?:stdout|stderr)>",
+                         re.S)
 
 
 def _command_sent(lead):
@@ -814,7 +853,7 @@ def _message_parts(content):
                 # reminder counts as empty and the person's text after it
                 # — same part or the next — is what both screens read.
                 text = _SYSTEM_REMINDER.sub("", part.get("text", ""))
-            elif kind == "tool_use" and tool is None:
+            elif kind == shape("type.tool_use") and tool is None:
                 tool = part
             elif kind == "image":
                 ref = remember_image(part)
@@ -1788,7 +1827,7 @@ def _thread_line(state, line, limit):
                 or shape("task.monitor_started") in line):
             asked = [part.get("tool_use_id") for part in
                      (message.get("content") if isinstance(message.get("content"), list) else [])
-                     if isinstance(part, dict) and part.get("type") == "tool_result"]
+                     if isinstance(part, dict) and part.get("type") == shape("type.tool_result")]
             description = next((state.get("descriptions", {}).get(i) for i in asked
                                 if state.get("descriptions", {}).get(i)), None)
             for groups in _TASK_LAUNCH.findall(line):
@@ -2116,12 +2155,15 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
     never a graveyard of every transcript on disk. Newest first.
     Never raises.
     """
-    found = transcripts_newest_first(projects_dir)
     # Two reads of the same directory, on purpose: live_sessions() is the
     # seam the tests patch to stage a live set, and a registry read costs
     # about 2 ms — not worth taking that seam away.
     live = live_sessions()
     registry = session_registry()
+    # Only what the filter below could keep is stat-ed; the filter still
+    # runs, so the answer is the same.
+    found = transcripts_newest_first(
+        projects_dir, only=None if include_idle else set(live) | set(waiting))
     if not include_idle:
         # A card waiting on the wrist keeps its session listed even when
         # the liveness check missed its process: cards live only inside

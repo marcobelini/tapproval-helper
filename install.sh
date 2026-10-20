@@ -20,8 +20,22 @@ if [ -d "$DIR/.git" ]; then
   # a fresh clone, keeping the old one aside rather than deleting it.
   if ! git -C "$DIR" pull -q --ff-only 2>/dev/null; then
     echo "update: fetching a fresh copy (the existing one could not fast-forward)"
-    mv "$DIR" "$DIR.superseded-$(date +%Y%m%d-%H%M%S)"
-    git clone -q --depth 1 "$REPO" "$DIR"
+    # Cloned beside it first, and swapped in only once the clone is whole.
+    # Moving the old one aside before cloning left no install at all when
+    # the clone failed for the same reason the pull did — a network blip —
+    # while every hook still pointed here (2026-10-19 review).
+    fresh="$DIR.fresh-$$"
+    rm -rf "$fresh"
+    if git clone -q --depth 1 "$REPO" "$fresh"; then
+      # The installed Mac bridge lives in the checkout but is not part of
+      # it (gitignored): it moves with the install, not with the old copy.
+      [ -d "$DIR/bridge-app" ] && mv "$DIR/bridge-app" "$fresh/bridge-app"
+      mv "$DIR" "$DIR.superseded-$(date +%Y%m%d-%H%M%S)"
+      mv "$fresh" "$DIR"
+    else
+      rm -rf "$fresh"
+      echo "update: could not fetch a fresh copy either; keeping the one installed" >&2
+    fi
   fi
 elif [ -d "$DIR" ]; then
   # A folder that is not a checkout. Where the helper came as a Claude Code

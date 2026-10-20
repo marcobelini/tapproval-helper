@@ -157,6 +157,66 @@ def _no_real_tunnel_record(tmp_path, monkeypatch):
     monkeypatch.setattr(watch_relay, "TUNNEL_LOG", str(tmp_path / "tunnel.log"))
 
 
+# Every module-level cache or memo in the relay and the dashboard, found
+# by name, so a new one is covered the day it is added rather than the
+# day it leaks. Seven were never reset by any test until 2026-10-17
+# (_SKILLS_CACHE, _TAILSCALE_CACHE, _RECAP_CACHE…), and #362 showed what
+# a test's value surviving into the real world costs.
+_CACHE_NAME = re.compile(r"^_[A-Z_]*(CACHE|MEMO)$")
+
+
+def _module_caches(module):
+    return {name: value for name, value in vars(module).items() if _CACHE_NAME.match(name)}
+
+
+def _reset_module_caches(monkeypatch, modules=(watch_relay, watch_dashboard)):
+    """Give each cache a fresh, empty value of its own kind for this test;
+    monkeypatch puts the originals back after. A kind it does not know is
+    an error, not a skip: a cache left alone is the leak this prevents."""
+    for module in modules:
+        for name, value in _module_caches(module).items():
+            if isinstance(value, dict):
+                monkeypatch.setattr(module, name, type(value)())
+            elif isinstance(value, tuple):
+                monkeypatch.setattr(module, name, (None,) * len(value))
+            else:
+                raise TypeError("%s.%s is a %s: teach _reset_module_caches to empty it"
+                                % (module.__name__, name, type(value).__name__))
+
+
+@pytest.fixture(autouse=True)
+def _fresh_module_caches(monkeypatch):
+    _reset_module_caches(monkeypatch)
+
+
+class TestModuleCachesStartEmpty:
+    def test_every_cache_is_found_and_emptied(self, monkeypatch):
+        names = set(_module_caches(watch_relay)) | set(_module_caches(watch_dashboard))
+        assert {"_SKILLS_CACHE", "_TAILSCALE_CACHE", "_RECAP_CACHE", "_META_CACHE",
+                "_ORIGIN_CACHE", "_AT_MAC_CACHE", "_AUDIT_PATH_MEMO"} <= names
+        # Fill every one, as an earlier test would, then reset as the
+        # fixture does before the next test.
+        for module in (watch_relay, watch_dashboard):
+            for name, value in _module_caches(module).items():
+                if isinstance(value, dict):
+                    value["left over"] = "by an earlier test"
+                else:
+                    monkeypatch.setattr(module, name, ("left", "over"))
+        _reset_module_caches(monkeypatch)
+        for module in (watch_relay, watch_dashboard):
+            for name, value in _module_caches(module).items():
+                assert not any(v is not None for v in (value.values() if isinstance(value, dict)
+                                                        else value)), name
+
+    def test_a_cache_of_an_unknown_kind_is_an_error(self, monkeypatch):
+        class Module:
+            __name__ = "fake"
+        fake = Module()
+        fake._ODD_CACHE = ["a list"]
+        with pytest.raises(TypeError, match="_ODD_CACHE"):
+            _reset_module_caches(monkeypatch, modules=(fake,))
+
+
 @pytest.fixture
 def settings(tmp_path, monkeypatch):
     """The throwaway settings.json every test already has, as a Path.
@@ -284,6 +344,10 @@ def _no_real_home_files(tmp_path, monkeypatch):
     sessions = home / "sessions"
     sessions.mkdir()
     monkeypatch.setattr(watch_dashboard, "CLAUDE_SESSIONS", str(sessions))
+    # Nor the owner's code folders: with no transcripts, the projects
+    # picker falls back to ~/Developer and its kin, and a test's empty
+    # world must not fill up with his repositories.
+    monkeypatch.setattr(watch_relay, "FIRST_SESSION_HOME", str(home / "home"))
     # And no test asks the real CLI whether it is signed in: /health does
     # that now, so a routing test would otherwise start a subprocess — and
     # one such test asserts that nothing was spawned at all. The tests
@@ -414,6 +478,72 @@ class TestClassifyBashReadOnly:
     def test_redirect_to_devnull_is_ignored(self):
         risk, _ = crc.classify_bash("ls -la > /dev/null")
         assert risk == Risk.SAFE
+
+
+class TestTheHolesTheReviewFound:
+    """2026-10-19 whole-repository review: each of these read SAFE, so
+    --quiet allowed it, and the parity check could keep it off the wrist."""
+
+    @pytest.mark.parametrize("command, floor", [
+        # A background & with no space before it ran the rest unseen.
+        ("echo x&rm -rf ~", Risk.CRITICAL),
+        ("echo x&git push --force origin main", Risk.CRITICAL),
+        ("cat a&python3 evil.py", Risk.MEDIUM),
+        # fd runs a command per match or per batch.
+        ("fd . -x python3 evil.py", Risk.MEDIUM),
+        ("fd -e py -X bash evil.sh", Risk.MEDIUM),
+        # In-place writes with the flag inside a cluster.
+        ("sed -ri '1i source /tmp/x.sh' ~/.zshrc", Risk.MEDIUM),
+        ("sed -ni 'p' f", Risk.MEDIUM),
+        ("sed -Ei 's/a/b/' f", Risk.MEDIUM),
+        ("sed -ie 's/a/b/' f", Risk.MEDIUM),
+        ("sort -uo ~/.zshrc /dev/null", Risk.MEDIUM),
+        ("sort -ro ~/.zshrc f", Risk.MEDIUM),
+        ("yq -Pi '.a=1' f.yaml", Risk.MEDIUM),
+        ("yq --inplace=true '.a=1' f.yaml", Risk.MEDIUM),
+        # A gh api field with its value attached is still a POST.
+        ("gh api -ftitle=x repos/o/r/issues", Risk.MEDIUM),
+        ("gh api repos/o/r/forks -Forganization=x", Risk.MEDIUM),
+        # git config deletions are writes.
+        ("git config --unset-all remote.origin.url", Risk.MEDIUM),
+        ("git config --remove-section remote.origin", Risk.MEDIUM),
+        ("git config --global --unset user.signingkey", Risk.MEDIUM),
+    ])
+    def test_now_at_least(self, command, floor):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= floor, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "echo x 2>&1", "echo x &>/dev/null", "fd -e py", "sed -n 'p' f",
+        "sort -u f", "yq '.a' f.yaml", "gh api repos/o/r/issues",
+        "git config user.name", "git config --get user.name",
+    ])
+    def test_the_reads_beside_them_stay_safe(self, command):
+        assert crc.classify_bash(command)[0] == Risk.SAFE, command
+
+    def test_a_pipe_of_stderr_too_is_a_pipe(self):
+        """`|&` was no separator: `echo hi |& sh` read MEDIUM, `| sh` CRITICAL."""
+        assert crc.classify_bash("echo hi |& sh")[0] == crc.classify_bash("echo hi | sh")[0]
+
+    def test_a_multiedit_is_scanned_like_an_edit(self):
+        edit = crc.classify({"tool_name": "Edit",
+                             "tool_input": {"file_path": "notes.md", "old_string": "a",
+                                            "new_string": "DROP TABLE users;"}})
+        multi = crc.classify({"tool_name": "MultiEdit",
+                              "tool_input": {"file_path": "notes.md",
+                                             "edits": [{"old_string": "a",
+                                                        "new_string": "DROP TABLE users;"}]}})
+        assert multi["risk"] == edit["risk"] == Risk.CRITICAL, (edit, multi)
+
+    def test_settings_are_written_through_a_symlink(self, tmp_path):
+        real = tmp_path / "dotfiles" / "settings.json"
+        real.parent.mkdir()
+        real.write_text("{}")
+        link = tmp_path / "settings.json"
+        link.symlink_to(real)
+        crc._write_settings(str(link), {"env": {"X": "1"}})
+        assert link.is_symlink(), "the link was replaced by a separate file"
+        assert json.loads(real.read_text()) == {"env": {"X": "1"}}
 
 
 class TestClassifyBashDestructive:
@@ -915,7 +1045,7 @@ class TestCardFacts:
         table = re.search(r"enum AnswerTarget \{(.*?)\n\}", source, re.S).group(1)
         assert "static let foot: CGFloat = 38" in table
         assert "static let screen: CGFloat = 44" in table
-        answers = source[source.index("struct DecisionButtons"):source.index("struct PendingCard")]
+        answers = source[source.index("struct DecisionButtons"):source.index("struct PlanEditsField")]
         heights = re.findall(r"minHeight: ([^)\n]+)", answers)
         assert heights, "no answer heights found"
         for height in heights:
@@ -924,15 +1054,39 @@ class TestCardFacts:
             "No, keep planning and Always allow each sit a gap below the coloured answers"
 
     @pytest.mark.private_layout
-    def test_the_card_screen_wraps_facts_and_the_list_does_not(self):
+    def test_facts_wrap_on_the_card_screen_and_in_the_thread(self):
+        """Wrapped on the card's own screen since 2026-10-15, and in the
+        thread since 2026-10-16, where each was one line cut in the
+        middle: no fact is cut anywhere a card is read."""
         swift = Path(__file__).with_name("WatchApp").joinpath(
             "Tapproval", "Cards.swift").read_text()
-        assert "FactLines(facts: facts, size: 14, wraps: true)" in swift
+        assert "FactLines(facts: facts, size: 14)" in swift
         assert "FactLines(facts: facts, size: 12)" in swift
         body = swift[swift.index("struct FactLines"):swift.index("struct CardDetail")]
-        wrapped, listed = body.split("} else {")
-        assert ".lineLimit(" not in wrapped and ".truncationMode(" not in wrapped
-        assert ".lineLimit(1)" in listed
+        assert ".lineLimit(" not in body and ".truncationMode(" not in body
+        assert ".fixedSize(horizontal: false, vertical: true)" in body
+
+    @pytest.mark.private_layout
+    def test_a_waiting_card_is_drawn_once_and_whole_in_its_thread(self):
+        """The owner's wrist photos of build 165 (2026-10-16): inside a
+        session a waiting card's words were drawn twice, in the thread and
+        again as the foot's line, and the thread's copy was cut at three
+        lines with each fact at one. The card is drawn once, in the
+        thread, whole; the foot holds only its answers."""
+        root = Path(__file__).with_name("WatchApp").joinpath("Tapproval")
+        session = root.joinpath("SessionDetail.swift").read_text()
+        cards = root.joinpath("Cards.swift").read_text()
+        bar = session[session.index("struct CardAnswerBar"):]
+        bar = bar[:bar.index("\n}\n")]
+        for words in ("shownHeadline", "card.headline", "card.badge", "footHeadline"):
+            assert words not in bar, "the foot draws the card's words again: %s" % words
+        row = cards[cards.index("struct CardRow"):cards.index("struct CardAnswerControls")]
+        assert "Text(card.shownHeadline)" in row, "the thread's card lost its headline"
+        assert ".lineLimit(" not in row and ".truncationMode(" not in row, \
+            "the thread's card cuts its words"
+        facts = cards[cards.index("struct FactLines"):cards.index("struct CardDetail")]
+        assert ".lineLimit(" not in facts and ".truncationMode(" not in facts, \
+            "a card's facts are cut"
 
     @pytest.mark.private_layout
     def test_an_answer_is_never_cut_where_it_is_chosen(self):
@@ -942,10 +1096,24 @@ class TestCardFacts:
         option's text must grow downwards, never be clipped."""
         swift = Path(__file__).with_name("WatchApp").joinpath(
             "Tapproval", "Cards.swift").read_text()
-        option = swift[swift.index("Text(option)"):]
+        option = swift[swift.index("Text(shown.label)"):]
         option = option[:option.index(".frame(maxWidth")]
         assert ".fixedSize(horizontal: false, vertical: true)" in option
         assert ".lineLimit(" not in option and ".truncationMode(" not in option
+
+    @pytest.mark.private_layout
+    def test_recommended_has_a_line_of_its_own_in_an_answer_row(self):
+        """The 2.0 screen test (2026-10-17): on 40 mm at XXL "Keep both
+        (Recommended)" broke as "(Recommende / d)", one word wider than its
+        row. The row shows the label, and "Recommended" on a smaller line
+        of its own, where it fits whole; the answer sent is unchanged."""
+        swift = Path(__file__).with_name("WatchApp").joinpath(
+            "Tapproval", "Cards.swift").read_text()
+        rows = swift[swift.index("struct QuestionOptionButtons"):swift.index("struct CardAnswerControls")]
+        assert "Text(option)" not in rows, "an option row draws Claude's words raw"
+        assert "Self.shownOption(option)" in rows
+        assert 'Text("Recommended")' in rows
+        assert "send(option)" in rows, "the answer sent must be the option as it came"
 
     @pytest.mark.private_layout
     def test_the_tier_badge_on_the_card_screen_is_never_cut_or_wrapped(self):
@@ -2642,6 +2810,50 @@ class TestSyncHelperFlags:
 
 
 @pytest.mark.private_layout
+class TestTheSyncCopiesOnlyTrackedDocs:
+    """2026-10-19 review: helper/docs went over whole, gitignored files
+    included — which the clean-tree check cannot see — so a .DS_Store, an
+    .env or a key left there reached the public repository. The copy block
+    itself runs here, in a scratch repository."""
+
+    @pytest.mark.private_layout
+    def test_an_ignored_file_in_docs_is_not_published(self, tmp_path):
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                   GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+
+        def run(*cmd, cwd=None):
+            return subprocess.run(cmd, check=True, capture_output=True, text=True,
+                                  env=env, cwd=cwd)
+
+        repo = tmp_path / "repo"
+        docs = repo / "helper" / "docs"
+        (docs / "media").mkdir(parents=True)
+        (repo / ".gitignore").write_text(".env\n.DS_Store\n")
+        (docs / "index.html").write_text("committed")
+        (docs / "media" / "film.txt").write_text("in a folder")
+        run("git", "init", "-q", str(repo))
+        run("git", "-C", str(repo), "add", ".")
+        run("git", "-C", str(repo), "commit", "-q", "-m", "docs")
+        (docs / "index.html").write_text("re-rendered")       # tracked, changed on disk
+        (docs / ".env").write_text("SECRET=1")                # ignored
+        (docs / ".DS_Store").write_text("finder")             # ignored
+        with open(os.path.join(_ROOT, "sync-helper.sh"), encoding="utf-8") as handle:
+            script = handle.read()
+        block = script[script.index('rm -rf "$CLONE/docs"'):]
+        block = block[:block.index("done < <(git ls-files -z -- helper/docs)") +
+                      len("done < <(git ls-files -z -- helper/docs)")]
+        clone = tmp_path / "clone"
+        clone.mkdir()
+        run("bash", "-c", "set -euo pipefail\nCLONE=%s\n%s" % (shlex.quote(str(clone)), block),
+            cwd=str(repo))
+        out = clone / "docs"
+        assert (out / "index.html").read_text() == "re-rendered"
+        assert (out / "media" / "film.txt").read_text() == "in a folder"
+        assert not (out / ".env").exists() and not (out / ".DS_Store").exists(), \
+            "a gitignored file went to the public repository"
+
+
 class TestTheSyncPublishesOnlyMain:
     """sync-helper.sh copied the working tree, so an uncommitted edit or an
     unmerged branch reached every user as it sat on disk (2026-10-05
@@ -7648,6 +7860,41 @@ class TestOnlyActiveSessionsAreListed:
         assert [s["session_id"] for s in sessions] == ["livesess1"]
         assert sessions[0]["live"] is True
 
+    def test_a_transcript_the_list_cannot_show_is_not_even_stat_ed(self, tmp_path, monkeypatch):
+        """The list polls every few seconds and shows a handful of live
+        sessions out of some 900 transcripts: stat-ing them all was half of
+        each poll (2026-10-18). Only live and waiting ones are looked at,
+        and the idle-including list still sees everything."""
+        import watch_dashboard
+        for name in ("livesess1", "waitsess1", "deadsess1", "deadsess2"):
+            _write_transcript(tmp_path, "-p", name + ".jsonl",
+                              [{"cwd": "/x/" + name,
+                                "message": {"role": "user", "content": "go"}}])
+        monkeypatch.setattr(watch_dashboard, "live_sessions",
+                            lambda: {"livesess1": "Terminal"})
+        real = os.path.getmtime
+        looked = []
+
+        def counting(path):
+            if str(path).endswith(".jsonl"):
+                looked.append(os.path.basename(str(path))[:-6])
+            return real(path)
+        monkeypatch.setattr(watch_dashboard.os.path, "getmtime", counting)
+        listed = watch_dashboard.transcripts_newest_first(str(tmp_path), only={"livesess1",
+                                                                               "waitsess1"})
+        assert sorted(f[3] for f in listed) == ["livesess1", "waitsess1"]
+        assert sorted(looked) == ["livesess1", "waitsess1"], looked
+        looked.clear()
+        sessions = watch_dashboard.recent_sessions(projects_dir=str(tmp_path),
+                                                   waiting=("waitsess1",))
+        assert sorted(s["session_id"] for s in sessions) == ["livesess1", "waitsess1"]
+        assert "deadsess1" not in looked and "deadsess2" not in looked, looked
+        looked.clear()
+        everything = watch_dashboard.recent_sessions(projects_dir=str(tmp_path),
+                                                     include_idle=True)
+        assert len(everything) == 4
+        assert {"deadsess1", "deadsess2"} <= set(looked)
+
 
 class TestCompoundCommandParity:
     """The bug that reached the wrist as silence: `Bash(grep *)`
@@ -8433,6 +8680,53 @@ class TestTheSyncScriptSaysWhatItDidAndDidNot:
                '  fi\n')
         gate = was[:was.index("\n  fi")]
         assert "else" not in gate
+
+
+class TestOneValueEverywhere:
+    """The port, the key file and the wrist wait are written in Python
+    twice, in shell, in JSON and in Swift, because each of those must
+    stand alone. Each copy is held to the hook's own constant here, so a
+    change made in one place cannot ship half-made (2026-10-17 tech-debt
+    review, item 3). The hook's constant is the owner: it is the one
+    every install already reads."""
+
+    def test_the_relay_and_the_hook_agree(self):
+        assert watch_relay.DEFAULT_PORT == crc.RELAY_PORT
+        assert watch_relay.AUTH_FILE == crc.AUTH_FILE
+        assert watch_relay.MAX_WAIT == crc.RELAY_WAIT_SECONDS
+
+    def test_a_relay_without_the_hook_still_waits_as_long(self, tmp_path):
+        """The relay's fallback for a missing hook module was 3600 s, so a
+        card left the wrist after an hour while the terminal waited a day."""
+        (tmp_path / "ClaudeRiskClassifier.py").write_text("raise ImportError('gone on purpose')\n")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(tmp_path), _ROOT]),
+                   HOME=str(tmp_path))
+        for name in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY", "CLAUDE_RISK_RELAY_WAIT"):
+            env.pop(name, None)
+        run = subprocess.run(
+            [sys.executable, "-c", "import watch_relay as r; print(r.MAX_WAIT, r.HELPER_VERSION)"],
+            capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=60)
+        assert run.returncode == 0, run.stderr
+        assert run.stdout.split()[-2:] == [str(float(crc.RELAY_WAIT_SECONDS)), "unknown"]
+
+    @pytest.mark.private_layout   # reads WatchApp/, which the public helper repo does not have
+    def test_the_watch_and_the_bridge_use_the_same_port(self):
+        """Swift cannot import Python; every port it spells out is the hook's."""
+        found = []
+        for folder in ("Tapproval", "Bridge", "Shared"):
+            for path in glob.glob(os.path.join(_ROOT, "WatchApp", folder, "*.swift")):
+                with open(path, encoding="utf-8") as handle:
+                    for line in handle:
+                        if line.lstrip().startswith("//"):
+                            continue
+                        found += re.findall(r'127\.0\.0\.1:(\d{4,5})|"(\d{4,5})"|":(\d{4,5})"', line)
+        ports = {int(next(p for p in groups if p)) for groups in found}
+        assert ports == {crc.RELAY_PORT}, ports
+
+    def test_uninstall_stops_the_tunnel_the_relay_starts(self):
+        with open(os.path.join(_ROOT, "uninstall.sh"), encoding="utf-8") as handle:
+            script = handle.read()
+        assert "127.0.0.1:%d" % watch_relay.TUNNEL_PORT in script
 
 
 class TestPluginManifest:
@@ -9354,6 +9648,10 @@ class TestWhatWeKnowAboutTheTranscript:
         Anything else is a shape nobody reads, and no test upstream will
         ever tell us it changed."""
         source = self._source_outside_the_table()
+        # The relay and the hook read transcripts too (2026-10-17 review).
+        for module in (watch_relay, crc):
+            with open(module.__file__, encoding="utf-8") as handle:
+                source += handle.read()
         orphans = [name for name, (value, _m, _s) in watch_dashboard.UPSTREAM_SHAPES.items()
                    if 'shape("%s")' % name not in source and value not in source]
         assert not orphans, ("named in UPSTREAM_SHAPES and read nowhere: %s"
@@ -9396,6 +9694,28 @@ class TestWhatWeKnowAboutTheTranscript:
                      "system-reminder", "[exited", "[killed]", "background with ID",
                      "agentId", "<task-id>"):
             assert text in named, "read bare, not named in the table: %r" % text
+
+    def test_the_relay_and_the_hook_read_through_the_table_too(self):
+        """The 2026-10-17 tech-debt review found the hook reading
+        planFilePath and permissionMode, and the relay matching tool calls
+        to their answers, all outside the table: 0 and 1 shape() calls
+        against the dashboard's 31. The relay can call shape(); the hook
+        cannot import this module, so every transcript key it spells out
+        must at least be named and dated here."""
+        with open(watch_relay.__file__, encoding="utf-8") as handle:
+            relay = "\n".join(line for line in handle.read().splitlines()
+                              if not line.lstrip().startswith("#"))
+        for text in ('"tool_result"', '"tool_use"'):
+            assert text not in relay, "the relay reads %s bare" % text
+        for name in ("type.tool_use", "type.tool_result"):
+            assert 'shape("%s")' % name in relay, name
+        with open(crc.__file__, encoding="utf-8") as handle:
+            hook = handle.read()
+        named = {text for text, _, _ in watch_dashboard.UPSTREAM_SHAPES.values()}
+        for key in re.findall(r'\.get\("(planFilePath|permissionMode)"\)', hook):
+            assert key in named, "the hook reads %r, which the table does not name" % key
+        assert {"planFilePath", "permissionMode"} <= set(
+            re.findall(r'\.get\("(planFilePath|permissionMode)"\)', hook))
 
     def test_a_system_line_we_have_no_reading_for_is_said_once(self, capsys):
         watch_dashboard._UNKNOWN_SUBTYPES.clear()
@@ -10558,6 +10878,93 @@ class TestNewSessionFromTheWatch:
         self._transcript(root, "-wt", tree, 1)
         assert str(repo) in {r["path"] for r in watch_relay.known_projects(projects_dir=str(root))}
 
+    # -- The first session, on a Mac whose transcripts offer nothing --
+    # (the owner, 2026-10-17: "make Tapproval able to start the first new
+    # session as well")
+
+    @staticmethod
+    def _home(tmp_path, monkeypatch, *repos, folders=()):
+        """A fake home folder: ``repos`` are "Developer/acme"-style paths
+        made into git repositories, oldest first; ``folders`` plain ones."""
+        home = tmp_path / "home"
+        home.mkdir(exist_ok=True)
+        for age, rel in enumerate(reversed(repos)):
+            repo = home / rel
+            (repo / ".git").mkdir(parents=True)
+            stamp = time.time() - 60 * (age + 1)
+            os.utime(repo, (stamp, stamp))
+        for rel in folders:
+            (home / rel).mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(watch_relay, "FIRST_SESSION_HOME", str(home))
+        return home
+
+    def test_with_no_transcripts_the_repositories_in_the_code_folder_are_offered(
+            self, tmp_path, monkeypatch):
+        home = self._home(tmp_path, monkeypatch, "Code/pantri", "Developer/acme",
+                          folders=("Developer/notes", "Developer/.hidden"))
+        (home / "Developer" / ".hidden" / ".git").mkdir(parents=True)
+        empty = tmp_path / "projects"
+        empty.mkdir()
+        rows = watch_relay.known_projects(projects_dir=str(empty))
+        assert [(r["name"], r["path"]) for r in rows] == [
+            ("acme", str(home / "Developer" / "acme")),
+            ("pantri", str(home / "Code" / "pantri"))], "newest first, repositories only"
+        assert all(r["first"] is True for r in rows)
+        assert all(isinstance(r["minutes_ago"], int) for r in rows)
+
+    def test_the_first_session_list_never_mixes_into_a_real_one(self, tmp_path, monkeypatch):
+        """One transcript anywhere, and the picker is the transcripts' again."""
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
+        self._home(tmp_path, monkeypatch, "Developer/stranger")
+        rows = watch_relay.known_projects(projects_dir=self._projects(tmp_path))
+        assert [r["name"] for r in rows] == ["acme", "pantri"]
+        assert not any(r.get("first") for r in rows)
+
+    def test_with_no_repositories_the_code_folders_themselves_are_offered(
+            self, tmp_path, monkeypatch):
+        home = self._home(tmp_path, monkeypatch, folders=("Developer", "Developer/notes"))
+        rows = watch_relay.first_projects()
+        assert [(r["name"], r["path"]) for r in rows] == [("Developer", str(home / "Developer"))]
+
+    def test_with_nothing_at_all_home_is_offered_as_the_one_place(self, tmp_path, monkeypatch):
+        home = self._home(tmp_path, monkeypatch)
+        assert [(r["name"], r["path"], r["first"]) for r in watch_relay.first_projects()] == [
+            ("Home", str(home), True)]
+
+    def test_a_code_folder_pointing_out_of_home_is_not_offered(self, tmp_path, monkeypatch):
+        """A symlink is how `~/Code` comes to mean `/Volumes/…`; a scratch
+        root is where the suite itself lives. Neither is a project."""
+        home = self._home(tmp_path, monkeypatch)
+        outside = tmp_path / "elsewhere" / "repo"
+        (outside / ".git").mkdir(parents=True)
+        (home / "Code").symlink_to(tmp_path / "elsewhere")
+        assert [r["name"] for r in watch_relay.first_projects()] == ["Home"]
+
+    def test_the_first_session_starts_in_an_offered_repository(self, tmp_path, monkeypatch):
+        """Offered is accepted: start_session validates against the same
+        list, and a stranger is still refused."""
+        home = self._home(tmp_path, monkeypatch, "Developer/acme")
+        empty = tmp_path / "projects"
+        empty.mkdir()
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
+        import subprocess as sp
+        opened = {}
+        def fake_run(cmd, **kw):
+            if cmd[0] == "open":
+                with open(cmd[1]) as handle:
+                    opened["line"] = handle.read().splitlines()[2]
+                os.unlink(cmd[1])
+            return sp.CompletedProcess(cmd, 0, "", "")
+        monkeypatch.setattr(watch_relay.subprocess, "run", fake_run)
+        repo = str(home / "Developer" / "acme")
+        assert watch_relay.start_session(repo, "Begin", projects_dir=str(empty),
+                                         platform="darwin") == "started"
+        assert ("cd %s && claude" % shlex.quote(repo)) in opened["line"]
+        assert watch_relay.start_session(str(home / "Developer" / "notes"), "Begin",
+                                         projects_dir=str(empty),
+                                         platform="darwin") == "unknown project"
+
     def test_refuses_anything_but_a_mac(self, tmp_path):
         assert watch_relay.start_session("/x", "go", platform="linux") == "new sessions need a Mac"
 
@@ -11176,8 +11583,58 @@ class TestLocalMeansLocal:
         ("192.168.1.77", "192.168.1.20", False),        # another machine on the Wi-Fi
         ("not-an-address", "not-an-address", False),
     ])
-    def test_this_machine_is_this_machine_whichever_address(self, peer, here, same):
+    def test_this_machine_is_this_machine_whichever_address(self, peer, here, same, monkeypatch):
+        monkeypatch.setattr(watch_relay, "_local_addresses", lambda: set())
         assert self._handler(peer, here)._from_this_machine() is same
+
+    def test_a_process_here_dialling_another_of_its_addresses_is_this_machine(self, monkeypatch):
+        """2026-10-19 review, reproduced: a socket bound to the Mac's second
+        address (192.168.1.35) dialling its first (.26) was "a watch on the
+        network", got a device key from /pair and answered its own CRITICAL
+        card. Every address on this machine's interfaces now counts."""
+        mine = {watch_relay._normal_ip(ip) for ip in ("192.168.1.26", "192.168.1.35",
+                                                      "100.69.31.42", "fe80::1")}
+        monkeypatch.setattr(watch_relay, "_local_addresses", lambda: mine)
+        assert self._handler("192.168.1.35", "192.168.1.26")._from_this_machine() is True
+        assert self._handler("100.69.31.42", "192.168.1.26")._from_this_machine() is True
+        assert self._handler("192.168.1.77", "192.168.1.26")._from_this_machine() is False
+
+    def test_every_interface_address_is_listed(self):
+        ifconfig = ("lo0: flags\n\tinet 127.0.0.1 netmask 0xff000000\n\tinet6 ::1 prefixlen 128\n"
+                    "en0: flags\n\tinet 192.168.1.26 netmask 0xffffff00 broadcast x\n"
+                    "\tinet6 fe80::14bb:3fb8:6634:2015%en0 prefixlen 64 secured\n"
+                    "en1: flags\n\tinet 192.168.1.35 netmask 0xffffff00 broadcast x\n"
+                    "utun3: flags\n\tinet 100.69.31.42 --> 100.69.31.42 netmask 0xffffffff\n")
+
+        class Done:
+            def __init__(self, out):
+                self.stdout = out
+
+        def run(argv, **_kw):
+            if argv == ["ifconfig"]:
+                return Done(ifconfig)
+            raise OSError("no such program")
+        found = {str(a) for a in watch_relay._local_addresses(run)}
+        assert {"127.0.0.1", "192.168.1.26", "192.168.1.35", "100.69.31.42",
+                "fe80::14bb:3fb8:6634:2015", "::1"} <= found, found
+
+    def test_linux_addresses_are_listed_too(self):
+        out = ("2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0\n"
+               "2: eth0    inet6 fe80::a/64 scope link\n")
+
+        class Done:
+            stdout = out
+
+        def run(argv, **_kw):
+            if argv[0] == "ifconfig":
+                raise OSError("not here")
+            return Done()
+        assert {str(a) for a in watch_relay._local_addresses(run)} == {"10.0.0.5", "fe80::a"}
+
+    def test_no_lister_answers_nothing(self):
+        def run(argv, **_kw):
+            raise OSError("none")
+        assert watch_relay._local_addresses(run) == set()
 
     def test_a_process_here_cannot_pair_by_dialling_the_wifi_address(self, fresh_auth):
         """The bypass: `--pair` opens a window that asks nothing, then a
@@ -12750,6 +13207,59 @@ class TestEveryTestRunSaysWhyItEnded:
         assert got == "com.apple.CoreSimulator.SimDeviceType.iPhone-17"
 
 
+class TestCiFailsSafeOnWhatItCannotRead:
+    """2026-10-19 review: three ways CI quietly did less than it said."""
+
+    @pytest.mark.private_layout
+    def test_a_name_ci_local_does_not_know_is_refused(self):
+        """`./ci-local.sh Lint` ran nothing and printed "green"."""
+        run = subprocess.run(["bash", os.path.join(_ROOT, "ci-local.sh"), "Lint"],
+                             capture_output=True, text=True, timeout=30)
+        assert run.returncode == 2, run.stdout + run.stderr
+        assert "usage" in run.stderr and "green" not in run.stdout
+
+    @pytest.mark.private_layout
+    def test_only_an_explicit_light_leaves_the_watch_jobs_out(self):
+        """An empty answer from a ci-scope.sh that crashed meant "light":
+        the flows and purchase tests went unrun, unremarked."""
+        script = open(os.path.join(_ROOT, "ci-local.sh"), encoding="utf-8").read()
+        assert '"$SCOPE" = full' not in script
+        assert script.count('"$SCOPE" != light') == 3
+
+    @pytest.mark.private_layout
+    def test_a_file_moved_out_of_watchapp_still_counts_as_a_watch_change(self, tmp_path):
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                   GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid",
+                   GITHUB_EVENT_NAME="pull_request")
+
+        def run(*cmd):
+            return subprocess.run(cmd, check=True, capture_output=True, text=True,
+                                  env=env, cwd=str(tmp_path))
+        shutil.copy(os.path.join(_ROOT, "ci-scope.sh"), tmp_path / "ci-scope.sh")
+        (tmp_path / "WatchApp").mkdir()
+        (tmp_path / "design").mkdir()
+        (tmp_path / "WatchApp" / "Foo.swift").write_text("a\nb\nc\nd\n")
+        run("git", "init", "-q", "-b", "main", ".")
+        run("git", "add", ".")
+        run("git", "commit", "-q", "-m", "base")
+        run("git", "checkout", "-q", "-b", "pr")
+        run("git", "mv", "WatchApp/Foo.swift", "design/Foo.swift")
+        run("git", "commit", "-q", "-m", "move")
+        run("git", "checkout", "-q", "main")
+        run("git", "merge", "-q", "--no-ff", "--no-edit", "pr")
+        assert run("bash", "ci-scope.sh").stdout.strip() == "full"
+
+    @pytest.mark.private_layout
+    def test_a_failed_build_number_lookup_reaches_its_warning(self):
+        """Under set -e the lookup's failure ended the deploy at the
+        assignment, so the "not fatal, never silent" warning was dead code."""
+        script = open(os.path.join(_ROOT, "WatchApp", "deploy-testflight.sh"),
+                      encoding="utf-8").read()
+        line = next(text for text in script.splitlines() if text.startswith("APPLE_HIGHEST=$("))
+        assert line.rstrip().endswith("|| true)"), line
+
+
 class TestTheLocalFallbackRunsWhatCiRuns:
     """`ci-local.sh` is the proof when GitHub will not run the workflow.
 
@@ -12779,8 +13289,8 @@ class TestTheLocalFallbackRunsWhatCiRuns:
         _, local = self._files()
         watch = local.split("# --- the watch app", 1)[1]
         assert 'CI_SIM="Tapproval CI"' in watch
-        assert "simctl create" in watch, "the simulator is made on demand"
-        own = watch.index('grep -F "$CI_SIM ("')
+        # Found or made on demand by sim-own.sh, whose own tests hold that.
+        own = watch.index('sim-own.sh "$CI_SIM"')
         shared = watch.index("sharing the first one listed")
         assert own < shared, "look for CI's own simulator before borrowing one"
 
@@ -13018,14 +13528,13 @@ class TestNewSkipsFailCi:
 
     def test_the_allowlist_holds_todays_counts(self):
         """Read from the code on 2026-10-12: five of PurchaseCompletesTests'
-        twelve call requireTestStore; all five PurchaseOnIOSHostTests call
-        requireAWorkingTestStore; StoreKitHarnessTests' one test skips when
-        the store answers nothing — six in the iOS run, as ci-local.sh says."""
+        twelve call requireTestStore. The iOS run's six skipped until
+        2026-10-17, when the iOS 27.0 test store worked on the CI Mac and
+        none did; its suites are unlisted, so a skip there fails CI."""
         m = self._module()
         with open(os.path.join(_ROOT, "WatchApp", "expected-skips.txt"), encoding="utf-8") as f:
             allowed = m.read_allowlist(f.read())
-        assert allowed == {"PurchaseCompletesTests": 5, "PurchaseOnIOSHostTests": 5,
-                           "StoreKitHarnessTests": 1}
+        assert allowed == {"PurchaseCompletesTests": 5}
 
     def _run(self, tmp_path, text):
         self._module()                      # skips in the public layout
@@ -13048,10 +13557,17 @@ class TestNewSkipsFailCi:
                          + _xctest_suite("StoreKitHarnessTests", 1, 0))
         assert done.returncode == 0, done.stdout + done.stderr
 
-    def test_todays_ios_run_proves_no_purchase(self, tmp_path):
+    def test_todays_ios_run_proves_the_purchase(self, tmp_path):
+        """2026-10-17, iOS 27.0: all six ran, none skipped."""
+        done = self._run(tmp_path, _xctest_suite("PurchaseOnIOSHostTests", 5, 0)
+                         + _xctest_suite("StoreKitHarnessTests", 1, 0))
+        assert done.returncode == 0, done.stdout + done.stderr
+
+    def test_the_ios_run_skipping_again_fails_ci(self, tmp_path):
+        """The run that was normal until 2026-10-17 is a regression now."""
         done = self._run(tmp_path, _xctest_suite("PurchaseOnIOSHostTests", 5, 5)
                          + _xctest_suite("StoreKitHarnessTests", 1, 1))
-        assert done.returncode == 2, done.stdout + done.stderr
+        assert done.returncode == 3, done.stdout + done.stderr
 
     def test_a_log_with_no_counts_is_not_a_clean_one(self, tmp_path):
         done = self._run(tmp_path, "** BUILD FAILED **\n")
@@ -13102,6 +13618,67 @@ class TestCiCanBeMovedToThisMacAndBack:
                        if (g == "==") == (setting == "self-hosted")]
             assert running, "nothing runs when CI_RUNNER=%r" % setting
 
+    @staticmethod
+    def _install(tmp_path, published):
+        """./ci-runner.sh install against a stand-in gh and curl: the
+        download is a real tarball, and ``published`` is what the release's
+        notes say its SHA-256 is (a function of the real one). The token
+        request fails, so a run that gets past the check stops there."""
+        import hashlib
+        import tarfile
+        payload = tmp_path / "payload"
+        payload.mkdir()
+        (payload / "unpacked-marker").write_text("x")
+        tarball = tmp_path / "runner.tar.gz"
+        with tarfile.open(tarball, "w:gz") as tar:
+            tar.add(payload / "unpacked-marker", arcname="unpacked-marker")
+        real = hashlib.sha256(tarball.read_bytes()).hexdigest()
+        body = "notes <!-- BEGIN SHA osx-arm64 -->%s<!-- END SHA osx-arm64 --> more" % published(real) \
+            if published(real) else "notes with no hash"
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "gh").write_text(
+            '#!/bin/bash\n'
+            'case "$*" in\n'
+            '  "auth status") exit 0 ;;\n'
+            '  *releases/latest*) echo v9.9.9 ;;\n'
+            '  *releases/tags/v9.9.9*) printf "%s\\n" "$BODY" ;;\n'
+            '  *registration-token*) exit 1 ;;\n'
+            '  *) echo "unexpected gh $*" >&2; exit 2 ;;\n'
+            'esac\n')
+        (bin_dir / "curl").write_text(
+            '#!/bin/bash\n'
+            'while [ $# -gt 0 ]; do [ "$1" = -o ] && { cp "%s" "$2"; exit 0; }; shift; done\n'
+            'exit 1\n' % tarball)
+        for fake in bin_dir.iterdir():
+            fake.chmod(0o755)
+        home = tmp_path / "home"
+        home.mkdir()
+        shutil.copy(os.path.join(_ROOT, "ci-runner.sh"), tmp_path / "ci-runner.sh")
+        env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]),
+                   HOME=str(home), BODY=body)
+        run = subprocess.run(["bash", str(tmp_path / "ci-runner.sh"), "install"], env=env,
+                             capture_output=True, text=True, timeout=30)
+        return run, home / ".tapproval-ci-runner"
+
+    @pytest.mark.private_layout
+    def test_the_runner_is_unpacked_only_when_its_release_hash_matches(self, tmp_path):
+        """The runner runs every CI job as this user: its download is held
+        to the SHA-256 its release publishes (#680)."""
+        run, runner = self._install(tmp_path, lambda real: real)
+        assert (runner / "unpacked-marker").exists(), run.stdout + run.stderr
+        assert "refusing" not in run.stderr
+
+    @pytest.mark.private_layout
+    @pytest.mark.parametrize("published", [lambda real: "0" * 64, lambda real: ""],
+                             ids=["wrong hash", "no hash published"])
+    def test_a_runner_whose_hash_does_not_match_is_refused(self, tmp_path, published):
+        run, runner = self._install(tmp_path, published)
+        assert run.returncode == 1
+        assert "refusing runner 9.9.9" in run.stderr, run.stderr
+        assert not (runner / "unpacked-marker").exists(), "unpacked before it was checked"
+        assert not list(runner.glob("*.tar.gz")), "the refused download was left behind"
+
     def test_the_mac_job_runs_the_same_checks(self):
         """Not a smaller set: the Mac job runs ci-local.sh, which
         TestTheLocalFallbackRunsWhatCiRuns holds equal to the hosted jobs."""
@@ -13140,17 +13717,27 @@ class TestWatchSimulatorsAreChosenBySize:
     The helper reads the newest runtime's supported types instead
     (2026-10-14 tech-debt audit)."""
 
+    # Not in version order, as on 2026-10-17 (27.0 listed before 26.5), and
+    # with a newer runtime that is listed but not installed: the newest
+    # *available* one is 27.0, and its types are the ones that count.
+    RT = "com.apple.CoreSimulator.SimRuntime."
     RUNTIMES = {"runtimes": [
-        {"platform": "watchOS", "isAvailable": True, "supportedDeviceTypes": [
-            {"name": "Apple Watch Series 9 (41mm)", "identifier": "old-41"}]},
-        {"platform": "iOS", "isAvailable": True, "supportedDeviceTypes": [
-            {"name": "iPhone 18", "identifier": "phone"}]},
-        {"platform": "watchOS", "isAvailable": True, "supportedDeviceTypes": [
+        {"platform": "watchOS", "isAvailable": True, "version": "27.0",
+         "identifier": RT + "watchOS-27-0", "supportedDeviceTypes": [
             {"name": "Apple Watch Series 13 (43mm)", "identifier": "s13-43"},
             {"name": "Apple Watch Ultra 5 (50mm)", "identifier": "u5-50"},
             {"name": "Apple Watch Ultra 4 (49mm)", "identifier": "u4-49"},
             {"name": "Apple Watch SE 4 (41mm)", "identifier": "se4-41"},
             {"name": "Apple Watch SE 3 (41mm)", "identifier": "se3-41"}]},
+        {"platform": "iOS", "isAvailable": True, "version": "27.0",
+         "identifier": RT + "iOS-27-0", "supportedDeviceTypes": [
+            {"name": "iPhone 18", "identifier": "phone"}]},
+        {"platform": "watchOS", "isAvailable": False, "version": "27.1",
+         "identifier": RT + "watchOS-27-1", "supportedDeviceTypes": [
+            {"name": "Apple Watch Series 14 (38mm)", "identifier": "gone-38"}]},
+        {"platform": "watchOS", "isAvailable": True, "version": "26.5",
+         "identifier": RT + "watchOS-26-5", "supportedDeviceTypes": [
+            {"name": "Apple Watch Series 9 (40mm)", "identifier": "old-40"}]},
     ]}
 
     def _helper(self, tmp_path, want):
@@ -13220,28 +13807,66 @@ class TestWatchSimulatorsAreChosenBySize:
             assert "simctl list devices available" not in script, name
             assert "./sim-udid.sh" in script, name
 
-    def _flows(self, tmp_path, fail_face=None):
+    OURS = {"com.apple.CoreSimulator.SimRuntime.watchOS-27-0": [
+        ("Tapproval Flows 41mm", "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", "Shutdown"),
+        ("Tapproval Flows 50mm", "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB", "Shutdown")]}
+    OLD = {"com.apple.CoreSimulator.SimRuntime.watchOS-26-5": [
+        ("Tapproval Flows 41mm", "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC", "Shutdown"),
+        ("Tapproval Flows 50mm", "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD", "Shutdown")]}
+    SHARED = {"com.apple.CoreSimulator.SimRuntime.watchOS-27-0": [
+        ("Apple Watch SE 4 (41mm)", "11111111-1111-1111-1111-111111111111", "Shutdown"),
+        ("Apple Watch Ultra 5 (50mm)", "22222222-2222-2222-2222-222222222222", "Shutdown")]}
+
+    @staticmethod
+    def _simctl(tmp_path, devices, events, create=True):
+        """A stand-in xcrun serving RUNTIMES and these devices, as JSON and
+        as text, and writing every create, shutdown, erase and delete to
+        events. With create=False, making a simulator fails."""
+        (tmp_path / "runtimes.json").write_text(json.dumps(
+            TestWatchSimulatorsAreChosenBySize.RUNTIMES))
+        (tmp_path / "devices.json").write_text(json.dumps({"devices": {
+            rt: [{"name": n, "udid": u, "state": st, "isAvailable": True} for n, u, st in sims]
+            for rt, sims in devices.items()}}))
+        (tmp_path / "devices.txt").write_text("".join(
+            "-- %s --\n" % rt + "".join("    %s (%s) (%s)\n" % sim for sim in sims)
+            for rt, sims in devices.items()))
+        made = ('echo "$*" >> "%s"; echo "EEEEEEEE-$(echo "$3" | tr -dc 0-9)-EEEE-EEEE-EEEEEEEEEEEE"'
+                % events) if create else "exit 1"
+        return (
+            '#!/bin/bash\n'
+            'case "$*" in\n'
+            '  "simctl list -j runtimes") cat "%(d)s/runtimes.json" ;;\n'
+            '  "simctl list -j devices available"|"simctl list devices -j") cat "%(d)s/devices.json" ;;\n'
+            '  "simctl list devices available") cat "%(d)s/devices.txt" ;;\n'
+            '  "simctl create "*) %(made)s ;;\n'
+            '  "simctl shutdown "*|"simctl erase "*|"simctl delete "*) echo "$*" >> "%(e)s" ;;\n'
+            '  "simctl boot "*|"simctl bootstatus "*) echo "$*" >> "%(e)s" ;;\n'
+            '  *) exit 1 ;;\n'
+            'esac\n') % {"d": tmp_path, "e": events, "made": made}
+
+    def _flows(self, tmp_path, fail_face=None, devices=None, create=True, keep=False,
+               lock_pid=None, workers=None):
         """watch-flows.sh itself, against a stand-in Xcode whose test runs
-        take two seconds each and say when they started and stopped."""
+        take two seconds each and say when they started and stopped. Our
+        own faces exist on the newest runtime unless devices says otherwise.
+        Every simulator's data counts as big, so tidying erases it."""
         import shutil
         app = tmp_path / "WatchApp"
         app.mkdir()
-        for name in ("watch-flows.sh", "sim-devtype.sh", "sim-udid.sh"):
+        for name in ("watch-flows.sh", "sim-devtype.sh", "sim-udid.sh", "sim-retire.sh",
+                     "sim-runtime.sh", "sim-tidy.sh", "sim-own.sh"):
             shutil.copy(os.path.join(_ROOT, "WatchApp", name), app / name)
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
-        (tmp_path / "runtimes.json").write_text(json.dumps(self.RUNTIMES))
         events = tmp_path / "events"
-        (bin_dir / "xcrun").write_text(
-            '#!/bin/bash\n'
-            'case "$*" in\n'
-            '  *" -j"*|*"--json"*|*" -j "*) cat "%s" ;;\n'
-            '  "simctl list runtimes") echo "com.apple.CoreSimulator.SimRuntime.watchOS-26-5" ;;\n'
-            '  "simctl list devices available")\n'
-            '    echo "    Tapproval Flows 41mm (AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA) (Shutdown)"\n'
-            '    echo "    Tapproval Flows 50mm (BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB) (Shutdown)" ;;\n'
-            '  *) exit 1 ;;\n'
-            'esac\n' % (tmp_path / "runtimes.json"))
+        events.write_text("")
+        sims = self.OURS if devices is None else devices
+        (bin_dir / "xcrun").write_text(self._simctl(tmp_path, sims, events, create))
+        data = tmp_path / "Devices"
+        for udid in [u for group in (sims, self.OURS) for v in group.values() for _, u, _ in v] \
+                + ["EEEEEEEE-41-EEEE-EEEE-EEEEEEEEEEEE", "EEEEEEEE-50-EEEE-EEEE-EEEEEEEEEEEE"]:
+            (data / udid / "data").mkdir(parents=True, exist_ok=True)
+            (data / udid / "data" / "grown").write_bytes(b"x" * 8192)
         (bin_dir / "xcodebuild").write_text(
             '#!/bin/bash\n'
             'dest=$(printf "%%s\\n" "$@" | grep -m1 "^id=")\n'
@@ -13250,15 +13875,35 @@ class TestWatchSimulatorsAreChosenBySize:
             '  test-without-building)\n'
             '    echo "start $dest $(date +%%s)" >> "%s"; sleep 2\n'
             '    echo "end $dest $(date +%%s)" >> "%s"\n'
-            '    if [ "$dest" = "id=$FAIL_UDID" ]; then echo "** TEST FAILED **"; exit 65; fi\n'
+            '    echo "workers $(printf "%%s\\n" "$@" | grep -A1 -x -- -parallel-testing-enabled'
+            ' | tail -1) $(printf "%%s\\n" "$@" | grep -A1 -x -- -parallel-testing-worker-count'
+            ' | tail -1)" >> "%s"\n'
+            '    echo "Test case \'FlowUITests.testA()\' passed on \'Clone 1 of x\' (1.0 seconds)"\n'
+            '    if [ "$dest" = "id=$FAIL_UDID" ]; then\n'
+            '      echo "Test case \'FlowUITests.testB()\' failed on \'Clone 2 of x\' (1.0 seconds)"\n'
+            '      echo "** TEST FAILED **"; exit 65; fi\n'
+            '    echo "Test case \'FlowUITests.testB()\' passed on \'Clone 2 of x\' (1.0 seconds)"\n'
             '    echo "** TEST SUCCEEDED **" ;;\n'
             '  *) echo "unexpected: $1" >> "%s"; exit 2 ;;\n'
-            'esac\n' % (events, events, events, events))
+            'esac\n' % (events, events, events, events, events))
         for fake in bin_dir.iterdir():
             fake.chmod(0o755)
-        env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]))
+        env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]),
+                   TMPDIR=str(tmp_path), SIM_DEVICES_DIR=str(data), SIM_TIDY_MB="0",
+                   FLOWS_LOCK_WAIT="1")
+        env.pop("FLOWS_KEEP_SIM", None)
+        env.pop("FLOWS_SIM_PREFIX", None)
+        env.pop("FLOWS_WORKERS", None)
+        if workers is not None:
+            env["FLOWS_WORKERS"] = str(workers)
         if fail_face:
             env["FAIL_UDID"] = fail_face
+        if keep:
+            env["FLOWS_KEEP_SIM"] = "1"
+        if lock_pid is not None:
+            lock = tmp_path / "tapproval-flows-Tapproval-Flows.lock"
+            lock.mkdir()
+            (lock / "pid").write_text("%d\n" % lock_pid)
         run = subprocess.run(["bash", str(app / "watch-flows.sh")], env=env,
                              capture_output=True, text=True, timeout=60)
         return run, events.read_text().splitlines()
@@ -13277,6 +13922,40 @@ class TestWatchSimulatorsAreChosenBySize:
         assert run.stdout.count("TEST SUCCEEDED") == 2
 
     @pytest.mark.private_layout
+    def test_each_face_splits_its_tests_across_two_clones(self, tmp_path):
+        """One face's test list was the whole 9.5 minutes of the flows: the
+        faces already overlapped. Split across two clones per face it took
+        355-434 s instead of 634 s, all 32 tests passing on both faces
+        (2026-10-17). FLOWS_WORKERS=1 is one simulator per face, as before."""
+        run, events = self._flows(tmp_path)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert [e for e in events if e.startswith("workers")] == ["workers YES 2"] * 2, events
+        # Split, xcodebuild prints no "Executed" totals; the log counts instead.
+        assert run.stdout.count("2 tests passed, 0 failed (split across clones)") == 2, run.stdout
+        one = tmp_path / "one"
+        one.mkdir()
+        run, events = self._flows(one, workers=1)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert [e for e in events if e.startswith("workers")] == ["workers NO 1"] * 2, events
+
+    @pytest.mark.private_layout
+    def test_each_face_is_booted_and_waited_on_before_its_tests(self, tmp_path):
+        """As the purchase step's iPhone is: booted first, the flows ran 31 of
+        31 on both faces, split across clones, in 416 s warm (2026-10-19)."""
+        run, events = self._flows(tmp_path)
+        assert run.returncode == 0, run.stdout + run.stderr
+        for udid in ("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"):
+            waited = events.index("simctl bootstatus %s -b" % udid)
+            started = next(i for i, e in enumerate(events) if e.startswith("start id=" + udid))
+            assert events.index("simctl boot " + udid) < waited < started, events
+
+    @pytest.mark.private_layout
+    def test_a_failure_on_a_clone_is_counted(self, tmp_path):
+        run, _ = self._flows(tmp_path, fail_face="BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")
+        assert run.returncode == 1
+        assert "1 tests passed, 1 failed (split across clones)" in run.stdout, run.stdout
+
+    @pytest.mark.private_layout
     def test_one_failing_face_fails_the_run_and_is_named(self, tmp_path):
         run, _ = self._flows(tmp_path, fail_face="BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")
         assert run.returncode == 1
@@ -13284,6 +13963,128 @@ class TestWatchSimulatorsAreChosenBySize:
         assert "TEST FAILED" in out and "TEST SUCCEEDED" in out
         # The failure sits under its own face's heading, not the other's.
         assert out.index("50mm") < out.index("TEST FAILED")
+
+    @pytest.mark.private_layout
+    def test_a_missing_face_is_made_on_the_newest_runtime(self, tmp_path):
+        """The runtime list is not in version order: on 2026-10-17 it listed
+        watchOS 27.0 before 26.5, and `tail -1` had made every simulator on
+        26.5 for weeks, keeping 24 GB of 26.5 runtime images alive. The
+        stand-in lists them in that order, with a newer 27.1 that is not
+        installed and must not be chosen."""
+        run, events = self._flows(tmp_path, devices={})
+        assert run.returncode == 0, run.stdout + run.stderr
+        created = [e for e in events if e.startswith("simctl create ")]
+        assert len(created) == 2, events
+        assert all(e.endswith("SimRuntime.watchOS-27-0") for e in created), created
+
+    @pytest.mark.private_layout
+    def test_ours_on_an_older_runtime_go_only_once_new_ones_are_made(self, tmp_path):
+        run, events = self._flows(tmp_path, devices=self.OLD)
+        assert run.returncode == 0, run.stdout + run.stderr
+        for short, old in (("41mm", "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC"),
+                           ("50mm", "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD")):
+            create = [i for i, e in enumerate(events)
+                      if e.startswith("simctl create Tapproval Flows %s " % short)]
+            assert len(create) == 1 and "simctl delete %s" % old in events, events
+            assert create[0] < events.index("simctl delete %s" % old), \
+                "retired before a replacement existed: %s" % events
+
+    @pytest.mark.private_layout
+    def test_ours_on_an_older_runtime_are_kept_when_no_new_one_can_be_made(self, tmp_path):
+        """Retiring first left nothing of our own when the create failed,
+        and the run fell back to a shared face another run could kill."""
+        devices = dict(self.OLD, **self.SHARED)
+        run, events = self._flows(tmp_path, devices=devices, create=False)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert not any(e.startswith("simctl delete ") for e in events), events
+        assert "WARNING: sharing" not in run.stderr, run.stderr
+        assert "start id=CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC" in " ".join(events), events
+
+    @pytest.mark.private_layout
+    def test_the_faces_are_tidied_after_the_run_unless_asked_to_keep(self, tmp_path):
+        """A simulator only ever shut down grew to 2-4 GB; 31 of them filled
+        the Mac mini on 2026-10-17. Ours are shut down, and erased once
+        big. A borrowed shared face is someone else's: untouched, not even
+        shut down, since another run may be on it. FLOWS_KEEP_SIM=1 leaves
+        ours exactly as they are, for a look at a failure."""
+        _, events = self._flows(tmp_path)
+        for udid in ("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"):
+            assert "simctl shutdown %s" % udid in events, events
+            assert "simctl erase %s" % udid in events, events
+        (tmp_path / "shared").mkdir()
+        run, events = self._flows(tmp_path / "shared", devices=self.SHARED, create=False)
+        assert "WARNING: sharing" in run.stderr, run.stderr
+        assert not any(e.startswith(("simctl shutdown", "simctl erase")) for e in events), events
+        (tmp_path / "keep").mkdir()
+        _, events = self._flows(tmp_path / "keep", keep=True)
+        assert not any(e.startswith(("simctl shutdown", "simctl erase")) for e in events), events
+
+    @pytest.mark.private_layout
+    def test_a_second_run_on_the_same_faces_waits_and_is_refused(self, tmp_path):
+        """Two sessions in one checkout ran the flows at once; the first to
+        finish would erase the faces the other was still testing on."""
+        run, events = self._flows(tmp_path, lock_pid=os.getpid())
+        assert run.returncode == 1, run.stdout + run.stderr
+        assert "another flows run" in run.stderr, run.stderr
+        assert "build" not in events, "it ran beside the other: %s" % events
+        assert (tmp_path / "tapproval-flows-Tapproval-Flows.lock").is_dir(), \
+            "the refused run removed the other run's lock"
+
+    @pytest.mark.private_layout
+    def test_a_lock_left_by_a_run_that_is_gone_is_taken_over(self, tmp_path):
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        run, events = self._flows(tmp_path, lock_pid=gone.pid)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert not (tmp_path / "tapproval-flows-Tapproval-Flows.lock").exists()
+
+    def _helper_run(self, tmp_path, script, *args, devices=None, env=None):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        events = tmp_path / "events"
+        events.write_text("")
+        (bin_dir / "xcrun").write_text(self._simctl(tmp_path, devices or {}, events))
+        (bin_dir / "xcrun").chmod(0o755)
+        run = subprocess.run(
+            [os.path.join(_ROOT, "WatchApp", script), *args],
+            env=dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]), **(env or {})),
+            capture_output=True, text=True, timeout=30)
+        return run, events.read_text().splitlines()
+
+    @pytest.mark.private_layout
+    @pytest.mark.parametrize("platform, newest", [
+        ("watchOS", "com.apple.CoreSimulator.SimRuntime.watchOS-27-0"),  # not 27.1: not installed
+        ("iOS", "com.apple.CoreSimulator.SimRuntime.iOS-27-0"),
+        ("tvOS", ""),
+    ])
+    def test_the_newest_installed_runtime_by_version(self, tmp_path, platform, newest):
+        run, _ = self._helper_run(tmp_path, "sim-runtime.sh", platform)
+        assert (run.returncode, run.stdout.strip()) == (0, newest), run.stderr
+
+    @pytest.mark.private_layout
+    def test_a_runtime_narrows_the_lookup_to_it(self, tmp_path):
+        devices = dict(self.OLD, **self.OURS)
+        run, _ = self._helper_run(tmp_path, "sim-udid.sh", "Tapproval Flows 41mm",
+                                  "com.apple.CoreSimulator.SimRuntime.watchOS-27-0", devices=devices)
+        assert run.stdout == "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA\n", run.stderr
+        run, _ = self._helper_run(tmp_path, "sim-udid.sh", "Tapproval Flows 41mm",
+                                  "com.apple.CoreSimulator.SimRuntime.watchOS-27-0", devices=self.OLD)
+        assert run.stdout == "", run.stdout
+
+    @pytest.mark.private_layout
+    def test_only_a_big_simulator_is_erased(self, tmp_path):
+        """Erasing after every run cost each next run a first boot; erasing
+        never let them grow to 2-4 GB. sim-tidy.sh shuts all down and
+        erases only the one past SIM_TIDY_MB."""
+        data = tmp_path / "Devices"
+        for udid, size in (("BIG", 3 * 1024 * 1024), ("SMALL", 1024)):
+            (data / udid / "data").mkdir(parents=True)
+            (data / udid / "data" / "f").write_bytes(b"x" * size)
+        run, events = self._helper_run(tmp_path, "sim-tidy.sh", "BIG", "SMALL", "NODATA",
+                                       env={"SIM_DEVICES_DIR": str(data), "SIM_TIDY_MB": "2"})
+        assert run.returncode == 0, run.stderr
+        assert events == ["simctl shutdown BIG", "simctl erase BIG",
+                          "simctl shutdown SMALL", "simctl shutdown NODATA"], events
 
 
 def _doc_paragraphs(path):
@@ -13309,6 +14110,105 @@ def _doc_paragraphs(path):
         chunk.append(stripped)
     if chunk:
         yield start, " ".join(chunk)
+
+
+class TestScreenshotsBuildOnceAndShootTwoFacesAtATime:
+    """watch-shots.sh used to be one full `xcodebuild test` per face, one
+    after another: the sixteen runs the "see every screen" check asks for
+    each built and booted in turn. It now builds once and photographs the
+    faces SHOTS_PARALLEL at a time (2026-10-17). These run the real script
+    against a stand-in Xcode whose test runs take two seconds each."""
+
+    FACES = (("Apple Watch SE 3 (40mm)", "40404040-0000-0000-0000-000000000040"),
+             ("Apple Watch Series 11 (42mm)", "42424242-0000-0000-0000-000000000042"),
+             ("Apple Watch Series 11 (46mm)", "46464646-0000-0000-0000-000000000046"),
+             ("Apple Watch Ultra 3 (49mm)", "49494949-0000-0000-0000-000000000049"))
+
+    def _shots(self, tmp_path, parallel=None, fail_udid=None):
+        import shutil
+        app = tmp_path / "WatchApp"
+        app.mkdir()
+        for name in ("watch-shots.sh", "sim-udid.sh", "sim-devtype.sh"):
+            shutil.copy(os.path.join(_ROOT, "WatchApp", name), app / name)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        events = tmp_path / "events"
+        events.write_text("")
+        listing = "".join('echo "    %s (%s) (Shutdown)"\n' % face for face in self.FACES)
+        (bin_dir / "xcrun").write_text(
+            '#!/bin/bash\n'
+            'if [ "$*" = "simctl list devices available" ]; then\n'
+            'echo "-- watchOS 27.0 --"\n' + listing + 'exit 0; fi\n'
+            'if [ "$1 $2 $3" = "xcresulttool export attachments" ]; then\n'
+            '  out=$(printf "%s\\n" "$@" | grep -A1 -x -- --output-path | tail -1)\n'
+            '  mkdir -p "$out"; echo png > "$out/a1.png"\n'
+            '  echo \'[{"attachments": [{"exportedFileName": "a1.png",'
+            ' "suggestedHumanReadableName": "screen.png"}]}]\' > "$out/manifest.json"\n'
+            '  exit 0; fi\n'
+            'exit 1\n')
+        (bin_dir / "xcodebuild").write_text(
+            '#!/bin/bash\n'
+            'dest=$(printf "%%s\\n" "$@" | grep -m1 "^id=")\n'
+            'case "$1" in\n'
+            '  build-for-testing) echo build >> "%(e)s"; echo "** TEST BUILD SUCCEEDED **" ;;\n'
+            '  test-without-building)\n'
+            '    bundle=$(printf "%%s\\n" "$@" | grep -A1 -x -- -resultBundlePath | tail -1)\n'
+            '    mkdir -p "$bundle"\n'
+            '    echo "start $dest $(date +%%s)" >> "%(e)s"; sleep 2\n'
+            '    echo "end $dest $(date +%%s)" >> "%(e)s"\n'
+            '    if [ "$dest" = "id=$FAIL_UDID" ]; then echo "** TEST FAILED **"; exit 65; fi\n'
+            '    echo "** TEST SUCCEEDED **" ;;\n'
+            '  *) echo "unexpected: $1" >> "%(e)s"; exit 2 ;;\n'
+            'esac\n' % {"e": events})
+        for fake in bin_dir.iterdir():
+            fake.chmod(0o755)
+        env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]),
+                   TMPDIR=str(tmp_path), ALL_SIZES="1")
+        for key in ("SHOTS_PARALLEL", "ONLY_SIZE", "CONTENT_SIZE", "FAIL_UDID"):
+            env.pop(key, None)
+        if parallel is not None:
+            env["SHOTS_PARALLEL"] = str(parallel)
+        if fail_udid:
+            env["FAIL_UDID"] = fail_udid
+        run = subprocess.run(["bash", str(app / "watch-shots.sh"), "testCaptureX"], env=env,
+                             capture_output=True, text=True, timeout=60)
+        lines = events.read_text().splitlines()
+        spans = {}
+        for line in lines:
+            kind, dest, at = (line.split() + ["", ""])[:3]
+            if kind in ("start", "end"):
+                spans.setdefault(dest, {})[kind] = int(at)
+        return run, lines, spans, app / "build" / "shots" / "testCaptureX"
+
+    @staticmethod
+    def _most_at_once(spans):
+        times = sorted(t for s in spans.values() for t in (s["start"], s["end"]))
+        return max(sum(1 for s in spans.values() if s["start"] <= t < s["end"]) for t in times)
+
+    @pytest.mark.private_layout
+    def test_one_build_and_two_faces_at_a_time(self, tmp_path):
+        run, lines, spans, out = self._shots(tmp_path)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert lines.count("build") == 1, lines
+        assert len(spans) == 4, spans
+        assert self._most_at_once(spans) == 2, spans
+        for size in ("40mm", "42mm", "46mm", "49mm"):
+            assert (out / size / "screen.png").exists(), size
+
+    @pytest.mark.private_layout
+    def test_one_at_a_time_on_request(self, tmp_path):
+        run, lines, spans, _ = self._shots(tmp_path, parallel=1)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert lines.count("build") == 1, lines
+        assert self._most_at_once(spans) == 1, spans
+
+    @pytest.mark.private_layout
+    def test_a_failed_face_fails_the_run_and_keeps_every_picture(self, tmp_path):
+        run, _, _, out = self._shots(tmp_path, fail_udid=self.FACES[1][1])
+        assert run.returncode == 1
+        assert "the test FAILED on Apple Watch Series 11 (42mm)" in run.stderr
+        for size in ("40mm", "42mm", "46mm", "49mm"):
+            assert (out / size / "screen.png").exists(), size
 
 
 class TestTheDocumentsDoNotRestateTheReviewState:
@@ -13491,8 +14391,8 @@ class TestTheReportingItselfIsChecked:
     # a key that is not here fails the first test below, which is the
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
-    VOCABULARY = {"bonjour", "bridge", "bridge_install", "claude", "codex", "crash", "helper",
-                  "icloud_off", "port", "signin", "stuck", "tunnel", "update"}
+    VOCABULARY = {"bonjour", "bridge", "bridge_install", "claude", "codex", "crash", "dashboard", "helper",
+                  "icloud_off", "pairing", "port", "signin", "stuck", "tunnel", "update"}
 
     @staticmethod
     def _module_source(name):
@@ -14036,6 +14936,72 @@ class TestConditionsAreSaidOutLoud:
         monkeypatch.setattr(watch_relay, "HELPER_VERSION", "1.1.1")
         assert watch_relay.check_helper_is_visible() is True
         assert watch_relay.conditions() == []
+
+    def test_a_pairing_that_cannot_be_saved_says_so(self, tmp_path):
+        """Auth.save printed to stderr and returned, so a watch paired then
+        vanished at the next restart with nothing on the wrist to say why
+        (2026-10-17 tech-debt review, item 2)."""
+        missing = tmp_path / "no-such-folder" / "auth.json"
+        auth = watch_relay.Auth(path=str(missing))
+        assert auth.save() is False
+        assert [c["key"] for c in watch_relay.conditions()] == ["pairing"]
+        auth.path = str(tmp_path / "auth.json")
+        assert auth.save() is True
+        assert watch_relay.conditions() == []
+
+    def test_a_broken_codex_check_is_said_not_read_as_no_codex(self, monkeypatch):
+        """A bug inside codex_hook_trusted() was caught as "no helper" and
+        cleared the codex condition in silence."""
+        import ClaudeRiskClassifier
+
+        def broken():
+            raise RuntimeError("broken on purpose")
+        monkeypatch.setattr(ClaudeRiskClassifier, "codex_hook_trusted", broken)
+        watch_relay.clear_condition("codex")
+        assert watch_relay.check_codex_hook() is False
+        detail = {c["key"]: c["detail"] for c in watch_relay.conditions()}
+        assert "could not check" in detail["codex"]
+        assert watch_relay.wired_agents() == ["claude"]
+
+    def test_a_broken_dashboard_leaves_approvals_working_and_says_so(self, tmp_path):
+        """The relay imported the dashboard unguarded, so one error in the
+        large, harmless module stopped the small, dangerous one and every
+        approval fell back to the terminal (2026-10-17 tech-debt review).
+        A relay beside a dashboard that raises on import must still load,
+        keep the card path's answers, and say what is missing."""
+        (tmp_path / "watch_dashboard.py").write_text("raise RuntimeError('broken on purpose')\n")
+        probe = (
+            "import json, watch_relay as r\n"
+            "card = {'id': 'c1', 'session_id': 's1'}\n"
+            "try:\n"
+            "    r.recent_sessions()\n"
+            "    raised = None\n"
+            "except OSError as e:\n"
+            "    raised = type(e).__name__\n"
+            "print(json.dumps({'loaded': r.check_dashboard_is_loaded(),\n"
+            "    'keys': [c['key'] for c in r.conditions()],\n"
+            "    'title': r.card_session_title('s1'), 'live': r.session_registry(),\n"
+            "    'card': r.with_session_title(card) == card, 'raised': raised,\n"
+            "    'limit': r.THREAD_TURN_LIMIT}))\n")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(tmp_path), _ROOT]),
+                   HOME=str(tmp_path))
+        for name in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY", "CLAUDE_RISK_RELAY_WAIT"):
+            env.pop(name, None)
+        run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                             env=env, cwd=str(tmp_path), timeout=60)
+        assert run.returncode == 0, run.stderr
+        out = json.loads(run.stdout.strip().splitlines()[-1])
+        assert out == {"loaded": False, "keys": ["dashboard"], "title": None, "live": {},
+                       "card": True, "raised": "DashboardUnavailable", "limit": 14}
+
+    def test_a_loaded_dashboard_withdraws_the_complaint(self):
+        watch_relay.note_condition("dashboard", "stale complaint")
+        assert watch_relay.check_dashboard_is_loaded() is True
+        assert watch_relay.conditions() == []
+
+    def test_the_relays_fallback_turn_limit_is_the_dashboards(self):
+        import watch_dashboard
+        assert watch_relay.THREAD_TURN_LIMIT == watch_dashboard.THREAD_TURN_LIMIT == 14
 
     def test_health_carries_conditions_to_a_credentialed_caller(self, fresh_auth):
         watch_relay.note_condition("bonjour", "not announcing")
@@ -14905,6 +15871,34 @@ class TestIssue400:
         assert ran == [("/p", "go")]
         assert first == (200, {"ok": True, "status": "started"})
         assert second == (200, {"ok": True, "status": "started", "repeat": True})
+
+    def test_the_same_send_over_the_other_route_runs_once(self, fresh_auth, monkeypatch):
+        """2026-10-19 review: the repeat key took the raw path, and through
+        the tunnel that carries /t/<secret>, so a send retried over the
+        other route was a new one and opened a second Terminal."""
+        watch_relay.LIMITS.reset()
+        ran = []
+        monkeypatch.setattr(watch_relay, "start_session",
+                            lambda path, text: ran.append((path, text)) or "started")
+        auth = _known_watch(fresh_auth)
+        lan, _ = watch_relay.serve(port=0, auth=auth)
+        tunnel, _ = watch_relay.serve(port=0, auth=auth, token="tunnelsecret")
+        _serve(lan)
+        _serve(tunnel)
+        try:
+            body = {"path": "/p", "text": "go"}
+            first = relay_call("http://127.0.0.1:%d/new" % lan.server_address[1],
+                               token="devicetoken", method="POST", body=body)
+            second = relay_call("http://127.0.0.1:%d/t/tunnelsecret/new"
+                                % tunnel.server_address[1],
+                                token="devicetoken", method="POST", body=body)
+        finally:
+            for server in (lan, tunnel):
+                server.shutdown()
+                server.server_close()
+        assert first[1].get("status") == "started", first
+        assert second[1].get("repeat") is True, second
+        assert ran == [("/p", "go")]
 
     def test_different_words_are_a_different_send(self, relay):
         base, ran = relay
@@ -16549,6 +17543,62 @@ class TestTheHelperInstallsTheMacBridge:
         assert run("git", "-C", str(home), "pull", "-q", "--ff-only").returncode == 0, \
             "the next update is an ordinary pull"
 
+    @staticmethod
+    def _update(tmp_path, clone_from):
+        """install.sh's checkout block on an existing install whose pull
+        fails (its remote is gone), with ``clone_from`` as the fresh source:
+        a real repository, or one that does not exist."""
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                   GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+
+        def run(*cmd, check=True):
+            return subprocess.run(cmd, check=check, capture_output=True, text=True, env=env)
+
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / ".gitignore").write_text("/bridge-app/\n")
+        (source / "watch_relay.py").write_text("# new\n")
+        run("git", "init", "-q", "-b", "main", str(source))
+        run("git", "-C", str(source), "add", ".")
+        run("git", "-C", str(source), "commit", "-q", "-m", "new")
+        home = tmp_path / ".tapproval"
+        run("git", "clone", "-q", "file://" + str(source), str(home))
+        (home / "watch_relay.py").write_text("# installed\n")
+        run("git", "-C", str(home), "commit", "-q", "-am", "installed")
+        (home / "bridge-app").mkdir()
+        (home / "bridge-app" / "marker").write_text("kept")
+        run("git", "-C", str(home), "remote", "set-url", "origin", "file://" + str(tmp_path / "gone"))
+        repo = "file://" + str(source if clone_from == "source" else tmp_path / "also-gone")
+        with open(os.path.join(_ROOT, "install.sh"), encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        start = lines.index('if [ -d "$DIR/.git" ]; then')
+        block = "\n".join(lines[start:lines.index("fi", start) + 1])
+        result = run("bash", "-c", "set -euo pipefail\nDIR=%s\nREPO=%s\n%s"
+                     % (shlex.quote(str(home)), shlex.quote(repo), block), check=False)
+        return result, home, sorted(p.name for p in tmp_path.iterdir())
+
+    def test_an_update_that_cannot_fetch_keeps_the_install(self, tmp_path):
+        """2026-10-19 review: a pull and a clone that both fail (a network
+        blip) moved the install aside and left nothing where every hook
+        points — and a missing hook script exits 2, which Claude Code reads
+        as a refusal."""
+        result, home, names = self._update(tmp_path, clone_from="nowhere")
+        assert result.returncode == 0, result.stderr
+        assert (home / "watch_relay.py").read_text() == "# installed\n"
+        assert (home / "bridge-app" / "marker").read_text() == "kept"
+        assert not [n for n in names if ".superseded-" in n or ".fresh-" in n], names
+        assert "keeping the one installed" in result.stderr
+
+    def test_an_update_by_fresh_clone_keeps_the_bridge(self, tmp_path):
+        result, home, names = self._update(tmp_path, clone_from="source")
+        assert result.returncode == 0, result.stderr
+        assert (home / "watch_relay.py").read_text() == "# new\n"
+        assert (home / "bridge-app" / "marker").read_text() == "kept", \
+            "the installed bridge went with the old copy"
+        assert [n for n in names if ".superseded-" in n], names
+        assert not [n for n in names if ".fresh-" in n], names
+
 
 class TestEveryCloudKitCallIsBounded:
     """The watch's CloudKit calls had no timeout and no quality of service:
@@ -16590,3 +17640,134 @@ class TestEveryCloudKitCallIsBounded:
         # Issue #38: a check nobody has seen be false is not a check.
         source = "let (r, _) = try await database.records(matching: q)"
         assert any("database.%s" % call in source for call in self.CALLS)
+
+
+class TestOurSimulatorsFollowTheNewestRuntime:
+    """The scripts find their simulators by name, and one found on an older
+    runtime was used for ever: after Xcode 27 every Tapproval simulator was
+    still on watchOS 26.5, keeping 24 GB of 26.5 images alive (2026-10-17).
+    sim-retire.sh deletes ours on any other runtime before the lookup."""
+
+    DEVICES = {"devices": {
+        "com.apple.CoreSimulator.SimRuntime.watchOS-26-5": [
+            {"name": "Tapproval CI", "udid": "OLD-OFF", "state": "Shutdown"},
+            {"name": "Tapproval CI", "udid": "OLD-ON", "state": "Booted"},
+            {"name": "Tapproval CI 2", "udid": "OTHER", "state": "Shutdown"}],
+        "com.apple.CoreSimulator.SimRuntime.watchOS-27-0": [
+            {"name": "Tapproval CI", "udid": "CURRENT", "state": "Shutdown"}],
+    }}
+
+    def _retire(self, tmp_path, *args):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (tmp_path / "devices.json").write_text(json.dumps(self.DEVICES))
+        log = tmp_path / "calls"
+        (bin_dir / "xcrun").write_text(
+            '#!/bin/bash\n'
+            'case "$*" in\n'
+            '  "simctl list devices -j") cat "%s" ;;\n'
+            '  *) echo "$*" >> "%s" ;;\n'
+            'esac\n' % (tmp_path / "devices.json", log))
+        (bin_dir / "xcrun").chmod(0o755)
+        run = subprocess.run(
+            [os.path.join(_ROOT, "WatchApp", "sim-retire.sh"), *args],
+            env=dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"])),
+            capture_output=True, text=True, timeout=30)
+        return run, (log.read_text().splitlines() if log.exists() else [])
+
+    @pytest.mark.private_layout
+    def test_only_ours_on_an_older_runtime_and_switched_off_is_deleted(self, tmp_path):
+        run, calls = self._retire(tmp_path, "Tapproval CI",
+                                  "com.apple.CoreSimulator.SimRuntime.watchOS-27-0")
+        assert run.returncode == 0, run.stderr
+        assert calls == ["simctl delete OLD-OFF"], calls  # not the booted one, not "CI 2", not 27.0
+
+    @pytest.mark.private_layout
+    def test_no_runtime_deletes_nothing(self, tmp_path):
+        run, calls = self._retire(tmp_path, "Tapproval CI", "")
+        assert run.returncode == 0 and calls == [], calls
+
+    NEW = "com.apple.CoreSimulator.SimRuntime.watchOS-27-0"
+    OLDER = "com.apple.CoreSimulator.SimRuntime.watchOS-26-5"
+    OLD = "0000000A-0000-0000-0000-00000000000A"
+    CURRENT = "0000000C-0000-0000-0000-00000000000C"
+
+    def _own(self, tmp_path, devices, create=True):
+        """sim-own.sh against a stand-in xcrun serving ``devices`` (runtime ->
+        [(name, udid, state)]) and logging every create and delete."""
+        import shutil
+        app = tmp_path / "WatchApp"
+        app.mkdir()
+        for name in ("sim-own.sh", "sim-udid.sh", "sim-retire.sh"):
+            shutil.copy(os.path.join(_ROOT, "WatchApp", name), app / name)
+        listing = {"devices": {rt: [{"name": n, "udid": u, "state": st, "isAvailable": True}
+                                    for n, u, st in sims] for rt, sims in devices.items()}}
+        (tmp_path / "devices.json").write_text(json.dumps(listing))
+        (tmp_path / "devices.txt").write_text("".join(
+            "-- %s --\n" % rt + "".join("    %s (%s) (%s)\n" % sim for sim in sims)
+            for rt, sims in devices.items()))
+        log = tmp_path / "calls"
+        log.write_text("")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        made = 'echo "$*" >> "%s"; echo NEW-UDID' % log if create else "exit 1"
+        (bin_dir / "xcrun").write_text(
+            '#!/bin/bash\n'
+            'case "$*" in\n'
+            '  "simctl list -j devices available"|"simctl list devices -j") cat "%(d)s/devices.json" ;;\n'
+            '  "simctl list devices available") cat "%(d)s/devices.txt" ;;\n'
+            '  "simctl create "*) %(made)s ;;\n'
+            '  "simctl delete "*) echo "$*" >> "%(log)s" ;;\n'
+            '  *) exit 1 ;;\n'
+            'esac\n' % {"d": tmp_path, "made": made, "log": log})
+        (bin_dir / "xcrun").chmod(0o755)
+        run = subprocess.run([str(app / "sim-own.sh"), "Tapproval CI", "devtype-46", self.NEW],
+                             env=dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"])),
+                             capture_output=True, text=True, timeout=30)
+        return run, log.read_text().splitlines()
+
+    @pytest.mark.private_layout
+    def test_ours_on_the_newest_runtime_is_used_and_the_old_one_retired(self, tmp_path):
+        run, calls = self._own(tmp_path, {
+            self.OLDER: [("Tapproval CI", self.OLD, "Shutdown")],
+            self.NEW: [("Tapproval CI", self.CURRENT, "Shutdown")]})
+        assert run.returncode == 0 and run.stdout == self.CURRENT + "\n", run.stdout + run.stderr
+        assert calls == ["simctl delete " + self.OLD], calls
+
+    @pytest.mark.private_layout
+    def test_one_is_made_before_the_old_one_goes(self, tmp_path):
+        run, calls = self._own(tmp_path, {
+            self.OLDER: [("Tapproval CI", self.OLD, "Shutdown")]})
+        assert run.stdout == "NEW-UDID\n", run.stdout + run.stderr
+        assert calls == ["simctl create Tapproval CI devtype-46 %s" % self.NEW,
+                         "simctl delete " + self.OLD], calls
+        assert "created a simulator of our own" in run.stderr
+
+    @pytest.mark.private_layout
+    def test_when_none_can_be_made_the_old_one_is_kept_and_used(self, tmp_path):
+        """Retiring first left nothing of our own when making one failed."""
+        run, calls = self._own(tmp_path, {
+            self.OLDER: [("Tapproval CI", self.OLD, "Shutdown")]},
+            create=False)
+        assert run.stdout == self.OLD + "\n", run.stdout + run.stderr
+        assert calls == [], "the only one we have was deleted: %s" % calls
+        assert "kept Tapproval CI on its older runtime" in run.stderr
+
+    @pytest.mark.private_layout
+    def test_nothing_to_be_had_prints_nothing(self, tmp_path):
+        run, calls = self._own(tmp_path, {self.NEW: [("Someone Else", "X", "Shutdown")]},
+                               create=False)
+        assert run.returncode == 0 and run.stdout == "", run.stdout
+        assert calls == []
+
+    @pytest.mark.private_layout
+    def test_every_own_simulator_is_found_through_the_helper(self):
+        """CI's watch, CI's iPhone and the flows: one helper, so a fix to the
+        order is made once (2026-10-18)."""
+        ci = open(os.path.join(_ROOT, "ci-local.sh"), encoding="utf-8").read()
+        flows = open(os.path.join(_ROOT, "WatchApp", "watch-flows.sh"), encoding="utf-8").read()
+        assert 'sim-own.sh "$CI_SIM"' in ci and 'sim-own.sh "$IOS_SIM"' in ci
+        assert './sim-own.sh "$own"' in flows
+        for script in (ci, flows):
+            assert "simctl create" not in script
+            assert "sim-retire.sh" not in script

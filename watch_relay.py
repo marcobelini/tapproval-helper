@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-watch_relay — the local bridge between the risk classifier and Tapproval.
+watch_relay — the local go-between for the risk classifier and Tapproval.
 
 The classifier hook decides *what* deserves a human; this relay carries the
-question to whatever screen the human is wearing. It is a deliberately tiny
-HTTP server on loopback:
+question to whatever screen the human is wearing. It is a standard-library
+HTTP server:
 
     hook  ── POST /card ────►  relay  ◄──── GET  /pending ──  watch app
           ◄─ blocks for the       │   ◄──── POST /decision ─
              decision ────────────┘
 
-Endpoints:
+The core of it:
 
     POST /card      {"card": {...}, "wait": seconds}
                     Queues a wrist card and blocks until the watch answers
                     or the wait expires. Responds {"id", "decision"} where
-                    decision is "allow", "deny" or "none" (timed out).
+                    decision is "allow", "deny" or "none" (timed out), with
+                    an "answer" for a question and a "dont_ask" flag for the
+                    terminal's "don't ask again" row. Loopback only, and
+                    signed with the 0600 key file; the hook believes only an
+                    answer that proves that key back.
     GET  /pending   {"cards": [{...}, ...]} — what the watch should show.
-    POST /decision  {"id": "...", "decision": "allow"|"deny"}
-    GET  /health    {"ok": true, "pending": n}
+    POST /decision  {"id": "...", "decision": one of VALID_DECISIONS}
+    GET  /health    {"ok": true, "pending": n, ...}
+
+Around it are the session list, threads, usage and activity the watch reads,
+sending from the wrist (/say, /new), pairing and enrolment, and admin routes
+for the key-file holder. ROUTES is the full table, with each route's rules.
 
 Run it::
 
@@ -27,8 +35,14 @@ Run it::
     python3 watch_relay.py --demo         # serve + inject sample cards
     python3 watch_relay.py --card "rm -rf build"   # inject one real card
 
-Design rules follow the classifier's: standard library only, loopback only,
-and fail closed — a relay that is down, slow or confused must never grant an
+The login job and --ensure serve on every interface (--host 0.0.0.0) with
+the travel tunnel, so a watch can reach it over the LAN, a tailnet or the
+tunnel. Only loopback is exempt from the device key, and only for what a
+local process needs; every other caller must present a paired device's
+key, whatever its address.
+
+Design rules follow the classifier's: standard library only, and fail
+closed — a relay that is down, slow or confused must never grant an
 approval. "none" is the only answer it gives on any doubt.
 """
 
@@ -91,7 +105,11 @@ try:
     from ClaudeRiskClassifier import __version__ as HELPER_VERSION
     MAX_WAIT = float(MAX_WAIT)
 except Exception:                                  # standalone deployment
-    MAX_WAIT = 3600.0
+    # The hook's own number, written once more: 3600 here let a relay that
+    # could not import the hook drop a card after an hour while the hook
+    # still waited a day (2026-10-17 tech-debt review, item 3). A test
+    # holds the two equal; `helper` says the import failed.
+    MAX_WAIT = 86400.0
     HELPER_VERSION = "unknown"
 
 
@@ -1229,13 +1247,62 @@ class CardQueue:
 # the relay, and the relay's job is small and dangerous, while reading
 # transcripts is large and harmless. Only what the relay itself calls is
 # imported; tests reach the rest through watch_dashboard.
-from watch_dashboard import (  # noqa: E402
-    activity_summary, card_session_title, recap_summary, _find_transcript, image_bytes,
-    _json_object, _message_of, _parse_thread, _read_appended,
-    project_root, prompts_at_the_mac, recent_sessions, resolve_session,
-    session_registry, session_state, shape, thread_tool_id, thread_wake_at,
-    transcript_origin, transcripts_newest_first,
-    THREAD_TURN_LIMIT, usage_summary)
+#
+# Guarded, because the two are not equal: an error anywhere in the large,
+# harmless module used to stop the small, dangerous one at import, and
+# every wrist approval then fell back to the terminal (2026-10-17 tech-debt
+# review). Now the relay starts without it: the card path gets the
+# answers it gets for an unknown session (no title, nobody live), and the
+# session and thread screens fail with DashboardUnavailable, which is an
+# OSError, so the readers that already treat a missing file as "nothing
+# to read" treat this the same way. check_dashboard_is_loaded() says so
+# on the Connection screen.
+class DashboardUnavailable(OSError):
+    """watch_dashboard could not be imported; the reason is the message."""
+
+
+_DASHBOARD_ERROR = None
+try:
+    from watch_dashboard import (  # noqa: E402
+        activity_summary, card_session_title, recap_summary, _find_transcript, image_bytes,
+        _json_object, _message_of, _parse_thread, _read_appended,
+        project_root, prompts_at_the_mac, recent_sessions, resolve_session,
+        session_registry, session_state, shape, thread_tool_id, thread_wake_at,
+        transcript_origin, transcripts_newest_first,
+        THREAD_TURN_LIMIT, usage_summary)
+except Exception as _error:  # noqa: BLE001 — any import-time failure, not only ImportError
+    _DASHBOARD_ERROR = "%s: %s" % (type(_error).__name__, _error)
+
+    def _dashboard_unavailable(*_args, **_kwargs):
+        raise DashboardUnavailable(_DASHBOARD_ERROR)
+
+    (activity_summary, recap_summary, _find_transcript, image_bytes, _json_object,
+     _message_of, _parse_thread, _read_appended, project_root, prompts_at_the_mac,
+     recent_sessions, resolve_session, session_state, shape, thread_tool_id,
+     thread_wake_at, transcript_origin, transcripts_newest_first,
+     usage_summary) = (_dashboard_unavailable,) * 19
+
+    def card_session_title(_session_id):
+        return None             # an unknown title: the card goes out as it came
+
+    def session_registry(*_args, **_kwargs):
+        return {}               # nobody live: the send guard can only ever ask
+
+    THREAD_TURN_LIMIT = 14      # watch_dashboard's own value
+
+
+def check_dashboard_is_loaded():
+    """Record whether watch_dashboard was imported beside this relay.
+    Approvals carry on either way; the sessions and threads do not."""
+    if _DASHBOARD_ERROR:
+        note_condition(
+            "dashboard",
+            "Part of the Tapproval helper failed to load, so sessions and "
+            "threads cannot show here. Approvals still reach your wrist; "
+            "reinstalling the helper should fix it.")
+        return False
+    clear_condition("dashboard")
+    return True
 
 
 def with_session_title(card):
@@ -1946,13 +2013,97 @@ def known_skills(cwd=None, home=None, now=None):
 # there too on Linux, can say so.
 SCRATCH_ROOTS = ("/tmp", "/private/tmp")
 
+# Where a person keeps code, by the names people give that folder, for the
+# Mac that has never run Claude Code: the first session has to start
+# somewhere, and the transcripts have nothing to offer yet.
+CODE_ROOTS = ("Developer", "Projects", "Code", "code", "src", "repos",
+              "dev", "work", "git", "Sites")
+# The home folder those names sit under. None means the real one; the
+# suite points it at a temporary folder so no test reads the owner's.
+FIRST_SESSION_HOME = None
+
+
+def _is_repository(path):
+    """A `.git` folder, or a worktree's `.git` file: the test
+    repository_root makes, without the walk. Never raises."""
+    marker = os.path.join(path, ".git")
+    return os.path.isdir(marker) or os.path.isfile(marker)
+
+
+def first_projects(limit=25, home=None):
+    """What *New session* offers on a Mac whose transcripts offer nothing:
+    the repositories in the person's code folders (`CODE_ROOTS`), newest
+    first; failing those, the code folders that exist; failing those, the
+    home folder itself, named "Home". So the first session can always be
+    started from the wrist (the owner, 2026-10-17) — before this, the
+    picker said "No projects yet" and the feature could not begin.
+
+    Each row carries ``first: True`` so a watch can one day say where the
+    list came from. Nothing under a scratch root, and nothing a symlink
+    carries outside the home folder. Never raises.
+    """
+    now = time.time()
+    home = os.path.realpath(home or FIRST_SESSION_HOME or os.path.expanduser("~"))
+    scratch = tuple(os.path.realpath(p) + os.sep for p in SCRATCH_ROOTS)
+
+    def row(path):
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = now
+        return {"name": os.path.basename(path.rstrip("/")) or path, "path": path,
+                "minutes_ago": max(0, int((now - mtime) / 60)), "first": True}
+
+    def inside_home(path):
+        real = os.path.realpath(path) + os.sep
+        return real.startswith(home + os.sep) and not real.startswith(scratch)
+
+    # One row per folder, whatever it is called: on a Mac's
+    # case-insensitive disk "Code" and "code" are the same folder, and
+    # realpath does not say so — the inode does.
+    seen = set()
+
+    def fresh(path):
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return False
+        key = (stat.st_dev, stat.st_ino)
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    roots = [os.path.join(home, name) for name in CODE_ROOTS]
+    roots = [r for r in roots if os.path.isdir(r) and inside_home(r) and fresh(r)]
+    repos = []
+    for root in roots:
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(root, name)
+            if (not name.startswith(".") and os.path.isdir(path)
+                    and inside_home(path) and _is_repository(path) and fresh(path)):
+                repos.append(row(path))
+    rows = repos or [row(r) for r in roots]
+    if not rows:
+        home_row = row(home)
+        home_row["name"] = "Home"
+        return [home_row]
+    rows.sort(key=lambda r: r["minutes_ago"])
+    return rows[:limit]
+
 
 def known_projects(projects_dir=None, limit=25):
     """The projects a new session may be started in: one row per repository
     a person has recently worked in, most recent first. Derived from the
     same transcripts the session list reads, so the watch never has to
     type a path and the relay never opens a terminal somewhere it has not
-    already seen Claude Code run.
+    already seen Claude Code run — or, before the first session, outside
+    the person's own code folders (`first_projects`), which stand in only
+    while this list would otherwise be empty.
 
     Two kinds of folder are not projects, and on 2026-09-23 they were most
     of the list. A session's own worktree folds into its repository — the
@@ -1990,7 +2141,10 @@ def known_projects(projects_dir=None, limit=25):
                      "minutes_ago": max(0, int((now - mtime) / 60))})
         if len(rows) >= limit:
             break
-    return rows
+    # A Mac that has never run Claude Code where a person sits (a fresh
+    # install, or only unattended loops so far) has nothing to offer from
+    # its transcripts — and the first session has to start somewhere.
+    return rows or first_projects(limit)
 
 
 def start_session(path, text, projects_dir=None, platform=None):
@@ -2004,8 +2158,9 @@ def start_session(path, text, projects_dir=None, platform=None):
     whose cards reach the wrist like any other's.
 
     Every failure comes back as words the watch can show: no Mac, no
-    ``claude`` on the PATH, a directory Claude Code has never worked in, or
-    a Terminal that will not open (no one logged in at the screen — the
+    ``claude`` on the PATH, a directory the picker did not offer (one Claude
+    Code has never worked in — or, before the first session, one outside
+    the person's code folders), or a Terminal that will not open (no one logged in at the screen — the
     usual reason). Never raises, never blocks longer than a few seconds.
     """
     text = " ".join(str(text or "").split())
@@ -2192,6 +2347,9 @@ class _PromptResolver:
                     pass
 
     def _scan(self, lines, shrunk, path):
+        # Through the dashboard's table of upstream shapes, so a rename in
+        # Claude Code's transcript is one entry to update, and dated.
+        call, answer = shape("type.tool_use"), shape("type.tool_result")
         try:
             if shrunk:
                 # The transcript was rewritten (compaction). Its history
@@ -2205,16 +2363,16 @@ class _PromptResolver:
                 # at the desk on the wrist for six days (2026-10-05).
                 self.open_calls.clear()
                 return any(
-                    part.get("type") == "tool_result"
+                    part.get("type") == answer
                     and part.get("tool_use_id") in self.use_ids
                     for part in self._parts(lines))
             for part in self._parts(lines):
-                if (part.get("type") == "tool_use"
+                if (part.get("type") == call
                         and part.get("name") == self.tool):
                     self.open_calls[part.get("id")] = path
                     if self._same_call(part.get("input") or {}):
                         self.use_ids.add(part.get("id"))
-                elif part.get("type") == "tool_result":
+                elif part.get("type") == answer:
                     self.open_calls.pop(part.get("tool_use_id"), None)
                     if part.get("tool_use_id") in self.use_ids:
                         return True
@@ -2306,6 +2464,30 @@ def _normal_ip(ip):
     except ValueError:
         return None
     return getattr(address, "ipv4_mapped", None) or address
+
+
+def _local_addresses(run=None):
+    """Every address on this machine's interfaces — Wi-Fi, Ethernet, the
+    tailnet, IPv6 — as address objects. Never raises; empty when no lister
+    answers. `ifconfig` on a Mac, `ip -o addr` where that is what there is.
+
+    A process here can bind its socket to one of this Mac's addresses and
+    dial another, so "the peer is the address it dialled" alone let it pair
+    as a watch and answer its own CRITICAL card (2026-10-19 review)."""
+    run = run or subprocess.run
+    found = set()
+    for argv in (["ifconfig"], ["ip", "-o", "addr"]):
+        try:
+            out = run(argv, capture_output=True, text=True, timeout=3).stdout or ""
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+        for match in re.finditer(r"\binet6?\s+([0-9A-Fa-f:.%a-zA-Z0-9]+?)(?:/\d+)?(?=\s)", out):
+            address = _normal_ip(match.group(1))
+            if address is not None:
+                found.add(address)
+        if found:
+            break
+    return found
 
 
 def _is_loopback(ip):
@@ -2671,10 +2853,15 @@ class RelayHandler(BaseHTTPRequestHandler):
         # A watch presenting a real key from off this machine means the
         # machine is paired, however the key reached it.
         if (allowed and not self._is_local_process()
-                and hasattr(self.auth, "note_device_seen")
                 and _credential_ok(self.auth, token)):
-            self.auth.note_device_seen()
+            self._note_paired()
         return allowed
+
+    def _note_paired(self):
+        """This request proves a watch holds the key: the machine is paired,
+        for the first-run door. The one place that says so."""
+        if hasattr(self.auth, "note_device_seen"):
+            self.auth.note_device_seen()
 
     def _credentialed(self):
         """Did this caller prove anything at all? Decides how much /health
@@ -2690,14 +2877,11 @@ class RelayHandler(BaseHTTPRequestHandler):
         the Mac bridge's credential. Loopback by itself proves nothing on
         the two routes that act: a command Claude runs is a local process
         too, and must not answer its own card. No store, no proof."""
-        token = self._presented()
-        if _credential_ok(self.auth, token):
-            if not self._is_local_process() and hasattr(self.auth, "note_device_seen"):
-                self.auth.note_device_seen()
+        if _credential_ok(self.auth, self._presented()):
+            if not self._is_local_process():
+                self._note_paired()
             return True
-        return (self._is_local_process()
-                and hasattr(self.auth, "is_bootstrap")
-                and self.auth.is_bootstrap(token))
+        return self._proves_bootstrap()
 
     def _is_local_process(self):
         """Loopback on the LAN listener — the hook and the bridge. False on
@@ -2717,8 +2901,12 @@ class RelayHandler(BaseHTTPRequestHandler):
         try:
             here = _normal_ip(self.connection.getsockname()[0])
         except (OSError, AttributeError, IndexError):
-            return False
-        return peer is not None and peer == here
+            here = None
+        if peer is not None and peer == here:
+            return True
+        # Bound to one of this Mac's addresses and dialling another: still
+        # this Mac (_local_addresses says how that paired a process).
+        return peer is not None and peer in _local_addresses()
 
     def _proves_bootstrap(self):
         """A local process holding the bootstrap from the 0600 auth file:
@@ -2737,9 +2925,10 @@ class RelayHandler(BaseHTTPRequestHandler):
             return path, query
         prefix = "/t/%s" % self.required_token
         if path == prefix or path.startswith(prefix + "/"):
-            # The prefix IS the credential — record that it matched, so
-            # authorization rests on the check itself, not on which
-            # listener the request happened to arrive at.
+            # The prefix is the rendezvous address, never a credential:
+            # record that it matched, and authorize_request() still asks
+            # for the device token on top (via_tunnel), so a leaked tunnel
+            # address alone opens nothing (CLAUDE.md, hard constraint 4).
             self.tunnel_authed = True
             return (path[len(prefix):] or "/"), query
         return None, query
@@ -2952,6 +3141,9 @@ class RelayHandler(BaseHTTPRequestHandler):
     #              this user, not merely this machine — and only a signed
     #              request gets the proof the hook requires of its answer.
 
+    # Every administration route: local, admin, never through the tunnel.
+    # One rule, so a route copied from another cannot drop lan_only.
+    _ADMIN_ROUTE = dict(local=True, admin=True, lan_only=True)
     ROUTES = {
         "GET": {
             "/pair": ("_get_pair", dict(auth=False, lan_only=True)),
@@ -2995,15 +3187,15 @@ class RelayHandler(BaseHTTPRequestHandler):
             # no_simulator, on /new and /say too: a Simulator's tap is never
             # an answer on a relay real cards reach (see _dispatch).
             "/decision": ("_post_decision", dict(token=True, no_simulator=True)),
-            "/admin/pair-open": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
-            "/admin/pair-relight": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
-            "/admin/pair-reset": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
-            "/admin/rotate": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
-            "/admin/update-deferred": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
-            "/admin/update-stuck": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
-            "/admin/update-unstuck": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
-            "/admin/bridge-failed": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
-            "/admin/bridge-ok": ("_post_admin", dict(local=True, admin=True, lan_only=True)),
+            "/admin/pair-open": ("_post_admin", _ADMIN_ROUTE),
+            "/admin/pair-relight": ("_post_admin", _ADMIN_ROUTE),
+            "/admin/pair-reset": ("_post_admin", _ADMIN_ROUTE),
+            "/admin/rotate": ("_post_admin", _ADMIN_ROUTE),
+            "/admin/update-deferred": ("_post_admin", _ADMIN_ROUTE),
+            "/admin/update-stuck": ("_post_admin", _ADMIN_ROUTE),
+            "/admin/update-unstuck": ("_post_admin", _ADMIN_ROUTE),
+            "/admin/bridge-failed": ("_post_admin", _ADMIN_ROUTE),
+            "/admin/bridge-ok": ("_post_admin", _ADMIN_ROUTE),
         },
     }
 
@@ -3247,15 +3439,17 @@ class RelayHandler(BaseHTTPRequestHandler):
             payload["answer"] = answer
         self._send_json(payload)
 
-    def _serialised_send(self, act):
+    def _serialised_send(self, act, path):
         """/new and /say both spawn a `claude` process on this Mac: the
         same per-caller budget and the same one-at-a-time gate, for the
         same reasons — serialising them is correctness, not politeness.
         `act(body)` returns the status word; the reply says whether it
-        was the good one."""
+        was the good one. ``path`` is the routed path: the raw one carries
+        the tunnel's /t/<secret> prefix, so the same message retried over
+        the other route was a new one and ran twice (2026-10-19 review)."""
         who = self._presented() or self.client_address[0]
         body = self._read_json() or {}
-        key = _send_key(who, self.path, body)
+        key = _send_key(who, path, body)
         replay = _recent_send(key)
         if replay is not None:
             # The watch gave up waiting (5 s) and the person tapped again;
@@ -3284,7 +3478,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         # Opens a Terminal on this Mac.
         self._serialised_send(lambda body: (
             start_session(str(body.get("path", ""))[:512], body.get("text", "")),
-            "started"))
+            "started"), path)
 
     def _post_say(self, path, query):
         # Only an explicit false turns brevity off: a watch that predates
@@ -3295,7 +3489,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                            body.get("text", ""),
                            brief=body.get("brief") is not False,
                            force=body.get("force") is True),
-            "sent"))
+            "sent"), path)
 
     def _post_diagnostic(self, path, query):
         """The watch telling this computer something went wrong on it.
@@ -3343,9 +3537,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         # key, so the machine is paired. Without this an iCloud-only watch
         # never shut the first-run door (D2), and it reopened at every
         # session start.
-        if (accepted and self._is_local_process() and self._proves_bootstrap()
-                and hasattr(self.auth, "note_device_seen")):
-            self.auth.note_device_seen()
+        if accepted and self._proves_bootstrap():   # a local process, by its own test
+            self._note_paired()
         self._send_json({"ok": accepted})
 
     def _post_admin(self, path, query):
@@ -3440,9 +3633,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         # there: paired, for the first-run door, as a direct poll would be.
         # Only from the key file's holder, the bridge: shutting the door is
         # the safe direction, but a stray local process is still no witness.
-        if (seen and self._proves_bootstrap()
-                and hasattr(self.auth, "note_device_seen")):
-            self.auth.note_device_seen()
+        if seen and self._proves_bootstrap():
+            self._note_paired()
         self._send_json({"ok": True})
 
 
@@ -3781,8 +3973,7 @@ class Auth:
         try:
             fd = os.open(temp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         except OSError as error:
-            print("relay: could not save %s: %s" % (self.path, error), file=sys.stderr)
-            return
+            return self._not_saved(error)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(body + "\n")
@@ -3791,11 +3982,25 @@ class Auth:
             os.chmod(temp, 0o600)
             os.replace(temp, self.path)
         except OSError as error:
-            print("relay: could not save %s: %s" % (self.path, error), file=sys.stderr)
             try:
                 os.unlink(temp)
             except OSError:
                 pass
+            return self._not_saved(error)
+        clear_condition("pairing")
+        return True
+
+    def _not_saved(self, error):
+        """A save that failed used to say so on stderr only, and the
+        pairing it was saving then vanished at the next restart, with the
+        watch none the wiser (2026-10-17 tech-debt review, item 2)."""
+        print("relay: could not save %s: %s" % (self.path, error), file=sys.stderr)
+        note_condition(
+            "pairing",
+            "This computer could not save its list of paired watches, so a "
+            "watch paired now may need pairing again after a restart. Check "
+            "that the home folder has free space.")
+        return False
 
     # ---- credentials -------------------------------------------------
 
@@ -3889,11 +4094,8 @@ class Auth:
             # The iCloud-mirrored key rotates with everything else, and stays
             # a usable key: the bridge re-mirrors it within the minute and a
             # watch picks it up without anyone touching anything.
-            self.devices = [{
-                "id": "icloud", "token": self.bootstrap,
-                "label": "Watch via iCloud", "issued": int(time.time()),
-                "last_seen": 0, "source": "icloud-mirror"}]
-            self.save()
+            self.devices = []
+            self._ensure_icloud_device()   # builds the row, and saves
             return self.tunnel_secret
 
     # ---- the pairing window -----------------------------------------
@@ -4381,8 +4583,10 @@ def wired_agents():
         from ClaudeRiskClassifier import codex_hook_trusted
         if codex_hook_trusted() is not None:
             agents.append("codex")
-    except Exception:                  # no helper beside us: `helper` says so
+    except ImportError:                # no helper beside us: `helper` says so
         pass
+    except Exception as error:         # noqa: BLE001 — check_codex_hook says it aloud
+        print("relay: could not check Codex's hook: %s" % error, file=sys.stderr)
     return agents
 
 
@@ -4393,9 +4597,20 @@ def check_codex_hook():
     is no Codex here. Paths are read on each call (#362)."""
     try:
         from ClaudeRiskClassifier import codex_hook_trusted
+    except ImportError:                # no helper beside us: `helper` says so
+        return True
+    try:
         trusted = codex_hook_trusted()
-    except Exception:                  # no helper beside us: `helper` says so
-        trusted = None
+    except Exception as error:         # noqa: BLE001 — a bug, not "no Codex"
+        # Read as "no Codex" until 2026-10-17, which cleared the condition
+        # in silence whenever the check itself broke.
+        print("relay: could not check Codex's hook: %s" % error, file=sys.stderr)
+        note_condition(
+            "codex",
+            "Tapproval could not check whether Codex trusts its hook, so "
+            "Codex questions may stay on the computer. Reinstalling the "
+            "helper should fix it.")
+        return False
     if trusted is False:
         note_condition(
             "codex",
@@ -4828,6 +5043,7 @@ def main(argv=None):
               file=sys.stderr)
 
     check_helper_is_visible()
+    check_dashboard_is_loaded()
     check_codex_hook()
     ensure_claude_on_path()
     helper_provenance()

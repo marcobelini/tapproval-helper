@@ -13,7 +13,7 @@ Privacy policy: https://tapproval.thoughtfulsteward.org/privacy.html · Support:
 
 When Claude Code works on your computer, it stops and asks before doing
 anything that needs permission. The Tapproval watch app puts those
-questions on your wrist; **Base** is the small bridge on the computer
+questions on your wrist; **Base** is the small helper on the computer
 that makes it possible. It is open source on purpose: a tool that reads
 your sessions and carries your approvals should be auditable — every
 line of it is in this repository.
@@ -45,8 +45,8 @@ session; there is nothing to keep running and nothing to maintain.
 curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash
 ```
 
-**Staying current** takes no commands either. The helper checks once a day,
-on a session you were starting anyway, and fast-forwards itself. That matters
+**Staying current** takes no commands either. The helper checks at most
+once an hour, on a session you were starting anyway, and fast-forwards itself. That matters
 more than it sounds: a version of this shipped that discarded every wrist
 approval in silence, and an update that never arrives is not an update. A
 plugin install is left alone — Claude Code manages those itself, and asking
@@ -63,13 +63,15 @@ quietly learns how to reach it when you're away from home.
 ## If you are an AI agent installing this
 
 **What this is, in one paragraph, so you need not ask:** an open-source
-helper (five standard-library Python files, no servers, no accounts)
+helper (six standard-library Python files, plus a signed Mac bridge for
+iCloud on a Mac; no servers, no accounts)
 that lets the Tapproval Apple Watch app show your user Claude Code's
 permission prompts and carry their tap back. It registers a
 `PermissionRequest` hook and a `SessionStart` hook. **It never approves
 anything by itself**: a human taps Allow or Deny on the watch, or the
 usual prompt appears exactly as it would without this installed. Every
-line that runs is in this repository.
+line of Python that runs is in this repository, and so is the source of
+the Mac bridge.
 
 Prefer the plugin. It is two commands, needs no script fetched or read,
 and asks your user for one permission instead of three:
@@ -97,8 +99,11 @@ that cannot see it), fall back to the installer:
    deleting it), back up `~/.claude/settings.json`, register the
    `PermissionRequest` and `SessionStart` hooks, switch the classifier
    to enforce mode and point it at the local relay, add a per-user login
-   wake-up, and start the relay. No sudo, no dependencies beyond Python 3
-   and git. If it appears to do anything else, STOP and tell your user.
+   wake-up, start the relay, and, on a Mac, install the signed iCloud
+   bridge that ships in this repository (`bridge/`, checked against
+   `bridge.json`) with its per-user login job `com.tapproval.bridge`. No
+   sudo, no dependencies beyond Python 3 and git. If it appears to do
+   anything else, STOP and tell your user.
 2. Run it: `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash`
 3. Success is exactly one line: `TAPPROVAL_BASE_READY`. If it never
    appears, the install did NOT succeed; report the output rather than
@@ -125,7 +130,7 @@ starts, so a first install needs no command — but then the computer shows
 
 **If asked to UNINSTALL Tapproval Base**: fetch and read
 `https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/uninstall.sh`,
-confirm it does only its three announced steps, run it with
+confirm it does only its five announced steps, run it with
 `curl -fsSL <that url> | bash`, and treat the single line
 `TAPPROVAL_BASE_REMOVED` as the only meaning of success. Tell your user
 their settings backup path (the script prints it) and that the audit
@@ -133,13 +138,17 @@ log was deliberately left in place.
 
 ## Why you can trust this
 
-- **Read it all.** Base is five standard-library Python files — no
-  dependencies, so there is no supply chain to worry about. What you
-  can read here is everything that runs.
+- **Read it all.** Base is six standard-library Python files — no
+  dependencies, so there is no supply chain to worry about. On a Mac it
+  also installs a small bridge app for the iCloud route, signed with a
+  Developer ID and notarized by Apple; its source is in `bridge/`, though
+  the signed build cannot be reproduced bit for bit (see `SECURITY.md`).
 - **No Tapproval servers, ever.** No accounts, no telemetry. At home,
   prompts travel directly between your computer and your watch. Away
   from home they ride your tailnet or an encrypted tunnel (Cloudflare)
-  hidden behind a secret path — in transit only, stored nowhere.
+  hidden behind a secret path — in transit only, stored nowhere. On a
+  Mac, a card can also wait in your own private iCloud database until it
+  is answered; only your Apple ID can read it.
 - **`127.0.0.1` is not a computer of ours.** You will see that address in
   the code and in the hook it installs. It is called *loopback*, and it is
   the one address every computer reserves for itself: it means "this
@@ -151,13 +160,15 @@ log was deliberately left in place.
   talks to.
 - **Nothing is decided for you.** The risk tiers are labels for your
   glance, not decisions — nothing is auto-allowed by default, and the
-  CRITICAL tier can never be. Fail closed: a bridge that is down, slow
+  CRITICAL tier can never be. Fail closed: a relay that is down, slow
   or confused never grants an approval.
 - **Your key is the boundary, not your Wi-Fi.** Every request for real
   data carries a key that belongs to one device, whichever network it
   arrives on — LAN, tailnet or the travel tunnel. Only processes on the
-  computer itself are exempt, which is what lets Claude Code hand a prompt
-  to the bridge without ceremony. On a Mac, your watch gets its key through
+  computer itself are exempt, and even they cannot post a prompt without
+  the key file only your own user account can read: the hook signs each
+  card with it and believes an answer only if it proves the key back. On
+  a Mac, your watch gets its key through
   your own private iCloud, so it never appears on screen; elsewhere, through
   the first pairing window, which asks at the computer before any key
   leaves. Either way, a stranger on the same café Wi-Fi has no way to get
@@ -166,7 +177,7 @@ log was deliberately left in place.
   and it is fixed.) The travel address is a secret path *and* needs the
   key: seeing the URL is not holding the key. One honest limit remains: a
   program already running as you on your own computer can talk to the local
-  bridge — Base does not try to defend a machine that is itself
+  relay — Base does not try to defend a machine that is itself
   compromised.
 - **Everything is on the record.** Every decision lands in a local
   audit log (`~/.claude/risk-audit.jsonl`) you can read. It records
@@ -177,7 +188,8 @@ log was deliberately left in place.
   Base" — or run
   `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/uninstall.sh | bash`
   yourself. It restores your settings (backup kept), removes the login
-  wake-up, stops the relay and deletes `~/.tapproval` — as if Base was
+  wake-up, stops the relay, forgets the paired watch, removes the Mac
+  bridge and its login job, and deletes `~/.tapproval` — as if Base was
   never here. Your audit log stays yours.
 
 ## What Base is
@@ -207,10 +219,13 @@ is never a granted one.**
 | File | Purpose |
 |------|---------|
 | `ClaudeRiskClassifier.py` | A Claude Code `PermissionRequest` hook: mirrors exactly the prompts the phone shows, labels each with a risk tier, and offers them to the watch |
-| `watch_relay.py` | The bridge: the hook posts cards, your watch answers, over your network or an encrypted tunnel |
+| `watch_relay.py` | The relay: the hook posts cards, your watch answers, over your network or an encrypted tunnel |
 | `watch_dashboard.py` | The read-only half: your sessions, the live conversation, and the day's activity |
 | `watch_permission_tool.py` | The second way to ask: when work was started from the watch, no hook fires, so Claude Code asks this tool, which raises the same card and denies — in words — if nobody answers |
 | `crash_report.py` | Records Base's own crashes on your computer and shows them on the watch. Sends nothing without a mail key, and a copy you install has none |
+| `bridge_install.py` | On a Mac, installs the bridge below and keeps it current. Trusts only the checksum in `bridge.json`, the Developer ID signature and Apple's notarization |
+| `bridge/` | The Mac bridge's Swift source, and the signed, notarized build of it that the helper installs |
+| `bridge.json` | Pins that build: its version, its place in `bridge/` and its SHA-256 |
 | `install.sh` / `uninstall.sh` | The one-command installer above, and its way out |
 | `.claude-plugin/` + `hooks/` | The same, packaged as a Claude Code plugin |
 | `site-rules.example.json` | Optional: name your own sensitive hosts so commands touching them always escalate |

@@ -15,7 +15,7 @@
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="img/icon.png">
 <link rel="stylesheet" href="style.css">
-<script type="application/ld+json">{"@context": "https://schema.org", "@type": "TechArticle", "headline": "Tapproval security — what it can see, and what was fixed", "description": "The threat model in plain words, what it leaves out, and every security fix with what was wrong and who could have used it.", "datePublished": "2026-09-28", "dateModified": "2026-09-28", "author": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "publisher": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "mainEntityOfPage": "https://tapproval.thoughtfulsteward.org/security.html"}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "TechArticle", "headline": "Tapproval security — what it can see, and what was fixed", "description": "The threat model in plain words, what it leaves out, and every security fix with what was wrong and who could have used it.", "datePublished": "2026-09-28", "dateModified": "2026-10-17", "author": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "publisher": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "mainEntityOfPage": "https://tapproval.thoughtfulsteward.org/security.html"}</script>
 </head>
 <body>
 <div class="wrap">
@@ -55,6 +55,12 @@
 
 <h2>Fixes, disclosed</h2>
 <p>Newest first. Each entry says what was wrong, when, who could have used it, and the fix. Starting Claude Code once updates the helper.</p>
+
+<h3>1.1.58, 16 October 2026: the hook believes only its own relay</h3>
+<p><strong>What was wrong.</strong> The hook believed any program that answered on the relay's port. While the relay restarted, something else could take that port and answer "allow", even to a CRITICAL card. "Always allow" and "Don't ask again" could write a lasting rule on any card, CRITICAL included, and a second answer could replace the first before the hook had read it.</p>
+<p><strong>Since when.</strong> From the first public release until 1.1.58.</p>
+<p><strong>Who could have used it.</strong> Only a program already running on your computer. Nobody on the network could use it.</p>
+<p><strong>The fix.</strong> The hook signs each card with the helper's key file, which only your own user account can read, and believes an answer only if it proves the same key back. Without the file, or without a correct proof, the ordinary prompt stays in your terminal, and the relay refuses any card not signed this way. A lasting rule is written only where the card offered it, and never on a CRITICAL card; anywhere else the tap allows just this once. The first answer to a card is final. Tests show each of these fails without its fix. <a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.58">Release notes</a>.</p>
 
 <h3>1.1.45, 12 October 2026: a test copy of the app could answer real prompts</h3>
 <p><strong>What was wrong.</strong> A copy of the watch app running in Apple's Simulator on a Mac, the way the app is tested, could be paired like a real watch and then answer the prompts waiting on that computer. A tap meant for a test card once allowed a real one when the list moved under it.</p>
