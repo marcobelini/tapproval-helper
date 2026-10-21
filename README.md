@@ -66,7 +66,10 @@ Tapproval gets one by putting each card in your own iCloud: the bridge the
 helper installs on a Mac (macOS 13 or later, signed in to iCloud with the
 same Apple Account as the watch) writes the card there, and Apple then
 buzzes your watch. Only an app signed by Apple and running on a Mac can
-write to your iCloud, so this is Mac only.
+write to your iCloud, so this is Mac only. When the bridge is added, macOS
+may show a notice that a background item was added: that is the bridge, and
+it is listed under System Settings → General → Login Items, where it can be
+switched off (`--install --no-bridge` leaves it out altogether).
 
 | | Mac | Linux or another computer |
 |---|---|---|

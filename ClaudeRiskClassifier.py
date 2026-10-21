@@ -108,7 +108,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.60"
+__version__ = "1.1.61"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -1867,16 +1867,37 @@ def _read_plan_file(path, inside=None):
         return ""
 
 
+_TAIL_CACHE = {}
+
+
 def _transcript_tail(transcript_path):
     """The last TRANSCRIPT_TAIL bytes of a transcript, as text, or "" when
-    it cannot be read."""
+    it cannot be read. A plan prompt asks twice (its file, auto mode): the
+    one most recent tail is kept, keyed by the file's size and time, so an
+    unchanged transcript is read once."""
     try:
+        info = os.stat(transcript_path)
+        key = (transcript_path, info.st_size, info.st_mtime_ns)
+        if key in _TAIL_CACHE:
+            return _TAIL_CACHE[key]
         with open(transcript_path, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            handle.seek(max(0, handle.tell() - TRANSCRIPT_TAIL))
-            return handle.read().decode("utf-8", "replace")
+            handle.seek(max(0, info.st_size - TRANSCRIPT_TAIL))
+            text = handle.read(TRANSCRIPT_TAIL).decode("utf-8", "replace")
     except (OSError, TypeError, ValueError):
         return ""
+    _TAIL_CACHE.clear()
+    _TAIL_CACHE[key] = text
+    return text
+
+
+def _json_object(line):
+    """One transcript or audit line as a dict, or None: not JSON, or JSON
+    that is not an object (callers .get() on what comes back)."""
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return None
+    return entry if isinstance(entry, dict) else None
 
 
 def _transcript_plan_path(transcript_path):
@@ -1885,12 +1906,8 @@ def _transcript_plan_path(transcript_path):
     for line in reversed(_transcript_tail(transcript_path).splitlines()):
         if '"planFilePath"' not in line:
             continue
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        found = ((entry.get("attachment") or {}).get("planFilePath")
-                 if isinstance(entry, dict) else None)
+        entry = _json_object(line)
+        found = (entry.get("attachment") or {}).get("planFilePath") if entry else None
         if found:
             return str(found)
     return ""
@@ -1949,11 +1966,8 @@ def auto_mode_seen(event):
     for line in _transcript_tail(transcript).splitlines():
         if '"permissionMode"' not in line:
             continue
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(entry, dict) and entry.get("permissionMode") == "auto":
+        entry = _json_object(line)
+        if entry and entry.get("permissionMode") == "auto":
             return True
     return False
 
@@ -2362,16 +2376,8 @@ def read_audit(policy):
     try:
         with open(path, "r", encoding="utf-8") as handle:
             for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                # Callers .get() on every entry: a line that is JSON but
-                # not an object must not reach them.
-                if isinstance(entry, dict):
+                entry = _json_object(line) if line.strip() else None
+                if entry is not None:
                     entries.append(entry)
     except OSError:
         return []
@@ -4282,10 +4288,24 @@ def _relay_health():
 
 
 def _relay_json(path, timeout=1):
-    """GET a path on the local relay as JSON, or None when nothing answers."""
+    """GET a path on the local relay as JSON, or None when nothing answers.
+    Signed with the key file: loopback alone opens only /health (S2)."""
     try:
+        import time
+        import urllib.parse
         import urllib.request
-        with urllib.request.urlopen(RELAY_URL + path, timeout=timeout) as reply:
+        import uuid
+        url = RELAY_URL + path
+        headers = {}
+        key = _relay_key({})
+        if key:
+            split = urllib.parse.urlsplit(url)
+            stamp, nonce = int(time.time()), uuid.uuid4().hex
+            mac = _relay_signature(key, "GET", urllib.parse.unquote(split.path),
+                                   stamp, nonce, b"", split.query)
+            headers["X-Tapproval-Signature"] = "v2 %d %s %s" % (stamp, nonce, mac)
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=timeout) as reply:
             return json.loads(reply.read())
     except Exception:
         return None

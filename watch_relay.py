@@ -56,7 +56,6 @@ import json
 import shlex
 import functools
 import os
-import plistlib
 import re
 import select
 import signal
@@ -100,14 +99,6 @@ def home_file(folder, name, legacy):
 # reads it too, which is why it moves only once the bridge can find it
 # (_bridge_reads_data_dir).
 AUTH_FILE = home_file("data", "auth.json", ".tapproval-auth.json")
-# The Mac bridge mirrors the key into the user's private iCloud database,
-# where only that Apple Account can read it. Where it is installed a watch
-# on the same account pairs through iCloud; the first-run door still opens,
-# for a watch on another account (see Auth.__init__).
-BRIDGE_APP = os.path.expanduser("~/.tapproval/bridge-app/TapprovalBridge.app")
-# Where it lived until 2026-10-16 (bridge_install.legacy_dir()): still a
-# bridge until the first install into the new place retires it.
-LEGACY_BRIDGE_APP = os.path.expanduser("~/.tapproval-bridge/TapprovalBridge.app")
 # Bumped whenever the wire contract or the auth rules change, so a running
 # relay from before an update can be recognised — and replaced — instead of
 # quietly serving the old rules forever (see ensure_running).
@@ -531,8 +522,8 @@ def _relay_pid(port=None):
     try:
         with open(PID_FILE, encoding="utf-8") as handle:
             pid = int(handle.read().strip())
-        os.kill(pid, 0)                                 # alive?
-        return pid
+        if _pid_alive(pid):
+            return pid
     except (OSError, ValueError):
         pass
     try:
@@ -2590,13 +2581,17 @@ def _is_private_address(ip):
 
 
 def authorize_request(client_ip, path, header_token,
-                      tunnel_authed, auth, via_tunnel=False):
+                      tunnel_authed, auth, via_tunnel=False, local_proof=False):
     """May this request touch real data? One rule for every listener.
 
-    Loopback is the local-process boundary the project documents and
-    accepts: the hook, the Mac bridge and the liveness probe all run as the
-    same user on the same machine. Everything else — LAN, tailnet, or the
-    travel tunnel — must present a device token, whatever its address.
+    Loopback alone opens only /health. Any account on this Mac, and any
+    raw port-forward into it, arrives as loopback, and transcripts, the
+    session list and the travel address are this user's (2026-10-16
+    review, S2). So a local caller proves itself too: ``local_proof`` is
+    the bootstrap from the 0600 key file, or a device key, which the hook,
+    the bridge and the command line all hold. Everything else — LAN,
+    tailnet, or the travel tunnel — must present a device token, whatever
+    its address.
 
     Being on the user's Wi-Fi used to be enough. On a home network that
     reads as "me"; on café Wi-Fi it reads as "everyone here", which is how
@@ -2609,10 +2604,10 @@ def authorize_request(client_ip, path, header_token,
     """
     if via_tunnel:
         return bool(tunnel_authed) and _credential_ok(auth, header_token)
-    if _is_loopback(client_ip):
-        return True
     if path == "/health":            # liveness only; the body is trimmed
         return True
+    if _is_loopback(client_ip):
+        return bool(local_proof)
     return _credential_ok(auth, header_token)
 
 
@@ -2871,10 +2866,17 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def _authorized(self, path):
         token = self._presented()
+        # A test relay (--allow-simulator) keeps the old open loopback, so a
+        # Simulator watch pointed at it can read without being paired: it
+        # cannot pair from this machine (/pair refuses it).
+        local_proof = self._is_local_process() and (
+            self.allow_simulator or self._proves_bootstrap()
+            or _credential_ok(self.auth, token))
         allowed = authorize_request(
             self.client_address[0], path, token,
             getattr(self, "tunnel_authed", False), self.auth,
-            via_tunnel=self.required_token is not None)
+            via_tunnel=self.required_token is not None,
+            local_proof=local_proof)
         # A watch presenting a real key from off this machine means the
         # machine is paired, however the key reached it.
         if (allowed and not self._is_local_process()
@@ -2908,11 +2910,26 @@ class RelayHandler(BaseHTTPRequestHandler):
             return True
         return self._proves_bootstrap()
 
+    # Headers a forwarding proxy adds (Tailscale serve, cloudflared, an
+    # nginx in front): the request came from somewhere else and was handed
+    # on. A raw TCP forward adds nothing, which is why loopback alone
+    # proves nothing beyond /health.
+    _FORWARDED_HEADERS = ("Forwarded", "X-Forwarded-For", "X-Real-IP",
+                          "CF-Connecting-IP")
+
+    def _forwarded(self):
+        return (any(self.headers.get(name) is not None
+                    for name in self._FORWARDED_HEADERS)
+                or any(name.lower().startswith("tailscale-user-")
+                       for name in self.headers.keys()))
+
     def _is_local_process(self):
         """Loopback on the LAN listener — the hook and the bridge. False on
-        the tunnel listener, where loopback is only cloudflared."""
+        the tunnel listener, where loopback is only cloudflared, and for a
+        request a proxy forwarded here from elsewhere."""
         return (self.required_token is None
-                and _is_loopback(self.client_address[0]))
+                and _is_loopback(self.client_address[0])
+                and not self._forwarded())
 
     def _from_this_machine(self):
         """Loopback, or a process here that dialled this Mac's own network
@@ -3251,7 +3268,13 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, 404)
             return
         handler, rules = route
-        if rules.get("auth", True) and not self._authorized(path):
+        # Read the signature first, whatever the route: the reply's proof
+        # rides on it, and a local route below may never ask for it.
+        self._presented()
+        # A local route carries its own, stricter rules below (key_file,
+        # admin); the device-or-key-file check is for the data routes.
+        if (rules.get("auth", True) and not rules.get("local")
+                and not self._authorized(path)):
             self._send_json({"error": "not paired"}, 403)
             return
         if rules.get("local") and (
@@ -4286,9 +4309,24 @@ def note_bridge_icloud(status):
     return True
 
 
+def _bridge_apps():
+    """Where a Mac bridge may be installed: the installer's place, then the
+    one it lived in until 2026-10-16, a bridge until the first install into
+    the new place retires it. Asked of bridge_install, so the relay and the
+    installer cannot disagree (and honour the same overrides).
+
+    The bridge mirrors the key into the user's private iCloud database,
+    where only that Apple Account can read it. Where it is installed a watch
+    on the same account pairs through iCloud; the first-run door still
+    opens, for a watch on another account (see Auth.__init__)."""
+    import bridge_install
+    return (bridge_install.app_path(),
+            os.path.join(bridge_install.legacy_dir(), bridge_install.APP_NAME))
+
+
 def bridge_installed():
     """Is a Mac bridge installed on this computer, in either place?"""
-    return os.path.isdir(BRIDGE_APP) or os.path.isdir(LEGACY_BRIDGE_APP)
+    return any(os.path.isdir(app) for app in _bridge_apps())
 
 
 # The first bridge that reads the key from ~/.tapproval/data (and still
@@ -4330,11 +4368,11 @@ def make_home_dirs():
 
 def _bridge_version(app):
     """An installed bridge's version as a tuple, or None if unreadable."""
+    import bridge_install
     try:
-        with open(os.path.join(app, "Contents", "Info.plist"), "rb") as handle:
-            text = plistlib.load(handle).get("CFBundleShortVersionString") or ""
-        return tuple(int(part) for part in text.split("."))
-    except (OSError, ValueError, plistlib.InvalidFileException):
+        return tuple(int(part) for part in
+                     (bridge_install.installed_version(app) or "").split("."))
+    except ValueError:
         return None
 
 
@@ -4342,7 +4380,7 @@ def _bridge_reads_data_dir():
     """May the key move? Only if every bridge installed here reads the new
     place: bridge 1.0.0 reads ~/.tapproval-auth.json alone, and with the
     key gone from there a closed watch would stop buzzing."""
-    for app in (BRIDGE_APP, LEGACY_BRIDGE_APP):
+    for app in _bridge_apps():
         if os.path.isdir(app):
             version = _bridge_version(app)
             if version is None or version < BRIDGE_READS_DATA_DIR:
@@ -5143,6 +5181,46 @@ def _port_taken(port):
     return 1
 
 
+def _start_slow_parts(args, queue, auth):
+    """The travel tunnel and the Bonjour advertiser, each on its own thread.
+
+    Both are slow to start: the tunnel probes Cloudflare (about a minute
+    when an adopted tunnel no longer answers) and Bonjour asks ipconfig,
+    tailscale and dns-sd. They used to run before the relay served at all,
+    so the hook, the bridge and the watch at home all waited on the away
+    route, and --ensure gave up after six seconds (2026-10-21). Returns
+    ``stop()``, which ends the advertiser however far it got. Never raises.
+    """
+    lock, stopping, made = threading.Lock(), [False], []
+
+    def tunnel():
+        # Not kept: the tunnel outlives this relay on purpose (see main()).
+        _start_tunnel(queue, auth, allow_simulator=args.allow_simulator)
+
+    def bonjour():
+        advertiser = _Advertiser(args.port)
+        with lock:
+            made.append(advertiser)
+            if stopping[0]:
+                advertiser.terminate()
+                return
+        advertiser.watch()
+        if args.tunnel:
+            advertiser.republish_when_tunnel_is_up()
+
+    if args.tunnel:
+        threading.Thread(target=tunnel, name="tunnel-start", daemon=True).start()
+    if not args.no_bonjour:
+        threading.Thread(target=bonjour, name="bonjour-start", daemon=True).start()
+
+    def stop():
+        with lock:
+            stopping[0] = True
+            for advertiser in made:
+                advertiser.terminate()
+    return stop
+
+
 def main(argv=None):
     args = _build_parser().parse_args(argv)
     if not isinstance(sys.stderr, _StampedStream):
@@ -5197,16 +5275,8 @@ def main(argv=None):
         auth.path = AUTH_FILE
     print("relay: listening on http://%s:%d" % (args.host, args.port),
           file=sys.stderr)
-    if args.tunnel:
-        # Not kept: the tunnel outlives this relay on purpose (see the finally).
-        _start_tunnel(queue, auth, allow_simulator=args.allow_simulator)
+    stop_slow_parts = _start_slow_parts(args, queue, auth)
     threading.Thread(target=watch_bridge, args=(queue,), daemon=True).start()
-    advertiser = None
-    if not args.no_bonjour:
-        advertiser = _Advertiser(args.port)
-        advertiser.watch()
-        if args.tunnel:
-            advertiser.republish_when_tunnel_is_up()
     _inject_startup_cards(args, queue)
 
     # SIGTERM (pkill, launchd, a relay restart from --ensure) must run the
@@ -5227,8 +5297,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("relay: stopped", file=sys.stderr)
     finally:
-        if advertiser is not None:
-            advertiser.terminate()
+        stop_slow_parts()
         # The tunnel is left running on purpose: the next relay adopts it,
         # so the travel address — the one route a watch without its iPhone
         # has — survives restarts and updates. start_tunnel() reaps it if

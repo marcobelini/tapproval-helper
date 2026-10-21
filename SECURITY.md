@@ -35,10 +35,11 @@ longer. A problem that is not yet fixed is not described in public.
 ## What is known and accepted
 
 - **A process running as you, on your machine, can talk to the local
-  relay.** Base does not defend against a compromised machine. The loopback
-  exemption is what lets Claude Code hand it a prompt in the first place,
-  and a prompt also needs the key file, which only your own user account
-  can read: the hook signs each card with it and believes an answer only
+  relay.** Base does not defend against a compromised machine: such a
+  process can read the key file too. Another account on the same Mac
+  cannot, and neither can a port-forward into it: loopback alone opens only
+  `/health`, and everything else takes the key file, which only your own
+  user account can read. A prompt needs it as well: the hook signs each card with it and believes an answer only
   if it proves the key back.
 - **The audit log records command text** (with credential-shaped fragments
   redacted) and stays on your computer.
@@ -99,7 +100,7 @@ private database, which only your Apple Account can read.
 
 ## Design rules we will not trade away
 
-- Loopback is the only exemption; every other caller presents a device key.
+- Loopback alone opens only `/health`; a local caller shows the key file, and every other caller presents a device key.
 - The travel tunnel's secret path is an address, never a credential.
 - Failure is closed: anything unparsed, unreachable or ambiguous ends in the
   prompt appearing where it always would.

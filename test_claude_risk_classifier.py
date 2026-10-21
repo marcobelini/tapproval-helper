@@ -371,8 +371,6 @@ def _no_real_bridge(tmp_path, monkeypatch):
     """Whether this Mac has the iCloud bridge installed decides whether the
     network pairing door opens. Tests say which world they are in; the
     default is a machine without it, where the door is the only way in."""
-    monkeypatch.setattr(watch_relay, "BRIDGE_APP", str(tmp_path / "no-bridge.app"))
-    monkeypatch.setattr(watch_relay, "LEGACY_BRIDGE_APP", str(tmp_path / "no-legacy-bridge.app"))
     monkeypatch.setattr(watch_relay, "_BRIDGE_ICLOUD", None)
     # And the installer (route B): its home, its login job and its pin are
     # temporary, launchd is never touched (an overridden agent path turns
@@ -1040,8 +1038,9 @@ class TestCardFacts:
 
     @pytest.mark.private_layout
     def test_every_answer_is_a_target_a_finger_can_hit(self):
-        """Design change 2 (the owner, 2026-10-16): 38 pt in a thread's foot,
-        44 pt on the card's own screen, from one table. A minHeight typed
+        """Design change 2 (the owner, 2026-10-16): one table of answer
+        heights, 44 pt in the thread (since its answers follow the card in
+        the thread's scroll, C3, 2026-10-21) and on the card's own screen. A minHeight typed
         as a bare number beside an answer is how "Always allow" ended up
         22 pt tall."""
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1050,7 +1049,7 @@ class TestCardFacts:
             pytest.skip("no watch app in this layout")
         source = open(path, encoding="utf-8").read()
         table = re.search(r"enum AnswerTarget \{(.*?)\n\}", source, re.S).group(1)
-        assert "static let foot: CGFloat = 38" in table
+        assert "static let thread: CGFloat = 44" in table
         assert "static let screen: CGFloat = 44" in table
         answers = source[source.index("struct DecisionButtons"):source.index("struct PlanEditsField")]
         heights = re.findall(r"minHeight: ([^)\n]+)", answers)
@@ -1059,6 +1058,18 @@ class TestCardFacts:
             assert "AnswerTarget" in height, "an answer's height is a bare number: %s" % height
         assert answers.count("AnswerTarget.secondaryGap") == 2, \
             "No, keep planning and Always allow each sit a gap below the coloured answers"
+
+    @pytest.mark.private_layout
+    def test_a_drag_over_a_waiting_cards_answers_never_answers(self):
+        """The guard the pinned bar had moves with the answers into the
+        thread: a slow drag across "Yes" once approved a plan (2026-10-16)."""
+        session = Path(__file__).with_name("WatchApp").joinpath(
+            "Tapproval", "SessionDetail.swift").read_text()
+        body = session[session.index("private func inlineAnswers"):]
+        body = body[:body.index("\n    }\n")]
+        for guard in (".allowsHitTesting(!dragging)", ".environment(\\.footDrag, footDrag)",
+                      "footDrag.move()", "footDrag.lift()"):
+            assert guard in body, guard
 
     @pytest.mark.private_layout
     def test_facts_wrap_on_the_card_screen_and_in_the_thread(self):
@@ -1076,17 +1087,23 @@ class TestCardFacts:
     @pytest.mark.private_layout
     def test_a_waiting_card_is_drawn_once_and_whole_in_its_thread(self):
         """The owner's wrist photos of build 165 (2026-10-16): inside a
-        session a waiting card's words were drawn twice, in the thread and
-        again as the foot's line, and the thread's copy was cut at three
-        lines with each fact at one. The card is drawn once, in the
-        thread, whole; the foot holds only its answers."""
+        session a waiting card's words were drawn twice and cut. Since C1
+        + C3 (2026-10-21) the card is one thing in the thread: its words
+        once, whole, and its answers directly under them; nothing pinned
+        to the glass draws it again."""
         root = Path(__file__).with_name("WatchApp").joinpath("Tapproval")
         session = root.joinpath("SessionDetail.swift").read_text()
         cards = root.joinpath("Cards.swift").read_text()
-        bar = session[session.index("struct CardAnswerBar"):]
-        bar = bar[:bar.index("\n}\n")]
-        for words in ("shownHeadline", "card.headline", "card.badge", "footHeadline"):
-            assert words not in bar, "the foot draws the card's words again: %s" % words
+        assert "struct CardAnswerBar" not in session, "the pinned answer bar is back"
+        loop = session[session.index("ForEach(Self.threadCards(waiting: waiting))"):]
+        loop = loop[:loop.index('Color.clear.frame(height: 1).id("bottom")')]
+        assert loop.count("CardRow(card: card)") == 1
+        assert loop.index("CardRow(card: card)") < loop.index("inlineAnswers(card)"), \
+            "the answers are not under the card's words"
+        assert "chevron.right" not in loop, "the chevron is back beside the card (C2)"
+        foot = session[session.index("switch foot {"):]
+        foot = foot[:foot.index("case .sends")]
+        assert "case .answers: EmptyView()" in foot
         row = cards[cards.index("struct CardRow"):cards.index("struct CardAnswerControls")]
         assert "Text(card.shownHeadline)" in row, "the thread's card lost its headline"
         assert ".lineLimit(" not in row and ".truncationMode(" not in row, \
@@ -2361,14 +2378,14 @@ class TestRelayTunnelToken:
 
 
 class TestRelayTunnelDiscovery:
-    def test_lan_listener_serves_tunnel_url(self):
+    def test_lan_listener_serves_tunnel_url(self, fresh_auth):
         watch_relay.TUNNEL_URL = "https://example.trycloudflare.com/t/tok"
         try:
-            server, _ = watch_relay.serve(port=0)
+            server, _ = watch_relay.serve(port=0, auth=fresh_auth)
             _serve(server)
             base = "http://127.0.0.1:%d" % server.server_address[1]
-            with urllib.request.urlopen(base + "/tunnel", timeout=5) as reply:
-                assert json.loads(reply.read())["url"].endswith("/t/tok")
+            status, body = relay_call(base + "/tunnel", token=fresh_auth.bootstrap)
+            assert status == 200 and body["url"].endswith("/t/tok")
             server.shutdown()
             server.server_close()
         finally:
@@ -2624,15 +2641,16 @@ class TestWatchSeenAttribution:
     """Only a real watch's polls count as "watch seen" — the CloudKit
     bridge identifies itself and stays out of the diagnostics."""
 
-    def test_bridge_polls_do_not_count_as_watch(self):
-        server, queue = watch_relay.serve(port=0)
+    def test_bridge_polls_do_not_count_as_watch(self, fresh_auth):
+        server, queue = watch_relay.serve(port=0, auth=fresh_auth)
         _serve(server)
         base = "http://127.0.0.1:%d" % server.server_address[1]
+        key = fresh_auth.bootstrap
 
-        urllib.request.urlopen(base + "/pending?source=bridge", timeout=5).read()
+        assert relay_call(base + "/pending?source=bridge", token=key)[0] == 200
         assert queue.watch_seen_seconds_ago() is None
 
-        urllib.request.urlopen(base + "/pending", timeout=5).read()
+        assert relay_call(base + "/pending", token=key)[0] == 200
         assert queue.watch_seen_seconds_ago() is not None
 
         server.shutdown()
@@ -4752,9 +4770,17 @@ class TestRelayPairing:
     network they arrive from. Being on the same Wi-Fi proves nothing — on a
     café network that is a room full of strangers."""
 
-    def test_loopback_needs_nothing(self):
+    @pytest.mark.parametrize("path", ["/sessions", "/thread", "/tunnel", "/pending"])
+    def test_loopback_alone_opens_only_health(self, path):
+        """Any account on this Mac, and any raw port-forward into it, is
+        loopback (2026-10-16 review, S2): it may ask whether the relay is
+        alive, nothing more."""
+        assert not watch_relay.authorize_request("127.0.0.1", path, "", False, "secret")
+        assert watch_relay.authorize_request("127.0.0.1", "/health", "", False, "secret")
+
+    def test_loopback_with_the_key_file_opens_the_data(self):
         assert watch_relay.authorize_request(
-            "127.0.0.1", "/say", "", False, "secret")
+            "127.0.0.1", "/sessions", "", False, "secret", local_proof=True)
 
     def test_strangers_are_refused_everywhere_but_health(self):
         assert not watch_relay.authorize_request(
@@ -8750,7 +8776,7 @@ class TestTheHelperKeepsItsFilesInOneFolder:
 
     @staticmethod
     def _bridge(version):
-        contents = os.path.join(watch_relay.BRIDGE_APP, "Contents")
+        contents = os.path.join(bridge_install.app_path(), "Contents")
         os.makedirs(contents, exist_ok=True)
         with open(os.path.join(contents, "Info.plist"), "wb") as handle:
             plistlib.dump({"CFBundleShortVersionString": version}, handle)
@@ -8794,7 +8820,7 @@ class TestTheHelperKeepsItsFilesInOneFolder:
 
     def test_a_bridge_whose_version_cannot_be_read_keeps_the_key_too(self):
         self._old_install()
-        os.makedirs(watch_relay.BRIDGE_APP)                   # no Info.plist
+        os.makedirs(bridge_install.app_path())                # no Info.plist
         assert "auth.json" not in watch_relay.move_loose_files()
 
     def test_the_bridge_the_helper_ships_reads_the_new_place(self):
@@ -10469,7 +10495,9 @@ class TestTheWristAnswersAHeadlessSend:
             self.asked.append(event)
             return {"risk": self.risk, "project": "acme"}
 
-        def wrist_card(self, tool, tool_input, risk, auto_mode=False):
+        _card_budgets = staticmethod(crc._card_budgets)
+
+        def wrist_card(self, tool, tool_input, risk, *budgets, auto_mode=False):
             card = {"headline": tool, "tier": risk.name,
                     "plan_card": tool == "ExitPlanMode"}
             if card["plan_card"]:
@@ -10480,6 +10508,21 @@ class TestTheWristAnswersAHeadlessSend:
             self.asked_the_watch = True
             self.card = card                      # what the wrist was shown
             return self.verdict, self.answer
+
+    def test_a_wrist_sent_run_keeps_the_policys_card_budget(self, monkeypatch):
+        """The hook cuts a card to the policy's headline_chars; a run sent
+        from the wrist used to ignore it (2026-10-21 /simplify review)."""
+        shown = []
+        monkeypatch.setattr(crc, "load_policy", lambda *a, **k: dict(
+            crc.DEFAULT_POLICY, relay="http://127.0.0.1:9", mode="enforce",
+            auto_allow_at_or_below="NONE", headline_chars=20))
+        monkeypatch.setattr(crc, "ask_watch",
+                            lambda card, policy, project=None: shown.append(card) or ("deny", None))
+        # No description: Claude's own words are shown whole; a headline
+        # made from the command is what the budget cuts.
+        wpt.decide("Bash", {"command": "rm -rf /tmp/" + "x" * 200}, crc=crc)
+        assert shown, "the watch was never asked"
+        assert len(shown[0]["headline"]) <= 20, shown[0]["headline"]
 
     def test_a_question_answered_on_the_wrist_carries_the_answer(self):
         """The answer was thrown away and the run told "your watch did not
@@ -10934,6 +10977,60 @@ class TestTwoRelaysOnePort:
             code = "raised"
         assert code == 0
         assert reported == [] and sent == []
+
+    def test_the_relay_serves_while_its_tunnel_starts(self, tmp_path, monkeypatch):
+        """The tunnel can take a minute to start (an adopted one that no
+        longer answers is probed five times). The relay serves the hook,
+        the bridge and the watch at home meanwhile (2026-10-21)."""
+        started = time.monotonic()
+        served_at = []
+        release = threading.Event()
+        monkeypatch.setattr(watch_relay, "_start_tunnel",
+                            lambda *a, **k: release.wait(3))
+        monkeypatch.setattr(watch_relay._RelayServer, "serve_forever",
+                            lambda self, *a, **k: served_at.append(time.monotonic()))
+        monkeypatch.setattr(watch_relay, "Auth", lambda: _throwaway_auth(tmp_path))
+        monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: None)
+        monkeypatch.setattr(watch_relay, "helper_provenance", lambda: None)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        try:
+            assert watch_relay.main(["--host", "127.0.0.1", "--port", str(port),
+                                     "--no-bonjour", "--tunnel"]) == 0
+        finally:
+            release.set()
+        assert served_at, "never served"
+        assert served_at[0] - started < 1.5, "the relay waited for its tunnel to start"
+
+    def test_bonjour_is_not_kept_waiting_by_the_tunnel(self, monkeypatch):
+        import argparse
+        release, advertised, stopped = threading.Event(), threading.Event(), []
+
+        class Advertiser:
+            def __init__(self, port):
+                advertised.set()
+
+            def watch(self):
+                pass
+
+            def republish_when_tunnel_is_up(self):
+                pass
+
+            def terminate(self):
+                stopped.append(True)
+
+        monkeypatch.setattr(watch_relay, "_start_tunnel", lambda *a, **k: release.wait(5))
+        monkeypatch.setattr(watch_relay, "_Advertiser", Advertiser)
+        args = argparse.Namespace(tunnel=True, no_bonjour=False, port=1,
+                                  allow_simulator=False)
+        try:
+            stop = watch_relay._start_slow_parts(args, None, None)
+            assert advertised.wait(2), "Bonjour waited for the tunnel"
+            stop()
+            assert stopped == [True], "stopping the relay ends the advertiser"
+        finally:
+            release.set()
 
     def test_and_as_a_real_process_it_writes_no_crash_record(self, relay, tmp_path):
         """The same race end to end, in the process the crash reporter
@@ -11432,7 +11529,9 @@ class TestNewSessionFromTheWatch:
             # 15 s, not 3: both routes scan ~/.claude/projects, which on a
             # machine with a few dozen projects takes two or three seconds
             # by itself, and this test is about routing, not speed.
-            with urllib.request.urlopen(base + "/projects", timeout=15) as r:
+            req = urllib.request.Request(base + "/projects",
+                                         headers={"X-Tapproval-Token": fresh_auth.bootstrap})
+            with urllib.request.urlopen(req, timeout=15) as r:
                 assert "projects" in json.loads(r.read())
             req = urllib.request.Request(base + "/new", method="POST",
                                          data=json.dumps({"path": "/nowhere", "text": "go"}).encode(),
@@ -11447,8 +11546,9 @@ class TestNewSessionFromTheWatch:
 
 
 class TestRelayRoutes:
-    """Every route through the dispatcher, from loopback — which the relay
-    trusts, so these hold what each route DOES rather than who may call it
+    """Every route through the dispatcher, from loopback with the key file
+    (loopback alone opens only /health since S2), so these hold what each
+    route DOES rather than who may call it
     (TestLanSourceIsNotTrusted holds that). The rules that used to sit inline in
     two long handlers now live in one table; a route added without a rule
     is the failure this class is here to catch."""
@@ -11510,9 +11610,9 @@ class TestRelayRoutes:
     def test_health_names_the_alert_route_once_the_bridge_polls(self, relay):
         """The watch can only promise a buzz when something will deliver
         one: /health says so, and a bridge poll is what makes it true."""
-        base, _, _ = relay
+        base, _, auth = relay
         assert self._call(base + "/health")[1]["alert_route"] is None
-        assert self._call(base + "/pending?source=bridge")[0] == 200
+        assert self._call(base + "/pending?source=bridge", token=auth.bootstrap)[0] == 200
         assert self._call(base + "/health")[1]["alert_route"] == "bridge"
 
     def test_the_read_routes_answer_with_their_shapes(self, relay, monkeypatch):
@@ -11520,11 +11620,12 @@ class TestRelayRoutes:
         monkeypatch.setattr(watch_relay, "recent_sessions", lambda **k: [])
         monkeypatch.setattr(watch_relay, "activity_summary", lambda: {"total": 0})
         monkeypatch.setattr(watch_relay, "usage_summary", lambda: {"input": 0})
-        base, _, _ = relay
-        assert self._call(base + "/projects")[1] == {"projects": [{"name": "x"}]}
-        assert self._call(base + "/sessions")[1] == {"sessions": []}
-        assert self._call(base + "/activity")[1] == {"total": 0}
-        assert self._call(base + "/usage")[1] == {"input": 0}
+        base, _, auth = relay
+        key = auth.bootstrap
+        assert self._call(base + "/projects", token=key)[1] == {"projects": [{"name": "x"}]}
+        assert self._call(base + "/sessions", token=key)[1] == {"sessions": []}
+        assert self._call(base + "/activity", token=key)[1] == {"total": 0}
+        assert self._call(base + "/usage", token=key)[1] == {"input": 0}
 
     @staticmethod
     def _raw(url, headers, body=b"{}"):
@@ -11588,8 +11689,8 @@ class TestRelayRoutes:
         assert caught.value.code == 403
 
     def test_an_unknown_thread_is_empty_not_an_error(self, relay):
-        base, _, _ = relay
-        status, body = self._call(base + "/thread?id=nope")
+        base, _, auth = relay
+        status, body = self._call(base + "/thread?id=nope", token=auth.bootstrap)
         assert status == 200
         assert body == {"turns": [], "running_tasks": 0, "running_tool": None,
                         "modified_seconds_ago": None, "state": "idle",
@@ -11597,27 +11698,66 @@ class TestRelayRoutes:
 
     def test_a_thread_says_its_state(self, relay, monkeypatch, tmp_path):
         """The thread's header shows the same state as the list's row."""
-        base, queue, _ = relay
+        base, queue, auth = relay
         transcript = tmp_path / "dddd4444.jsonl"
         transcript.write_text(json.dumps({"message": {"role": "user", "content": "Hi"}}) + "\n")
         past = time.time() - 120
         os.utime(transcript, (past, past))
         monkeypatch.setattr(watch_relay, "_find_transcript", lambda sid: str(transcript))
         monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "none.jsonl"))
-        assert self._call(base + "/thread?id=dddd4444")[1]["state"] == "idle"
+        assert self._call(base + "/thread?id=dddd4444", token=auth.bootstrap)[1]["state"] == "idle"
         waiter = threading.Thread(target=lambda: queue.submit(
             {"tier": "HIGH", "headline": "x", "detail": "x",
              "session_id": "dddd4444-full-id"}, 3.0), daemon=True)
         waiter.start()
         _wait_until(queue.pending, what="the card to be queued")
-        status, body = self._call(base + "/thread?id=dddd4444")
+        status, body = self._call(base + "/thread?id=dddd4444", token=auth.bootstrap)
         assert (body["state"], body["state_reason"]) == ("asking", "card")
 
     def test_the_tunnel_route_hands_over_the_away_addresses(self, relay, monkeypatch):
         monkeypatch.setattr(watch_relay, "TUNNEL_URL", "https://t.example")
-        base, _, _ = relay
-        status, body = self._call(base + "/tunnel")
+        base, _, auth = relay
+        status, body = self._call(base + "/tunnel", token=auth.bootstrap)
         assert status == 200 and body["url"] == "https://t.example"
+
+    @pytest.mark.parametrize("path", ["/sessions", "/thread?id=x", "/tunnel",
+                                      "/pending", "/projects", "/usage"])
+    def test_loopback_without_the_key_file_reads_nothing(self, relay, path):
+        """Another account on this Mac, or a port-forward into it, is
+        loopback too (S2). It could read transcripts and the travel address
+        with its secret; now it gets /health and nothing else."""
+        base, _, auth = relay
+        assert self._call(base + path)[0] == 403
+        assert self._call(base + path, token=auth.bootstrap)[0] == 200
+        status, *_ = signed_call(base + path, auth.bootstrap, method="GET")
+        assert status == 200, "signed with the key file, as the bridge does"
+
+    def test_the_status_command_reads_with_the_key_file(self, relay, monkeypatch, tmp_path):
+        """--status reads the travel address from /tunnel; since S2 that
+        takes the key file, so the command signs with it."""
+        base, _, auth = relay
+        monkeypatch.setattr(watch_relay, "TUNNEL_URL", "https://t.example")
+        key_file = tmp_path / "auth.json"
+        key_file.write_text(json.dumps({"bootstrap": auth.bootstrap}))
+        monkeypatch.setattr(crc, "AUTH_FILE", str(key_file))
+        monkeypatch.setattr(crc, "RELAY_URL", base)
+        assert crc._relay_json("/tunnel", timeout=5)["url"] == "https://t.example"
+        monkeypatch.setattr(crc, "AUTH_FILE", str(tmp_path / "missing.json"))
+        assert crc._relay_json("/tunnel", timeout=5) is None, "no key file, nothing read"
+
+    def test_a_forwarded_request_is_not_a_local_process(self, relay):
+        """A proxy on this Mac (Tailscale serve, cloudflared, nginx) hands on
+        a request from elsewhere: it arrives as loopback but is not one."""
+        base, _, auth = relay
+        forwarded = {"X-Forwarded-For": "203.0.113.9", "Content-Type": "application/json"}
+        request = urllib.request.Request(base + "/heartbeat", data=b"{}",
+                                         headers=forwarded, method="POST")
+        try:
+            urllib.request.urlopen(request, timeout=5)
+            status = 200
+        except urllib.error.HTTPError as error:
+            status = error.code
+        assert status == 403, "a local-only route refuses a forwarded caller"
 
     def test_a_malformed_card_is_refused_before_anything_waits(self, relay):
         base, _, auth = relay
@@ -11638,8 +11778,8 @@ class TestRelayRoutes:
         assert status == 200 and body == {"ok": False}
 
     def test_loopback_alone_cannot_answer_a_card(self, relay):
-        # A command Claude runs is a local process too. Reading and posting
-        # cards stay free on loopback; answering and speaking need a key.
+        # A command Claude runs is a local process too. Loopback alone reads
+        # nothing (S2); answering and speaking need a key.
         base, _, auth = relay
         assert self._call(base + "/decision", method="POST",
                           body={"id": "ghost", "decision": "allow"})[0] == 403
@@ -12510,9 +12650,7 @@ class TestFirstPairingIsAWindow:
         review guarded stays guarded: that door asks at the Mac before a
         key leaves, so a stranger on the same Wi-Fi gets nothing (the
         suite's dialog answers no)."""
-        bridge = tmp_path / "TapprovalBridge.app"
-        bridge.mkdir()
-        monkeypatch.setattr(watch_relay, "BRIDGE_APP", str(bridge))
+        Path(bridge_install.app_path()).mkdir(parents=True)
         auth = watch_relay.Auth(path=str(tmp_path / "auth.json"))
         auth.save = lambda: None
         assert not auth.paired_ever
@@ -17267,7 +17405,6 @@ def _write_pin(pin):
 
 # Taken before any fixture stands in for them.
 _REAL_MAC_SUPPORTED = bridge_install.mac_supported
-_REAL_BRIDGE_APP = watch_relay.BRIDGE_APP
 
 
 def _make_app(path, version):
@@ -17617,9 +17754,7 @@ class TestTheHelperInstallsTheMacBridge:
 
     def test_a_mac_without_icloud_is_said_and_stops_carrying_the_key(
             self, fresh_auth, tmp_path, monkeypatch):
-        bridge = tmp_path / "TapprovalBridge.app"
-        bridge.mkdir()
-        monkeypatch.setattr(watch_relay, "BRIDGE_APP", str(bridge))
+        Path(bridge_install.app_path()).mkdir(parents=True)
         assert watch_relay.icloud_carries_the_key(), "a bridge that never reported counts"
         server, _queue = watch_relay.serve(port=0, auth=_known_watch(fresh_auth))
         _serve(server)
@@ -17696,8 +17831,8 @@ class TestTheHelperInstallsTheMacBridge:
     def test_the_bridge_lives_inside_the_helpers_folder(self, monkeypatch):
         monkeypatch.delenv("TAPPROVAL_BRIDGE_DIR")
         assert bridge_install.bridge_dir() == os.path.expanduser("~/.tapproval/bridge-app")
-        assert _REAL_BRIDGE_APP == os.path.join(bridge_install.bridge_dir(), "TapprovalBridge.app"), \
-            "the relay and the installer must agree on where it is"
+        assert watch_relay._bridge_apps()[0] == bridge_install.app_path(), \
+            "the relay asks the installer where it is"
 
     def test_the_public_repository_ignores_it(self):
         ignore = os.path.join(_ROOT, "helper", "gitignore")
@@ -17756,9 +17891,7 @@ class TestTheHelperInstallsTheMacBridge:
 
     def test_the_relay_counts_a_bridge_in_either_place(self, tmp_path, monkeypatch):
         assert not watch_relay.bridge_installed()
-        old = tmp_path / "old" / "TapprovalBridge.app"
-        old.mkdir(parents=True)
-        monkeypatch.setattr(watch_relay, "LEGACY_BRIDGE_APP", str(old))
+        Path(bridge_install.legacy_dir(), "TapprovalBridge.app").mkdir(parents=True)
         assert watch_relay.bridge_installed(), "the owner's Mac, until the move"
         assert watch_relay.icloud_carries_the_key(), "so its pairing is as before"
 

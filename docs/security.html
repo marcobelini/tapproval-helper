@@ -15,7 +15,7 @@
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="img/icon.png">
 <link rel="stylesheet" href="style.css">
-<script type="application/ld+json">{"@context": "https://schema.org", "@type": "TechArticle", "headline": "Tapproval security — what it can see, and what was fixed", "description": "The threat model in plain words, what it leaves out, and every security fix with what was wrong and who could have used it.", "datePublished": "2026-09-28", "dateModified": "2026-10-17", "author": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "publisher": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "mainEntityOfPage": "https://tapproval.thoughtfulsteward.org/security.html"}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "TechArticle", "headline": "Tapproval security — what it can see, and what was fixed", "description": "The threat model in plain words, what it leaves out, and every security fix with what was wrong and who could have used it.", "datePublished": "2026-09-28", "dateModified": "2026-10-21", "author": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "publisher": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "mainEntityOfPage": "https://tapproval.thoughtfulsteward.org/security.html"}</script>
 </head>
 <body>
 <div class="wrap">
@@ -38,7 +38,7 @@
 <ul>
 <li><strong>It approves nothing on its own by default.</strong> Allowing the harmless tiers automatically is something you switch on. A CRITICAL call is never auto-allowed, whatever the setting.</li>
 <li><strong>It fails closed.</strong> Anything it cannot parse, reach or judge ends with the ordinary prompt in your terminal, exactly as if Tapproval were not installed.</li>
-<li><strong>Only a process on your own computer is let in without a key</strong>, and even that process can never answer a card, so a command Claude runs cannot approve its own prompt. Posting a card takes the helper's key file, and the hook believes only an answer that proves the same key, so a program that grabs the helper's port while it restarts cannot answer for it. Being on the same Wi-Fi counts for nothing: on a café network, that is a room full of strangers.</li>
+<li><strong>Nothing gets in without a key</strong> except the "are you there?" check. A program on your own computer shows the helper's key file, which only your own user account can read, and even then it can never answer a card, so a command Claude runs cannot approve its own prompt. Posting a card takes the helper's key file, and the hook believes only an answer that proves the same key, so a program that grabs the helper's port while it restarts cannot answer for it. Being on the same Wi-Fi counts for nothing: on a café network, that is a room full of strangers.</li>
 <li><strong>A current watch never sends its key.</strong> Every App Store version from 1.4 signs each request. Each signature can be used once. The helper proves itself in its answer, and the watch keeps an address only from an answer carrying that proof.</li>
 <li><strong>Standard-library Python only.</strong> The helper installs no third-party packages, so there is no dependency tree to trust.</li>
 </ul>
@@ -55,6 +55,12 @@
 
 <h2>Fixes, disclosed</h2>
 <p>Newest first. Each entry says what was wrong, when, who could have used it, and the fix. Starting Claude Code once updates the helper.</p>
+
+<h3>21 October 2026: another account on the same Mac could read your sessions</h3>
+<p><strong>What was wrong.</strong> The helper let any program on the computer in without a key, as long as it connected from the computer itself. That included other user accounts on the same Mac, and anything forwarded into it. They could read your session list, your conversations, and the travel address with its secret.</p>
+<p><strong>Since when.</strong> From the first public release.</p>
+<p><strong>Who could have used it.</strong> Someone with their own account on your Mac, or a program forwarding connections into it. Nobody on the network could, and nobody could answer a card this way.</p>
+<p><strong>The fix.</strong> A program on the computer now shows the helper's key file, which only your own user account can read, before it can read anything but the "are you there?" check. A request that a proxy forwarded from elsewhere is no longer treated as coming from the computer. Tests show both fail without the fix.</p>
 
 <h3>1.1.58, 16 October 2026: the hook believes only its own relay</h3>
 <p><strong>What was wrong.</strong> The hook believed any program that answered on the relay's port. While the relay restarted, something else could take that port and answer "allow", even to a CRITICAL card. "Always allow" and "Don't ask again" could write a lasting rule on any card, CRITICAL included, and a second answer could replace the first before the hook had read it.</p>

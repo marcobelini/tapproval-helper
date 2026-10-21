@@ -50,7 +50,8 @@ enum RelaySigning {
 
     /// `request`, signed v2 with `key` — or unchanged when there is no key,
     /// which the relay answers as it would any unproven local caller. The
-    /// bridge's one way out.
+    /// signing vectors check it against the relay (TestSigningVectors); the
+    /// app and the bridge sign through header() in their proven paths.
     static func signed(_ request: URLRequest, key: String?,
                                    now: Date = Date()) -> URLRequest {
         guard let key, !key.isEmpty else { return request }

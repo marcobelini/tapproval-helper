@@ -112,7 +112,11 @@ def decide(tool_name, tool_input, crc=None, cwd=None):
             # plan neither leads to stays unread, and the wrist still
             # decides. The call itself goes ahead unchanged.
             shown = dict(tool_input, plan=crc.plan_text(tool_input))
+        # The policy's card budgets, as the hook's build_response applies
+        # them: a wrist-sent run ignored headline_chars and detail_chars
+        # (2026-10-21 /simplify review).
         card = crc.wrist_card(tool_name, shown, result["risk"],
+                              *crc._card_budgets(policy),
                               auto_mode=(tool_name == "ExitPlanMode"
                                          and crc.auto_mode_seen({})))
         if tool_name == "AskUserQuestion":

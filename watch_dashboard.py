@@ -78,6 +78,16 @@ USAGE_WINDOW_HOURS = 5
 _CACHE_LOCK = threading.RLock()
 
 
+def _bounded_put(cache, key, value, limit):
+    """Store under the cache lock, then drop the oldest entries past
+    ``limit``: the relay runs for weeks and must not grow with every
+    transcript it ever saw."""
+    with _CACHE_LOCK:
+        cache[key] = value
+        while len(cache) > limit:
+            cache.pop(next(iter(cache)), None)
+
+
 def _stat_cached(cache, path, compute, extra=None, limit=64):
     """Memoize ``compute()`` per path until the file's (mtime, size) changes.
 
@@ -97,10 +107,7 @@ def _stat_cached(cache, path, compute, extra=None, limit=64):
     if cached and cached[0] == key:
         return cached[1]
     result = compute()
-    with _CACHE_LOCK:
-        cache[path] = (key, result)
-        while len(cache) > limit:
-            cache.pop(next(iter(cache)), None)
+    _bounded_put(cache, path, (key, result), limit)
     return result
 
 
@@ -757,21 +764,17 @@ def _findings_as_lines(text):
     return _JSON_FENCE.sub(lines, text)
 
 
-# What a thread notice can be, so the watch can draw each as what it is:
-#   "signin" — Claude Code on this Mac is signed out; the person has to act
-#              there, and the notice says how.
-#   "error"  — a line the CLI itself marks as a failure.
-#   "output" — what a slash command printed (/recap, /cost): ordinary
-#              output, not a fault.
-# Claude Code's own fault lines are notices, never drawn as replies.
-NOTICE_TONES = ("signin", "error", "output")
-
 SIGNED_OUT_NOTICE = ("Claude Code on this computer is signed out — run: "
                      "claude auth login")
 
 
 def _notice(text, tone, entry):
-    """A system notice turn, carrying the tone the watch draws it in."""
+    """A system notice turn, carrying the tone the watch draws it in:
+    "signin" (Claude Code on this Mac is signed out; the person has to act
+    there, and the notice says how), "error" (a line the CLI itself marks as
+    a failure) or "output" (what a slash command printed, /recap or /cost:
+    ordinary output, not a fault). Claude Code's own fault lines are
+    notices, never drawn as replies."""
     return {"role": "system", "kind": "notice", "tone": tone, "text": text,
             "desc": "", "at": entry.get("timestamp", "")}
 
@@ -1158,10 +1161,7 @@ def recap_summary(audit_log=None, now=None):
         if unchanged or clock - computed_at < RECAP_MIN_INTERVAL:
             return stats
     stats = _recap_uncached(path, now)
-    with _CACHE_LOCK:
-        _RECAP_CACHE[path] = (key, clock, stats)
-        while len(_RECAP_CACHE) > 8:
-            _RECAP_CACHE.pop(next(iter(_RECAP_CACHE)), None)
+    _bounded_put(_RECAP_CACHE, path, (key, clock, stats), 8)
     return stats
 
 
@@ -1202,10 +1202,7 @@ _TRANSCRIPT_PATHS_MAX = 4096
 
 def _remember_transcript(prefix, path):
     """Memoise where a session's transcript is, for _find_transcript."""
-    with _CACHE_LOCK:
-        _TRANSCRIPT_PATHS[prefix] = path
-        while len(_TRANSCRIPT_PATHS) > _TRANSCRIPT_PATHS_MAX:
-            _TRANSCRIPT_PATHS.pop(next(iter(_TRANSCRIPT_PATHS)), None)
+    _bounded_put(_TRANSCRIPT_PATHS, prefix, path, _TRANSCRIPT_PATHS_MAX)
 
 
 def _find_transcript(prefix, projects_dir=None):
@@ -1853,7 +1850,7 @@ def _thread_line(state, line, limit):
         # unknown command — writes its output here, not as an assistant
         # turn. The watch shows it as a notice; it used to drop the line,
         # and a send that bounced showed nothing, which read as the watch
-        # being broken. Each notice carries a tone (see NOTICE_TONES): a
+        # being broken. Each notice carries a tone (see _notice): a
         # /recap is ordinary "output", a line the CLI marks as failed is an
         # "error", and Claude Code's own sign-in failure is "signin" — on
         # 2026-10-11 that arrived here, as a local_command, and reached the
@@ -2100,31 +2097,23 @@ def prompts_at_the_mac(audit_log=None, tail=128 * 1024):
     its tool_result has not arrived. Reads the log's tail, cached on its
     size and time. Never raises."""
     path = audit_log or _audit_log_path()
-    try:
-        stat = os.stat(path)
-    except OSError:
-        return set()
-    key = (stat.st_size, stat.st_mtime)
-    with _CACHE_LOCK:
-        cached = _AT_MAC_CACHE.get(path)
-    if cached and cached[0] == key:
-        return cached[1]
-    found = set()
-    try:
-        with open(path, "rb") as handle:
-            handle.seek(max(0, stat.st_size - tail))
-            for raw in handle.read().decode("utf-8", "replace").splitlines():
-                entry = _json_object(raw)
-                if (entry and entry.get("effective") == "escalate"
-                        and entry.get("watch") != "skipped-parity"
-                        and entry.get("tool_use_id")):
-                    found.add(str(entry["tool_use_id"]))
-    except OSError:
-        return set()
-    with _CACHE_LOCK:
-        _AT_MAC_CACHE.clear()
-        _AT_MAC_CACHE[path] = (key, found)
-    return found
+
+    def read():
+        found = set()
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - tail))
+                for raw in handle.read().decode("utf-8", "replace").splitlines():
+                    entry = _json_object(raw)
+                    if (entry and entry.get("effective") == "escalate"
+                            and entry.get("watch") != "skipped-parity"
+                            and entry.get("tool_use_id")):
+                        found.add(str(entry["tool_use_id"]))
+        except OSError:
+            return set()
+        return found
+    return _stat_cached(_AT_MAC_CACHE, path, read, limit=1)
 
 
 def thread_wake_at(path):

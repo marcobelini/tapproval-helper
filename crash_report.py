@@ -196,8 +196,7 @@ def subject_for(entry, repeats):
 def body_for(entry, count):
     where = {"thread": "in a background thread — the relay kept running",
              "request": "answering a request — the relay kept running",
-             "process": "on the main path — the process stopped",
-             "hook": "inside the Claude Code hook"}.get(
+             "process": "on the main path — the process stopped"}.get(
                  entry.get("source"), entry.get("source") or "unknown")
     lines = [
         "Helper:   Tapproval %s" % (entry.get("helper") or "unknown version"),
