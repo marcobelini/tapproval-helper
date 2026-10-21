@@ -56,6 +56,7 @@ import json
 import shlex
 import functools
 import os
+import plistlib
 import re
 import select
 import signal
@@ -75,10 +76,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8977          # also referenced by the classifier's --watch/--status
 TUNNEL_PORT = 8978
-# Read once, to migrate a pre-per-device install into the auth file; never
-# written any more. The function that used to create it went with the
-# single-token design, and was the last write-then-chmod left in the tree.
-AUTH_FILE = os.path.expanduser("~/.tapproval-auth.json")
+# The helper's own files live in ~/.tapproval/data and ~/.tapproval/logs,
+# beside its code. Until 1.1.60 they lay loose in the home folder as
+# ~/.tapproval-*; the relay moves each one once (move_loose_files), and
+# until it has, every reader and writer uses the file where it is.
+# ClaudeRiskClassifier.py and crash_report.py spell the same rule out
+# again, because each must stand alone.
+TAPPROVAL_DIR = os.path.expanduser("~/.tapproval")
+LEGACY_HOME = os.path.expanduser("~")
+
+
+def home_file(folder, name, legacy):
+    """Where one of the helper's files is: ~/.tapproval/<folder>/<name>,
+    unless only the old loose file ~/<legacy> exists yet."""
+    new = os.path.join(TAPPROVAL_DIR, folder, name)
+    old = os.path.join(LEGACY_HOME, legacy)
+    if not os.path.exists(new) and os.path.exists(old):
+        return old
+    return new
+
+
+# The key file: every paired device's key, mode 0600. The Mac bridge
+# reads it too, which is why it moves only once the bridge can find it
+# (_bridge_reads_data_dir).
+AUTH_FILE = home_file("data", "auth.json", ".tapproval-auth.json")
 # The Mac bridge mirrors the key into the user's private iCloud database,
 # where only that Apple Account can read it. Where it is installed a watch
 # on the same account pairs through iCloud; the first-run door still opens,
@@ -463,6 +484,9 @@ def _spawn_detached(command, log_path, cwd=None):
     # relay's own log was rotated, and the /say log grew by every reply.
     _rotate_log(log_path)
     try:
+        # The first spawn on a new install may come before the relay ever
+        # made ~/.tapproval/logs.
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
         with open(log_path, "a") as log:
             subprocess.Popen(command, cwd=cwd, stdout=log, stderr=log,
                              start_new_session=True)
@@ -495,7 +519,7 @@ def _probe_relay(timeout=2):
     return _loopback_json("/health", timeout=timeout)
 
 
-PID_FILE = os.environ.get("TAPPROVAL_PID_FILE") or os.path.expanduser("~/.tapproval-relay.pid")
+PID_FILE = os.environ.get("TAPPROVAL_PID_FILE") or home_file("data", "relay.pid", ".tapproval-relay.pid")
 # How long --ensure gives a freshly spawned relay to answer /health before
 # it stops claiming the relay "started". A seam for tests.
 RELAY_START_WAIT = 6.0
@@ -637,8 +661,8 @@ def run_admin(args):
     return 0
 
 
-RELAY_LOG = os.path.expanduser("~/.tapproval-relay.log")
-SAY_LOG = os.path.expanduser("~/.tapproval-say.log")
+RELAY_LOG = home_file("logs", "relay.log", ".tapproval-relay.log")
+SAY_LOG = home_file("logs", "say.log", ".tapproval-say.log")
 RELAY_LOG_MAX = 2 * 1024 * 1024      # keep the tail worth reading
 
 
@@ -671,8 +695,8 @@ def _rotate_log(path=None, limit=RELAY_LOG_MAX):
 # Overridable like CLAUDE_SETTINGS_PATH and CLAUDE_LAUNCH_AGENT_PATH, so a
 # test — including one that runs the hook in a subprocess, where a
 # monkeypatch cannot reach — never pulls the working tree it is testing.
-_UPDATE_STAMP = os.environ.get("TAPPROVAL_UPDATE_STAMP") or os.path.expanduser(
-    "~/.tapproval-last-update")
+_UPDATE_STAMP = os.environ.get("TAPPROVAL_UPDATE_STAMP") or home_file(
+    "data", "last-update", ".tapproval-last-update")
 # An hour, not a day: a helper published in the afternoon sat unread until
 # the next morning (2026-10-01) while the watch said "start Claude Code
 # once to update it". A fetch is cheap, and it never blocks a session.
@@ -705,6 +729,7 @@ def _self_update():
     except OSError:
         pass
     try:
+        os.makedirs(os.path.dirname(_UPDATE_STAMP), mode=0o700, exist_ok=True)
         with open(_UPDATE_STAMP, "w") as handle:
             handle.write(str(int(time.time())))
     except OSError:
@@ -4266,6 +4291,114 @@ def bridge_installed():
     return os.path.isdir(BRIDGE_APP) or os.path.isdir(LEGACY_BRIDGE_APP)
 
 
+# The first bridge that reads the key from ~/.tapproval/data (and still
+# from the old place, for a helper that has not moved it).
+BRIDGE_READS_DATA_DIR = (1, 0, 1)
+
+# Every file the helper once left loose in the home folder: (folder, name,
+# the old loose name). The key, the away address and the logs are the ones
+# that matter; the pid file and the update stamp only tidy up.
+LOOSE_FILES = (
+    ("data", "auth.json", ".tapproval-auth.json"),
+    ("data", "tunnel.json", ".tapproval-tunnel.json"),
+    ("data", "relay.pid", ".tapproval-relay.pid"),
+    ("data", "last-update", ".tapproval-last-update"),
+    ("data", "crashes.jsonl", ".tapproval-crashes.jsonl"),
+    ("logs", "relay.log", ".tapproval-relay.log"),
+    ("logs", "tunnel.log", ".tapproval-tunnel.log"),
+    ("logs", "say.log", ".tapproval-say.log"),
+)
+
+
+def _tell(line):
+    print(line, file=sys.stderr)
+
+
+def make_home_dirs():
+    """~/.tapproval/data (only this user may open it) and ~/.tapproval/logs.
+    True when both are there. Never raises."""
+    try:
+        os.makedirs(os.path.join(TAPPROVAL_DIR, "data"), mode=0o700, exist_ok=True)
+        os.chmod(os.path.join(TAPPROVAL_DIR, "data"), 0o700)
+        os.makedirs(os.path.join(TAPPROVAL_DIR, "logs"), exist_ok=True)
+        return True
+    except OSError as error:
+        _tell("relay: could not make %s/data and logs (%s); the files stay "
+              "where they are" % (TAPPROVAL_DIR, error))
+        return False
+
+
+def _bridge_version(app):
+    """An installed bridge's version as a tuple, or None if unreadable."""
+    try:
+        with open(os.path.join(app, "Contents", "Info.plist"), "rb") as handle:
+            text = plistlib.load(handle).get("CFBundleShortVersionString") or ""
+        return tuple(int(part) for part in text.split("."))
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+
+
+def _bridge_reads_data_dir():
+    """May the key move? Only if every bridge installed here reads the new
+    place: bridge 1.0.0 reads ~/.tapproval-auth.json alone, and with the
+    key gone from there a closed watch would stop buzzing."""
+    for app in (BRIDGE_APP, LEGACY_BRIDGE_APP):
+        if os.path.isdir(app):
+            version = _bridge_version(app)
+            if version is None or version < BRIDGE_READS_DATA_DIR:
+                return False
+    return True
+
+
+def move_loose_files():
+    """Move each old ~/.tapproval-* file into ~/.tapproval once.
+
+    Run by the relay only once it holds the port, so no older relay is left
+    to write the old place again. A file already at the new place is never
+    overwritten: the old one is left and said. Returns the names moved."""
+    if not make_home_dirs():
+        return []
+    moved = []
+    for folder, name, legacy in LOOSE_FILES:
+        old = os.path.join(LEGACY_HOME, legacy)
+        new = os.path.join(TAPPROVAL_DIR, folder, name)
+        if not os.path.exists(old):
+            continue
+        if name == "auth.json" and not _bridge_reads_data_dir():
+            _tell("relay: the pairing key stays at ~/%s until the Mac bridge "
+                  "can read ~/.tapproval/data" % legacy)
+            continue
+        if os.path.exists(new):
+            _tell("relay: ~/%s left where it is: %s already exists" % (legacy, new))
+            continue
+        try:
+            shutil.move(old, new)
+            moved.append(name)
+        except OSError as error:
+            _tell("relay: could not move ~/%s (%s); it is used where it is" % (legacy, error))
+    if moved:
+        _tell("relay: moved %s into %s" % (", ".join(moved), TAPPROVAL_DIR))
+    return moved
+
+
+def _use_moved_files():
+    """After move_loose_files: every path this process holds, where its file
+    is now. A path an environment variable chose is kept."""
+    global AUTH_FILE, PID_FILE, RELAY_LOG, SAY_LOG, _UPDATE_STAMP, TUNNEL_STATE, TUNNEL_LOG
+    AUTH_FILE = home_file("data", "auth.json", ".tapproval-auth.json")
+    PID_FILE = os.environ.get("TAPPROVAL_PID_FILE") or home_file("data", "relay.pid", ".tapproval-relay.pid")
+    RELAY_LOG = home_file("logs", "relay.log", ".tapproval-relay.log")
+    SAY_LOG = home_file("logs", "say.log", ".tapproval-say.log")
+    _UPDATE_STAMP = os.environ.get("TAPPROVAL_UPDATE_STAMP") or home_file(
+        "data", "last-update", ".tapproval-last-update")
+    TUNNEL_STATE = (os.environ.get("TAPPROVAL_TUNNEL_STATE")
+                    or home_file("data", "tunnel.json", ".tapproval-tunnel.json"))
+    TUNNEL_LOG = home_file("logs", "tunnel.log", ".tapproval-tunnel.log")
+    crash_report = sys.modules.get("crash_report")
+    if crash_report is not None:
+        crash_report.CRASH_LOG = home_file("data", "crashes.jsonl", ".tapproval-crashes.jsonl")
+
+
 def icloud_carries_the_key():
     """Does the Mac bridge carry the key through iCloud here?
 
@@ -4297,10 +4430,10 @@ TUNNEL_URL = None
 # TN3135), so the travel address is the one route it has — and a new random
 # address at every relay restart stranded it until it next met the Mac.
 TUNNEL_STATE = (os.environ.get("TAPPROVAL_TUNNEL_STATE")
-                or os.path.expanduser("~/.tapproval-tunnel.json"))
+                or home_file("data", "tunnel.json", ".tapproval-tunnel.json"))
 # cloudflared's own log: where the new address is read from, and the first
 # place to look when the away address will not open.
-TUNNEL_LOG = os.path.expanduser("~/.tapproval-tunnel.log")
+TUNNEL_LOG = home_file("logs", "tunnel.log", ".tapproval-tunnel.log")
 TUNNEL_ANNOUNCE_WAIT = 60      # seconds for cloudflared to name its address
 
 
@@ -5015,6 +5148,7 @@ def main(argv=None):
     if not isinstance(sys.stderr, _StampedStream):
         sys.stderr = _StampedStream(sys.stderr)
     forget_host_session()
+    make_home_dirs()
     if args.ensure:
         return ensure_running()
     if args.update:
@@ -5056,6 +5190,11 @@ def main(argv=None):
         if error.errno != errno.EADDRINUSE:
             raise
         return _port_taken(args.port)
+    # Only now, holding the port: no older relay is left to write the old
+    # loose files again once they have moved.
+    if move_loose_files():
+        _use_moved_files()
+        auth.path = AUTH_FILE
     print("relay: listening on http://%s:%d" % (args.host, args.port),
           file=sys.stderr)
     if args.tunnel:

@@ -2,3 +2,7 @@ site-rules.json
 __pycache__/
 # The Mac bridge the helper installs (bridge_install.py); never part of a pull.
 /bridge-app/
+# The helper's own files: the paired watches' keys, the away address, the
+# logs (watch_relay.LOOSE_FILES). Never part of a pull.
+/data/
+/logs/

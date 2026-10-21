@@ -2180,6 +2180,13 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
             found = [f for f in found
                      if f[3] not in registry or registry[f[3]]["bridged"]
                      or f[3] in waiting]
+    # One row per session. A session that left its worktree writes on in
+    # the repository's folder, and the worktree's copy of its transcript
+    # stays: the list sent both under one id, the watch drew one row per id
+    # and left a row-sized hole (2026-10-21). Newest first, so the copy kept
+    # is the one still being written.
+    seen = set()
+    found = [f for f in found if not (f[3] in seen or seen.add(f[3]))]
     # The cap keeps the list short, never a card's session out of it.
     found = found[:limit] + [f for f in found[limit:] if f[3] in waiting]
     at_mac = prompts_at_the_mac()

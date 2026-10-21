@@ -224,7 +224,7 @@ var refusalsSaid: Set<String> = []
     let line: String
     switch refusal {
     case .noKey:
-        line = "no key in ~/.tapproval-auth.json; the relay cannot be asked"
+        line = "no key in ~/.tapproval/data/auth.json or ~/.tapproval-auth.json; the relay cannot be asked"
     case let .unproven(path, status):
         line = "an answer from \(path) (HTTP \(status)) without the relay's proof; ignored"
     }
@@ -318,14 +318,26 @@ var lastMirroredInfo: [String?] = []
 /// file removes /pair's last legitimate caller, and it keeps working while
 /// the relay is restarting, where the old fetch would mirror a nil token
 /// and strand an away watch.
+///
+/// The key lives in ~/.tapproval/data/ since 1.0.1. The helper moves it
+/// there from ~/.tapproval-auth.json only once a bridge that reads the new
+/// place is installed, so the old place is still read for a helper that
+/// has not moved it yet.
+let authFiles = ["~/.tapproval/data/auth.json", "~/.tapproval-auth.json"]
+
 func bootstrapToken() -> String? {
-    let path = ("~/.tapproval-auth.json" as NSString).expandingTildeInPath
-    guard let data = FileManager.default.contents(atPath: path),
-          let root = try? JSONSerialization.jsonObject(with: data)
-              as? [String: Any],
-          root["version"] as? Int == 1
-    else { return nil }
-    return root["bootstrap"] as? String
+    for name in authFiles {
+        let path = (name as NSString).expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: path) else {
+            continue
+        }
+        guard let root = try? JSONSerialization.jsonObject(with: data)
+                  as? [String: Any],
+              root["version"] as? Int == 1
+        else { return nil }
+        return root["bootstrap"] as? String
+    }
+    return nil
 }
 
 @MainActor func mirrorRelayInfo() async {

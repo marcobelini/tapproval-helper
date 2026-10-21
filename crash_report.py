@@ -44,7 +44,21 @@ DEDUPE_WINDOW = 60 * 60          # seconds; one report per fingerprint per hour
 MAX_SENDS_PER_WINDOW = 12        # a crash loop tells you nothing the first one did not
 SEND_TIMEOUT = 5.0               # the process is usually dying; do not hang it
 
-CRASH_LOG = os.path.expanduser("~/.tapproval-crashes.jsonl")
+# In ~/.tapproval/data since 1.1.60; the relay moves the old loose
+# ~/.tapproval-crashes.jsonl there once, and until it has, that is used.
+# (watch_relay.home_file says the same; this file must stand alone.)
+_NEW_CRASH_LOG = os.path.expanduser("~/.tapproval/data/crashes.jsonl")
+_OLD_CRASH_LOG = os.path.expanduser("~/.tapproval-crashes.jsonl")
+
+
+def crash_log_path():
+    """Where the crash log is now."""
+    if not os.path.exists(_NEW_CRASH_LOG) and os.path.exists(_OLD_CRASH_LOG):
+        return _OLD_CRASH_LOG
+    return _NEW_CRASH_LOG
+
+
+CRASH_LOG = crash_log_path()
 CRASH_LOG_MAX = 512 * 1024
 
 # The key is never in the repository and never in an argument: a file on
@@ -160,6 +174,7 @@ def record(entry, path=None):
     """Write the crash down. This is the record; e-mail is the push."""
     path = path or CRASH_LOG
     try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         _rotate(path)
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, sort_keys=True) + "\n")

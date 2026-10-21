@@ -27,9 +27,12 @@ if [ -d "$DIR/.git" ]; then
     fresh="$DIR.fresh-$$"
     rm -rf "$fresh"
     if git clone -q --depth 1 "$REPO" "$fresh"; then
-      # The installed Mac bridge lives in the checkout but is not part of
-      # it (gitignored): it moves with the install, not with the old copy.
-      [ -d "$DIR/bridge-app" ] && mv "$DIR/bridge-app" "$fresh/bridge-app"
+      # The installed Mac bridge, the helper's data (the paired watches'
+      # keys among it) and its logs live in the checkout but are not part
+      # of it (gitignored): they move with the install, not with the old copy.
+      for kept in bridge-app data logs; do
+        if [ -d "$DIR/$kept" ]; then mv "$DIR/$kept" "$fresh/$kept"; fi
+      done
       mv "$DIR" "$DIR.superseded-$(date +%Y%m%d-%H%M%S)"
       mv "$fresh" "$DIR"
     else
@@ -39,9 +42,10 @@ if [ -d "$DIR/.git" ]; then
   fi
 elif [ -d "$DIR" ]; then
   # A folder that is not a checkout. Where the helper came as a Claude Code
-  # plugin, the Mac bridge (bridge-app/) already lives here, and git clone
-  # refuses a folder that is not empty: make it a checkout in place, keeping
-  # what is there. The repository's .gitignore names bridge-app/.
+  # plugin, the Mac bridge (bridge-app/), its data and its logs already live
+  # here, and git clone refuses a folder that is not empty: make it a
+  # checkout in place, keeping what is there. The repository's .gitignore
+  # names all three.
   git -C "$DIR" init -q
   git -C "$DIR" remote add origin "$REPO" 2>/dev/null \
     || git -C "$DIR" remote set-url origin "$REPO"

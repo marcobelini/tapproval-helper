@@ -58,10 +58,11 @@ keeps two facts about purchases, on the watch and in your own iCloud:
 whether this Apple ID has unlocked, and how many free answers it has
 used.</p>
 <h2>What the open-source helper stores locally</h2>
-<p>The helper keeps a few files in your home folder: its logs (the relay's,
-the travel tunnel's, and the output of work you start from the watch),
-the pairing keys for your watch, and the two described below. None of
-them leaves your computer.</p>
+<p>The helper keeps a few files on your computer: in its own folder,
+<code>~/.tapproval</code>, its logs (the relay's, the travel tunnel's, and the output
+of work you start from the watch), the pairing keys for your watch and the
+crash record described below; and, beside Claude Code's own files, the
+audit log described below. None of them leaves your computer.</p>
 <p><strong>An audit log</strong> — which prompts appeared and how they were answered — so
 the app can show you your day. It records project folder names only:
 never full paths, never file contents.</p>

@@ -108,7 +108,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.59"
+__version__ = "1.1.60"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -128,8 +128,12 @@ RELAY_PORT = 8977
 # proves the same key: anything else that answers on RELAY_PORT — a
 # squatter while the relay restarts — is not the relay (2026-10-16
 # review, S1). CLAUDE_RISK_AUTH_FILE points an isolated relay's hook at
-# that relay's own file.
-AUTH_FILE = os.path.expanduser("~/.tapproval-auth.json")
+# that relay's own file. It lives in ~/.tapproval/data since 1.1.60; the
+# relay moves the old ~/.tapproval-auth.json there once the Mac bridge can
+# read it, and until then the old place is the file (watch_relay.home_file).
+AUTH_FILE = os.path.expanduser("~/.tapproval/data/auth.json")
+if not os.path.exists(AUTH_FILE) and os.path.exists(os.path.expanduser("~/.tapproval-auth.json")):
+    AUTH_FILE = os.path.expanduser("~/.tapproval-auth.json")
 
 # The wrist card's two budgets. DEFAULT_POLICY quotes these, and the policy
 # file may override them; wrist_card() falls back to them when it does not.
@@ -190,6 +194,7 @@ SECRET_PATH = re.compile(
     r"\.config[/\\]gh[/\\]hosts\.ya?ml|\.gitconfig\b|\.terraformrc|"
     # Tapproval's own device keys: whoever reads them can answer a card.
     r"\.tapproval-auth\.json|\.tapproval-token|\.tapproval-devices\.json|"
+    r"\.tapproval[/\\]data[/\\]|"
     # Each read SAFE until the 2026-09-30 review: App Store Connect and
     # other private keys, database and vault passwords, a direnv file,
     # GnuPG and macOS keychains, shell history, a process's environment,
@@ -4308,7 +4313,7 @@ def _away_answers(url):
         return False
 
 
-RELAY_LOG_PATH = "~/.tapproval-relay.log"
+RELAY_LOG_PATH = "~/.tapproval/logs/relay.log"
 
 
 def connection_lines(health, tunnel, away_ok):

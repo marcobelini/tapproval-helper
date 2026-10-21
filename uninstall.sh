@@ -9,8 +9,9 @@ echo "Tapproval Base uninstaller — here is everything it will do:"
 echo "  1. Remove Base's hooks, settings entries and login wake-up"
 echo "     (a settings backup is kept)"
 echo "  2. Stop the local relay"
-echo "  3. Delete ~/.tapproval, the relay's log and its update stamp"
-echo "  4. Forget the paired watch (~/.tapproval-token, ~/.tapproval-auth.json)"
+echo "  3. Delete ~/.tapproval (the helper, its data and its logs), and the"
+echo "     ~/.tapproval-* files older versions kept beside it"
+echo "  4. Forget the paired watch (its key is in ~/.tapproval/data)"
 echo "     — after a reinstall, pair it again from Settings"
 echo "  5. On a Mac, stop the iCloud bridge and remove its login job (the"
 echo "     bridge itself lives in ~/.tapproval and goes with it)"
@@ -40,7 +41,9 @@ if [ "$(uname -s)" = "Darwin" ]; then
 fi
 rm -rf "$HOME/.tapproval-bridge"
 rm -rf "$HOME/.tapproval"
-# Everything else the relay writes beside its directory. Left behind, the
+# What the relay wrote beside its directory until 1.1.60, when it moved
+# into ~/.tapproval/data and logs (a relay that never restarted since, or a
+# key kept back for an old bridge, can still be here). Left behind, the
 # pairing outlived the install it belonged to — a "clean exit" that kept
 # the key to the door.
 rm -f "$HOME/.tapproval-token" "$HOME/.tapproval-auth.json" \

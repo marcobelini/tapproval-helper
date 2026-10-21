@@ -263,8 +263,8 @@ python3 ~/.tapproval/ClaudeRiskClassifier.py --status
 Its *Connection* block names the relay, the iCloud route, whether the away
 address answers from the internet, Tailscale, when the watch was last seen,
 any problem the helper has noticed (the same sentences the watch's
-**Settings → Connection** shows), and the log: `~/.tapproval-relay.log`.
-cloudflared's own log, for the away address, is `~/.tapproval-tunnel.log`.
+**Settings → Connection** shows), and the log: `~/.tapproval/logs/relay.log`.
+cloudflared's own log, for the away address, is `~/.tapproval/logs/tunnel.log`.
 What each row on the watch means, and what to do about it:
 https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html
 

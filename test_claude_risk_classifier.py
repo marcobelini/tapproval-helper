@@ -21,6 +21,8 @@ import io
 import hashlib
 import json
 import os
+import plistlib
+import socket
 from pathlib import Path
 import glob
 import re
@@ -333,6 +335,11 @@ def _no_real_home_files(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_RISK_AUTH_FILE", str(home / "auth.json"))
     monkeypatch.setattr(watch_relay, "RELAY_LOG", str(home / "relay.log"))
     monkeypatch.setattr(watch_relay, "SAY_LOG", str(home / "say.log"))
+    # The folder the helper keeps its files in, and the home folder they
+    # once lay loose in: a relay a test starts makes the one and moves out
+    # of the other.
+    monkeypatch.setattr(watch_relay, "TAPPROVAL_DIR", str(home / "tapproval"))
+    monkeypatch.setattr(watch_relay, "LEGACY_HOME", str(home / "loose"))
     # And no test may read the owner's own Claude Code transcripts. Routes
     # that list sessions walked ~/.claude/projects — on this machine a
     # 97 MB transcript among them — so a routing test could time out
@@ -2156,6 +2163,49 @@ class TestASessionHasOneState:
         assert (row["state"], row["state_reason"]) == ("idle", "")
 
 
+class TestASessionIsListedOnce:
+    """One conversation can have its transcript in two project folders: a
+    session that left its worktree goes on writing under the repository's
+    folder, and the worktree's copy stays. The list sent both, under one
+    id, and the watch draws one row per id: on 2026-10-21 the owner's
+    wrist showed a row-sized hole under NEEDS YOU, for a session listed at
+    26 and at 843 minutes. The thread was opened from whichever copy was
+    remembered last, the older one."""
+
+    def _two_copies(self, tmp_path, monkeypatch):
+        import watch_dashboard as wd
+        monkeypatch.setattr(wd, "live_sessions", lambda: {"eeee5555": "Terminal"})
+        monkeypatch.setattr(wd, "session_registry", lambda: {})
+        monkeypatch.setattr(wd, "_task_output_files", lambda *a, **k: {})
+        wd._THREAD_STATE.clear()
+        root = tmp_path / "projects"
+        copies = {}
+        for folder, ask, age in (("-Users-x-Acme--claude-worktrees-fix", "old ask", 50000),
+                                 ("-Users-x-Acme", "new ask", 60)):
+            (root / folder).mkdir(parents=True)
+            path = root / folder / "eeee5555.jsonl"
+            path.write_text(json.dumps({"cwd": "/x", "message": {"role": "user", "content": ask}}) + "\n")
+            os.utime(path, (time.time() - age, time.time() - age))
+            copies[ask] = str(path)
+        return wd, str(root), copies
+
+    def test_two_copies_of_one_session_are_one_row(self, tmp_path, monkeypatch):
+        wd, root, _ = self._two_copies(tmp_path, monkeypatch)
+        rows = wd.recent_sessions(projects_dir=root)
+        assert [r["session_id"] for r in rows] == ["eeee5555"]
+
+    def test_the_row_is_the_newest_copy(self, tmp_path, monkeypatch):
+        wd, root, copies = self._two_copies(tmp_path, monkeypatch)
+        (row,) = wd.recent_sessions(projects_dir=root)
+        assert row["opening"] == "new ask"
+        assert row["minutes_ago"] == 1
+
+    def test_a_waiting_card_keeps_one_row_too(self, tmp_path, monkeypatch):
+        wd, root, _ = self._two_copies(tmp_path, monkeypatch)
+        rows = wd.recent_sessions(projects_dir=root, waiting={"eeee5555"})
+        assert [r["session_id"] for r in rows] == ["eeee5555"]
+
+
 class TestTheDashboardRemembersWhatItRead:
     """Polled every few seconds, so what does not change is read once."""
 
@@ -2282,7 +2332,7 @@ class TestRelayTunnelToken:
         assert self._get(base + "/t/s3cret/health") == 403
 
     def test_the_logged_request_line_never_carries_the_secret(self, tokened, capsys):
-        """The prefix is a rendezvous address, and ~/.tapproval-relay.log
+        """The prefix is a rendezvous address, and the relay log
         is no place for it: every request line used to read
         ``"GET /t/<secret>/pending HTTP/1.1"``. The route after it stays,
         so the log still says what was asked for."""
@@ -2840,12 +2890,12 @@ class TestTheSyncCopiesOnlyTrackedDocs:
         (docs / ".DS_Store").write_text("finder")             # ignored
         with open(os.path.join(_ROOT, "sync-helper.sh"), encoding="utf-8") as handle:
             script = handle.read()
-        block = script[script.index('rm -rf "$CLONE/docs"'):]
+        block = script[script.index('rm -rf "$dest/docs"'):]
         block = block[:block.index("done < <(git ls-files -z -- helper/docs)") +
                       len("done < <(git ls-files -z -- helper/docs)")]
         clone = tmp_path / "clone"
         clone.mkdir()
-        run("bash", "-c", "set -euo pipefail\nCLONE=%s\n%s" % (shlex.quote(str(clone)), block),
+        run("bash", "-c", "set -euo pipefail\ndest=%s\n%s" % (shlex.quote(str(clone)), block),
             cwd=str(repo))
         out = clone / "docs"
         assert (out / "index.html").read_text() == "re-rendered"
@@ -3664,7 +3714,7 @@ class TestStatusTroubleshoots:
         text = "\n".join(lines)
         assert "iCloud route  : on" in text
         assert "answers" in text and "Next step     : none" in text
-        assert "tapproval-relay.log" in text
+        assert "~/.tapproval/logs/relay.log" in text
 
     def test_a_condition_is_printed_and_becomes_the_next_step(self):
         health = dict(self.HEALTH, alert_route=None, conditions=[
@@ -8682,6 +8732,194 @@ class TestTheSyncScriptSaysWhatItDidAndDidNot:
         assert "else" not in gate
 
 
+class TestTheHelperKeepsItsFilesInOneFolder:
+    """Until 1.1.60 the helper left eight files loose in the home folder as
+    ~/.tapproval-*. They live in ~/.tapproval/data and ~/.tapproval/logs
+    now, beside its code, moved once by the relay (owner, 2026-10-21) —
+    and nothing a user set up, above all a paired watch, is lost on the way.
+    The suite's fixture points both folders into the test's own tmp_path."""
+
+    @staticmethod
+    def _old_install():
+        loose = watch_relay.LEGACY_HOME
+        os.makedirs(loose, exist_ok=True)
+        for _folder, _name, legacy in watch_relay.LOOSE_FILES:
+            with open(os.path.join(loose, legacy), "w", encoding="utf-8") as handle:
+                handle.write("old " + legacy)
+        return loose
+
+    @staticmethod
+    def _bridge(version):
+        contents = os.path.join(watch_relay.BRIDGE_APP, "Contents")
+        os.makedirs(contents, exist_ok=True)
+        with open(os.path.join(contents, "Info.plist"), "wb") as handle:
+            plistlib.dump({"CFBundleShortVersionString": version}, handle)
+
+    def test_every_loose_file_moves_and_keeps_what_it_held(self):
+        loose = self._old_install()
+        moved = watch_relay.move_loose_files()
+        assert sorted(moved) == sorted(name for _f, name, _l in watch_relay.LOOSE_FILES)
+        for folder, name, legacy in watch_relay.LOOSE_FILES:
+            assert not os.path.exists(os.path.join(loose, legacy)), legacy
+            with open(os.path.join(watch_relay.TAPPROVAL_DIR, folder, name), encoding="utf-8") as handle:
+                assert handle.read() == "old " + legacy
+        data = os.path.join(watch_relay.TAPPROVAL_DIR, "data")
+        assert os.stat(data).st_mode & 0o777 == 0o700, "the keys' folder is this user's alone"
+        assert watch_relay.move_loose_files() == [], "once"
+
+    def test_a_paired_watch_needs_no_new_pairing(self):
+        old = os.path.join(watch_relay.LEGACY_HOME, ".tapproval-auth.json")
+        os.makedirs(watch_relay.LEGACY_HOME, exist_ok=True)
+        before = _RealAuth(path=old)
+        token = before.issue_device("watch-1")
+        assert watch_relay.home_file("data", "auth.json", ".tapproval-auth.json") == old
+        assert watch_relay.move_loose_files() == ["auth.json"]
+        where = watch_relay.home_file("data", "auth.json", ".tapproval-auth.json")
+        assert where == os.path.join(watch_relay.TAPPROVAL_DIR, "data", "auth.json")
+        assert os.stat(where).st_mode & 0o777 == 0o600
+        after = _RealAuth(path=where)
+        assert [d["token"] for d in after.devices if d.get("id") == "watch-1"] == [token]
+        assert after.bootstrap == before.bootstrap, "the bridge's key, too"
+
+    def test_the_key_waits_for_a_bridge_that_can_find_it(self):
+        """Bridge 1.0.0 reads ~/.tapproval-auth.json and nothing else: moving
+        the key under it would stop a closed watch buzzing."""
+        loose = self._old_install()
+        self._bridge("1.0.0")
+        moved = watch_relay.move_loose_files()
+        assert "auth.json" not in moved and "tunnel.json" in moved
+        assert os.path.exists(os.path.join(loose, ".tapproval-auth.json"))
+        self._bridge("1.0.1")
+        assert watch_relay.move_loose_files() == ["auth.json"]
+
+    def test_a_bridge_whose_version_cannot_be_read_keeps_the_key_too(self):
+        self._old_install()
+        os.makedirs(watch_relay.BRIDGE_APP)                   # no Info.plist
+        assert "auth.json" not in watch_relay.move_loose_files()
+
+    def test_the_bridge_the_helper_ships_reads_the_new_place(self):
+        """Otherwise the key of a Mac with the bridge would never move."""
+        with open(os.path.join(_ROOT, "bridge.json"), encoding="utf-8") as handle:
+            pinned = tuple(int(p) for p in json.load(handle)["version"].split("."))
+        assert pinned >= watch_relay.BRIDGE_READS_DATA_DIR
+
+    def test_a_file_already_in_the_new_place_is_never_overwritten(self):
+        loose = self._old_install()
+        logs = os.path.join(watch_relay.TAPPROVAL_DIR, "logs")
+        os.makedirs(logs)
+        with open(os.path.join(logs, "relay.log"), "w", encoding="utf-8") as handle:
+            handle.write("new")
+        assert "relay.log" not in watch_relay.move_loose_files()
+        with open(os.path.join(logs, "relay.log"), encoding="utf-8") as handle:
+            assert handle.read() == "new"
+        assert os.path.exists(os.path.join(loose, ".tapproval-relay.log"))
+
+    def test_a_new_install_starts_in_the_new_place(self):
+        assert watch_relay.home_file("logs", "relay.log", ".tapproval-relay.log") == \
+            os.path.join(watch_relay.TAPPROVAL_DIR, "logs", "relay.log")
+
+    def test_a_relay_that_loses_the_port_moves_nothing(self, tmp_path, monkeypatch):
+        """Another relay still holds the port and writes the old files: moving
+        them under it would leave it writing a key the next relay never reads."""
+        loose = self._old_install()
+        monkeypatch.setattr(watch_relay, "Auth", lambda: _throwaway_auth(tmp_path))
+        monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: None)
+        monkeypatch.setattr(watch_relay, "helper_provenance", lambda: None)
+        monkeypatch.setattr(watch_relay, "install_crash_reporting", lambda: None)
+        holder = socket.socket()
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        try:
+            watch_relay.main(["--host", "127.0.0.1", "--port", str(holder.getsockname()[1]),
+                              "--no-bonjour"])
+        finally:
+            holder.close()
+            watch_relay.clear_condition("port")
+        assert sorted(os.listdir(loose)) == sorted(legacy for _f, _n, legacy in watch_relay.LOOSE_FILES)
+
+    def test_a_relay_that_holds_the_port_moves_them_and_keeps_its_key(self, tmp_path, monkeypatch):
+        self._old_install()
+        os.remove(os.path.join(watch_relay.LEGACY_HOME, ".tapproval-auth.json"))
+        old_key = os.path.join(watch_relay.LEGACY_HOME, ".tapproval-auth.json")
+        auth = _RealAuth(path=old_key)
+        auth.issue_device("watch-1")
+        monkeypatch.setattr(watch_relay, "Auth", lambda: auth)
+        monkeypatch.setattr(watch_relay, "AUTH_FILE", old_key)
+        for name in ("ensure_claude_on_path", "helper_provenance", "install_crash_reporting",
+                     "check_helper_is_visible", "check_dashboard_is_loaded", "check_codex_hook",
+                     "watch_bridge", "_inject_startup_cards"):
+            monkeypatch.setattr(watch_relay, name, lambda *a, **k: None)
+        monkeypatch.delenv("TAPPROVAL_PID_FILE", raising=False)
+        monkeypatch.delenv("TAPPROVAL_TUNNEL_STATE", raising=False)
+        monkeypatch.delenv("TAPPROVAL_UPDATE_STAMP", raising=False)
+        for name in ("PID_FILE", "RELAY_LOG", "SAY_LOG", "_UPDATE_STAMP", "TUNNEL_STATE", "TUNNEL_LOG"):
+            monkeypatch.setattr(watch_relay, name, getattr(watch_relay, name))  # put back after
+
+        class Server:
+            def serve_forever(self):
+                raise KeyboardInterrupt
+
+            def server_close(self):
+                pass
+
+        monkeypatch.setattr(watch_relay, "serve", lambda *a, **k: (Server(), None))
+        monkeypatch.setattr(watch_relay.signal, "signal", lambda *a: None)
+        assert watch_relay.main(["--host", "127.0.0.1", "--port", "1", "--no-bonjour"]) == 0
+        new_key = os.path.join(watch_relay.TAPPROVAL_DIR, "data", "auth.json")
+        assert auth.path == new_key == watch_relay.AUTH_FILE
+        assert watch_relay.TUNNEL_STATE == os.path.join(watch_relay.TAPPROVAL_DIR, "data", "tunnel.json")
+        assert not os.path.exists(old_key)
+        auth.issue_device("watch-2")                    # a pairing after the move
+        assert {d.get("id") for d in _RealAuth(path=new_key).devices} >= {"watch-1", "watch-2"}
+
+    def test_the_hook_reads_the_key_where_it_is(self, tmp_path):
+        """The hook stands alone, so it decides once more, at import."""
+        def where(home):
+            env = dict(os.environ, HOME=str(home), PYTHONPATH=_ROOT)
+            for name in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY", "CLAUDE_RISK_RELAY_WAIT",
+                         "CLAUDE_RISK_AUTH_FILE"):
+                env.pop(name, None)
+            run = subprocess.run([sys.executable, "-c",
+                                  "import ClaudeRiskClassifier as c, crash_report as r;"
+                                  "print(c.AUTH_FILE); print(r.CRASH_LOG)"],
+                                 capture_output=True, text=True, env=env, cwd=str(home), timeout=60)
+            assert run.returncode == 0, run.stderr
+            return run.stdout.split()
+        home = tmp_path / "user"
+        home.mkdir()
+        assert where(home) == [str(home / ".tapproval/data/auth.json"),
+                               str(home / ".tapproval/data/crashes.jsonl")]
+        (home / ".tapproval-auth.json").write_text("{}")
+        (home / ".tapproval-crashes.jsonl").write_text("")
+        assert where(home) == [str(home / ".tapproval-auth.json"),
+                               str(home / ".tapproval-crashes.jsonl")]
+        (home / ".tapproval" / "data").mkdir(parents=True)
+        (home / ".tapproval" / "data" / "auth.json").write_text("{}")
+        assert where(home)[0] == str(home / ".tapproval/data/auth.json")
+
+    def test_the_first_writes_make_their_folders(self, tmp_path):
+        logs = os.path.join(watch_relay.TAPPROVAL_DIR, "logs", "say.log")
+        assert watch_relay._spawn_detached([sys.executable, "-c", "pass"], logs) == ""
+        assert os.path.isdir(os.path.dirname(logs))
+        crashes = tmp_path / "fresh" / "data" / "crashes.jsonl"
+        assert crash_report.record({"message": "x"}, path=str(crashes))
+
+    def test_uninstall_still_removes_every_old_loose_file(self):
+        with open(os.path.join(_ROOT, "uninstall.sh"), encoding="utf-8") as handle:
+            script = handle.read()
+        for _folder, _name, legacy in watch_relay.LOOSE_FILES:
+            assert '"$HOME/%s"' % legacy in script, legacy
+        assert 'rm -rf "$HOME/.tapproval"\n' in script
+
+    def test_the_public_repository_ignores_both_folders(self):
+        ignore = os.path.join(_ROOT, "helper", "gitignore")
+        if not os.path.exists(ignore):                    # the public layout
+            ignore = os.path.join(_ROOT, ".gitignore")
+        with open(ignore, encoding="utf-8") as handle:
+            names = handle.read().split()
+        assert "/data/" in names and "/logs/" in names
+
+
 class TestOneValueEverywhere:
     """The port, the key file and the wrist wait are written in Python
     twice, in shell, in JSON and in Swift, because each of those must
@@ -8722,6 +8960,22 @@ class TestOneValueEverywhere:
                         found += re.findall(r'127\.0\.0\.1:(\d{4,5})|"(\d{4,5})"|":(\d{4,5})"', line)
         ports = {int(next(p for p in groups if p)) for groups in found}
         assert ports == {crc.RELAY_PORT}, ports
+
+    @pytest.mark.private_layout   # reads WatchApp/, which the public helper repo does not have
+    def test_the_bridge_reads_the_key_where_the_helper_keeps_it(self):
+        """The bridge reads the key file itself. It reads the new place in
+        ~/.tapproval/data first, and the old loose file for a helper that has
+        not moved it yet; the helper's own file must be one of the two."""
+        with open(os.path.join(_ROOT, "WatchApp", "Bridge", "main.swift"), encoding="utf-8") as handle:
+            swift = handle.read()
+        listed = re.search(r"let authFiles = \[([^\]]*)\]", swift).group(1)
+        places = [os.path.expanduser(name) for name in re.findall(r'"([^"]+)"', listed)]
+        assert places == [os.path.expanduser("~/.tapproval/data/auth.json"),
+                          os.path.expanduser("~/.tapproval-auth.json")]
+        # The suite moves AUTH_FILE into a temporary home, so read the source.
+        with open(os.path.join(_ROOT, "ClaudeRiskClassifier.py"), encoding="utf-8") as handle:
+            owned = re.search(r'^AUTH_FILE = os\.path\.expanduser\("([^"]+)"\)', handle.read(), re.M).group(1)
+        assert os.path.expanduser(owned) in places
 
     def test_uninstall_stops_the_tunnel_the_relay_starts(self):
         with open(os.path.join(_ROOT, "uninstall.sh"), encoding="utf-8") as handle:
@@ -9861,6 +10115,9 @@ class TestTheHelperReportsItsOwnCrashes:
         assert log_lines(str(tmp_path / "c")), "written down before the send"
 
     def test_an_unwritable_log_is_reported_not_thrown(self, tmp_path, capsys):
+        # A missing folder is made now (~/.tapproval/data on a new install);
+        # a file where the folder should be cannot be.
+        (tmp_path / "no").write_text("a file, not a folder")
         reason, _ = crash_report.report("boom", "stack",
                                         path=str(tmp_path / "no" / "such" / "c"),
                                         settings=(None, None, None))
@@ -12440,13 +12697,13 @@ class TestTheBridgeIsPublishedWithItsHelper:
         assert "WatchApp/Bridge/Bridge.entitlements" in listed
         for path in listed:
             assert os.path.isfile(os.path.join(_ROOT, path)), path
-        assert 'cp $BRIDGE_SOURCES "$CLONE/bridge/"' in script
+        assert 'cp $BRIDGE_SOURCES "$dest/bridge/"' in script
         # The signed bridge ships beside its source, and a pin naming a zip
         # the tree does not hold stops the sync instead of shipping a helper
         # that installs nothing.
-        copy = script.index('cp "$PINNED_ZIP" "$CLONE/$PINNED_ZIP"')
+        copy = script.index('cp "$PINNED_ZIP" "$dest/$PINNED_ZIP"')
         assert script.index('[ ! -f "$PINNED_ZIP" ]') < copy
-        assert script.index('cp $BRIDGE_SOURCES "$CLONE/bridge/"') < copy
+        assert script.index('cp $BRIDGE_SOURCES "$dest/bridge/"') < copy
 
 
 class TestTheChangelogIsTheHelpersOwn:
@@ -12524,7 +12781,7 @@ class TestTheSyncRefusesAStalePage:
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
         start = text.index("if command -v uvx >/dev/null 2>&1; then\n  if ! python3 render-privacy.py")
-        end = text.index('rm -rf "$CLONE/docs"', start)
+        end = text.index('copy_public_tree "$CLONE"', start)
         return text[start:end]
 
     def _repo(self, tmp_path, gh_body, privacy_changed=False,
@@ -15278,6 +15535,9 @@ class TestTheEffectOntology:
         ("yq -i '.a=1' deploy.yml", crc.Risk.MEDIUM),
         # Tapproval's own device keys: reading them is answering its cards.
         ("cat ~/.tapproval-auth.json", crc.Risk.HIGH),
+        # ...and where they live since 1.1.60, with the away address beside them.
+        ("cat ~/.tapproval/data/auth.json", crc.Risk.HIGH),
+        ("cat /Users/me/.tapproval/data/tunnel.json", crc.Risk.HIGH),
     ])
     def test_every_command_that_used_to_read_safe(self, command, floor):
         risk, rules = crc.classify_bash(command)
@@ -17523,14 +17783,15 @@ class TestTheHelperInstallsTheMacBridge:
 
         source = tmp_path / "source"
         source.mkdir()
-        (source / ".gitignore").write_text("/bridge-app/\n")
+        (source / ".gitignore").write_text("/bridge-app/\n/data/\n/logs/\n")
         (source / "watch_relay.py").write_text("# helper\n")
         run("git", "init", "-q", "-b", "main", str(source))
         run("git", "-C", str(source), "add", ".")
         run("git", "-C", str(source), "commit", "-q", "-m", "helper")
         home = tmp_path / ".tapproval"
-        (home / "bridge-app").mkdir(parents=True)
-        (home / "bridge-app" / "marker").write_text("kept")
+        for kept in ("bridge-app", "data", "logs"):
+            (home / kept).mkdir(parents=True)
+            (home / kept / "marker").write_text("kept")
         with open(os.path.join(_ROOT, "install.sh"), encoding="utf-8") as handle:
             lines = handle.read().splitlines()
         start = lines.index('if [ -d "$DIR/.git" ]; then')
@@ -17538,7 +17799,8 @@ class TestTheHelperInstallsTheMacBridge:
         run("bash", "-c", "set -euo pipefail\nDIR=%s\nREPO=%s\n%s"
             % (shlex.quote(str(home)), shlex.quote("file://" + str(source)), block))
         assert (home / "watch_relay.py").read_text() == "# helper\n"
-        assert (home / "bridge-app" / "marker").read_text() == "kept"
+        for kept in ("bridge-app", "data", "logs"):
+            assert (home / kept / "marker").read_text() == "kept"
         assert run("git", "-C", str(home), "status", "--porcelain").stdout == ""
         assert run("git", "-C", str(home), "pull", "-q", "--ff-only").returncode == 0, \
             "the next update is an ordinary pull"
@@ -17557,7 +17819,7 @@ class TestTheHelperInstallsTheMacBridge:
 
         source = tmp_path / "source"
         source.mkdir()
-        (source / ".gitignore").write_text("/bridge-app/\n")
+        (source / ".gitignore").write_text("/bridge-app/\n/data/\n/logs/\n")
         (source / "watch_relay.py").write_text("# new\n")
         run("git", "init", "-q", "-b", "main", str(source))
         run("git", "-C", str(source), "add", ".")
@@ -17566,8 +17828,9 @@ class TestTheHelperInstallsTheMacBridge:
         run("git", "clone", "-q", "file://" + str(source), str(home))
         (home / "watch_relay.py").write_text("# installed\n")
         run("git", "-C", str(home), "commit", "-q", "-am", "installed")
-        (home / "bridge-app").mkdir()
-        (home / "bridge-app" / "marker").write_text("kept")
+        for kept in ("bridge-app", "data", "logs"):
+            (home / kept).mkdir()
+            (home / kept / "marker").write_text("kept")
         run("git", "-C", str(home), "remote", "set-url", "origin", "file://" + str(tmp_path / "gone"))
         repo = "file://" + str(source if clone_from == "source" else tmp_path / "also-gone")
         with open(os.path.join(_ROOT, "install.sh"), encoding="utf-8") as handle:
@@ -17594,8 +17857,9 @@ class TestTheHelperInstallsTheMacBridge:
         result, home, names = self._update(tmp_path, clone_from="source")
         assert result.returncode == 0, result.stderr
         assert (home / "watch_relay.py").read_text() == "# new\n"
-        assert (home / "bridge-app" / "marker").read_text() == "kept", \
-            "the installed bridge went with the old copy"
+        for kept in ("bridge-app", "data", "logs"):
+            assert (home / kept / "marker").read_text() == "kept", \
+                "%s went with the old copy (the paired watches' keys are in data)" % kept
         assert [n for n in names if ".superseded-" in n], names
         assert not [n for n in names if ".fresh-" in n], names
 
