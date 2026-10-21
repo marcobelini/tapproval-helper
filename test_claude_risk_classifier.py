@@ -1060,8 +1060,8 @@ class TestCardFacts:
         middle: no fact is cut anywhere a card is read."""
         swift = Path(__file__).with_name("WatchApp").joinpath(
             "Tapproval", "Cards.swift").read_text()
-        assert "FactLines(facts: facts, size: 14)" in swift
-        assert "FactLines(facts: facts, size: 12)" in swift
+        assert "FactLines(facts: facts, size: 15)" in swift
+        assert "FactLines(facts: facts, size: 13)" in swift
         body = swift[swift.index("struct FactLines"):swift.index("struct CardDetail")]
         assert ".lineLimit(" not in body and ".truncationMode(" not in body
         assert ".fixedSize(horizontal: false, vertical: true)" in body
@@ -17771,3 +17771,74 @@ class TestOurSimulatorsFollowTheNewestRuntime:
         for script in (ci, flows):
             assert "simctl create" not in script
             assert "sim-retire.sh" not in script
+
+
+class TestTheWatchUsesFourTextSizes:
+    """The owner chose four text sizes for the watch app (F2, 2026-10-18):
+    17, 15, 13 and 11 pt, where fourteen had grown one call site at a time.
+    A size outside the four is a fifth size, which is how the fourteen came
+    about, so it fails here rather than in a screenshot weeks later."""
+
+    SIZES = {11, 13, 15, 17}
+    # Not text: each is a glyph or a numeral drawn at a size of its own.
+    NOT_TEXT = {
+        5: "the dot between a thread's parts (SessionDetail)",
+        7: "the waiting dot in a thread (SessionDetail)",
+        19: "the hide-swipe eye icon (Sessions)",
+        34: "Activity's two big numerals (SettingsScreens)",
+    }
+    SIZE = re.compile(
+        r"(?:system\(size:|scaled\(|\bsize:)\s*"
+        r"(?:compact\s*\?\s*(\d+)\s*:\s*)?(\d+)")
+    BUILT_IN = re.compile(
+        r"\.font\(\.(?:largeTitle|title|title2|title3|headline|subheadline"
+        r"|body|callout|footnote|caption|caption2)\)")
+
+    def _sources(self):
+        root = Path(__file__).with_name("WatchApp").joinpath("Tapproval")
+        for path in sorted(root.glob("*.swift")):
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                if not line.strip().startswith("//"):
+                    yield "%s:%d" % (path.name, number), line
+
+    @pytest.mark.private_layout
+    def test_every_text_size_is_one_of_the_four(self):
+        stray = []
+        for where, line in self._sources():
+            for match in self.SIZE.finditer(line):
+                for size in filter(None, match.groups()):
+                    size = int(size)
+                    if size not in self.SIZES and size not in self.NOT_TEXT:
+                        stray.append("%s: %d pt" % (where, size))
+        assert not stray, "a fifth text size: " + ", ".join(stray)
+
+    @pytest.mark.private_layout
+    def test_no_text_uses_a_built_in_style(self):
+        """A built-in style (.headline, .footnote …) is a size of the
+        system's choosing, which is a fifth size by another name."""
+        found = ["%s" % where for where, line in self._sources()
+                 if self.BUILT_IN.search(line)]
+        assert not found, "built-in text style at " + ", ".join(found)
+
+    @pytest.mark.private_layout
+    def test_a_waiting_card_comes_to_rest_below_the_bar(self):
+        """The thread scrolls under the time and back, so a scroll aimed at
+        the glass's top put a card's tier under the time once the thread was
+        long enough to reach it (F2's sizes, 2026-10-18, on 40 mm)."""
+        swift = Path(__file__).with_name("WatchApp").joinpath(
+            "Tapproval", "SessionDetail.swift").read_text()
+        end = swift[swift.index("private func scrollToEnd"):]
+        end = end[:end.index("\n    }\n")]
+        assert "anchor: Self.belowTheBar(topEdge)" in end
+        assert "anchor: .top)" not in end
+
+    def test_the_guard_reads_every_form_a_size_takes(self):
+        lines = ['.font(.system(size: 14, weight: .semibold))',
+                 '.scaled(compact ? 12 : 13, .medium)',
+                 'FactLines(facts: facts, size: 12)',
+                 '.scaled(16)']
+        found = [int(s) for line in lines for m in self.SIZE.finditer(line)
+                 for s in m.groups() if s]
+        assert found == [14, 12, 13, 12, 16]
+        assert self.BUILT_IN.search('Text("x").font(.headline)')
+        assert not self.BUILT_IN.search('.font(.system(size: 13))')

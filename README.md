@@ -60,6 +60,27 @@ Then install **Tapproval** on your Apple Watch and open it once on the
 same Wi-Fi — it finds this computer by itself, pairs automatically, and
 quietly learns how to reach it when you're away from home.
 
+**A buzz while Tapproval is closed needs a Mac.** watchOS pauses apps in
+the background, and a closed app wakes only for a notification from Apple.
+Tapproval gets one by putting each card in your own iCloud: the bridge the
+helper installs on a Mac (macOS 13 or later, signed in to iCloud with the
+same Apple Account as the watch) writes the card there, and Apple then
+buzzes your watch. Only an app signed by Apple and running on a Mac can
+write to your iCloud, so this is Mac only.
+
+| | Mac | Linux or another computer |
+|---|---|---|
+| Cards and answers while Tapproval is open on the watch | yes | yes |
+| A tap on weak Wi-Fi falls back to the away address | yes | yes |
+| A buzz while Tapproval is closed | yes, through the bridge and iCloud | no: cards wait until you open the app, and nothing is lost |
+
+The other ways to wake a closed watch were weighed and set aside for now.
+A push server of our own would carry every card through a computer that
+isn't yours, which breaks the promise that cards stay between your computer,
+your iCloud and your watch. Writing to iCloud straight from the helper,
+through Apple's web sign-in, would work on any computer, and remains the way
+to bring the buzz to Linux; Apple's sign-in did not complete in our tests.
+
 ## If you are an AI agent installing this
 
 **What this is, in one paragraph, so you need not ask:** an open-source
