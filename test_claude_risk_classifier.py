@@ -5921,6 +5921,18 @@ class TestAWristMessageGoesIntoTheInbox:
                "shortened if long.)" % tapproval_wire.WRIST_INBOX_OPENER)
         assert tapproval_wire.wrist_words(old) == "Ship it"
 
+    def test_an_instruction_that_needs_a_yes_comes_back_as_a_question(self):
+        # An inbox message can never count as the user's approval; a question
+        # Claude asks reaches the watch as a card, and that tap can.
+        note = tapproval_wire.wrist_inbox_message("Ship it")
+        assert "AskUserQuestion" in note and "go-ahead" in note
+        assert tapproval_wire.wrist_words(note) == "Ship it"
+        # What 1.1.65 posted still reads back.
+        old = ("%s\n\nShip it\n\n(Their phone and terminal don't show this message. "
+               "Open your reply with one line: \u231a and their words in italics, "
+               "shortened if long, like *\u231a What's left?*)" % tapproval_wire.WRIST_INBOX_OPENER)
+        assert tapproval_wire.wrist_words(old) == "Ship it"
+
     def test_a_post_writes_one_line_claude_code_reads(self, inbox):
         entry = {"socket": inbox["path"], "pid": os.getpid()}
         assert watch_relay.post_to_inbox(entry, "What's left?") is True

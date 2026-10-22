@@ -224,9 +224,18 @@ WRIST_INBOX_OPENER = "From the user's Apple Watch (Tapproval), in their own word
 WRIST_INBOX_NOTE_START = "(Their phone and terminal don't show this message."
 # A watch and the words in italics, the owner's choice of hint (2026-10-22;
 # 1.1.64 asked for "From your watch: ").
+# Claude Code files the message as one from another session, which can
+# never count as the user's approval; a question it asks back can, because
+# the hook turns it into a card on the watch and the tap is the user's own
+# answer (proven 2026-10-22: "Ship it" approved that way). So the message
+# says how to get the go-ahead.
 WRIST_INBOX_NOTE = ("(Their phone and terminal don't show this message. Open "
                     "your reply with one line: \u231a and their words in "
-                    "italics, shortened if long, like *\u231a What's left?*)")
+                    "italics, shortened if long, like *\u231a What's left?* "
+                    "If what they ask needs their go-ahead (anything you would "
+                    "confirm with them before doing it), ask them with "
+                    "AskUserQuestion first: Tapproval shows the question on "
+                    "their watch, and their answer there is their own.)")
 
 
 # Settings' "Short replies", which a headless run gets as Claude Code's
