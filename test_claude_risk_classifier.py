@@ -5933,6 +5933,16 @@ class TestAWristMessageGoesIntoTheInbox:
                "shortened if long, like *\u231a What's left?*)" % tapproval_wire.WRIST_INBOX_OPENER)
         assert tapproval_wire.wrist_words(old) == "Ship it"
 
+    def test_the_echo_line_comes_off_the_reply_and_nothing_else(self):
+        strip = tapproval_wire.strip_wrist_echo
+        assert strip("*\u231a What's left?*\n\nTwo things.") == "Two things."
+        assert strip("_\u231a What's left?_\nTwo things.") == "Two things."
+        assert strip("\u231a What's left?") == ""
+        # Only a whole opening line that is the hint.
+        for kept in ("Two things.", "Two things.\n*\u231a later*",
+                     "*\u231a What's left?* Two things.", "Time \u231a is up."):
+            assert strip(kept) == kept
+
     def test_a_post_writes_one_line_claude_code_reads(self, inbox):
         entry = {"socket": inbox["path"], "pid": os.getpid()}
         assert watch_relay.post_to_inbox(entry, "What's left?") is True
@@ -6037,6 +6047,23 @@ class TestAWristMessageGoesIntoTheInbox:
         turns = watch_dashboard.session_thread("inbox1", projects_dir=str(tmp_path))
         assert [(t["text"], t.get("origin")) for t in turns] == [
             ("from the desk", None), ("Ship it", "headless")]
+
+    def test_the_wrist_does_not_hear_its_words_twice(self, tmp_path):
+        # Claude opens with "*⌚ …*" for the terminal and the phone, which
+        # hide the inbox message; the wrist has the wearer's own bubble.
+        filed = ("Another Claude session sent a message:\n%s"
+                 % tapproval_wire.wrist_inbox_message("Proceed with the recommended course"))
+        _write_transcript(tmp_path, "-p", "inbox2.jsonl", [
+            {"cwd": "/x", "entrypoint": "cli", "isMeta": True,
+             "message": {"role": "user", "content": filed}},
+            {"cwd": "/x", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "*\u231a Proceed with the recommended course\u2026*"}]}},
+            {"cwd": "/x", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "*\u231a Proceed*\n\nDone: **merged**."}]}},
+        ])
+        turns = watch_dashboard.session_thread("inbox2", projects_dir=str(tmp_path))
+        assert [(t["role"], t["text"]) for t in turns] == [
+            ("user", "Proceed with the recommended course"), ("assistant", "Done: merged.")]
 
     def test_a_ready_inbox_is_not_a_side_thread(self, tmp_path, monkeypatch):
         _write_transcript(tmp_path, "-p", "side1.jsonl", [
@@ -6424,6 +6451,14 @@ class TestSlashCommandsReachTheWrist:
         assert watch_dashboard._command_sent(
             "<command-name>/loop</command-name><command-args>5m /x</command-args>") == "/loop 5m /x"
         assert watch_dashboard._command_sent("plain words") is None
+
+    def test_a_machine_payload_is_not_shown_as_args(self):
+        # The desktop app's /wrap-up and /recap carry their session as JSON.
+        echo = ('<command-name>/wrap-up</command-name>\n<command-args>{"session_id":'
+                '"0000","transcript_path":"/tmp/x.jsonl"}</command-args>')
+        assert watch_dashboard._command_sent(echo) == "/wrap-up"
+        assert watch_dashboard._command_sent(
+            "<command-name>/x</command-name><command-args>{not json</command-args>") == "/x {not json"
 
 
 class TestNoticesCarryATone:

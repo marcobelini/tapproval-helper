@@ -769,6 +769,14 @@ def _command_sent(lead):
         return None
     args = _COMMAND_ARGS.search(lead)
     tail = " ".join(args.group(1).split()) if args else ""
+    # The desktop app's /wrap-up and /recap pass their session as JSON
+    # ({"session_id": …}): the app's to read, never words the person typed.
+    if tail[:1] in "{[":
+        try:
+            json.loads(tail)
+            tail = ""
+        except ValueError:
+            pass
     return (m.group(1) + " " + tail).strip()
 
 
@@ -2038,6 +2046,13 @@ def _thread_line(state, line, limit):
     # to TURN_CHARS flattened (far beyond any real reply, and the whole of
     # the longest message the wrist may send); if something truly
     # enormous is ever cut, cut at a word and say so.
+    # A reply to a wrist message opens with "*⌚ their words*" for the
+    # terminal and the phone; the wrist already shows the words as the
+    # wearer's own bubble, so it reads on from the line after.
+    if role == "assistant" and kind == "text":
+        text = wire.strip_wrist_echo(str(text))
+        if not text.strip():
+            return
     raw_text = text
     text = (plain_text(str(text)[:32768]) if kind == "text" else lead)
     if len(text) > TURN_CHARS:

@@ -262,3 +262,18 @@ def wrist_words(content):
     if end < 0:
         return None
     return rest[:end].strip() or None
+
+
+# The one line WRIST_INBOX_NOTE asks Claude to open with — "*⌚ What's
+# left?*", italics optional — standing alone as the reply's first line;
+# a hint with the reply on the same line is left whole rather than cut.
+_WRIST_ECHO = re.compile(r"\A\s*([*_]?)\u231a[^\n]*?\1[ \t]*(?:\n\s*|\Z)")
+
+
+def strip_wrist_echo(text):
+    """A reply without its opening "*⌚ …*" line. The terminal and the
+    phone need that line, because they hide the inbox message; the wrist
+    shows the wearer's own bubble, so there it would say their words
+    twice, reworded."""
+    m = _WRIST_ECHO.match(text)
+    return text[m.end():] if m else text
