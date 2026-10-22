@@ -18,6 +18,13 @@ that makes it possible. It is open source on purpose: a tool that reads
 your sessions and carries your approvals should be auditable — every
 line of it is in this repository.
 
+**One conversation, everywhere.** A message you send from the watch to a
+session open on your computer goes into that session, so its terminal and
+the Claude app on your phone show it, and Claude's answer opens with
+"*⌚ …*" and your words. What you type in the terminal or on the phone shows
+on the watch. If what you asked for needs your yes first, Claude asks it
+back as a question card on your wrist.
+
 *(Technical id: `tapproval-helper` — the repo and plugin keep that name;
 the product name is Tapproval Base.)*
 

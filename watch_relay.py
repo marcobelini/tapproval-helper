@@ -1868,6 +1868,98 @@ def thread_news(path, mark, wait, still=lambda: True):
         _THREAD_WAITERS.release()
 
 
+# How long `end_session` waits for a signalled session to be gone. A
+# probe on 2026-10-22 (SIGTERM, SIGINT then SIGTERM, SIGHUP, idle and
+# mid-answer) saw every one exit within 1.7 s, its transcript whole, its
+# registry file removed, and `claude --resume` pick it up again after.
+# Under the watch's own 5 s wait for an answer.
+END_WAIT_SECONDS = 3.5
+
+
+def _our_claude_processes():
+    """(pid, command) of every process of this user's whose command runs
+    Claude Code. Never raises; nothing found is an empty list."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,uid=,command="], capture_output=True,
+                             text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or not parts[0].isdigit() or parts[1] != str(os.getuid()):
+            continue
+        if "claude" in parts[2]:
+            found.append((int(parts[0]), parts[2]))
+    return found
+
+
+def _gone(pid):
+    """True once ``pid`` no longer runs (reaped here if it was ours)."""
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def end_session(prefix, waiting=()):
+    """End a session from the wrist: stop the Claude Code process the
+    session registry names for it, and any copy a wrist message started
+    (`claude --resume <id> -p`), which nothing else tracks. Returns
+    "ended", or a word the watch turns into a sentence; never raises.
+
+    Only a session in a terminal, and only a process this user owns whose
+    command is Claude Code's: the registry is a file on disk, and its pid
+    could by now name anything. Never while a card waits for the session —
+    the wearer answers that first. A session from the Claude app is left
+    to the app, which keeps its own sessions and would not expect one to
+    vanish under it."""
+    registry = session_registry()
+    session_id, _ = resolve_session(prefix, registry=registry)
+    if not session_id:
+        return "unknown session"
+    if any(str(card) and (session_id.startswith(str(card)) or str(card).startswith(session_id))
+           for card in waiting):
+        return "card waiting"
+    entry = registry.get(session_id)
+    if entry is not None and entry.get("status") != "Terminal":
+        return "desktop"
+    ours = _our_claude_processes()
+    copies = [pid for pid, command in ours if "--resume " + session_id in command]
+    pids = list(copies)
+    if entry is not None:
+        if entry["pid"] not in {pid for pid, _ in ours}:
+            return "not ours"
+        pids = [entry["pid"]] + [pid for pid in copies if pid != entry["pid"]]
+    if not pids:
+        return "not live"
+    started = time.monotonic()
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return "not ours"
+    while time.monotonic() - started < END_WAIT_SECONDS:
+        if all(_gone(pid) for pid in pids):
+            print("relay: end %s (%d process%s, %d ms)" % (
+                session_id[:8], len(pids), "" if len(pids) == 1 else "es",
+                (time.monotonic() - started) * 1000), file=sys.stderr)
+            return "ended"
+        time.sleep(0.1)
+    print("relay: end %s: still running after %.0f s" % (session_id[:8], END_WAIT_SECONDS),
+          file=sys.stderr)
+    return "still running"
+
+
 def type_into_session(session_id, text, registry):
     """Type a wrist message into the terminal a live session runs in.
     True when it was typed; False sends it the old way. Never raises.
@@ -3395,6 +3487,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             # and a command Claude runs is a local process too — it must
             # not be able to answer its own card or speak into a session.
             "/say": ("_post_say", dict(token=True, no_simulator=True)),
+            "/end": ("_post_end", dict(token=True, no_simulator=True)),
             # The watch reporting its own trouble. A device token, like
             # /say: a local process must not be able to file a fault in
             # the watch's name.
@@ -3731,6 +3824,14 @@ class RelayHandler(BaseHTTPRequestHandler):
                            brief=body.get("brief") is not False,
                            force=body.get("force") is True),
             "sent"), path)
+
+    def _post_end(self, path, query):
+        # Ends a session on this Mac. Under the same budget and gate as a
+        # send: it acts on a process, and a tap retried after the watch
+        # gave up must not act twice.
+        waiting = [card["session_id"] for card in self.queue.pending() if card.get("session_id")]
+        self._serialised_send(lambda body: (
+            end_session(str(body.get("session_id", ""))[:64], waiting), "ended"), path)
 
     def _post_diagnostic(self, path, query):
         """The watch telling this computer something went wrong on it.

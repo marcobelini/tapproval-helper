@@ -4835,7 +4835,7 @@ class TestRelayPairing:
     ])
     @pytest.mark.parametrize("path", [
         "/pending", "/sessions", "/thread", "/activity", "/usage",
-        "/decision", "/say", "/tunnel",
+        "/decision", "/say", "/end", "/tunnel",
     ])
     def test_a_private_address_is_not_a_credential(self, ip, path):
         """The café-Wi-Fi hole, closed. Every one of these once answered a
@@ -5371,6 +5371,7 @@ class TestLanSourceIsNotTrusted:
     @pytest.mark.parametrize("path,body", [
         ("/decision", {"id": "x", "decision": "allow"}),
         ("/say", {"session_id": "x", "text": "hello"}),
+        ("/end", {"session_id": "x"}),
     ])
     def test_writes_are_refused_without_a_key(self, lan, path, body):
         base, _, _ = lan
@@ -12349,6 +12350,7 @@ class TestTheRelayRefusesASimulator:
         ("/decision", {"id": "ghost", "decision": "allow"}),
         ("/say", {"session_id": "x", "text": "hi"}),
         ("/new", {"path": "/x", "text": "hi"}),
+        ("/end", {"session_id": "x"}),
     ]
 
     @pytest.fixture
@@ -12357,6 +12359,8 @@ class TestTheRelayRefusesASimulator:
         ran = []
         monkeypatch.setattr(watch_relay, "say_to_session",
                             lambda *a, **k: ran.append("say") or "sent")
+        monkeypatch.setattr(watch_relay, "end_session",
+                            lambda *a, **k: ran.append("end") or "ended")
         monkeypatch.setattr(watch_relay, "start_session",
                             lambda *a, **k: ran.append("new") or "started")
         allow = getattr(request, "param", False)
@@ -12388,7 +12392,7 @@ class TestTheRelayRefusesASimulator:
     def test_the_answering_routes_carry_the_rule(self):
         post = watch_relay.RelayHandler.ROUTES["POST"]
         guarded = {p for p, (_, rules) in post.items() if rules.get("no_simulator")}
-        assert guarded == {"/decision", "/say", "/new"}
+        assert guarded == {"/decision", "/say", "/new", "/end"}
 
     @pytest.mark.parametrize("tag", ["1", "yes"])
     @pytest.mark.parametrize("path,body", GUARDED)
@@ -18960,3 +18964,114 @@ class TestTheWatchCatchesUp:
         threading.Timer(0.3, asked.set).start()
         watch_relay.thread_news(path, mark, 10, still=lambda: not asked.is_set())
         assert time.monotonic() - started < 1.0
+
+
+class TestASessionCanBeEndedFromTheWrist:
+    """2026-10-22: the owner's "archive" is ending the session on the
+    computer. Only a terminal session's own Claude Code process, and the
+    copies wrist messages started, never while a card waits for it, never
+    a pid the registry names that is no longer Claude Code's."""
+
+    SID = "e0e0e0e0-1111-4000-8000-00000000end1"
+
+    @pytest.fixture
+    def stage(self, monkeypatch):
+        procs = []
+
+        def start():
+            proc = subprocess.Popen(["sleep", "30"])
+            procs.append(proc)
+            return proc
+
+        def arrange(entry=None, ours=()):
+            monkeypatch.setattr(watch_relay, "session_registry",
+                                lambda: {self.SID: entry} if entry else {})
+            monkeypatch.setattr(watch_relay, "resolve_session",
+                                lambda prefix, registry=None: (self.SID, "/tmp")
+                                if self.SID.startswith(prefix) else (None, None))
+            monkeypatch.setattr(watch_relay, "_our_claude_processes", lambda: list(ours))
+        yield start, arrange
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    def test_a_terminal_session_is_ended(self, stage):
+        start, arrange = stage
+        proc = start()
+        arrange({"status": "Terminal", "pid": proc.pid}, [(proc.pid, "/usr/local/bin/claude")])
+        assert watch_relay.end_session(self.SID[:12]) == "ended"
+        assert proc.poll() is not None, "the process is gone"
+
+    def test_the_copies_a_wrist_message_started_end_with_it(self, stage):
+        start, arrange = stage
+        live, copy = start(), start()
+        arrange({"status": "Terminal", "pid": live.pid},
+                [(live.pid, "claude"), (copy.pid, "claude --resume %s -p -- hi" % self.SID)])
+        assert watch_relay.end_session(self.SID[:12]) == "ended"
+        assert live.poll() is not None and copy.poll() is not None
+
+    def test_a_closed_session_with_a_copy_still_running_ends_the_copy(self, stage):
+        start, arrange = stage
+        copy = start()
+        arrange(None, [(copy.pid, "claude --resume %s -p -- hi" % self.SID)])
+        assert watch_relay.end_session(self.SID[:12]) == "ended"
+        assert copy.poll() is not None
+
+    def test_nothing_running_is_said_so(self, stage):
+        _, arrange = stage
+        arrange(None, [])
+        assert watch_relay.end_session(self.SID[:12]) == "not live"
+
+    def test_an_unknown_session(self, stage):
+        _, arrange = stage
+        arrange(None, [])
+        assert watch_relay.end_session("ffffffff") == "unknown session"
+
+    def test_never_while_a_card_waits(self, stage):
+        start, arrange = stage
+        proc = start()
+        arrange({"status": "Terminal", "pid": proc.pid}, [(proc.pid, "claude")])
+        assert watch_relay.end_session(self.SID[:12], waiting=[self.SID]) == "card waiting"
+        assert proc.poll() is None, "nothing was signalled"
+
+    def test_a_session_of_the_claude_app_is_left_to_the_app(self, stage):
+        start, arrange = stage
+        proc = start()
+        arrange({"status": "Desktop", "pid": proc.pid}, [(proc.pid, "claude")])
+        assert watch_relay.end_session(self.SID[:12]) == "desktop"
+        assert proc.poll() is None
+
+    def test_a_pid_that_is_no_longer_claude_is_never_signalled(self, stage):
+        """The registry is a file; its pid may since name another program."""
+        start, arrange = stage
+        proc = start()
+        arrange({"status": "Terminal", "pid": proc.pid}, [])
+        assert watch_relay.end_session(self.SID[:12]) == "not ours"
+        assert proc.poll() is None
+
+    def test_one_that_will_not_stop_is_said_so(self, stage, monkeypatch):
+        start, arrange = stage
+        proc = subprocess.Popen([sys.executable, "-c",
+                                 "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                                 "print('ready', flush=True); time.sleep(30)"],
+                                stdout=subprocess.PIPE)
+        proc.stdout.readline()
+        try:
+            monkeypatch.setattr(watch_relay, "END_WAIT_SECONDS", 0.5)
+            arrange({"status": "Terminal", "pid": proc.pid}, [(proc.pid, "claude")])
+            assert watch_relay.end_session(self.SID[:12]) == "still running"
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_only_this_users_claude_processes_are_listed(self, monkeypatch):
+        listing = ("  101 %d /usr/local/bin/claude\n  102 0 /usr/local/bin/claude\n"
+                   "  103 %d /bin/zsh\n" % (os.getuid(), os.getuid()))
+        monkeypatch.setattr(watch_relay.subprocess, "run",
+                            lambda *a, **k: subprocess.CompletedProcess(a, 0, listing, ""))
+        assert watch_relay._our_claude_processes() == [(101, "/usr/local/bin/claude")]
+
+    def test_the_wait_fits_inside_the_watchs(self):
+        """The watch gives an answer 5 s (RelayModel.http)."""
+        assert watch_relay.END_WAIT_SECONDS < 5

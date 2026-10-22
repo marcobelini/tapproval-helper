@@ -4,6 +4,7 @@
 > agent on your computer asks permission, the question appears on the
 > watch, marked with one of five risk tiers, and one tap answers it.
 > No account and no server of ours. Independent; not affiliated with Anthropic.
+> Made for Claude Code users and vibe coders who step away while Claude works.
 
 ## What it does
 - Approve or deny Claude Code permission prompts with one tap on the watch.
@@ -13,6 +14,12 @@
 - Shows which sessions need you, which are running and which are idle,
   grouped by what they need and named with their project; read a
   conversation and reply, or start a new session from the watch.
+- One conversation, everywhere: a message sent from the watch to a session
+  open on the computer goes into that session, so the terminal and the
+  Claude app on the phone show it and the answer, which opens with the
+  watch mark and the user's words. What is typed in the terminal or on the
+  phone shows on the watch. When an instruction from the wrist needs a yes
+  first, Claude asks it back as a question card on the watch.
 - Replies and plans read on the watch the way they do on the phone: bold,
   lists and indented sub-points.
 - Multiple-choice questions arrive with the same choices as on the desktop; several questions arrive one after another. From watch app 2.0, more than one answer can be picked where Claude allows it.
