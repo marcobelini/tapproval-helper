@@ -1699,6 +1699,22 @@ class TestTheLoginJobIsOnlyClaimedWhenLaunchdTookIt:
         ok, calls = self._install(monkeypatch, tmp_path, [False, False, True])
         assert ok is True and calls == ["bootout", "bootstrap", "bootstrap"]
 
+    def test_the_job_launchd_reads_says_what_it_runs(self, monkeypatch, tmp_path):
+        """Read back as launchd will: the label, this interpreter, the relay
+        and --ensure, even from a folder whose name XML would choke on."""
+        relay = tmp_path / "R&D <tools>" / "watch_relay.py"
+        relay.parent.mkdir()
+        relay.write_text("")
+        monkeypatch.setattr(crc.sys, "platform", "darwin")
+        monkeypatch.setattr(crc, "_relay_path", lambda: str(relay))
+        monkeypatch.setattr(crc, "_launch_agent_path", lambda: str(tmp_path / "agent.plist"))
+        assert crc.install_launch_agent() is True          # the path is a test's: launchd untouched
+        with open(tmp_path / "agent.plist", "rb") as handle:
+            job = plistlib.load(handle)
+        assert job == {"Label": "com.tapproval.relay",
+                       "ProgramArguments": [crc.sys.executable, str(relay), "--ensure"],
+                       "RunAtLoad": True}
+
     def test_a_job_that_was_not_loaded_is_fine(self, monkeypatch, tmp_path):
         """bootout of an unloaded job fails; that is the first install."""
         ok, calls = self._install(monkeypatch, tmp_path, [False, True])
@@ -2043,37 +2059,46 @@ class TestRecapSummary:
         path.write_text("", encoding="utf-8")
         assert wd.recap_summary(str(path), self.NOW)["silenced_percent"] == 0
 
-    def test_a_changing_log_is_not_rescanned_on_every_call(self, tmp_path):
-        """The one route where a (mtime, size) cache is not enough.
-
-        The hook appends throughout a session, so that key changes
-        constantly and every open of the screen would re-read the whole
-        file. Nothing rate-limits a GET, so the floor is what bounds the
-        work — navigating in and out must not have the relay scanning a
-        lifetime of decisions each time.
-        """
+    def test_a_growing_log_is_read_only_from_where_it_stopped(self, tmp_path, monkeypatch):
+        """The hook appends throughout a session. The recap's counts only add
+        up, so it follows the log as the Today screen does: a new decision
+        shows at once, and only the appended lines are read (2026-10-21; it
+        used to re-read the whole log, at most once a minute)."""
         import watch_dashboard as wd
         path = self._log(tmp_path, self._rows())
         assert wd.recap_summary(path, self.NOW)["total"] == 129
-        # The log grows, as it does during any live session.
         with open(path, "a", encoding="utf-8") as handle:
             for _ in range(50):
                 handle.write(json.dumps({"ts": "2026-09-02T10:00:00+00:00",
                                           "tier": "SAFE",
                                           "decision": "allow"}) + "\n")
-        within = self.NOW + wd.RECAP_MIN_INTERVAL - 1
-        assert wd.recap_summary(path, within)["total"] == 129, "rescanned early"
-        after = self.NOW + wd.RECAP_MIN_INTERVAL + 1
-        assert wd.recap_summary(path, after)["total"] == 179
+        offsets = []
+        real = wd._read_appended
+        monkeypatch.setattr(wd, "_read_appended",
+                            lambda p, offset, limit=None: offsets.append(offset) or real(p, offset, limit))
+        assert wd.recap_summary(path, self.NOW)["total"] == 179, "the new lines were not counted"
+        assert offsets and offsets[0] > 0, "the whole log was read again"
 
-    def test_an_unchanged_log_is_served_from_cache(self, tmp_path):
-        # The floor bounds the worst case; the stat key still spares the
-        # common one, where nothing has been decided since the last look.
+    def test_a_rotated_log_starts_the_recap_over(self, tmp_path):
+        import watch_dashboard as wd
+        path = self._log(tmp_path, self._rows())
+        assert wd.recap_summary(path, self.NOW)["total"] == 129
+        with open(path, "w", encoding="utf-8") as handle:     # rotated: smaller
+            handle.write(json.dumps({"ts": "2026-09-03T10:00:00+00:00",
+                                      "tier": "CRITICAL", "decision": "escalate"}) + "\n")
+        facts = wd.recap_summary(path, self.NOW)
+        assert (facts["total"], facts["critical"], facts["first_day"]) == (1, 1, "2026-09-03")
+
+    def test_an_unchanged_log_is_not_read_again(self, tmp_path, monkeypatch):
         import watch_dashboard as wd
         path = self._log(tmp_path, self._rows())
         first = wd.recap_summary(path, self.NOW)
-        later = wd.recap_summary(path, self.NOW + 10 * wd.RECAP_MIN_INTERVAL)
-        assert first is later
+        read = []
+        real = wd._read_appended
+        monkeypatch.setattr(wd, "_read_appended",
+                            lambda p, offset, limit=None: read.append(real(p, offset, limit)[0]) or real(p, offset, limit))
+        assert wd.recap_summary(path, self.NOW) == first
+        assert read == [[]], "an unchanged log was read"
 
 
 class TestRelayBonjour:
@@ -2236,7 +2261,7 @@ class TestTheDashboardRemembersWhatItRead:
         monkeypatch.setattr(wd, "CLAUDE_PROJECTS", projects)
         monkeypatch.setattr(wd, "_TRANSCRIPT_PATHS", {})
         row = wd.recent_sessions()[0]
-        assert row["session_id"] in wd._TRANSCRIPT_PATHS
+        assert any(full.startswith(row["session_id"]) for full in wd._TRANSCRIPT_PATHS)
 
         def no_walking(*args):
             raise AssertionError("walked the project folders")
@@ -8839,6 +8864,33 @@ class TestTheHelperKeepsItsFilesInOneFolder:
         with open(os.path.join(logs, "relay.log"), encoding="utf-8") as handle:
             assert handle.read() == "new"
         assert os.path.exists(os.path.join(loose, ".tapproval-relay.log"))
+
+    def test_after_the_move_every_path_points_at_the_new_place(self, monkeypatch):
+        """_use_moved_files re-points everything this process holds, from
+        the same recipe the import used, and keeps a path a variable chose."""
+        names = ("AUTH_FILE", "PID_FILE", "RELAY_LOG", "SAY_LOG", "_UPDATE_STAMP",
+                 "TUNNEL_STATE", "TUNNEL_LOG")
+        for name in names:                      # put back whatever this test sets
+            monkeypatch.setattr(watch_relay, name, getattr(watch_relay, name))
+        monkeypatch.setattr(crash_report, "CRASH_LOG", crash_report.CRASH_LOG)
+        monkeypatch.setenv("TAPPROVAL_PID_FILE", "/chosen/relay.pid")
+        monkeypatch.delenv("TAPPROVAL_UPDATE_STAMP", raising=False)
+        monkeypatch.delenv("TAPPROVAL_TUNNEL_STATE", raising=False)
+        self._old_install()
+        watch_relay.move_loose_files()
+        watch_relay._use_moved_files()
+        data = os.path.join(watch_relay.TAPPROVAL_DIR, "data")
+        logs = os.path.join(watch_relay.TAPPROVAL_DIR, "logs")
+        assert {name: getattr(watch_relay, name) for name in names} == {
+            "AUTH_FILE": os.path.join(data, "auth.json"),
+            "PID_FILE": "/chosen/relay.pid",
+            "RELAY_LOG": os.path.join(logs, "relay.log"),
+            "SAY_LOG": os.path.join(logs, "say.log"),
+            "_UPDATE_STAMP": os.path.join(data, "last-update"),
+            "TUNNEL_STATE": os.path.join(data, "tunnel.json"),
+            "TUNNEL_LOG": os.path.join(logs, "tunnel.log"),
+        }
+        assert crash_report.CRASH_LOG == os.path.join(data, "crashes.jsonl")
 
     def test_a_new_install_starts_in_the_new_place(self):
         assert watch_relay.home_file("logs", "relay.log", ".tapproval-relay.log") == \
@@ -16011,14 +16063,83 @@ class TestPollsReadOnlyWhatChanged:
         lines += [json.dumps({"message": {"role": "assistant", "content": "ok %d" % n}})
                   for n in range(10)]
         path.write_text("\n".join(lines) + "\n")
-        watch_dashboard._META_SETTLED.pop(str(path), None)
+        watch_dashboard._META_CACHE.pop((str(path), 5), None)
         first = watch_dashboard.session_meta(str(path), scan_lines=5)
         assert first[0] == "/x/proj" and first[1] == "Ship it"
-        monkeypatch.setattr(watch_dashboard, "_session_meta",
+        monkeypatch.setattr(watch_dashboard, "_read_appended",
                             lambda *a, **k: pytest.fail("read again"))
         with open(path, "a") as handle:
             handle.write(json.dumps({"message": {"role": "assistant", "content": "more"}}) + "\n")
         assert watch_dashboard.session_meta(str(path), scan_lines=5) == first
+
+
+class TestSessionMetaFollowsTheTranscript:
+    """2026-10-21: an active session's size changes on every poll, and the
+    stat-keyed cache re-parsed its first 600 lines each time — about 80 ms
+    a session, a /sessions. session_meta now folds in only what was
+    appended, and must still say exactly what a full read says."""
+
+    def _line(self, n):
+        if n == 0:
+            return json.dumps({"cwd": "/x/proj", "message": {"role": "user", "content": "<command-name>/x</command-name>"}})
+        role = "user" if n % 3 == 0 else "assistant"
+        return json.dumps({"message": {"role": role, "content": "turn %d" % n}})
+
+    def test_it_matches_a_full_read_as_the_transcript_grows(self, tmp_path):
+        path = str(tmp_path / "s.jsonl")
+        open(path, "w").close()
+        for n in range(30):
+            with open(path, "a") as handle:
+                handle.write(self._line(n) + "\n")
+            assert watch_dashboard.session_meta(path, scan_lines=20) == \
+                watch_dashboard._session_meta(path, scan_lines=20), n
+
+    def test_a_line_still_being_written_waits(self, tmp_path):
+        path = str(tmp_path / "s.jsonl")
+        with open(path, "w") as handle:
+            handle.write(self._line(0) + "\n" + self._line(3)[:15])  # half a line
+        assert watch_dashboard.session_meta(path)[2] == 1, "the half line was counted"
+        with open(path, "a") as handle:
+            handle.write(self._line(3)[15:] + "\n")
+        assert watch_dashboard.session_meta(path) == watch_dashboard._session_meta(path)
+
+    def test_a_rewritten_transcript_is_read_again(self, tmp_path):
+        path = str(tmp_path / "s.jsonl")
+        with open(path, "w") as handle:
+            handle.write("\n".join(self._line(n) for n in range(10)) + "\n")
+        watch_dashboard.session_meta(path)
+        with open(path, "w") as handle:                       # shorter: rewritten
+            handle.write(json.dumps({"cwd": "/y", "message": {"role": "user", "content": "New ask"}}) + "\n")
+        assert watch_dashboard.session_meta(path) == ("/y", "New ask", 1)
+
+    def test_a_large_transcript_is_read_only_to_its_limit(self, tmp_path, monkeypatch):
+        path = str(tmp_path / "s.jsonl")
+        with open(path, "w") as handle:
+            handle.write("\n".join(self._line(n) for n in range(500)) + "\n")
+        asked = []
+        real = watch_dashboard._read_appended
+        monkeypatch.setattr(watch_dashboard, "_read_appended",
+                            lambda p, offset, limit=None: asked.append(limit) or real(p, offset, limit))
+        watch_dashboard.session_meta(path, scan_lines=40)
+        assert asked == [40], "read past the lines it needs"
+
+
+class TestATranscriptIsFoundByAnyPrefix:
+    def test_a_full_id_and_a_short_one_find_the_same_entry(self, tmp_path, monkeypatch):
+        """A card's session is looked up by a 12-character prefix and by the
+        full id; each used to walk every project folder (2026-10-21)."""
+        import watch_dashboard as wd
+        project = tmp_path / "proj"
+        project.mkdir()
+        sid = "abcdef123456-7890-aaaa-bbbb-ccccdddd0000"
+        (project / (sid + ".jsonl")).write_text("{}\n")
+        monkeypatch.setattr(wd, "CLAUDE_PROJECTS", str(tmp_path))
+        monkeypatch.setattr(wd, "_TRANSCRIPT_PATHS", {})
+        found = wd._find_transcript(sid)
+        assert found and found.endswith(sid + ".jsonl")
+        monkeypatch.setattr(wd.os, "listdir", lambda *a: pytest.fail("walked the folders"))
+        assert wd._find_transcript(sid[:12]) == found
+        assert wd._find_transcript(sid[:8]) == found
 
 
 class TestALineThatIsNotAnObject:

@@ -108,7 +108,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.61"
+__version__ = "1.1.62"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -3141,20 +3141,19 @@ def report_facts(entries):
     """What the audit log says, as numbers: the totals, the tier split,
     how many prompts the policy would have raised, the per-project and
     per-tool splits, the latest escalations. Pure, so a test can hold it."""
-    total = len(entries)
     tiers = Counter(e.get("tier", "?") for e in entries)
-    decisions = Counter(e.get("decision", "?") for e in entries)
-    escalated = decisions.get("escalate", 0) + decisions.get("deny", 0)
-    projects = sorted({e.get("project") for e in entries if e.get("project")})
-    by_project = []
-    for name in projects:
-        rows = [e for e in entries if e.get("project") == name]
-        asked = len([e for e in rows if e.get("decision") in ("escalate", "deny")])
-        share = 100.0 * (len(rows) - asked) / len(rows)
-        by_project.append((name, len(rows), asked, share))
     by_tool = Counter(e.get("tool", "?") for e in entries
                       if e.get("decision") == "allow")
     escalations = [e for e in entries if e.get("decision") in ("escalate", "deny")]
+    rows, asked = Counter(), Counter()          # per project, in one pass
+    for e in entries:
+        if e.get("project"):
+            rows[e["project"]] += 1
+            asked[e["project"]] += e.get("decision") in ("escalate", "deny")
+    by_project = [(name, rows[name], asked[name],
+                   100.0 * (rows[name] - asked[name]) / rows[name])
+                  for name in sorted(rows)]
+    total, escalated = len(entries), len(escalations)
     return {"total": total, "tiers": tiers, "escalated": escalated,
             "saved": total - escalated, "by_project": by_project,
             "by_tool": by_tool.most_common(5), "escalations": escalations[-5:]}
@@ -3322,24 +3321,6 @@ def _launch_agent_path():
         os.path.expanduser("~"), "Library", "LaunchAgents",
         "com.tapproval.relay.plist")
 
-_LAUNCH_AGENT_XML = """<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
-"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.tapproval.relay</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>%s</string>
-    <string>%s</string>
-    <string>--ensure</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-</dict>
-</plist>
-"""
-
-
 def _launchctl(*args):
     """Run launchctl quietly: True when it succeeded. Never raises, never
     blocks an install. Its answer used to be dropped, so an install whose
@@ -3350,11 +3331,6 @@ def _launchctl(*args):
                               capture_output=True, timeout=10).returncode == 0
     except Exception:
         return False
-
-
-def _xml_escape(text):
-    return (text.replace("&", "&amp;").replace("<", "&lt;")
-                .replace(">", "&gt;"))
 
 
 def install_launch_agent():
@@ -3370,13 +3346,15 @@ def install_launch_agent():
     relay = _relay_path()
     if not os.path.exists(relay):
         return False
-    plist = _LAUNCH_AGENT_XML % (_xml_escape(sys.executable),
-                                 _xml_escape(relay))
+    import plistlib
+    job = {"Label": "com.tapproval.relay",
+           "ProgramArguments": [sys.executable, relay, "--ensure"],
+           "RunAtLoad": True}
     target = _launch_agent_path()
     try:
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "w", encoding="utf-8") as handle:
-            handle.write(plist)
+        with open(target, "wb") as handle:
+            plistlib.dump(job, handle)
     except OSError:
         return False
     if _launch_agent_is_real():

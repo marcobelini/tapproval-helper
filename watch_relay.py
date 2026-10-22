@@ -95,10 +95,53 @@ def home_file(folder, name, legacy):
     return new
 
 
+# Every file the helper once left loose in the home folder: (folder, name,
+# the old loose name). The key, the away address and the logs are the ones
+# that matter; the pid file and the update stamp only tidy up.
+LOOSE_FILES = (
+    ("data", "auth.json", ".tapproval-auth.json"),
+    ("data", "tunnel.json", ".tapproval-tunnel.json"),
+    ("data", "relay.pid", ".tapproval-relay.pid"),
+    ("data", "last-update", ".tapproval-last-update"),
+    ("data", "crashes.jsonl", ".tapproval-crashes.jsonl"),
+    ("logs", "relay.log", ".tapproval-relay.log"),
+    ("logs", "tunnel.log", ".tapproval-tunnel.log"),
+    ("logs", "say.log", ".tapproval-say.log"),
+)
+
+# The paths this module holds, by global name: (its file in LOOSE_FILES,
+# the environment variable that may choose it instead). Read at import and
+# again by _use_moved_files once the files have moved, so the two can
+# never disagree about where a file is.
+_HOME_PATHS = {
+    "AUTH_FILE": ("auth.json", None),
+    "PID_FILE": ("relay.pid", "TAPPROVAL_PID_FILE"),
+    "RELAY_LOG": ("relay.log", None),
+    "SAY_LOG": ("say.log", None),
+    "_UPDATE_STAMP": ("last-update", "TAPPROVAL_UPDATE_STAMP"),
+    "TUNNEL_STATE": ("tunnel.json", "TAPPROVAL_TUNNEL_STATE"),
+    "TUNNEL_LOG": ("tunnel.log", None),
+}
+
+
+def _loose_file(name):
+    """home_file() for one of LOOSE_FILES, by its name."""
+    for folder, file_name, legacy in LOOSE_FILES:
+        if file_name == name:
+            return home_file(folder, file_name, legacy)
+    raise KeyError(name)
+
+
+def _home_path(global_name):
+    """Where the file a global names is now. A variable's choice wins."""
+    name, variable = _HOME_PATHS[global_name]
+    return (variable and os.environ.get(variable)) or _loose_file(name)
+
+
 # The key file: every paired device's key, mode 0600. The Mac bridge
 # reads it too, which is why it moves only once the bridge can find it
 # (_bridge_reads_data_dir).
-AUTH_FILE = home_file("data", "auth.json", ".tapproval-auth.json")
+AUTH_FILE = _home_path("AUTH_FILE")
 # Bumped whenever the wire contract or the auth rules change, so a running
 # relay from before an update can be recognised — and replaced — instead of
 # quietly serving the old rules forever (see ensure_running).
@@ -340,6 +383,44 @@ def conditions():
                 for key, (detail, tone) in sorted(_CONDITIONS.items())]
 
 
+# The admin routes that only say something about this relay, or take it
+# back: a process here tells the relay, and /health carries it to the
+# wrist. Each entry stays a literal call, so the tests that read every
+# condition this file can note (its key, its tone) still see these.
+ADMIN_CONDITIONS = {
+    # The launcher found a newer helper but a card is pending, so it left
+    # this relay in place. That used to be one line on stderr, in a log on
+    # a Mac nobody is looking at, while the machine ran yesterday's rules.
+    # It clears itself: the only resolution is being replaced, and the
+    # replacement starts with nothing recorded. Worded to stay true after
+    # the card is answered: the deferral ends only at the next session
+    # start, and a sentence that said "a card is pending" would sit on the
+    # wrist, false, for the rest of a long session.
+    "/admin/update-deferred": lambda: note_condition(
+        "update",
+        "A newer helper is waiting to take over. It will replace this one "
+        "the next time Claude Code starts with no card waiting.",
+        tone="in_hand"),
+    # The hourly pull failed in a way the next one will repeat (a diverged
+    # clone, local edits in the way). Fixed wording, no body: what git said
+    # goes to the log, not to the wrist.
+    "/admin/update-stuck": lambda: note_condition(
+        "stuck",
+        "The helper on this computer can no longer update itself, so it "
+        "will miss fixes. Ask Claude Code to reinstall Tapproval's helper."),
+    "/admin/update-unstuck": lambda: clear_condition("stuck"),
+    # The detached --bridge-update could not install the pinned bridge.
+    # Fixed wording, no body, like update-stuck: why goes to the bridge's
+    # install.log, not to the wrist.
+    "/admin/bridge-failed": lambda: note_condition(
+        "bridge_install",
+        "Tapproval could not set up its iCloud bridge on this computer, so "
+        "your watch may not buzz while Tapproval is closed. It tries again "
+        "within the hour while Claude Code runs."),
+    "/admin/bridge-ok": lambda: clear_condition("bridge_install"),
+}
+
+
 def check_helper_is_visible():
     """Record whether the classifier could be imported beside this relay.
 
@@ -510,7 +591,7 @@ def _probe_relay(timeout=2):
     return _loopback_json("/health", timeout=timeout)
 
 
-PID_FILE = os.environ.get("TAPPROVAL_PID_FILE") or home_file("data", "relay.pid", ".tapproval-relay.pid")
+PID_FILE = _home_path("PID_FILE")
 # How long --ensure gives a freshly spawned relay to answer /health before
 # it stops claiming the relay "started". A seam for tests.
 RELAY_START_WAIT = 6.0
@@ -652,8 +733,8 @@ def run_admin(args):
     return 0
 
 
-RELAY_LOG = home_file("logs", "relay.log", ".tapproval-relay.log")
-SAY_LOG = home_file("logs", "say.log", ".tapproval-say.log")
+RELAY_LOG = _home_path("RELAY_LOG")
+SAY_LOG = _home_path("SAY_LOG")
 RELAY_LOG_MAX = 2 * 1024 * 1024      # keep the tail worth reading
 
 
@@ -686,8 +767,7 @@ def _rotate_log(path=None, limit=RELAY_LOG_MAX):
 # Overridable like CLAUDE_SETTINGS_PATH and CLAUDE_LAUNCH_AGENT_PATH, so a
 # test — including one that runs the hook in a subprocess, where a
 # monkeypatch cannot reach — never pulls the working tree it is testing.
-_UPDATE_STAMP = os.environ.get("TAPPROVAL_UPDATE_STAMP") or home_file(
-    "data", "last-update", ".tapproval-last-update")
+_UPDATE_STAMP = _home_path("_UPDATE_STAMP")
 # An hour, not a day: a helper published in the afternoon sat unread until
 # the next morning (2026-10-01) while the watch said "start Claude Code
 # once to update it". A fetch is cheap, and it never blocks a session.
@@ -3606,51 +3686,6 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self.auth.open_window()
             self._send_json({"ok": True, "devices": 0,
                              "seconds": PAIR_WINDOW_SECONDS})
-        elif path == "/admin/update-deferred":
-            # The launcher found a newer helper but a card is pending, so
-            # it left this relay in place. That used to be one line on
-            # stderr, in a log on a Mac nobody is looking at, while the
-            # machine ran yesterday's rules. The relay records it about
-            # itself; /health carries it to the wrist. It clears itself:
-            # the only resolution is being replaced, and the replacement
-            # starts with nothing recorded.
-            # Worded to stay true after the card is answered: the deferral
-            # ends only at the next session start, and a sentence that
-            # said "a card is pending" would sit on the wrist, false, for
-            # the rest of a long session.
-            note_condition(
-                "update",
-                "A newer helper is waiting to take over. It will replace "
-                "this one the next time Claude Code starts with no card "
-                "waiting.", tone="in_hand")
-            self._send_json({"ok": True})
-        elif path == "/admin/update-stuck":
-            # The hourly pull failed in a way the next one will repeat (a
-            # diverged clone, local edits in the way). Fixed wording, no
-            # body: what git said goes to the log, not to the wrist.
-            note_condition(
-                "stuck",
-                "The helper on this computer can no longer update itself, so "
-                "it will miss fixes. Ask Claude Code to reinstall Tapproval's "
-                "helper.")
-            self._send_json({"ok": True})
-        elif path == "/admin/update-unstuck":
-            clear_condition("stuck")
-            self._send_json({"ok": True})
-        elif path == "/admin/bridge-failed":
-            # The detached --bridge-update could not install the pinned
-            # bridge. Fixed wording, no body, like update-stuck: why goes
-            # to the bridge's install.log, not to the wrist.
-            note_condition(
-                "bridge_install",
-                "Tapproval could not set up its iCloud bridge on this "
-                "computer, so your watch may not buzz while Tapproval is "
-                "closed. It tries again within the hour while Claude Code "
-                "runs.")
-            self._send_json({"ok": True})
-        elif path == "/admin/bridge-ok":
-            clear_condition("bridge_install")
-            self._send_json({"ok": True})
         elif path == "/admin/rotate":
             secret = self.auth.rotate()
             _rotate_tunnel_prefix(secret)
@@ -3659,6 +3694,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             if not icloud_carries_the_key():
                 self.auth.open_window()
             self._send_json({"ok": True, "rotated": True})
+        elif path in ADMIN_CONDITIONS:
+            ADMIN_CONDITIONS[path]()
+            self._send_json({"ok": True})
         else:
             # Fail closed by shape: an admin route added to ROUTES without
             # a branch here used to fall through to a key rotation.
@@ -4333,19 +4371,6 @@ def bridge_installed():
 # from the old place, for a helper that has not moved it).
 BRIDGE_READS_DATA_DIR = (1, 0, 1)
 
-# Every file the helper once left loose in the home folder: (folder, name,
-# the old loose name). The key, the away address and the logs are the ones
-# that matter; the pid file and the update stamp only tidy up.
-LOOSE_FILES = (
-    ("data", "auth.json", ".tapproval-auth.json"),
-    ("data", "tunnel.json", ".tapproval-tunnel.json"),
-    ("data", "relay.pid", ".tapproval-relay.pid"),
-    ("data", "last-update", ".tapproval-last-update"),
-    ("data", "crashes.jsonl", ".tapproval-crashes.jsonl"),
-    ("logs", "relay.log", ".tapproval-relay.log"),
-    ("logs", "tunnel.log", ".tapproval-tunnel.log"),
-    ("logs", "say.log", ".tapproval-say.log"),
-)
 
 
 def _tell(line):
@@ -4422,19 +4447,11 @@ def move_loose_files():
 def _use_moved_files():
     """After move_loose_files: every path this process holds, where its file
     is now. A path an environment variable chose is kept."""
-    global AUTH_FILE, PID_FILE, RELAY_LOG, SAY_LOG, _UPDATE_STAMP, TUNNEL_STATE, TUNNEL_LOG
-    AUTH_FILE = home_file("data", "auth.json", ".tapproval-auth.json")
-    PID_FILE = os.environ.get("TAPPROVAL_PID_FILE") or home_file("data", "relay.pid", ".tapproval-relay.pid")
-    RELAY_LOG = home_file("logs", "relay.log", ".tapproval-relay.log")
-    SAY_LOG = home_file("logs", "say.log", ".tapproval-say.log")
-    _UPDATE_STAMP = os.environ.get("TAPPROVAL_UPDATE_STAMP") or home_file(
-        "data", "last-update", ".tapproval-last-update")
-    TUNNEL_STATE = (os.environ.get("TAPPROVAL_TUNNEL_STATE")
-                    or home_file("data", "tunnel.json", ".tapproval-tunnel.json"))
-    TUNNEL_LOG = home_file("logs", "tunnel.log", ".tapproval-tunnel.log")
+    for global_name in _HOME_PATHS:
+        globals()[global_name] = _home_path(global_name)
     crash_report = sys.modules.get("crash_report")
     if crash_report is not None:
-        crash_report.CRASH_LOG = home_file("data", "crashes.jsonl", ".tapproval-crashes.jsonl")
+        crash_report.CRASH_LOG = _loose_file("crashes.jsonl")
 
 
 def icloud_carries_the_key():
@@ -4467,11 +4484,10 @@ TUNNEL_URL = None
 # iPhone off, a watch reaches its computer only over the internet (Apple,
 # TN3135), so the travel address is the one route it has — and a new random
 # address at every relay restart stranded it until it next met the Mac.
-TUNNEL_STATE = (os.environ.get("TAPPROVAL_TUNNEL_STATE")
-                or home_file("data", "tunnel.json", ".tapproval-tunnel.json"))
+TUNNEL_STATE = _home_path("TUNNEL_STATE")
 # cloudflared's own log: where the new address is read from, and the first
 # place to look when the away address will not open.
-TUNNEL_LOG = home_file("logs", "tunnel.log", ".tapproval-tunnel.log")
+TUNNEL_LOG = _home_path("TUNNEL_LOG")
 TUNNEL_ANNOUNCE_WAIT = 60      # seconds for cloudflared to name its address
 
 

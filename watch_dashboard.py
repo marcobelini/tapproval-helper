@@ -27,8 +27,9 @@ import threading
 import time
 from collections import OrderedDict
 
-def _read_appended(path, offset):
+def _read_appended(path, offset, limit=None):
     """Lines appended since ``offset`` -> (lines, new_offset, shrunk).
+    At most ``limit`` lines when given; the offset stops after the last.
 
     The one owner of the append-follow rules every transcript follower
     needs: only whole lines are consumed (a mid-append partial tail waits
@@ -56,6 +57,8 @@ def _read_appended(path, offset):
                     break                      # a line still being written
                 read += len(raw)
                 lines.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
+                if limit is not None and len(lines) >= limit:
+                    break
     except OSError:
         return [], offset, shrunk
     return lines, offset + read, shrunk
@@ -414,7 +417,7 @@ def derive_title(text):
     return title[:1].upper() + title[1:] if title else ""
 
 
-_META_CACHE = {}   # path -> ((mtime, size), (cwd, opening, turns))
+_META_CACHE = OrderedDict()   # (path, scan_lines) -> what session_meta has read so far
 _ORIGIN_CACHE = {}  # path -> ((mtime, size), (cwd, entrypoint))
 
 
@@ -864,53 +867,65 @@ def _message_parts(content):
                     images.append(ref)
     return text, tool, images
 
-# Answers that can no longer change: path -> (size when settled, scan_lines,
-# result). A transcript only grows, and once its first scan_lines lines
-# hold both the working directory and the opening ask, nothing appended
-# can alter either — yet an active session's (mtime, size) changes on
-# every poll, and the stat cache re-read its first 600 lines each time.
-_META_SETTLED = OrderedDict()
+def _meta_start():
+    return {"offset": 0, "lines": 0, "cwd": None, "opening": None, "turns": 0}
+
+
+def _fold_meta(state, line, scan_lines):
+    """One transcript line into what session_meta knows. Lines past
+    ``scan_lines`` change nothing: a session of slash commands never has an
+    opening, and waiting for one read the whole transcript (2026-09-30)."""
+    if state["lines"] >= scan_lines:
+        return
+    state["lines"] += 1
+    entry = _json_object(line)
+    if entry is None:
+        return
+    if state["cwd"] is None and entry.get("cwd"):
+        state["cwd"] = entry["cwd"]
+    message = _message_of(entry)
+    if message.get("role") != "user" or entry.get(shape("key.is_meta")):
+        return
+    state["turns"] += 1
+    if state["opening"] is not None:
+        return
+    text, _, _ = _message_parts(message.get("content"))
+    lead = str(text).lstrip()
+    # Skip system-injected openers; we want what the human asked.
+    if lead and not lead.startswith(_SYSTEM_OPENERS):
+        state["opening"] = " ".join(plain_text(text).split())[:120]
 
 
 def session_meta(path, scan_lines=600):
-    """Cached front for :func:`_session_meta` —
-    /sessions re-reads a dozen transcripts per watch visit otherwise."""
+    """``(cwd, opening ask, user turns)`` from a transcript's first
+    ``scan_lines`` lines — what :func:`_session_meta` reads, followed
+    instead of re-read. Each call folds in only the whole lines appended
+    since the last, and once ``scan_lines`` lines are in nothing more is
+    read. An active session's size changes on every poll, and a stat-keyed
+    cache re-parsed its first 600 lines each time: about 80 ms a session,
+    a /sessions, on a live 7.7 MB transcript (2026-10-21). Never raises."""
+    key = (path, scan_lines)
     with _CACHE_LOCK:
-        settled = _META_SETTLED.get(path)
-    if settled is not None and settled[1] == scan_lines:
+        cached = _META_CACHE.get(key)
+    # A copy: two requests following the same transcript at once each fold
+    # from where the cache stood, and neither counts a turn twice.
+    state = dict(cached) if cached else _meta_start()
+    if state["lines"] >= scan_lines:
         try:
-            if os.path.getsize(path) >= settled[0]:
-                return settled[2]
+            if os.path.getsize(path) >= state["offset"]:
+                return state["cwd"], state["opening"], state["turns"]
         except OSError:
-            pass
-        with _CACHE_LOCK:
-            _META_SETTLED.pop(path, None)   # shrank: a rewrite
-    result = _stat_cached(_META_CACHE, path,
-                          lambda: _session_meta(path, scan_lines),
-                          extra=scan_lines)
-    if result[0] and result[1] and _has_lines(path, scan_lines):
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            size = None
-        if size is not None:
-            with _CACHE_LOCK:
-                _META_SETTLED[path] = (size, scan_lines, result)
-                while len(_META_SETTLED) > 256:
-                    _META_SETTLED.popitem(last=False)
-    return result
-
-
-def _has_lines(path, count):
-    """Does the file already hold at least ``count`` whole lines?"""
-    try:
-        with open(path, "rb") as handle:
-            for index, _ in enumerate(handle, 1):
-                if index >= count:
-                    return True
-    except OSError:
-        pass
-    return False
+            return state["cwd"], state["opening"], state["turns"]
+        state = _meta_start()                       # shrank: a rewrite
+    lines, offset, shrunk = _read_appended(path, state["offset"],
+                                           limit=scan_lines - state["lines"])
+    if shrunk:
+        state = _meta_start()
+    for line in lines:
+        _fold_meta(state, line, scan_lines)
+    state["offset"] = offset
+    _bounded_put(_META_CACHE, key, state, 256)
+    return state["cwd"], state["opening"], state["turns"]
 
 
 def _session_meta(path, scan_lines=600):
@@ -922,34 +937,16 @@ def _session_meta(path, scan_lines=600):
     inside "familia". The transcript carries the true ``cwd``, so read it.
     Never raises.
     """
-    cwd, opening, turns = None, None, 0
+    state = _meta_start()
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            for index, line in enumerate(handle):
-                # Stop where the caller said, found or not: a session of
-                # slash commands never has an opening, and waiting for one
-                # read the whole transcript on every /sessions (2026-09-30).
-                if index >= scan_lines:
+            for line in handle:
+                if state["lines"] >= scan_lines:
                     break
-                entry = _json_object(line)
-                if entry is None:
-                    continue
-                if cwd is None and entry.get("cwd"):
-                    cwd = entry["cwd"]
-                message = _message_of(entry)
-                if message.get("role") != "user" or entry.get(shape("key.is_meta")):
-                    continue
-                turns += 1
-                if opening is not None:
-                    continue
-                text, _, _ = _message_parts(message.get("content"))
-                lead = str(text).lstrip()
-                # Skip system-injected openers; we want what the human asked.
-                if lead and not lead.startswith(_SYSTEM_OPENERS):
-                    opening = " ".join(plain_text(text).split())[:120]
+                _fold_meta(state, line, scan_lines)
     except OSError:
         pass
-    return cwd, opening, turns
+    return state["cwd"], state["opening"], state["turns"]
 
 
 _AUDIT_PATH_MEMO = (None, None)   # (what it was read from, the path)
@@ -1121,69 +1118,49 @@ def _activity_summary_locked(path, today):
     return _finish_counts(stats)
 
 
-# The recap costs one full pass over the audit log, which the Today screen
-# deliberately never does — that log grows for the product's whole lifetime.
-#
-# A plain (mtime, size) cache is not enough here, and this is the one route
-# where that matters: the hook appends to the audit log throughout a
-# session, so the key changes constantly and every open of the screen would
-# re-read the whole file. Navigating in and out a few times would have the
-# relay scanning a lifetime of decisions on the user's own machine, and
-# nothing rate-limits a GET.
-#
-# So: return the cached answer when the file has not changed, and otherwise
-# not more often than this. A lifetime figure does not notice a minute of
-# staleness, and the work per caller is now bounded however the screen is
-# used.
-RECAP_MIN_INTERVAL = 60
+# The recap is a lifetime figure, but its counts only ever add up: the
+# total, the four buckets, CRITICAL and the first day. So it follows the
+# audit log the way the Today screen does, reading only what was appended
+# since the last ask; a rotation (the file shrank) starts it over. It used
+# to re-read the whole log, at most once a minute (2026-10-21).
+_RECAP_CACHE = OrderedDict()   # path -> {"offset", the running counts}
 
-_RECAP_CACHE = OrderedDict()   # path -> (stat_key, computed_at, stats)
+
+def _recap_start():
+    return {"offset": 0, "total": 0, "silenced": 0, "asked": 0,
+            "answered_on_watch": 0, "critical": 0, "first_day": ""}
 
 
 def recap_summary(audit_log=None, now=None):
-    """Everything the triage has done since the log began. Never raises.
-
-    A lifetime figure by definition, so unlike :func:`activity_summary` it
-    cannot read only what was appended since last time.
-    """
+    """Everything the triage has done since the log began. Never raises."""
     path = audit_log or _audit_log_path()
-    clock = now or time.time()
-    try:
-        st = os.stat(path)
-        key = (st.st_mtime, st.st_size)
-    except OSError:
-        key = None
     with _CACHE_LOCK:
         cached = _RECAP_CACHE.get(path)
-    if cached is not None:
-        cached_key, computed_at, stats = cached
-        unchanged = key is not None and cached_key == key
-        if unchanged or clock - computed_at < RECAP_MIN_INTERVAL:
-            return stats
-    stats = _recap_uncached(path, now)
-    _bounded_put(_RECAP_CACHE, path, (key, clock, stats), 8)
-    return stats
+    # A copy, so two requests at once never fold the same lines twice.
+    running = dict(cached) if cached else _recap_start()
+    lines, offset, shrunk = _read_appended(path, running["offset"])
+    if shrunk:
+        running = _recap_start()
+    for line in lines:
+        entry = _json_object(line)
+        if entry is None:
+            continue              # a torn line is not a reason to fail
+        _count_decision(running, entry)
+        day = str(entry.get("ts", ""))[:10]
+        if day and (not running["first_day"] or day < running["first_day"]):
+            running["first_day"] = day
+        if entry.get("tier") == "CRITICAL":
+            running["critical"] += 1
+    running["offset"] = offset
+    _bounded_put(_RECAP_CACHE, path, running, 8)
+    return _recap_facts(running, now)
 
 
-def _recap_uncached(path, now=None):
-    stats = {"total": 0, "silenced": 0, "asked": 0, "answered_on_watch": 0,
-             "critical": 0, "first_day": "", "days": 0,
-             "silenced_percent": 0, "seconds_saved": 0}
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                entry = _json_object(line)
-                if entry is None:
-                    continue          # a torn last line is not a reason to fail
-                _count_decision(stats, entry)
-                day = str(entry.get("ts", ""))[:10]
-                if day and (not stats["first_day"] or day < stats["first_day"]):
-                    stats["first_day"] = day
-                if entry.get("tier") == "CRITICAL":
-                    stats["critical"] += 1
-    except OSError:
-        return stats
-
+def _recap_facts(running, now=None):
+    """The answer from the running counts: the derived numbers, and how
+    many days the log covers up to today."""
+    stats = {key: value for key, value in running.items() if key != "offset"}
+    stats.update(days=0, silenced_percent=0, seconds_saved=0)
     _finish_counts(stats)
     if stats["first_day"]:
         from datetime import datetime, timezone
@@ -1196,13 +1173,17 @@ def _recap_uncached(path, now=None):
     return stats
 
 
-_TRANSCRIPT_PATHS = {}   # prefix -> path, validated with exists()
+_TRANSCRIPT_PATHS = {}   # full session id -> path, validated with exists()
 _TRANSCRIPT_PATHS_MAX = 4096
 
 
-def _remember_transcript(prefix, path):
-    """Memoise where a session's transcript is, for _find_transcript."""
-    _bounded_put(_TRANSCRIPT_PATHS, prefix, path, _TRANSCRIPT_PATHS_MAX)
+def _remember_transcript(path):
+    """Memoise where a session's transcript is, for _find_transcript, under
+    its full id: a card's 12-character prefix and the resolver's full id
+    then find the same entry, where each used to walk every project
+    folder for itself (2026-10-21)."""
+    session_id = os.path.basename(path)[:-len(".jsonl")]
+    _bounded_put(_TRANSCRIPT_PATHS, session_id, path, _TRANSCRIPT_PATHS_MAX)
 
 
 def _find_transcript(prefix, projects_dir=None):
@@ -1211,7 +1192,9 @@ def _find_transcript(prefix, projects_dir=None):
     session every couple of seconds while a thread view is open. Never
     raises."""
     with _CACHE_LOCK:
-        cached = _TRANSCRIPT_PATHS.get(prefix)
+        cached = _TRANSCRIPT_PATHS.get(prefix) or next(
+            (path for session_id, path in _TRANSCRIPT_PATHS.items()
+             if session_id.startswith(prefix)), None)
     if cached and os.path.exists(cached):
         return cached
     root = projects_dir or CLAUDE_PROJECTS
@@ -1224,7 +1207,7 @@ def _find_transcript(prefix, projects_dir=None):
                 if entry.endswith(".jsonl") and entry.startswith(prefix):
                     path = os.path.join(pdir, entry)
                     if projects_dir is None:
-                        _remember_transcript(prefix, path)
+                        _remember_transcript(path)
                     return path
     except OSError:
         pass
@@ -2196,7 +2179,7 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
             # that first open finds the transcript without walking every
             # project folder — and the thread state is already warm, parsed
             # just now for this row.
-            _remember_transcript(session_id[:12], path)
+            _remember_transcript(path)
         wake_at = (_THREAD_STATE.get(path) or {}).get("wake_at")
         state, reason = session_state(
             max(0, int(time.time() - mtime)), running_tool, running_tasks,
