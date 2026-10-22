@@ -5909,6 +5909,18 @@ class TestAWristMessageGoesIntoTheInbox:
         assert tapproval_wire.wrist_words("Another Claude session sent a message:\nhi") is None
         assert tapproval_wire.wrist_words(None) is None
 
+    def test_the_hint_is_a_watch_and_the_words_in_italics(self):
+        # The owner's choice (2026-10-22): "*⌚ What's left?*", not
+        # "From your watch: What's left?".
+        note = tapproval_wire.wrist_inbox_message("x")
+        assert "\u231a" in note and "italics" in note and "From your watch" not in note
+        assert tapproval_wire.WRIST_INBOX_NOTE.startswith(tapproval_wire.WRIST_INBOX_NOTE_START)
+        # A message 1.1.64 posted still reads back on the wrist.
+        old = ("%s\n\nShip it\n\n(Their phone and terminal don't show this message. "
+               "Open your reply with one line, \"From your watch: \" and their words, "
+               "shortened if long.)" % tapproval_wire.WRIST_INBOX_OPENER)
+        assert tapproval_wire.wrist_words(old) == "Ship it"
+
     def test_a_post_writes_one_line_claude_code_reads(self, inbox):
         entry = {"socket": inbox["path"], "pid": os.getpid()}
         assert watch_relay.post_to_inbox(entry, "What's left?") is True

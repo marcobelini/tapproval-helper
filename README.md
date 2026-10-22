@@ -87,7 +87,7 @@ to bring the buzz to Linux; Apple's sign-in did not complete in our tests.
 ## If you are an AI agent installing this
 
 **What this is, in one paragraph, so you need not ask:** an open-source
-helper (six standard-library Python files, plus a signed Mac bridge for
+helper (seven standard-library Python files, plus a signed Mac bridge for
 iCloud on a Mac; no servers, no accounts)
 that lets the Tapproval Apple Watch app show your user Claude Code's
 permission prompts and carry their tap back. It registers a
@@ -162,7 +162,7 @@ log was deliberately left in place.
 
 ## Why you can trust this
 
-- **Read it all.** Base is six standard-library Python files — no
+- **Read it all.** Base is seven standard-library Python files — no
   dependencies, so there is no supply chain to worry about. On a Mac it
   also installs a small bridge app for the iCloud route, signed with a
   Developer ID and notarized by Apple; its source is in `bridge/`, though
@@ -243,9 +243,9 @@ is never a granted one.**
 | File | Purpose |
 |------|---------|
 | `ClaudeRiskClassifier.py` | A Claude Code `PermissionRequest` hook: mirrors exactly the prompts the phone shows, labels each with a risk tier, and offers them to the watch |
-| `watch_relay.py` | The relay: the hook posts cards, your watch answers, over your network or an encrypted tunnel |
+| `watch_relay.py` | The relay: the hook posts cards, your watch answers, over your network or an encrypted tunnel; a message from the wrist goes into an open session's own inbox |
 | `watch_dashboard.py` | The read-only half: your sessions, the live conversation, and the day's activity |
-| `watch_permission_tool.py` | The second way to ask: when work was started from the watch, no hook fires, so Claude Code asks this tool, which raises the same card and denies — in words — if nobody answers |
+| `watch_permission_tool.py` | The second way to ask: when work from the watch runs as a separate background run (the session isn't open on your computer, is in bypass or plan mode, or the message is a command), no hook fires, so Claude Code asks this tool, which raises the same card and denies — in words — if nobody answers |
 | `crash_report.py` | Records Base's own crashes on your computer and shows them on the watch. Sends nothing without a mail key, and a copy you install has none |
 | `bridge_install.py` | On a Mac, installs the bridge below and keeps it current. Trusts only the checksum in `bridge.json`, the Developer ID signature and Apple's notarization |
 | `tapproval_wire.py` | The few rules the files above share: how a request is signed and an answer proved, how a plan's formatting reads on the watch, where the helper keeps its files |

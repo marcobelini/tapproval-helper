@@ -43,6 +43,13 @@ longer. A problem that is not yet fixed is not described in public.
   if it proves the key back.
 - **The audit log records command text** (with credential-shaped fragments
   redacted) and stays on your computer.
+- **A message from the wrist can become a turn of a session you have
+  open.** It is written to that session's inbox socket only if the socket
+  sits in Claude Code's own socket folder, is a real socket rather than a
+  link, is owned by you, and is held by that session's own process. It
+  then runs under that session's permission mode and hook. It is never
+  posted to a session in bypass or plan mode, and a command is never
+  posted there.
 - **Cards travel through your own private iCloud or an encrypted tunnel**
   when you are away from home. The tunnel carries them in transit only; in
   iCloud a card waits in your own private database until it is answered.

@@ -219,9 +219,14 @@ def unwrap(lines):
 # wrapping, which differs between versions.
 
 WRIST_INBOX_OPENER = "From the user's Apple Watch (Tapproval), in their own words:"
-WRIST_INBOX_NOTE = ("(Their phone and terminal don't show this message. Open your "
-                    "reply with one line, \"From your watch: \" and their words, "
-                    "shortened if long.)")
+# The note's opening stays the same from version to version: it is where
+# the wrist finds the end of the words, in this and older messages alike.
+WRIST_INBOX_NOTE_START = "(Their phone and terminal don't show this message."
+# A watch and the words in italics, the owner's choice of hint (2026-10-22;
+# 1.1.64 asked for "From your watch: ").
+WRIST_INBOX_NOTE = ("(Their phone and terminal don't show this message. Open "
+                    "your reply with one line: \u231a and their words in "
+                    "italics, shortened if long, like *\u231a What's left?*)")
 
 
 # Settings' "Short replies", which a headless run gets as Claude Code's
@@ -244,7 +249,7 @@ def wrist_words(content):
     if start < 0:
         return None
     rest = content[start + len(WRIST_INBOX_OPENER):]
-    end = rest.rfind(WRIST_INBOX_NOTE)
+    end = rest.rfind(WRIST_INBOX_NOTE_START)
     if end < 0:
         return None
     return rest[:end].strip() or None
