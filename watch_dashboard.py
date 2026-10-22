@@ -27,6 +27,8 @@ import threading
 import time
 from collections import OrderedDict
 
+import tapproval_wire as wire
+
 def _read_appended(path, offset, limit=None):
     """Lines appended since ``offset`` -> (lines, new_offset, shrunk).
     At most ``limit`` lines when given; the offset stops after the last.
@@ -1217,23 +1219,22 @@ def _find_transcript(prefix, projects_dir=None):
 # Markdown is noise at watch size. These turn Claude's replies into the
 # plain lines a 40mm screen can show: structure kept (one line per list
 # item or paragraph), markers gone.
-_MD_FENCE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)")
-_MD_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+")
-_MD_QUOTE = re.compile(r"^\s{0,3}>\s?")
-_MD_BULLET = re.compile(r"^(\s*)[-*+]\s+")
-_MD_NUMBER = re.compile(r"^\s*\d+[.)]\s+")
-_MD_HR = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
-_MD_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
-_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
-_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
-_MD_CODE = re.compile(r"`+([^`]*)`+")
-_MD_STRONG = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*"
-                        r"|(?<!\w)__(?=\S)(.+?)(?<=\S)__(?!\w)")
-_MD_EM = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])"
-                    r"|(?<!\w)_(?=\S)([^_\n]+?)(?<=\S)_(?!\w)")
-_MD_STRIKE = re.compile(r"~~(.+?)~~")
-_MD_HTML = re.compile(r"</?[a-zA-Z][^>]*>")
-_MD_ESCAPE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!>])")
+# The patterns are tapproval_wire's, the hook's too.
+_MD_FENCE = wire.MD_FENCE
+_MD_HEADING = wire.MD_HEADING
+_MD_QUOTE = wire.MD_QUOTE
+_MD_BULLET = wire.MD_BULLET
+_MD_NUMBER = wire.MD_NUMBER
+_MD_HR = wire.MD_HR
+_MD_TABLE_SEP = wire.MD_TABLE_SEP
+_MD_IMAGE = wire.MD_IMAGE
+_MD_LINK = wire.MD_LINK
+_MD_CODE = wire.MD_CODE
+_MD_STRONG = wire.MD_STRONG
+_MD_EM = wire.MD_EM
+_MD_STRIKE = wire.MD_STRIKE
+_MD_HTML = wire.MD_HTML
+_MD_ESCAPE = wire.MD_ESCAPE
 
 
 def blocks(markdown, always=False):
@@ -1302,57 +1303,10 @@ def blocks(markdown, always=False):
     return out
 
 
-def _flatten_line(line, keep_inline=False):
-    """One Markdown line reduced to what it says: the one list of rules
-    plain_text and _marked_lines both apply. They were two copies of the
-    same thirteen substitutions, and a rule added to one would have made
-    the wrist show the same reply two ways. ``keep_inline`` leaves code,
-    emphasis and strike marks for a caller that styles them itself."""
-    line = _MD_HEADING.sub("", line)
-    line = _MD_QUOTE.sub("", line)
-    line = _MD_BULLET.sub(r"\1• ", line)
-    if line.lstrip().startswith("|"):
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        line = " · ".join(c for c in cells if c)
-    line = _MD_IMAGE.sub(r"\1", line)
-    line = _MD_LINK.sub(r"\1", line)
-    if not keep_inline:
-        line = _MD_CODE.sub(r"\1", line)
-        line = _MD_STRONG.sub(lambda m: m.group(1) or m.group(2), line)
-        line = _MD_EM.sub(lambda m: m.group(1) or m.group(2), line)
-        line = _MD_STRIKE.sub(r"\1", line)
-    line = _MD_HTML.sub("", line)
-    return _MD_ESCAPE.sub(r"\1", line)
-
-
-def _unwrap(lines):
-    """Markdown lines with each wrapped paragraph or point joined into one
-    line, as Markdown itself reads them: the watch draws a line at a time,
-    so a ``**bold**`` split by a hard wrap showed its asterisks (the
-    owner's wrist, 2026-10-14). The hook's ``_unwrap`` is the same rule;
-    TestWrappedLinesAreOneLine holds the two copies together."""
-    out, joinable, in_fence = [], False, False
-    for raw in lines:
-        if _MD_FENCE.match(raw):
-            in_fence, joinable = not in_fence, False
-            out.append(raw)
-            continue
-        closed = (not raw.strip() or in_fence or _MD_HEADING.match(raw)
-                  or _MD_HR.match(raw) or _MD_TABLE_SEP.match(raw)
-                  or raw.lstrip().startswith("|"))
-        opens = _MD_BULLET.match(raw) or _MD_NUMBER.match(raw) or _MD_QUOTE.match(raw)
-        if joinable and not (closed or opens):
-            out[-1] = out[-1].rstrip() + " " + raw.strip()
-        else:
-            out.append(raw)
-            joinable = not closed
-        # A hard break — a trailing backslash or two spaces — is a line
-        # break the writer asked for, never a wrap; its backslash is markup.
-        if joinable and (out[-1].endswith("  ") or out[-1].endswith("\\")):
-            end = out[-1].rstrip(" ")
-            out[-1] = (end[:-1] if end.endswith("\\") else end).rstrip()
-            joinable = False
-    return out
+# One line read, and wrapped lines joined: tapproval_wire's rules, which the
+# hook's plan card applies too.
+_flatten_line = wire.flatten_line
+_unwrap = wire.unwrap
 
 
 def _marked_lines(lines):

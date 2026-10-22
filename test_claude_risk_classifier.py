@@ -47,6 +47,7 @@ import crash_report
 import watch_permission_tool as wpt
 import watch_relay
 import watch_dashboard
+import tapproval_wire
 
 import ClaudeRiskClassifier as crc
 from ClaudeRiskClassifier import Risk
@@ -3375,6 +3376,19 @@ class TestSigningVectors:
             assert watch_relay.seal(key, nonce, p["secret"]) == p["sealed"]
         with watch_relay._NONCE_LOCK:
             watch_relay._SEEN_NONCES.clear()
+
+    def test_the_hook_makes_every_v2_vector(self):
+        """The hook signs only v2, so it is held to the v2 vectors the watch
+        and the bridge are, and to every proof it checks an answer by."""
+        v = _signing_vectors()
+        key, nonce, stamp = v["key"], v["nonce"], v["stamp"]
+        v2 = [s for s in v["signatures"] if s["query"] is not None]
+        assert v2
+        for s in v2:
+            assert crc._relay_signature(key, s["method"], s["path"], stamp, nonce,
+                                        s["body"].encode("utf-8"), s["query"]) == s["mac"], s["name"]
+        for p in v["proofs2"]:
+            assert crc._relay_proof2(key, nonce, p["status"], p["body"].encode("utf-8")) == p["proof2"]
 
     def test_the_vectors_cover_both_versions_and_every_proof(self):
         v = _signing_vectors()
@@ -7051,15 +7065,19 @@ class TestThePlanKeepsItsFormatting:
         assert marked.endswith("\n\n" + crc.PLAN_CONTINUES)
         assert marked.count("**") % 2 == 0 and marked.count("`") % 2 == 0
 
-    def test_one_reading_of_a_line_on_both_sides_of_the_mac(self):
-        # The thread's replies and a plan card read Markdown by the same
-        # rules; the hook carries its own copy (it must run alone), so the
-        # two are held together here rather than by memory.
-        for line in ("- **bold** and *em* with `code`", "  * nested ~~gone~~ item",
-                     "> a quote with [a link](https://x.y)", "plain \\*escaped\\*",
-                     "<b>html</b> stays words", "| a | b |"):
-            assert crc._plan_marked_line(line).strip() == \
-                watch_dashboard._flatten_line(line, keep_inline=True).strip(), line
+    @pytest.mark.parametrize("line, read", [
+        ("- **bold** and *em* with `code`", "• **bold** and *em* with `code`"),
+        ("  * nested ~~gone~~ item", "  • nested ~~gone~~ item"),
+        ("> a quote with [a link](https://x.y)", "a quote with a link"),
+        ("plain \\*escaped\\*", "plain *escaped*"),
+        ("<b>html</b> stays words", "html stays words"),
+        ("| a | b |", "a · b"),
+    ])
+    def test_one_reading_of_a_line_on_both_sides_of_the_mac(self, line, read):
+        """A plan card and a reply in the thread read Markdown alike, by
+        tapproval_wire's rules (#731): marks kept, block markup read."""
+        assert crc._plan_marked(line) == read
+        assert watch_dashboard._marked_lines([line]) == read
 
 
 class TestWrappedLinesAreOneLine:
@@ -7129,10 +7147,79 @@ class TestWrappedLinesAreOneLine:
         assert text.splitlines()[1:] == want
 
     def test_one_rule_on_both_sides_of_the_mac(self):
-        # The hook carries its own copy (it must run alone).
-        for md in (self.PLAN, "a\\\nb  \nc\nd"):
-            lines = md.splitlines()
-            assert crc._unwrap(lines) == watch_dashboard._unwrap(lines)
+        """The hook and the dashboard used to carry a copy each, held equal
+        by a test. They share tapproval_wire's now (#731); a copy that came
+        back would be free to drift again."""
+        assert tapproval_wire.unwrap("a\\\nb  \nc\nd".splitlines()) == ["a", "b", "c d"]
+        for module in (crc, watch_dashboard):
+            with open(module.__file__, encoding="utf-8") as handle:
+                source = handle.read()
+            assert "def _unwrap(" not in source and "def _flatten_line(" not in source
+            assert "_PM_" not in source and "re.compile(r\"^\\s*(`{3,}" not in source
+
+
+class TestTheSharedWireModule:
+    """tapproval_wire holds what the hook, the relay and the dashboard must
+    agree on (#731). The hook imports it on every prompt, so it must stay
+    small, standard library only, and do nothing at import; and a helper
+    folder that somehow lacks it must leave the question with the person."""
+
+    def _tree(self):
+        with open(tapproval_wire.__file__, encoding="utf-8") as handle:
+            return ast.parse(handle.read())
+
+    def test_it_imports_only_the_standard_library(self):
+        names = set()
+        for node in ast.walk(self._tree()):
+            if isinstance(node, ast.Import):
+                names |= {alias.name.split(".")[0] for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names.add(node.module.split(".")[0])
+        # Named, not looked up: sys.stdlib_module_names is 3.10+, and CI runs
+        # the suite on older interpreters too. A new import here is a choice.
+        assert names == {"__future__", "hashlib", "json", "os", "re", "hmac", "urllib"}, names
+
+    def test_it_does_nothing_at_import_but_name_things(self):
+        """Top level: the docstring, imports, functions, and constants that
+        are literals or compiled patterns. Nothing that reads a file, a
+        clock or the network while a prompt waits."""
+        for node in self._tree().body:
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef)):
+                continue
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+                continue                                    # the docstring
+            assert isinstance(node, ast.Assign), ast.dump(node)[:120]
+            value = node.value
+            ok = isinstance(value, ast.Constant) or (
+                isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+                and isinstance(value.func.value, ast.Name)
+                and (value.func.value.id, value.func.attr) == ("re", "compile"))
+            assert ok, ast.dump(node)[:120]
+
+    def test_a_hook_without_it_leaves_the_question_with_the_person(self, tmp_path):
+        """No decision on stdout and a failing exit: Claude Code then asks
+        in the terminal, as it does whenever no hook answers (fail closed)."""
+        import shutil
+        shutil.copy(crc.__file__, tmp_path / "ClaudeRiskClassifier.py")
+        event = {"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                 "tool_input": {"command": "ls"}, "cwd": str(tmp_path)}
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_RISK_")}
+        env.update(CLAUDE_SETTINGS_PATH=str(tmp_path / "settings.json"),
+                   CLAUDE_RISK_AUDIT_LOG=str(tmp_path / "audit.jsonl"),
+                   PYTHONPATH="", HOME=str(tmp_path))
+        done = subprocess.run([sys.executable, "-I", str(tmp_path / "ClaudeRiskClassifier.py")],
+                              input=json.dumps(event), capture_output=True, text=True,
+                              env=env, timeout=30, cwd=str(tmp_path))
+        assert done.returncode != 0
+        assert done.stdout.strip() == "", "no decision may be printed"
+        assert "tapproval_wire" in done.stderr
+
+    def test_the_hook_and_the_relay_share_it_rather_than_copy_it(self):
+        assert crc.wire is tapproval_wire and watch_relay.wire is tapproval_wire
+        assert watch_relay.sign_request is tapproval_wire.sign_request
+        assert crc._relay_proof2 is tapproval_wire.relay_proof2
+        with open(crc.__file__, encoding="utf-8") as handle:
+            assert "hmac.new(" not in handle.read(), "the hook signs through the wire"
 
 
 class TestPhoneVocabulary:
@@ -9050,10 +9137,15 @@ class TestOneValueEverywhere:
         places = [os.path.expanduser(name) for name in re.findall(r'"([^"]+)"', listed)]
         assert places == [os.path.expanduser("~/.tapproval/data/auth.json"),
                           os.path.expanduser("~/.tapproval-auth.json")]
-        # The suite moves AUTH_FILE into a temporary home, so read the source.
+        # The suite moves AUTH_FILE into a temporary home, so read the source:
+        # the hook's new place and its old one must be the bridge's two.
         with open(os.path.join(_ROOT, "ClaudeRiskClassifier.py"), encoding="utf-8") as handle:
-            owned = re.search(r'^AUTH_FILE = os\.path\.expanduser\("([^"]+)"\)', handle.read(), re.M).group(1)
-        assert os.path.expanduser(owned) in places
+            call = re.search(r'^AUTH_FILE = wire\.home_file\("([^"]+)", "([^"]+)", "([^"]+)",'
+                             r'\s*os\.path\.expanduser\("([^"]+)"\), os\.path\.expanduser\("([^"]+)"\)\)',
+                             handle.read(), re.M)
+        folder, name, legacy, home, loose = call.groups()
+        assert [os.path.expanduser(os.path.join(home, folder, name)),
+                os.path.expanduser(os.path.join(loose, legacy))] == places
 
     def test_uninstall_stops_the_tunnel_the_relay_starts(self):
         with open(os.path.join(_ROOT, "uninstall.sh"), encoding="utf-8") as handle:
@@ -17316,14 +17408,17 @@ class TestTheHookBelievesOnlyItsRelay:
             server.server_close()
 
     def test_the_hook_signs_as_the_relay_checks(self):
-        """The hook carries its own copy of the relay's signing, because
-        importing the relay costs it 0.4-1.5 s a prompt. Held equal here."""
+        """Known bytes, not one copy against another: the hook and the relay
+        sign with the same function since #731, so comparing them would
+        prove nothing. The hook always signs v2, the empty query included."""
         body = "{\"card\": {\"headline\": \"Æblegrød\"}}".encode("utf-8")
         assert crc._relay_signature("k", "POST", "/card", 1700000000, "n" * 32, body) == \
-            watch_relay.sign_request("k", "POST", "/card", 1700000000, "n" * 32, body,
-                                     query="")
+            "f6439ba9e0685bc76ae6b8ef4fc97670189935df90c48bbec8b68d73a77966fa"
         assert crc._relay_proof2("k", "n" * 32, 200, body) == \
-            watch_relay.relay_proof2("k", "n" * 32, 200, body)
+            "a6d9ccf1760eed7bc5f27a6eb78fba4adc642321bc42d49b28d5b5ab7c100f43"
+        assert crc._relay_signature("k", "POST", "/card", 1700000000, "n" * 32, body) != \
+            watch_relay.sign_request("k", "POST", "/card", 1700000000, "n" * 32, body), \
+            "v1 leaves the query out; the hook must not"
 
     def test_the_relay_hears_the_hook_and_proves_itself(self, live_relay):
         port, queue = live_relay

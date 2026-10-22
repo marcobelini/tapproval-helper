@@ -76,6 +76,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from enum import IntEnum
 
+import tapproval_wire as wire
+
 # argparse, shutil and tempfile are imported where they are used. They
 # serve the installer and the CLI only, and this module is a hook that
 # starts once per tool call, on a path that never touches them. (shlex is
@@ -108,7 +110,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.62"
+__version__ = "1.1.63"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -131,9 +133,8 @@ RELAY_PORT = 8977
 # that relay's own file. It lives in ~/.tapproval/data since 1.1.60; the
 # relay moves the old ~/.tapproval-auth.json there once the Mac bridge can
 # read it, and until then the old place is the file (watch_relay.home_file).
-AUTH_FILE = os.path.expanduser("~/.tapproval/data/auth.json")
-if not os.path.exists(AUTH_FILE) and os.path.exists(os.path.expanduser("~/.tapproval-auth.json")):
-    AUTH_FILE = os.path.expanduser("~/.tapproval-auth.json")
+AUTH_FILE = wire.home_file("data", "auth.json", ".tapproval-auth.json",
+                           os.path.expanduser("~/.tapproval"), os.path.expanduser("~"))
 
 # The wrist card's two budgets. DEFAULT_POLICY quotes these, and the policy
 # file may override them; wrist_card() falls back to them when it does not.
@@ -1725,7 +1726,7 @@ def _plan_plain(plan):
     gone, the line structure kept. Headings, bullets and numbers stay as
     words; code keeps its text without the fences."""
     lines = []
-    for raw in _unwrap(str(plan or "").splitlines()):
+    for raw in wire.unwrap(str(plan or "").splitlines()):
         line = raw.strip()
         if line.startswith("```"):
             continue
@@ -1739,69 +1740,9 @@ def _plan_plain(plan):
     return "\n".join(lines).strip()
 
 
-# The Markdown a plan card keeps for a watch that renders it: the same
-# reading as watch_dashboard._flatten_line(keep_inline=True) gives a reply,
-# copied because the hook runs alone (TestThePlanKeepsItsFormatting holds
-# the two copies together). Headings, nesting and code are the plan's own.
-_PM_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
-_PM_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+")
-_PM_QUOTE = re.compile(r"^\s{0,3}>\s?")
-_PM_BULLET = re.compile(r"^(\s*)[-*+]\s+")
-_PM_NUMBER = re.compile(r"^\s*\d+[.)]\s+")
-_PM_HR = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
-_PM_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
-_PM_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
-_PM_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
-_PM_HTML = re.compile(r"</?[a-zA-Z][^>]*>")
-_PM_ESCAPE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!>])")
-
-
-def _plan_marked_line(line):
-    """One plan line with its block markup read and its inline marks
-    (bold, emphasis, code, strike) left for the watch to draw."""
-    line = _PM_HEADING.sub("", line)
-    line = _PM_QUOTE.sub("", line)
-    line = _PM_BULLET.sub(r"\1• ", line)
-    if line.lstrip().startswith("|"):
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        line = " · ".join(c for c in cells if c)
-    line = _PM_IMAGE.sub(r"\1", line)
-    line = _PM_LINK.sub(r"\1", line)
-    line = _PM_HTML.sub("", line)
-    return _PM_ESCAPE.sub(r"\1", line)
-
-
-def _unwrap(lines):
-    """Markdown lines with each wrapped paragraph or point joined into one
-    line, as Markdown itself reads them. The watch draws a line at a time,
-    so a ``**bold**`` opened on one line of a hard-wrapped plan and closed
-    on the next showed its asterisks (the owner's wrist, 2026-10-14). A
-    line that starts something of its own — a heading, a point, a quote, a
-    table row, a rule, a fence — is never joined, and nothing joins onto a
-    heading, a table row or code. watch_dashboard carries the same rule for
-    replies; TestWrappedLinesAreOneLine holds the two copies together."""
-    out, joinable, in_fence = [], False, False
-    for raw in lines:
-        if _PM_FENCE.match(raw):
-            in_fence, joinable = not in_fence, False
-            out.append(raw)
-            continue
-        closed = (not raw.strip() or in_fence or _PM_HEADING.match(raw)
-                  or _PM_HR.match(raw) or _PM_TABLE_SEP.match(raw)
-                  or raw.lstrip().startswith("|"))
-        opens = _PM_BULLET.match(raw) or _PM_NUMBER.match(raw) or _PM_QUOTE.match(raw)
-        if joinable and not (closed or opens):
-            out[-1] = out[-1].rstrip() + " " + raw.strip()
-        else:
-            out.append(raw)
-            joinable = not closed
-        # A hard break — a trailing backslash or two spaces — is a line
-        # break the writer asked for, never a wrap; its backslash is markup.
-        if joinable and (out[-1].endswith("  ") or out[-1].endswith("\\")):
-            end = out[-1].rstrip(" ")
-            out[-1] = (end[:-1] if end.endswith("\\") else end).rstrip()
-            joinable = False
-    return out
+# A plan card keeps the Markdown a watch that renders it can draw: the same
+# reading tapproval_wire gives a reply in the dashboard. Headings, nesting
+# and code are the plan's own.
 
 
 def _plan_marked(plan):
@@ -1810,8 +1751,8 @@ def _plan_marked(plan):
     are set apart as code, and bold stays bold (2026-10-11). A paragraph
     wrapped over several lines is one line (``_unwrap``)."""
     lines, in_fence = [], False
-    for raw in _unwrap(str(plan or "").expandtabs(4).splitlines()):
-        if _PM_FENCE.match(raw):
+    for raw in wire.unwrap(str(plan or "").expandtabs(4).splitlines()):
+        if wire.MD_FENCE.match(raw):
             in_fence = not in_fence
             continue
         if in_fence:
@@ -1819,18 +1760,18 @@ def _plan_marked(plan):
             if code:
                 lines.append("  " + (code if "`" in code else "`%s`" % code))
             continue
-        if not raw.strip() or _PM_HR.match(raw) or _PM_TABLE_SEP.match(raw):
+        if not raw.strip() or wire.MD_HR.match(raw) or wire.MD_TABLE_SEP.match(raw):
             if not raw.strip() and lines and lines[-1]:
                 lines.append("")
             continue
-        text = _plan_marked_line(raw).strip()
+        text = wire.flatten_line(raw, keep_inline=True).strip()
         if not text:
             continue
-        if _PM_HEADING.match(raw):
+        if wire.MD_HEADING.match(raw):
             text = "**%s**" % text.replace("**", "")
             if lines and lines[-1]:
                 lines.append("")   # set apart, as the phone sets it
-        elif _PM_BULLET.match(raw) or _PM_NUMBER.match(raw):
+        elif wire.MD_BULLET.match(raw) or wire.MD_NUMBER.match(raw):
             depth = (len(raw) - len(raw.lstrip(" "))) // 2
             text = "  " * min(depth, 3) + text
         lines.append(text)
@@ -2574,31 +2515,16 @@ def _relay_wait(policy):
 def _relay_key(policy):
     """The bootstrap out of the relay's key file, or "" when there is none
     to read: no key, no card (the relay refuses an unsigned one)."""
-    path = os.path.expanduser(str(policy.get("auth_file") or AUTH_FILE))
-    try:
-        with open(path, encoding="utf-8") as handle:
-            return str(json.load(handle).get("bootstrap") or "")
-    except (OSError, ValueError, AttributeError):
-        return ""
+    return wire.read_bootstrap(os.path.expanduser(str(policy.get("auth_file") or AUTH_FILE)))
 
 
-# The relay's own signing (watch_relay.sign_request, v2, and relay_proof2),
-# written once more here: importing the relay costs the hook 0.4-1.5 s on
-# every prompt. TestTheHookSignsAsTheRelayChecks holds the two equal.
+# The hook always signs v2, the query included even when empty: the
+# relay's own rule (tapproval_wire), not a copy of it.
 def _relay_signature(key, method, path, stamp, nonce, body, query=""):
-    import hmac
-    message = "\n".join([method.upper(), path, query, str(stamp), nonce,
-                         hashlib.sha256(body or b"").hexdigest()])
-    return hmac.new(key.encode("utf-8"), message.encode("utf-8"),
-                    hashlib.sha256).hexdigest()
+    return wire.sign_request(key, method, path, stamp, nonce, body, query=query)
 
 
-def _relay_proof2(key, nonce, status, body):
-    import hmac
-    message = "tapproval-proof2\n%s\n%d\n%s" % (
-        nonce, int(status), hashlib.sha256(body or b"").hexdigest())
-    return hmac.new(key.encode("utf-8"), message.encode("utf-8"),
-                    hashlib.sha256).hexdigest()
+_relay_proof2 = wire.relay_proof2
 
 
 def ask_watch(card, policy, project=None):
@@ -2641,7 +2567,7 @@ def ask_watch(card, policy, project=None):
     request = urllib.request.Request(
         url, data=body,
         headers={"Content-Type": "application/json",
-                 "X-Tapproval-Signature": "v2 %d %s %s" % (stamp, nonce, mac)})
+                 "X-Tapproval-Signature": wire.signature_header(stamp, nonce, mac)})
     try:
         with urllib.request.urlopen(request, timeout=wait + 3.0) as reply:
             raw = reply.read()
@@ -4281,7 +4207,7 @@ def _relay_json(path, timeout=1):
             stamp, nonce = int(time.time()), uuid.uuid4().hex
             mac = _relay_signature(key, "GET", urllib.parse.unquote(split.path),
                                    stamp, nonce, b"", split.query)
-            headers["X-Tapproval-Signature"] = "v2 %d %s %s" % (stamp, nonce, mac)
+            headers["X-Tapproval-Signature"] = wire.signature_header(stamp, nonce, mac)
         request = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(request, timeout=timeout) as reply:
             return json.loads(reply.read())
@@ -4295,20 +4221,7 @@ def _away_answers(url):
     answer; Cloudflare's own error pages are HTML. None when unknown."""
     if not url:
         return None
-    try:
-        import urllib.error
-        import urllib.request
-        request = urllib.request.Request(url.rstrip("/") + "/health",
-                                         headers={"User-Agent": "Tapproval-status"})
-        try:
-            with urllib.request.urlopen(request, timeout=8) as reply:
-                status, ctype = reply.status, reply.headers.get("Content-Type", "")
-        except urllib.error.HTTPError as error:
-            status = error.code
-            ctype = error.headers.get("Content-Type", "") if error.headers else ""
-        return status in (200, 401, 403) and "json" in (ctype or "")
-    except Exception:
-        return False
+    return wire.answers_as_relay(url.rstrip("/") + "/health", 8, "Tapproval-status")
 
 
 RELAY_LOG_PATH = "~/.tapproval/logs/relay.log"

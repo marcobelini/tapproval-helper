@@ -248,6 +248,7 @@ is never a granted one.**
 | `watch_permission_tool.py` | The second way to ask: when work was started from the watch, no hook fires, so Claude Code asks this tool, which raises the same card and denies — in words — if nobody answers |
 | `crash_report.py` | Records Base's own crashes on your computer and shows them on the watch. Sends nothing without a mail key, and a copy you install has none |
 | `bridge_install.py` | On a Mac, installs the bridge below and keeps it current. Trusts only the checksum in `bridge.json`, the Developer ID signature and Apple's notarization |
+| `tapproval_wire.py` | The few rules the files above share: how a request is signed and an answer proved, how a plan's formatting reads on the watch, where the helper keeps its files |
 | `bridge/` | The Mac bridge's Swift source, and the signed, notarized build of it that the helper installs |
 | `bridge.json` | Pins that build: its version, its place in `bridge/` and its SHA-256 |
 | `install.sh` / `uninstall.sh` | The one-command installer above, and its way out |

@@ -72,6 +72,8 @@ import uuid
 from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import tapproval_wire as wire
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8977          # also referenced by the classifier's --watch/--status
 TUNNEL_PORT = 8978
@@ -88,11 +90,7 @@ LEGACY_HOME = os.path.expanduser("~")
 def home_file(folder, name, legacy):
     """Where one of the helper's files is: ~/.tapproval/<folder>/<name>,
     unless only the old loose file ~/<legacy> exists yet."""
-    new = os.path.join(TAPPROVAL_DIR, folder, name)
-    old = os.path.join(LEGACY_HOME, legacy)
-    if not os.path.exists(new) and os.path.exists(old):
-        return old
-    return new
+    return wire.home_file(folder, name, legacy, TAPPROVAL_DIR, LEGACY_HOME)
 
 
 # Every file the helper once left loose in the home folder: (folder, name,
@@ -682,16 +680,12 @@ def _admin_signature(path, body, auth_file=None):
     """The headers proving this user holds the key file, signed with the
     bootstrap so the key itself never travels; {} if it cannot be read,
     and the relay decides what an unproven caller may do."""
-    try:
-        with open(auth_file or AUTH_FILE, encoding="utf-8") as handle:
-            bootstrap = str(json.load(handle).get("bootstrap") or "")
-    except (OSError, ValueError, AttributeError):
-        return {}
+    bootstrap = wire.read_bootstrap(auth_file or AUTH_FILE)
     if not bootstrap:
         return {}
     stamp, nonce = int(time.time()), uuid.uuid4().hex
     mac = sign_request(bootstrap, "POST", path, stamp, nonce, body, query="")
-    return {"X-Tapproval-Signature": "v2 %d %s %s" % (stamp, nonce, mac)}
+    return {"X-Tapproval-Signature": wire.signature_header(stamp, nonce, mac)}
 
 
 def _admin_call(path, timeout=5):
@@ -2711,44 +2705,12 @@ _SEEN_NONCES = OrderedDict()
 _NONCE_LOCK = threading.Lock()
 
 
-def _signature_message(method, path, stamp, nonce, body, query=None):
-    """v1 covers method, path, time, nonce and body; v2 (``query`` given,
-    even empty) adds the raw query string, which v1 left open: a signed
-    request for `?id=A` could be sent on as `?id=B` (2026-09-30 review)."""
-    import hashlib
-    parts = [str(method).upper(), str(path)]
-    if query is not None:
-        parts.append(str(query))
-    parts += [str(stamp), str(nonce), hashlib.sha256(body or b"").hexdigest()]
-    return "\n".join(parts).encode("utf-8")
-
-
-def sign_request(token, method, path, stamp, nonce, body=b"", query=None):
-    import hashlib
-    return hmac.new(str(token).encode("utf-8"),
-                    _signature_message(method, path, stamp, nonce, body, query),
-                    hashlib.sha256).hexdigest()
-
-
-def relay_proof(token, nonce):
-    """What the relay answers a signed request with: only a holder of the
-    same key can produce it for this nonce."""
-    import hashlib
-    return hmac.new(str(token).encode("utf-8"),
-                    ("tapproval-proof\n%s" % nonce).encode("utf-8"),
-                    hashlib.sha256).hexdigest()
-
-
-def relay_proof2(token, nonce, status, body):
-    """The proof over the answer itself: the nonce, the status and the
-    SHA-256 of the body. relay_proof names only the nonce, so a proof
-    could be kept while the body under it was rewritten (2026-09-30
-    review). A watch that has seen this header requires it from then on."""
-    import hashlib
-    message = "tapproval-proof2\n%s\n%d\n%s" % (
-        nonce, int(status), hashlib.sha256(body or b"").hexdigest())
-    return hmac.new(str(token).encode("utf-8"), message.encode("utf-8"),
-                    hashlib.sha256).hexdigest()
+# The message, the signature and both proofs are tapproval_wire's, the
+# hook's too: one rule, not two copies held equal by a test.
+_signature_message = wire.signature_message
+sign_request = wire.sign_request
+relay_proof = wire.relay_proof
+relay_proof2 = wire.relay_proof2
 
 
 def seal(token, nonce, secret):
@@ -4572,17 +4534,8 @@ def _tunnel_answers(url, token):
     with nothing behind it (or no tunnel at all) in HTML: 502, 530. Never
     raises.
     """
-    request = urllib.request.Request("%s/t/%s/health" % (url, token),
-                                     headers={"User-Agent": "Tapproval-helper"})
-    try:
-        with urllib.request.urlopen(request, timeout=10) as reply:
-            status, ctype = reply.status, reply.headers.get("Content-Type", "")
-    except urllib.error.HTTPError as error:
-        status = error.code
-        ctype = error.headers.get("Content-Type", "") if error.headers else ""
-    except Exception:
-        return False
-    return status in (200, 401, 403) and "json" in (ctype or "")
+    return wire.answers_as_relay("%s/t/%s/health" % (url, token), 10,
+                                 "Tapproval-helper")
 
 
 # The edge needs a moment after a relay handover: cloudflared has been
