@@ -1361,8 +1361,8 @@ try:
         inbox_ready,
         _json_object, _message_of, _parse_thread, _read_appended,
         project_root, prompts_at_the_mac, recent_sessions, resolve_session,
-        session_registry, session_state, shape, thread_tool_id, thread_wake_at,
-        transcript_origin, transcripts_newest_first,
+        session_registry, session_state, shape, thread_after, thread_tool_id,
+        thread_wake_at, transcript_origin, transcripts_newest_first,
         THREAD_TURN_LIMIT, usage_summary)
 except Exception as _error:  # noqa: BLE001 — any import-time failure, not only ImportError
     _DASHBOARD_ERROR = "%s: %s" % (type(_error).__name__, _error)
@@ -1372,9 +1372,9 @@ except Exception as _error:  # noqa: BLE001 — any import-time failure, not onl
 
     (activity_summary, recap_summary, _find_transcript, image_bytes, _json_object,
      _message_of, _parse_thread, _read_appended, project_root, prompts_at_the_mac,
-     recent_sessions, resolve_session, session_state, shape, thread_tool_id,
-     thread_wake_at, transcript_origin, transcripts_newest_first,
-     usage_summary) = (_dashboard_unavailable,) * 19
+     recent_sessions, resolve_session, session_state, shape, thread_after,
+     thread_tool_id, thread_wake_at, transcript_origin, transcripts_newest_first,
+     usage_summary) = (_dashboard_unavailable,) * 20
 
     def card_session_title(_session_id):
         return None             # an unknown title: the card goes out as it came
@@ -1818,6 +1818,54 @@ def session_is_waiting(session_id):
         return False
     last = turns[-1]
     return last.get("role") == "assistant" and last.get("kind") in (None, "text")
+
+
+# How long a watch's question about its open thread may be held while
+# nothing happens, and how often the transcript is looked at meanwhile.
+# Holding the question is what makes the wrist quick: an answer leaves the
+# moment its line is written, not at the watch's next 2.5 s look, and a
+# quiet thread costs the watch three questions a minute instead of 24.
+# Under cloudflared's 100 s, and well inside the watch's own timeout.
+THREAD_WAIT_MAX = 20.0
+THREAD_WAIT_STEP = 0.25
+# Questions held at once, across every watch. One more is answered at
+# once, as before, so no device can tie up the relay's threads.
+_THREAD_WAITERS = threading.BoundedSemaphore(8)
+
+
+def _query_number(query, name, kind):
+    """``query[name]`` as ``kind``, or None when absent or not a number."""
+    try:
+        value = kind((query.get(name) or [""])[0])
+    except (TypeError, ValueError):
+        return None
+    return value if value == value and value >= 0 else None   # no NaN, no negatives
+
+
+def thread_news(path, mark, wait, still=lambda: True):
+    """``thread_after(path, mark)``, held up to ``wait`` seconds (at most
+    THREAD_WAIT_MAX) while it has nothing to say and ``still()`` holds.
+    The thread's lock is taken per look, never across the wait."""
+    news = thread_after(path, mark)
+    if news[0] or news[4] or wait <= 0:
+        return news
+    if not _THREAD_WAITERS.acquire(blocking=False):
+        return news
+    try:
+        give_up = time.monotonic() + min(wait, THREAD_WAIT_MAX)
+        while time.monotonic() < give_up and still():
+            time.sleep(THREAD_WAIT_STEP)
+            try:
+                if os.path.getsize(path) == mark:
+                    continue
+            except OSError:
+                break
+            news = thread_after(path, mark)
+            if news[0] or news[4]:
+                break
+        return news
+    finally:
+        _THREAD_WAITERS.release()
 
 
 def type_into_session(session_id, text, registry):
@@ -3539,32 +3587,52 @@ class RelayHandler(BaseHTTPRequestHandler):
         session_id = (query.get("id", [""])[0] or "")[:64]
         turns, active, running, tool_now = [], None, 0, None
         path_on_disk = _find_transcript(session_id) if session_id else None
+        # A watch from 2.0 on says how far it has read (`after`) and how
+        # long it will wait for more (`wait`); one before it asks for the
+        # newest 14 and is answered exactly as it always was.
+        mark = _query_number(query, "after", int)
+        news = None
+
+        def card_is_waiting():
+            return bool(session_id) and any(
+                str(card.get("session_id") or "").startswith(session_id)
+                for card in self.queue.pending())
+        card_waiting = card_is_waiting()
         if path_on_disk:
+            if mark is None:
+                turns, running, tool_now = _parse_thread(
+                    path_on_disk, THREAD_TURN_LIMIT)
+            else:
+                wait = _query_number(query, "wait", float) or 0.0
+                news = thread_news(path_on_disk, mark, wait,
+                                   lambda: card_is_waiting() == card_waiting)
+                turns, running, tool_now = news[:3]
+                card_waiting = card_is_waiting()
             try:
-                # Freshness first — the watch shows a "working" pulse
-                # while Claude is actually writing.
+                # Freshness after any wait — the watch shows a "working"
+                # pulse while Claude is actually writing.
                 active = max(0, int(time.time()
                                     - os.path.getmtime(path_on_disk)))
             except OSError:
                 pass
-            turns, running, tool_now = _parse_thread(
-                path_on_disk, THREAD_TURN_LIMIT)
+        elif mark is not None:
+            news = ([], 0, None, 0, True)
         # The same state the session list shows, for the thread's header.
-        card_waiting = bool(session_id) and any(
-            str(card.get("session_id") or "").startswith(session_id)
-            for card in self.queue.pending())
         wake_at = thread_wake_at(path_on_disk)
         state, reason = session_state(
             active, tool_now, running, card_waiting,
             bool(path_on_disk) and thread_tool_id(path_on_disk) in prompts_at_the_mac(),
             wake_at=wake_at)
-        self._send_json({"turns": turns,
-                         "running_tasks": running,
-                         "running_tool": tool_now,
-                         "modified_seconds_ago": active,
-                         "state": state,
-                         "state_reason": reason,
-                         "wake_at": int(wake_at) if state == "scheduled" else None})
+        reply = {"turns": turns,
+                 "running_tasks": running,
+                 "running_tool": tool_now,
+                 "modified_seconds_ago": active,
+                 "state": state,
+                 "state_reason": reason,
+                 "wake_at": int(wake_at) if state == "scheduled" else None}
+        if news is not None:
+            reply["mark"], reply["reset"] = news[3], news[4]
+        self._send_json(reply)
 
     def _get_tunnel(self, path, query):
         # LAN only: hand the watch its away-addresses while it's home.

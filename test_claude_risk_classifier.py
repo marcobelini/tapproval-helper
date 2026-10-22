@@ -12126,6 +12126,51 @@ class TestRelayRoutes:
         status, body = self._call(base + "/thread?id=dddd4444", token=auth.bootstrap)
         assert (body["state"], body["state_reason"]) == ("asking", "card")
 
+    def test_a_watch_that_catches_up_is_answered_the_moment_a_line_lands(
+            self, relay, monkeypatch, tmp_path):
+        """2026-10-22: the watch asked every 2.5 s, so an answer waited on
+        the wrist for up to that long. A held question is answered when the
+        line is written."""
+        base, _, auth = relay
+        transcript = tmp_path / "eeee5555.jsonl"
+        transcript.write_text(json.dumps({"message": {"role": "user", "content": "Hi"},
+                                          "timestamp": "1"}) + "\n")
+        monkeypatch.setattr(watch_relay, "_find_transcript", lambda sid: str(transcript))
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "none.jsonl"))
+        watch_dashboard._THREAD_STATE.pop(str(transcript), None)
+        status, first = self._call(base + "/thread?id=eeee5555&after=0", token=auth.bootstrap)
+        assert status == 200 and first["reset"] is True
+        assert [t["text"] for t in first["turns"]] == ["Hi"]
+
+        def answer():
+            with open(transcript, "a") as handle:
+                handle.write(json.dumps({"message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "Hello"}]}, "timestamp": "2"}) + "\n")
+        threading.Timer(0.5, answer).start()
+        started = time.monotonic()
+        status, news = self._call(base + "/thread?id=eeee5555&after=%d&wait=10"
+                                  % first["mark"], token=auth.bootstrap)
+        took = time.monotonic() - started
+        assert status == 200 and [t["text"] for t in news["turns"]] == ["Hello"]
+        assert news["reset"] is False and news["mark"] == os.path.getsize(transcript)
+        assert 0.4 < took < 2.0, "answered when the line landed, not at the wait's end"
+
+    def test_a_watch_before_catching_up_is_answered_as_it_always_was(
+            self, relay, monkeypatch, tmp_path):
+        """The App Store's watches ask without `after` and read the newest
+        14; they get no mark and no wait."""
+        base, _, auth = relay
+        transcript = tmp_path / "ffff6666.jsonl"
+        transcript.write_text("".join(json.dumps({"message": {"role": "assistant", "content": [
+            {"type": "text", "text": "r%d" % n}]}, "timestamp": str(n)}) + "\n" for n in range(30)))
+        monkeypatch.setattr(watch_relay, "_find_transcript", lambda sid: str(transcript))
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "none.jsonl"))
+        started = time.monotonic()
+        status, body = self._call(base + "/thread?id=ffff6666&wait=10", token=auth.bootstrap)
+        assert time.monotonic() - started < 2.0
+        assert "mark" not in body and "reset" not in body
+        assert [t["text"] for t in body["turns"]] == ["r%d" % n for n in range(16, 30)]
+
     def test_the_tunnel_route_hands_over_the_away_addresses(self, relay, monkeypatch):
         monkeypatch.setattr(watch_relay, "TUNNEL_URL", "https://t.example")
         base, _, auth = relay
@@ -16274,7 +16319,7 @@ class TestAThreadIsReadFromItsEnd:
         read = []
         real = watch_dashboard._read_appended
         monkeypatch.setattr(watch_dashboard, "_read_appended",
-                            lambda p, offset: read.append(offset) or real(p, offset))
+                            lambda p, offset, **kw: read.append(offset) or real(p, offset, **kw))
         turns, _, _ = watch_dashboard._parse_thread(str(path), 14)
         size = os.path.getsize(path)
         assert read and size - read[0] <= 5000, "only the tail is read"
@@ -18723,3 +18768,160 @@ class TestTheWatchUsesFourTextSizes:
         assert found == [14, 12, 13, 12, 16]
         assert self.BUILT_IN.search('Text("x").font(.headline)')
         assert not self.BUILT_IN.search('.font(.system(size: 13))')
+
+
+class TestTheWatchCatchesUp:
+    """2026-10-22: the watch was sent the newest 14 turns and swapped them
+    in whole. A burst between two looks, or a wrist down for a minute,
+    slid answers past it unseen, and the person's pinned message sat above
+    a gap: the phone and terminal showed text the wrist never did."""
+
+    @pytest.fixture
+    def thread(self, tmp_path):
+        path = tmp_path / "-p" / "catch.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+
+        def say(role, text=None, tool=None, **extra):
+            content = ([{"type": "text", "text": text}] if tool is None else
+                       [{"type": "tool_use", "id": "t%d" % time.monotonic_ns(),
+                         "name": tool, "input": {}}])
+            entry = {"type": role, "message": {"role": role, "content": content},
+                     "timestamp": "2026-10-22T10:00:00Z"}
+            entry.update(extra)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry) + "\n")
+        watch_dashboard._THREAD_STATE.pop(str(path), None)
+        yield str(path), say
+        watch_dashboard._THREAD_STATE.pop(str(path), None)
+
+    def test_nothing_between_two_looks_is_lost(self, thread):
+        path, say = thread
+        say("user", "go")
+        _, _, _, mark, reset = watch_dashboard.thread_after(path, 0)
+        assert reset
+        for n in range(40):
+            say("assistant", "answer %d" % n)
+        turns, _, _, _, reset = watch_dashboard.thread_after(path, mark)
+        assert not reset
+        assert [t["text"] for t in turns] == ["answer %d" % n for n in range(40)]
+
+    def test_the_old_window_did_lose_them(self, thread):
+        """The positive control: the window the App Store's watches read
+        drops the middle of the same burst, which is the bug."""
+        path, say = thread
+        say("user", "go")
+        for n in range(40):
+            say("assistant", "answer %d" % n)
+        turns = watch_dashboard._parse_thread(path, 14)[0]
+        assert "answer 10" not in [t["text"] for t in turns]
+
+    def test_the_first_look_has_no_gap_after_your_message(self, thread):
+        path, say = thread
+        say("user", "go")
+        for n in range(30):
+            say("assistant", "answer %d" % n)
+        turns, *_ = watch_dashboard.thread_after(path, 0)
+        assert [t["text"] for t in turns] == ["go"] + ["answer %d" % n for n in range(30)]
+
+    def test_a_turn_keeps_its_number_and_a_growing_run_is_sent_again(self, thread):
+        path, say = thread
+        say("assistant", "looking")
+        say("assistant", tool="Bash")
+        first, *_, mark, _ = watch_dashboard.thread_after(path, 0)
+        run = first[-1]
+        say("assistant", tool="Edit")
+        again, *_ = watch_dashboard.thread_after(path, mark)
+        assert len(again) == 1 and again[0]["n"] == run["n"]
+        assert again[0]["text"] == "Ran a command, edited a file"
+        assert watch_dashboard.thread_after(path, 0)[0][0]["n"] == first[0]["n"], \
+            "the same turn, the same number"
+
+    def test_nothing_new_is_nothing(self, thread):
+        path, say = thread
+        say("assistant", "done")
+        _, _, _, mark, _ = watch_dashboard.thread_after(path, 0)
+        assert watch_dashboard.thread_after(path, mark)[0] == []
+
+    def test_a_rewritten_file_starts_over(self, thread):
+        path, say = thread
+        for n in range(5):
+            say("assistant", "old %d" % n)
+        _, _, _, mark, _ = watch_dashboard.thread_after(path, 0)
+        open(path, "w").close()
+        say("assistant", "new")
+        turns, _, _, _, reset = watch_dashboard.thread_after(path, mark)
+        assert reset and [t["text"] for t in turns] == ["new"]
+
+    def test_a_watch_too_far_behind_starts_over(self, thread, monkeypatch):
+        path, say = thread
+        monkeypatch.setattr(watch_dashboard, "THREAD_TURNS_HELD", 10)
+        monkeypatch.setattr(watch_dashboard, "THREAD_TURNS_KEPT", 5)
+        say("assistant", "first")
+        _, _, _, mark, _ = watch_dashboard.thread_after(path, 0)
+        for n in range(20):
+            say("assistant", "later %d" % n)
+        turns, _, _, _, reset = watch_dashboard.thread_after(path, mark)
+        assert reset, "what it missed is gone, so the watch is told to start over"
+        assert turns[-1]["text"] == "later 19"
+
+    def test_a_reply_that_opens_with_markup_is_shown(self, thread):
+        path, say = thread
+        say("assistant", "<details>the reply</details>")
+        say("user", "<command-message>noise</command-message>")
+        turns, *_ = watch_dashboard.thread_after(path, 0)
+        assert [(t["role"], t["text"]) for t in turns] == [("assistant", "the reply")]
+
+    def test_a_stop_says_interrupted(self, thread):
+        path, say = thread
+        say("assistant", "half an answer")
+        say("user", "[Request interrupted by user for tool use]")
+        turns, *_ = watch_dashboard.thread_after(path, 0)
+        assert (turns[-1]["kind"], turns[-1]["text"]) == ("notice", "Interrupted")
+
+    def test_a_compaction_summary_is_not_your_message(self, thread):
+        path, say = thread
+        say("user", "my real question")
+        say("assistant", "answer")
+        say("user", "This session is being continued from a previous conversation",
+            isCompactSummary=True)
+        turns, *_ = watch_dashboard.thread_after(path, 0)
+        assert (turns[-1]["kind"], turns[-1]["text"]) == ("notice", "Conversation compacted")
+        state = watch_dashboard._THREAD_STATE[path]
+        assert state["last_said"]["text"] == "my real question"
+
+    def test_a_held_question_ends_when_a_line_lands_and_not_before(self, thread):
+        path, say = thread
+        say("assistant", "done")
+        _, _, _, mark, _ = watch_dashboard.thread_after(path, 0)
+        started = time.monotonic()
+        assert watch_relay.thread_news(path, mark, 0.6)[0] == []
+        assert time.monotonic() - started >= 0.6
+        threading.Timer(0.3, lambda: say("assistant", "late")).start()
+        started = time.monotonic()
+        turns = watch_relay.thread_news(path, mark, 10)[0]
+        assert [t["text"] for t in turns] == ["late"]
+        assert time.monotonic() - started < 1.0
+
+    def test_no_more_than_eight_questions_are_held(self, thread, monkeypatch):
+        path, say = thread
+        say("assistant", "done")
+        _, _, _, mark, _ = watch_dashboard.thread_after(path, 0)
+        monkeypatch.setattr(watch_relay, "_THREAD_WAITERS", threading.BoundedSemaphore(1))
+        watch_relay._THREAD_WAITERS.acquire()
+        try:
+            started = time.monotonic()
+            watch_relay.thread_news(path, mark, 5)
+            assert time.monotonic() - started < 0.5, "a ninth question is answered at once"
+        finally:
+            watch_relay._THREAD_WAITERS.release()
+
+    def test_a_held_question_lets_go_when_a_card_arrives(self, thread):
+        path, say = thread
+        say("assistant", "done")
+        _, _, _, mark, _ = watch_dashboard.thread_after(path, 0)
+        started = time.monotonic()
+        asked = threading.Event()
+        threading.Timer(0.3, asked.set).start()
+        watch_relay.thread_news(path, mark, 10, still=lambda: not asked.is_set())
+        assert time.monotonic() - started < 1.0

@@ -17,6 +17,7 @@ Standard library only, like everything else here.
 from __future__ import annotations
 
 import base64
+import bisect
 import hashlib
 import json
 import os
@@ -29,9 +30,12 @@ from collections import OrderedDict
 
 import tapproval_wire as wire
 
-def _read_appended(path, offset, limit=None):
+def _read_appended(path, offset, limit=None, starts=None):
     """Lines appended since ``offset`` -> (lines, new_offset, shrunk).
     At most ``limit`` lines when given; the offset stops after the last.
+    ``starts``, a list when given, receives each line's byte offset, in
+    step with ``lines``: where a line begins is its name for as long as
+    the file is only appended to.
 
     The one owner of the append-follow rules every transcript follower
     needs: only whole lines are consumed (a mid-append partial tail waits
@@ -57,6 +61,8 @@ def _read_appended(path, offset, limit=None):
             for raw in handle:
                 if not raw.endswith(b"\n"):
                     break                      # a line still being written
+                if starts is not None:
+                    starts.append(offset + read)
                 read += len(raw)
                 lines.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
                 if limit is not None and len(lines) >= limit:
@@ -602,6 +608,16 @@ UPSTREAM_SHAPES = {
     "registry.name_derived":
         ("derived", "The nameSource of a name the CLI made from the folder "
          "(\"acme-3f\"): not a title anybody chose.", "2026-09-03"),
+    "key.compact_summary":
+        ("isCompactSummary", "Marks the user line /compact writes: the whole "
+         "summary of the conversation so far, which the terminal folds away. "
+         "Read as a message it showed as the owner's own words, 30 KB of "
+         "them, pinned at the head of the thread.", "2026-10-22"),
+    "text.interrupted":
+        ("[Request interrupted", "The user line written when the person "
+         "stops Claude (\"[Request interrupted by user]\", \"… for tool "
+         "use]\"). The terminal says Interrupted; the wrist said nothing, "
+         "and an answer seemed to stop mid-way.", "2026-10-22"),
     "text.caveat_opener":
         ("Caveat:", "How a slash command's local-command note opens, as a "
          "user turn nobody typed.", "2026-08-27"),
@@ -813,6 +829,9 @@ def _findings_as_lines(text):
 
 SIGNED_OUT_NOTICE = ("Claude Code on this computer is signed out — run: "
                      "claude auth login")
+# What the terminal shows in place of /compact's summary and of a stop.
+COMPACTED_NOTICE = "Conversation compacted"
+INTERRUPTED_NOTICE = "Interrupted"
 
 
 def _notice(text, tone, entry):
@@ -1605,7 +1624,7 @@ def _fresh_thread_state():
             "descriptions": OrderedDict(), "task_labels": {}, "running_label": None,
             "wake_at": None,
             "github": None,
-            "last_said": None,
+            "last_said": None, "floor": 0, "merged": [],
             "result": None, "result_at": 0.0, "limit": None}
 
 
@@ -1654,7 +1673,7 @@ def _merge_tool_runs(turns):
     phrase — "Ran a command, edited a file" — deduped, order kept. One
     call is named by what it was for, several are counted. Pure."""
     merged = []
-    runs = []                 # (name, desc, at) of the current consecutive run
+    runs = []                 # (name, desc, at, n) of the current consecutive run
 
     def flush():
         if not runs:
@@ -1663,18 +1682,22 @@ def _merge_tool_runs(turns):
             phrase = "ran %s" % runs[0][1]
         else:
             counts = OrderedDict()
-            for name, _desc, _at in runs:
+            for name, _desc, _at, _n in runs:
                 counts[name] = counts.get(name, 0) + 1
             phrase = ", ".join(_tool_phrase(name, n)
                                for name, n in counts.items())
-        merged.append({"role": "assistant", "kind": "tool", "at": runs[-1][2],
-                       "text": phrase[:1].upper() + phrase[1:]})
+        turn = {"role": "assistant", "kind": "tool", "at": runs[-1][2],
+                "text": phrase[:1].upper() + phrase[1:]}
+        # A run is named by its first line, so one that grows keeps its name.
+        if runs[0][3] is not None:
+            turn["n"] = runs[0][3]
+        merged.append(turn)
         del runs[:]
 
     for turn in turns:
         if turn["kind"] == "tool":
             runs.append((turn["text"], turn.get("desc") or "",
-                         turn.get("at", "")))
+                         turn.get("at", ""), turn.get("n")))
             continue
         flush()
         merged.append(dict(turn))
@@ -1733,11 +1756,21 @@ def _tail_start(path, tail=None):
         return 0
 
 
+# How many raw turns a thread holds for the watch to catch up from: past
+# HELD, the oldest are let go down to KEPT. It was 56 → 28 when the watch
+# only ever asked for the newest 14; a watch that asks for everything since
+# its last look needs the turns it missed still to be here.
+THREAD_TURNS_HELD = 160
+THREAD_TURNS_KEPT = 120
+
+
 def _parse_thread_locked(path, limit):
     state = _thread_state_for(path)
     if state["offset"] == 0 and not state["turns"]:
-        state["offset"] = _tail_start(path)
-    lines, state["offset"], shrunk = _read_appended(path, state["offset"])
+        state["offset"] = state["floor"] = _tail_start(path)
+    starts = []
+    lines, state["offset"], shrunk = _read_appended(path, state["offset"],
+                                                    starts=starts)
     if shrunk:
         # Rewritten transcript: the returned lines are the whole new file;
         # keeping the old accumulations would duplicate every surviving turn.
@@ -1746,9 +1779,24 @@ def _parse_thread_locked(path, limit):
         state["offset"] = offset
         _THREAD_STATE[path] = state
     if lines:
-        for line in lines:
+        # By index, not zip(): zip(strict=) is 3.10, and the helper runs on 3.9.
+        for index, line in enumerate(lines):
+            at_byte = starts[index]
             try:
                 _thread_line(state, line, limit)
+                # A turn's number is where its line begins in the file, so
+                # it names the same turn after a relay restart. A line that
+                # made two turns numbers the second one higher.
+                fresh = 0
+                for turn in reversed(state["turns"]):
+                    if "n" in turn:
+                        break
+                    fresh += 1
+                for i, turn in enumerate(state["turns"][len(state["turns"]) - fresh:]):
+                    turn["n"] = at_byte + i
+                if len(state["turns"]) > THREAD_TURNS_HELD:
+                    state["turns"] = state["turns"][-THREAD_TURNS_KEPT:]
+                    state["floor"] = state["turns"][0]["n"]
             except (AttributeError, TypeError, ValueError, KeyError, IndexError) as error:
                 # One line of a shape nobody expected used to end the batch
                 # — and the offset had moved past it, so the rest was lost
@@ -1767,11 +1815,59 @@ def _parse_thread_locked(path, limit):
         merged = _merge_tool_runs(state["turns"])
         session_id = os.path.splitext(os.path.basename(path))[0]
         running = _running_task_count(state, session_id)
+        state["merged"] = merged
         state["result"] = (_keep_what_was_said(merged, state["last_said"], limit),
                            running, state["running_tool"])
         state["result_at"] = time.monotonic()
         state["limit"] = limit
     return state["result"]
+
+
+# The first look at a thread from a watch that catches up (`after=0`): far
+# enough back that the person's last message and everything Claude said
+# since are usually all there, with no jump between them.
+THREAD_FIRST_LOOK = 40
+# Catching up never sends more than this; past it the watch starts over
+# from the newest turns, and is told so.
+THREAD_CATCH_UP = 60
+
+
+def thread_after(path, mark):
+    """What a watch that has read the transcript up to byte ``mark`` has
+    not seen -> (turns, running, running_tool, mark, reset).
+
+    The thread is no longer a window of the newest 14 that the watch
+    swaps in whole: a burst of turns between two looks, or a wrist down
+    for a while, slid answers past the window unseen, and the person's
+    pinned message sat above a gap. ``turns`` are every turn that grew or
+    began at or after ``mark``, each carrying ``n``, its number; the watch
+    puts each one where its number says. ``mark`` in the reply is where to
+    ask from next. ``reset`` says the turns are a fresh start, not an
+    addition: a first look (``mark`` 0), a file that was rewritten, or a
+    watch so far behind that what it missed is gone. Never raises.
+    """
+    with _thread_lock(path):
+        try:
+            _, running, tool_now = _parse_thread_locked(path, THREAD_TURN_LIMIT)
+        except Exception:
+            return [], 0, None, mark, False
+        state = _thread_state_for(path)
+        merged, now = state["merged"], state["offset"]
+        if mark <= 0 or mark > now or mark < state["floor"]:
+            turns = _keep_what_was_said(merged, state["last_said"], THREAD_FIRST_LOOK)
+            return turns, running, tool_now, now, True
+        # Each raw turn from the mark on, and the merged turn it went into:
+        # a tool run that grew is sent again under the number it had.
+        numbers = [turn.get("n", -1) for turn in merged]
+        wanted = []
+        for turn in state["turns"]:
+            if turn.get("n", -1) >= mark:
+                at = bisect.bisect_right(numbers, turn["n"]) - 1
+                if at >= 0 and (not wanted or wanted[-1] != at):
+                    wanted.append(at)
+        if len(wanted) > THREAD_CATCH_UP:
+            return [merged[i] for i in wanted[-THREAD_CATCH_UP:]], running, tool_now, now, True
+        return [merged[i] for i in wanted], running, tool_now, now, False
 
 
 def _keep_what_was_said(turns, said, limit):
@@ -1850,6 +1946,11 @@ def _thread_line(state, line, limit):
         return
     if role not in ("user", "assistant"):
         return
+    # /compact's summary of everything so far: the terminal folds it into
+    # one line, and so does the wrist. It is never the person's message.
+    if role == "user" and entry.get(shape("key.compact_summary")):
+        state["turns"].append(_notice(COMPACTED_NOTICE, "output", entry))
+        return
     inbox = False
     if role == "user" and entry.get(shape("key.is_meta")):
         # A wrist message delivered into the session's inbox is filed as a
@@ -1906,7 +2007,14 @@ def _thread_line(state, line, limit):
         # A turn that is only a picture: give it words, so a watch that
         # cannot show the picture still says one arrived.
         lead, text, kind = "[image]", "[image]", "text"
-    if not lead or lead.startswith(_SYSTEM_OPENERS):
+    # The person stopped Claude: the terminal says so, and so does the
+    # wrist, or the answer above reads as cut off for no reason.
+    if role == "user" and lead.startswith(shape("text.interrupted")):
+        state["turns"].append(_notice(INTERRUPTED_NOTICE, "output", entry))
+        return
+    # Only a USER line can be the harness's own note. Claude's reply may
+    # open with "<" — HTML, XML, a generic — and was dropped whole.
+    if not lead or (role == "user" and lead.startswith(_SYSTEM_OPENERS)):
         return
     # After the CLI has answered a slash command itself, the headless run
     # still gives Claude a turn, and Claude — having nothing to add —
@@ -1966,8 +2074,6 @@ def _thread_line(state, line, limit):
     state["turns"].append(turn)
     if role == "user" and kind == "text":
         state["last_said"] = turn
-    if len(state["turns"]) > limit * 4:
-        state["turns"] = state["turns"][-limit * 2:]
 
 
 # A GitHub fact is a LAST-MENTIONED claim parsed from what Claude wrote —
