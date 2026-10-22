@@ -327,6 +327,7 @@ def session_registry(sessions_dir=None):
             "cwd": str(data.get("cwd") or ""),
             "pid": int(pid),
             "started_at": _started_seconds(data.get(shape("registry.started_at"))),
+            "socket": str(data.get(shape("registry.messaging_socket")) or ""),
         }
     return registry
 
@@ -345,6 +346,32 @@ def live_sessions(sessions_dir=None):
     """
     return {sid: entry["status"]
             for sid, entry in session_registry(sessions_dir).items()}
+
+
+_MODE_TAIL_BYTES = 262144
+
+
+def permission_mode(path, tail=_MODE_TAIL_BYTES):
+    """The permission mode of a session's latest turn, from the end of its
+    transcript; "" when it cannot be told. Never raises."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - tail))
+            text = handle.read().decode("utf-8", "replace")
+    except (OSError, TypeError):
+        return ""
+    found = re.findall(r'"%s"\s*:\s*"([A-Za-z]+)"' % shape("key.permission_mode"), text)
+    return found[-1] if found else ""
+
+
+def inbox_ready(entry, transcript):
+    """Whether a wrist message can go into this live session's own inbox:
+    it has one, and its mode is not one in which Claude Code would hold a
+    message from outside for a click (#246, 2026-10-22)."""
+    if not (entry or {}).get("socket"):
+        return False
+    return permission_mode(transcript) not in (shape("mode.bypass"), shape("mode.plan"))
 
 
 _REPO_SLUG_CACHE = OrderedDict()
@@ -597,6 +624,10 @@ UPSTREAM_SHAPES = {
     "task.monitor_started":
         ("Monitor started (task", "The tool result that says a Monitor "
          "started; it is a background task like a command.", "2026-10-01"),
+    "task.workflow_launched":
+        ("Workflow launched in background. Task ID:", "The tool result that "
+         "says a Workflow started; the phone counts it as a running task, "
+         "like an agent.", "2026-10-22"),
     "wakeup.scheduled":
         ("Next wakeup scheduled for", "ScheduleWakeup's result when it took: "
          "\"Next wakeup scheduled for 07:42:00 (in 257s)\". The session "
@@ -635,6 +666,17 @@ UPSTREAM_SHAPES = {
     "key.permission_mode":
         ("permissionMode", "The mode a turn ran in, on each transcript "
          "line; the hook watches for \"auto\".", "2026-10-17"),
+    "mode.bypass":
+        ("bypassPermissions", "The permission mode that skips every prompt. "
+         "Claude Code holds a message from outside for a click in such a "
+         "session, so a wrist message goes the old way there.", "2026-10-22"),
+    "mode.plan":
+        ("plan", "Plan mode, which Claude Code counts as bypassing when it "
+         "decides whether to hold a message from outside.", "2026-10-17"),
+    "registry.messaging_socket":
+        ("messagingSocketPath", "The session's inbox socket, in its "
+         "registry file: where a wrist message is posted so the open "
+         "session itself reads it (Claude Code 2.1.303).", "2026-10-22"),
     "entrypoint.sdk_cli":
         ("sdk-cli", "What a transcript and the session registry call a run "
          "nobody is sitting at: `claude -p`, the Agent SDK, a scheduled "
@@ -1432,7 +1474,8 @@ def _tool_phrase(name, count=1):
 # a task-notification when they end; the difference is what is running.
 _TASK_LAUNCH = re.compile(
     r"running in background with ID: ([\w-]+)|agentId: ([a-f0-9]+)"
-    r"|Monitor started \(task ([\w-]+)")
+    r"|Monitor started \(task ([\w-]+)"
+    r"|Workflow launched in background\. Task ID: ([\w-]+)")
 _TASK_DONE = re.compile(r"<task-id>([\w-]+)</task-id>")
 _WAKEUP_IN = re.compile(r"Next wakeup scheduled for [^(]*\(in (\d+)s\)")
 # How many tool descriptions to remember, to name a task by what it is for.
@@ -1758,7 +1801,8 @@ def _thread_line(state, line, limit):
     # QUOTING an id (writing tests, discussing a task) must not count.
     if role != "assistant":
         if (shape("task.launched") in line or shape("task.agent_id") in line
-                or shape("task.monitor_started") in line):
+                or shape("task.monitor_started") in line
+                or shape("task.workflow_launched") in line):
             asked = [part.get("tool_use_id") for part in
                      (message.get("content") if isinstance(message.get("content"), list) else [])
                      if isinstance(part, dict) and part.get("type") == shape("type.tool_result")]
@@ -1806,8 +1850,18 @@ def _thread_line(state, line, limit):
         return
     if role not in ("user", "assistant"):
         return
+    inbox = False
     if role == "user" and entry.get(shape("key.is_meta")):
-        return
+        # A wrist message delivered into the session's inbox is filed as a
+        # hidden line from "another session"; its words are the wearer's.
+        content = message.get("content")
+        if isinstance(content, list):
+            content = "\n".join(str(block.get("text", "")) for block in content
+                                 if isinstance(block, dict))
+        words = wire.wrist_words(content)
+        if words is None:
+            return
+        message, inbox = {"content": words}, True
     text, part, pictures = _message_parts(message.get("content"))
     tool, tool_description = "", ""
     if part is not None:
@@ -1903,11 +1957,11 @@ def _thread_line(state, line, limit):
             turn["blocks"] = parts
     if pictures:
         turn["images"] = pictures
-    # A turn a headless run appended — the wrist's sends arrive this way
-    # — is not one the session's live process has seen. Name it, so a
-    # thread that forks here is legible on both devices rather than
-    # mysterious on one.
-    if role == "user" and kind == "text" and entry.get("entrypoint") == shape("entrypoint.sdk_cli"):
+    # A turn the wrist sent — appended by a headless run, which the live
+    # process has not seen, or posted into the session's inbox (#246) —
+    # is named, so the thread shows where it came from.
+    if role == "user" and kind == "text" and (
+            inbox or entry.get("entrypoint") == shape("entrypoint.sdk_cli")):
         turn["origin"] = "headless"
     state["turns"].append(turn)
     if role == "user" and kind == "text":
@@ -2159,7 +2213,8 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
             # open session does not read. Said per row, by the side that
             # knows, so a route that does reach a live session can turn it
             # off without a new watch build.
-            "side_thread": session_id in live,
+            "side_thread": (session_id in live
+                            and not inbox_ready(registry.get(session_id), path)),
             "path": cwd or "",
             "session_id": session_id[:12],
             "opening": opening or "",

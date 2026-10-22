@@ -60,6 +60,9 @@ import re
 import select
 import signal
 import shutil
+import socket
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1355,6 +1358,7 @@ _DASHBOARD_ERROR = None
 try:
     from watch_dashboard import (  # noqa: E402
         activity_summary, card_session_title, recap_summary, _find_transcript, image_bytes,
+        inbox_ready,
         _json_object, _message_of, _parse_thread, _read_appended,
         project_root, prompts_at_the_mac, recent_sessions, resolve_session,
         session_registry, session_state, shape, thread_tool_id, thread_wake_at,
@@ -1377,6 +1381,9 @@ except Exception as _error:  # noqa: BLE001 — any import-time failure, not onl
 
     def session_registry(*_args, **_kwargs):
         return {}               # nobody live: the send guard can only ever ask
+
+    def inbox_ready(*_args, **_kwargs):
+        return False            # the old route, which needs nothing from here
 
     THREAD_TURN_LIMIT = 14      # watch_dashboard's own value
 
@@ -1817,8 +1824,10 @@ def type_into_session(session_id, text, registry):
     """Type a wrist message into the terminal a live session runs in.
     True when it was typed; False sends it the old way. Never raises.
 
-    Off unless TAPPROVAL_TYPE_INTO_TERMINAL=1, until it has been seen to
-    work: macOS must first let the helper script Terminal (a consent a
+    Off unless TAPPROVAL_TYPE_INTO_TERMINAL=1. Tested 2026-10-22 (#246): the
+    words reached the right tab, but from the helper Return did not reliably
+    submit them, and the session's inbox (post_to_inbox) does the same job
+    without keystrokes, so this stays off. The history: macOS must first let the helper script Terminal (a consent a
     background process cannot ask for — the first test on 2026-09-24 hung
     on it), and whether the line `do script` types ends in the Return
     Claude Code's prompt submits on has not yet been watched happen. A
@@ -1849,6 +1858,64 @@ def type_into_session(session_id, text, registry):
     if not ok:
         _TERMINAL_REFUSED[app] = time.time()
     return ok and said == "typed"
+
+
+# Where Claude Code puts a session's inbox socket: its own directory under
+# the temp folder, or the per-user runtime folder on Linux. Anything else in
+# a registry file is not posted to.
+INBOX_PATH = re.compile(r"^(?:/private)?/tmp/cc-socks(?:-\d+)?/[^/]+\.sock$"
+                        r"|^/run/user/\d+/cc-socks/[^/]+\.sock$")
+INBOX_TIMEOUT = 3.0
+
+
+def _peer_pid(sock):
+    """The pid at the other end of a connected Unix socket, or None."""
+    try:
+        if sys.platform == "darwin":
+            # SOL_LOCAL (0), LOCAL_PEERPID (2): <sys/un.h>
+            return struct.unpack("i", sock.getsockopt(0, 2, 4))[0]
+        creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                struct.calcsize("3i"))
+        return struct.unpack("3i", creds)[0]
+    except (OSError, AttributeError, struct.error):
+        return None
+
+
+def post_to_inbox(entry, text, brief=False, timeout=INBOX_TIMEOUT):
+    """Post a wrist message into a live session's own inbox (Claude Code's
+    cross-session messaging), where the open session reads it as its next
+    turn: no keystrokes, no permission, and the terminal and the phone
+    follow it (#246, tested 2026-10-22). True only when the line was
+    written. Never raises.
+
+    The socket is the one the session's registry file names, under Claude
+    Code's own directory, a socket and not a link, ours, and held by that
+    session's process: the same checks Claude Code makes before it sends."""
+    entry = entry or {}
+    path = str(entry.get("socket") or "")
+    if not INBOX_PATH.match(path):
+        return False
+    try:
+        found = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISSOCK(found.st_mode) or found.st_uid != os.getuid():
+        return False
+    line = json.dumps({"type": "user",
+                       "message": {"role": "user",
+                                   "content": wire.wrist_inbox_message(text, brief)}}) + "\n"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(path)
+        if _peer_pid(sock) != entry.get("pid"):
+            return False
+        sock.sendall(line.encode("utf-8"))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
 
 
 class _StampedStream:
@@ -1885,7 +1952,10 @@ class _StampedStream:
 def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
     """Send an instruction to a session, the way the terminal would.
 
-    Runs ``claude --resume <id> -p <text>`` in that session's directory so
+    A session open on this computer gets it in its own inbox (post_to_inbox,
+    #246), as its next turn. Otherwise — a closed session, one in bypass or
+    plan mode, a command, or a post that fails — this
+    runs ``claude --resume <id> -p <text>`` in that session's directory so
     the reply lands in the same transcript the watch is reading — which is
     why the answer simply appears in the thread view. With ``brief`` (the
     default) the reply is asked for in Claude Code's Concise style, which
@@ -1901,9 +1971,22 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
     session_id, cwd = resolve_session(prefix, projects_dir, registry=registry)
     if not session_id:
         return "unknown session"
+    started = time.monotonic()
+    # Open on this computer: into the session's own inbox, so the open
+    # session itself reads it — the terminal and the phone with it. Not in
+    # a mode where Claude Code would hold it for a click; then, and when
+    # the post fails, the old route.
+    entry = registry.get(session_id)
+    # A command (/recap, a skill from More) is not one: the inbox delivers
+    # text, never a command, so it goes the old way, which runs it.
+    if (entry and not text.startswith("/")
+            and inbox_ready(entry, _find_transcript(session_id, projects_dir))
+            and post_to_inbox(entry, text, brief=brief)):
+        print("relay: say %s inbox (%d ms)" % (session_id[:8],
+              (time.monotonic() - started) * 1000), file=sys.stderr)
+        return "sent"
     # Open in a terminal and waiting for input: type it there. The words
     # land in the live session itself — the one route that does not fork.
-    started = time.monotonic()
     if type_into_session(session_id, text, registry):
         print("relay: say %s typed (%d ms)" % (session_id[:8],
               (time.monotonic() - started) * 1000), file=sys.stderr)

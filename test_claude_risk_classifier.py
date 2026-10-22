@@ -5856,6 +5856,176 @@ class TestASendIntoALiveSessionAsksFirst:
         assert origins == {"from the desk": None, "from the wrist": "headless"}
 
 
+class TestAWristMessageGoesIntoTheInbox:
+    """#246: a wrist message ran as a headless `claude --resume -p` beside
+    the open session, which never read it, and neither did the phone that
+    follows it. Claude Code's own inbox socket takes the message into the
+    open session itself (tested 2026-10-22, 5 of 5). Claude Code files it as
+    a hidden peer line the phone does not show, so the message asks Claude
+    to say the wearer's words back, and the wrist reads them out again."""
+
+    @pytest.fixture
+    def inbox(self, monkeypatch):
+        # A Unix socket path must stay under ~104 bytes: not in tmp_path.
+        folder = tempfile.mkdtemp(prefix="tapproval-inbox-", dir="/tmp")
+        path = os.path.join(folder, "1.sock")
+        monkeypatch.setattr(watch_relay, "INBOX_PATH",
+                            re.compile("^" + re.escape(folder) + r"/[^/]+\.sock$"))
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+        server.settimeout(5)
+        got = []
+
+        def accept():
+            try:
+                conn, _ = server.accept()
+                conn.settimeout(5)
+                data = b""
+                while not data.endswith(b"\n"):
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                got.append(data)
+                conn.close()
+            except OSError:
+                pass
+
+        worker = threading.Thread(target=accept, daemon=True)
+        worker.start()
+        yield {"path": path, "got": got, "worker": worker}
+        server.close()
+        shutil.rmtree(folder, ignore_errors=True)
+
+    def test_the_words_go_out_and_come_back(self):
+        sent = tapproval_wire.wrist_inbox_message("Run the tests, then tell me")
+        # As Claude Code 2.1.303 files it, and as an older one wrapped it.
+        for filed in ("Another Claude session sent a message:\n%s\n\nThis came "
+                      "from another Claude session" % sent,
+                      '<cross-session-message from="uds:/tmp/x.sock">\n%s\n'
+                      "</cross-session-message>" % sent):
+            assert tapproval_wire.wrist_words(filed) == "Run the tests, then tell me"
+        assert tapproval_wire.wrist_words("Another Claude session sent a message:\nhi") is None
+        assert tapproval_wire.wrist_words(None) is None
+
+    def test_a_post_writes_one_line_claude_code_reads(self, inbox):
+        entry = {"socket": inbox["path"], "pid": os.getpid()}
+        assert watch_relay.post_to_inbox(entry, "What's left?") is True
+        inbox["worker"].join(5)
+        line = json.loads(inbox["got"][0])
+        assert line["type"] == "user" and line["message"]["role"] == "user"
+        assert tapproval_wire.wrist_words(line["message"]["content"]) == "What's left?"
+
+    def test_a_socket_held_by_another_process_is_not_posted_to(self, inbox):
+        assert watch_relay.post_to_inbox({"socket": inbox["path"], "pid": 1}, "hi") is False
+
+    def test_only_a_real_socket_where_claude_code_keeps_them(self, inbox, tmp_path):
+        assert watch_relay.post_to_inbox({"socket": "/etc/passwd", "pid": os.getpid()}, "x") is False
+        folder = os.path.dirname(inbox["path"])
+        plain = os.path.join(folder, "2.sock")
+        open(plain, "w").close()
+        assert watch_relay.post_to_inbox({"socket": plain, "pid": os.getpid()}, "x") is False
+        link = os.path.join(folder, "3.sock")
+        os.symlink(inbox["path"], link)
+        assert watch_relay.post_to_inbox({"socket": link, "pid": os.getpid()}, "x") is False
+        assert watch_relay.post_to_inbox({}, "x") is False
+
+    def test_a_session_that_would_hold_it_is_not_ready(self, tmp_path):
+        def transcript(mode):
+            return str(_write_transcript(tmp_path, "-m", "%s.jsonl" % mode, [
+                {"type": "user", "permissionMode": "default",
+                 "message": {"role": "user", "content": "a"}},
+                {"type": "user", "permissionMode": mode,
+                 "message": {"role": "user", "content": "b"}}]))
+        entry = {"socket": "/tmp/cc-socks/1.sock"}
+        assert watch_dashboard.inbox_ready(entry, transcript("auto")) is True
+        assert watch_dashboard.inbox_ready(entry, transcript("bypassPermissions")) is False
+        assert watch_dashboard.inbox_ready(entry, transcript("plan")) is False
+        assert watch_dashboard.inbox_ready(entry, None) is True     # mode unknown: it prompts
+        assert watch_dashboard.inbox_ready({}, transcript("auto")) is False
+        assert watch_dashboard.inbox_ready(None, transcript("auto")) is False
+
+    def _stage(self, monkeypatch, posted):
+        monkeypatch.setattr(watch_relay, "session_registry",
+                            lambda *a, **k: {"abcdef12-3": {"pid": 7, "socket": "/tmp/cc-socks/7.sock"}})
+        monkeypatch.setattr(watch_relay, "resolve_session",
+                            lambda *a, **k: ("abcdef12-3", "/tmp"))
+        monkeypatch.setattr(watch_relay, "_find_transcript", lambda *a, **k: None)
+        monkeypatch.setattr(watch_relay, "inbox_ready", lambda *a, **k: True)
+        sent = []
+        monkeypatch.setattr(watch_relay, "post_to_inbox",
+                            lambda entry, text, brief=False: sent.append((text, brief)) or posted)
+        self.sent = sent
+        spawned = []
+        monkeypatch.setattr(watch_relay, "_spawn_detached",
+                            lambda *a, **k: spawned.append(a) or None)
+        monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
+        monkeypatch.setattr(watch_relay, "signed_in", lambda: True)
+        return spawned
+
+    def test_an_open_session_gets_it_in_its_inbox(self, monkeypatch, capsys):
+        spawned = self._stage(monkeypatch, posted=True)
+        assert watch_relay.say_to_session("abcdef12", "What's left?") == "sent"
+        assert spawned == []
+        assert "say abcdef12 inbox" in capsys.readouterr().err
+
+    def test_a_command_takes_the_old_route_which_runs_it(self, monkeypatch, capsys):
+        # The inbox delivers text, never a command: /recap posted there
+        # arrived as words Claude read, and Claude Code did not run it.
+        spawned = self._stage(monkeypatch, posted=True)
+        monkeypatch.setattr(watch_relay, "type_into_session", lambda *a, **k: False)
+        assert watch_relay.say_to_session("abcdef12", "/recap", force=True) == "sent"
+        assert self.sent == []
+        assert len(spawned) == 1 and spawned[0][0][-1] == "/recap"
+        assert "say abcdef12 headless" in capsys.readouterr().err
+
+    def test_short_replies_are_asked_for_in_the_inbox_too(self, monkeypatch):
+        self._stage(monkeypatch, posted=True)
+        watch_relay.say_to_session("abcdef12", "What's left?")
+        watch_relay.say_to_session("abcdef12", "And then?", brief=False)
+        assert self.sent == [("What's left?", True), ("And then?", False)]
+        short = tapproval_wire.wrist_inbox_message("What's left?", brief=True)
+        assert tapproval_wire.WRIST_INBOX_BRIEF in short
+        assert tapproval_wire.WRIST_INBOX_BRIEF not in tapproval_wire.wrist_inbox_message("x")
+        assert tapproval_wire.wrist_words(short) == "What's left?"
+
+    def test_a_post_that_fails_takes_the_old_route(self, monkeypatch):
+        spawned = self._stage(monkeypatch, posted=False)
+        monkeypatch.setattr(watch_relay, "type_into_session", lambda *a, **k: False)
+        # Still live, so the old route asks first, as before.
+        assert watch_relay.say_to_session("abcdef12", "What's left?") == "live"
+        assert watch_relay.say_to_session("abcdef12", "What's left?", force=True) == "sent"
+        assert len(spawned) == 1
+
+    def test_the_wrist_reads_its_own_words_back(self, tmp_path):
+        filed = ("Another Claude session sent a message:\n%s\n\nThis came from another "
+                 "Claude session" % tapproval_wire.wrist_inbox_message("Ship it"))
+        _write_transcript(tmp_path, "-p", "inbox1.jsonl", [
+            {"cwd": "/x", "entrypoint": "cli",
+             "message": {"role": "user", "content": "from the desk"}},
+            {"cwd": "/x", "entrypoint": "cli", "isMeta": True,
+             "origin": {"kind": "peer", "from": "unknown"},
+             "message": {"role": "user", "content": filed}},
+            {"cwd": "/x", "entrypoint": "cli", "isMeta": True,
+             "message": {"role": "user", "content": "Base directory for this skill"}},
+        ])
+        turns = watch_dashboard.session_thread("inbox1", projects_dir=str(tmp_path))
+        assert [(t["text"], t.get("origin")) for t in turns] == [
+            ("from the desk", None), ("Ship it", "headless")]
+
+    def test_a_ready_inbox_is_not_a_side_thread(self, tmp_path, monkeypatch):
+        _write_transcript(tmp_path, "-p", "side1.jsonl", [
+            {"cwd": "/x", "entrypoint": "cli", "permissionMode": "auto",
+             "message": {"role": "user", "content": "hello"}}])
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda *a, **k: {"side1": "Terminal"})
+        for socket_path, side in (("/tmp/cc-socks/1.sock", False), ("", True)):
+            monkeypatch.setattr(watch_dashboard, "session_registry", lambda *a, _s=socket_path, **k: {
+                "side1": {"socket": _s, "bridged": False, "cwd": "/x", "name": ""}})
+            rows = watch_dashboard.recent_sessions(projects_dir=str(tmp_path))
+            assert [r["side_thread"] for r in rows if r["session_id"] == "side1"] == [side]
+
+
 class TestCodeBlocksForTheWatch:
     """The phone shows code in a box; the wrist showed "[code]". A watch
     that can draw the box now gets the code alongside the flattened text,
@@ -7366,6 +7536,80 @@ class TestMonitorsAreTasks:
         assert row["running_label"] == "TestFlight build 2 milestones"
         assert row["state"] == "running" and row["state_reason"] == "tasks"
         assert path
+
+
+class TestWorkflowsAreTasks:
+    """A background Workflow is a running task, and the phone counts it.
+    The wrist did not: its launch reads "Workflow launched in background.
+    Task ID: …", which nothing recognised (2026-10-22: a session running an
+    agent and a deep-research workflow showed 2 running tasks on the phone
+    and 1 on the wrist)."""
+
+    def _session(self, tmp_path, monkeypatch, lines, live=("wflow1",)):
+        import watch_dashboard
+        path = _write_transcript(tmp_path, "-p", "wf01.jsonl", lines)
+        tasks = tmp_path / "tmp" / "claude-1" / "proj" / "wf01" / "tasks"
+        tasks.mkdir(parents=True, exist_ok=True)
+        for task in live:
+            (tasks / ("%s.output" % task)).write_text("", encoding="utf-8")
+        monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+        watch_dashboard._THREAD_STATE.pop(str(path), None)
+        return str(path)
+
+    @staticmethod
+    def _workflow_launch(task="wflow1"):
+        return [
+            {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_w1", "name": "Workflow",
+                 "input": {"name": "deep-research", "args": "a question"}}]}},
+            {"message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_w1", "content":
+                 "Workflow launched in background. Task ID: %s\nSummary: Deep "
+                 "research harness.\nTranscript dir: /tmp/x" % task}]}},
+        ]
+
+    @staticmethod
+    def _agent_launch(agent="a1b2c3d4e5f6a7b8c"):
+        return [
+            {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_a1", "name": "Agent",
+                 "input": {"description": "Repo history", "prompt": "look"}}]}},
+            {"message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_a1", "content":
+                 "Async agent launched successfully.\nagentId: %s (internal ID)" % agent}]}},
+        ]
+
+    def test_a_running_workflow_is_counted(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        path = self._session(tmp_path, monkeypatch, self._workflow_launch())
+        _, running, _ = watch_dashboard._parse_thread(path, 14)
+        assert running == 1, "the phone counts a workflow; so must the wrist"
+
+    def test_an_agent_and_a_workflow_are_two(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        path = self._session(tmp_path, monkeypatch,
+                             self._agent_launch() + self._workflow_launch(),
+                             live=("a1b2c3d4e5f6a7b8c", "wflow1"))
+        _, running, _ = watch_dashboard._parse_thread(path, 14)
+        assert running == 2
+        assert watch_dashboard._THREAD_STATE[path]["running_label"] == "Repo history"
+
+    def test_a_workflow_ends_with_its_status(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        path = self._session(tmp_path, monkeypatch, self._workflow_launch() + [
+            {"message": {"role": "user", "content":
+             "<task-notification>\n<task-id>wflow1</task-id>\n<status>completed"
+             "</status>\n<summary>Workflow finished</summary>\n</task-notification>"}}])
+        _, running, _ = watch_dashboard._parse_thread(path, 14)
+        assert running == 0
+
+    def test_claude_quoting_the_words_launches_nothing(self, tmp_path, monkeypatch):
+        import watch_dashboard
+        path = self._session(tmp_path, monkeypatch, [
+            {"message": {"role": "assistant", "content":
+             "It said: Workflow launched in background. Task ID: wflow1"}}])
+        _, running, _ = watch_dashboard._parse_thread(path, 14)
+        assert running == 0
 
 
 class TestAScheduledSessionSaysWhenItComesBack:

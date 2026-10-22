@@ -204,3 +204,47 @@ def unwrap(lines):
             out[-1] = (end[:-1] if end.endswith("\\") else end).rstrip()
             joinable = False
     return out
+
+
+# ---- a wrist message in an open session's inbox ----------------------------
+#
+# Claude Code gives every session an inbox socket (cross-session messaging),
+# and a message posted there becomes a turn of the open session itself: the
+# terminal and the phone follow it, where a headless `claude --resume -p`
+# was a side thread neither saw (#246, tested 2026-10-22). Claude Code files
+# such a message as a hidden "from another session" line, which the phone
+# does not show, so the message asks Claude to say the wearer's words back
+# first. The relay writes it; the dashboard reads the words back out for the
+# wrist's thread. Tapproval's own wording is the marker, not Claude Code's
+# wrapping, which differs between versions.
+
+WRIST_INBOX_OPENER = "From the user's Apple Watch (Tapproval), in their own words:"
+WRIST_INBOX_NOTE = ("(Their phone and terminal don't show this message. Open your "
+                    "reply with one line, \"From your watch: \" and their words, "
+                    "shortened if long.)")
+
+
+# Settings' "Short replies", which a headless run gets as Claude Code's
+# Concise style; an open session keeps its own style, so it is asked.
+WRIST_INBOX_BRIEF = "Keep the answer short: they read it on a watch."
+
+
+def wrist_inbox_message(text, brief=False):
+    """What the relay posts into a session's inbox for one wrist message."""
+    note = WRIST_INBOX_NOTE + (" " + WRIST_INBOX_BRIEF if brief else "")
+    return "%s\n\n%s\n\n%s" % (WRIST_INBOX_OPENER, text, note)
+
+
+def wrist_words(content):
+    """The wearer's words from a delivered inbox message, or None when the
+    text is not one of ours."""
+    if not isinstance(content, str):
+        return None
+    start = content.find(WRIST_INBOX_OPENER)
+    if start < 0:
+        return None
+    rest = content[start + len(WRIST_INBOX_OPENER):]
+    end = rest.rfind(WRIST_INBOX_NOTE)
+    if end < 0:
+        return None
+    return rest[:end].strip() or None
