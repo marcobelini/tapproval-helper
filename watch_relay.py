@@ -320,6 +320,9 @@ ANSWER_CHARS = 2000   # a wrist answer's words; ClaudeRiskClassifier.ANSWER_CHAR
 SEND_CHARS = 30000
 
 VALID_DECISIONS = ("allow", "deny", "answer", "always", "dont_ask")
+# What a card id looks like: twelve lowercase hex digits, the relay's own
+# or the hook's (#795).
+CARD_ID = re.compile(r"^[0-9a-f]{12}$")
 
 # The Bonjour service type the watch app browses for.
 BONJOUR_TYPE = "_wristtriage._tcp"
@@ -771,6 +774,103 @@ _UPDATE_STAMP = _home_path("_UPDATE_STAMP")
 _UPDATE_EVERY = 3600.0
 
 
+# A plugin install is Claude Code's to update, and Claude Code leaves
+# auto-update off for every marketplace but Anthropic's own: a user sat on
+# 1.1.52 for weeks, without the bridge that makes a closed watch buzz,
+# until they ran `claude plugin update` by hand (2026-10-23). So the relay
+# asks GitHub for the releases once a day and says how to get them.
+# Quietly, because releases come often (the owner, 2026-10-23): never
+# when Claude Code's auto-update is on for this marketplace, only for a
+# release out a week or more, and drawn as news, not as a problem.
+# Empty turns the look off.
+RELEASES_URL = os.environ.get(
+    "TAPPROVAL_RELEASES_URL",
+    "https://api.github.com/repos/marcobelini/tapproval-helper/releases?per_page=30")
+_RELEASE_LOOK_EVERY = 24 * 3600.0
+RELEASE_GRACE_SECONDS = 7 * 24 * 3600.0
+MARKETPLACE = "tapproval"       # helper/.claude-plugin/marketplace.json
+
+
+def _version_tuple(text):
+    """"v1.1.10" → (1, 1, 10); anything else → None."""
+    match = re.match(r"^v?(\d+(?:\.\d+)*)$", str(text or "").strip())
+    return tuple(int(part) for part in match.group(1).split(".")) if match else None
+
+
+def _helper_releases():
+    """[(tag, published at, epoch seconds)] of the published releases."""
+    import datetime
+
+    request = urllib.request.Request(RELEASES_URL, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": "tapproval-helper"})
+    with urllib.request.urlopen(request, timeout=10) as reply:
+        listed = json.loads(reply.read().decode("utf-8"))
+    return [(release.get("tag_name"), datetime.datetime.strptime(
+                release["published_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=datetime.timezone.utc).timestamp())
+            for release in listed
+            if not release.get("draft") and not release.get("prerelease")
+            and release.get("published_at")]
+
+
+def _auto_update_on():
+    """Whether Claude Code auto-updates this marketplace, read in its own
+    order: the settings file's extraKnownMarketplaces entry, then the
+    /plugin toggle's record. Read only, never written."""
+    claude = os.path.expanduser("~/.claude")
+    plugins = os.environ.get("CLAUDE_CODE_PLUGIN_CACHE_DIR") or os.path.join(claude, "plugins")
+    for path, entries in (
+            (os.environ.get("CLAUDE_SETTINGS_PATH") or os.path.join(claude, "settings.json"),
+             lambda data: data.get("extraKnownMarketplaces")),
+            (os.path.join(plugins, "known_marketplaces.json"), lambda data: data)):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                entry = (entries(json.load(handle)) or {}).get(MARKETPLACE) or {}
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(entry, dict) and isinstance(entry.get("autoUpdate"), bool):
+            return entry["autoUpdate"]
+    return False
+
+
+def check_for_newer_helper(releases=_helper_releases, auto_update=_auto_update_on,
+                           now=time.time):
+    """Note "outdated" when a release newer than this helper has been out
+    a week and Claude Code will not fetch it by itself; clear it otherwise.
+    A look that fails leaves things as they were and says so in the log.
+    Never raises."""
+    ours = _version_tuple(HELPER_VERSION)
+    try:
+        listed = [] if auto_update() else releases()
+        why = None
+    except Exception as error:
+        listed, why = [], error
+    missed = [_version_tuple(tag) for tag, published in listed
+              if _version_tuple(tag) and now() - published >= RELEASE_GRACE_SECONDS]
+    if why is not None or ours is None:
+        print("relay: could not tell whether a newer helper is out (%s; "
+              "this one is %s)" % (why, HELPER_VERSION), file=sys.stderr)
+    elif any(version > ours for version in missed):
+        note_condition(
+            "outdated",
+            "A newer helper is out. Claude Code can install updates by "
+            "itself: type /plugin, open Marketplaces, choose tapproval and "
+            "pick Enable auto-update.", tone="in_hand")
+    else:
+        clear_condition("outdated")
+
+
+def watch_for_newer_helper(here=None):
+    """The daily look, for plugin installs only: a git install pulls its
+    own updates (_self_update)."""
+    here = here or os.path.dirname(os.path.abspath(__file__))
+    if not RELEASES_URL or os.path.exists(os.path.join(here, ".git")):
+        return
+    while True:
+        check_for_newer_helper()
+        time.sleep(_RELEASE_LOOK_EVERY)
+
+
 def _self_update():
     """Kick off a fast-forward of a git-installed helper, once an hour.
 
@@ -1015,6 +1115,12 @@ def ensure_running(updated=False):
         # yesterday's rules forever — an update that never arrives is not an
         # update. But a relay holding a card is holding someone's approval:
         # replace it only when nothing is waiting.
+        if not running.get("pending"):
+            # That look can be twenty seconds old (PORT_TAKEN_WAIT), and a
+            # card posted since died with the relay. Look again just
+            # before stopping it; the hook re-posts a card cut off in what
+            # little window remains.
+            running = _probe_relay() or running
         if running.get("pending"):
             print("relay: update deferred — a card is waiting", file=sys.stderr)
             # Say it where it can be seen: the running relay records the
@@ -1106,6 +1212,8 @@ class CardQueue:
         # store lives and dies with the relay.
         self._session_allows = set()
         self._decisions = {}            # id -> "allow" | "deny"
+        self._seen = set()              # every id queued here, for not_here_yet()
+        self.started = time.monotonic()
         self.last_poll = None           # monotonic time of last /pending fetch
         self.last_bridge_poll = None    # the same, for the Mac bridge
 
@@ -1156,25 +1264,31 @@ class CardQueue:
         if replayable and rule in self._session_allows:
             # Granted "always" earlier this session — answered instantly.
             return "", "allow", None
-        card_id = uuid.uuid4().hex[:12]
         entry = dict(card)
-        entry["id"] = card_id
+        wanted = entry.pop("post_id", None)
         # Always recomputed: the bucket is the relay's to decide, never the
         # poster's, so a card cannot ask for a looser notification.
         entry["alert"] = alert_bucket(entry)
-        # T0 of the buzz-when-closed latency measurement (with the bridge's
-        # "mirrored" line and the watch's "alert delivered" line).
-        print("relay: queued %s %s at %d" % (card_id, entry["alert"],
-                                             int(time.time() * 1000)),
-              file=sys.stderr)
         deadline = time.monotonic() + wait
         # The monotonic clock stops while a Mac sleeps, so on its own a 24 h
         # wait could hold a card for days of calendar time (six, for one
         # answered question on 2026-10-05). The wall clock bounds it too.
         wall_deadline = self.wall_clock() + wait
         with self._lock:
+            # The hook's own id, so a repost after a restart keeps it (#795);
+            # anything else, or an id already in use, gets a fresh one.
+            card_id = (wanted if isinstance(wanted, str) and CARD_ID.match(wanted)
+                       and wanted not in self._pending and wanted not in self._decisions
+                       else uuid.uuid4().hex[:12])
+            entry["id"] = card_id
             self._pending[card_id] = entry
+            self._seen.add(card_id)
             self._lock.notify_all()
+        # T0 of the buzz-when-closed latency measurement (with the bridge's
+        # "mirrored" line and the watch's "alert delivered" line).
+        print("relay: queued %s %s at %d" % (card_id, entry["alert"],
+                                             int(time.time() * 1000)),
+              file=sys.stderr)
         # Once a card is up it STAYS up — a lowered wrist pauses polling
         # for minutes at a time and must not cost the question. A card
         # leaves in exactly three ways: answered here, its prompt resolved
@@ -1281,6 +1395,20 @@ class CardQueue:
             if self.last_poll is None:
                 return None
             return int(time.monotonic() - self.last_poll)
+
+    # A relay that has just started may not hold, yet, a card its hook is
+    # about to post again after the last relay died with it — while the
+    # watch still shows that card's iCloud copy (#795). A tap on it in that
+    # minute is answered 503, which the bridge keeps and retries, rather
+    # than a final "no longer waiting".
+    START_GRACE_SECONDS = 60.0
+
+    def not_here_yet(self, card_id):
+        """True for a card id this young relay has never held."""
+        with self._lock:
+            unknown = card_id not in self._pending and card_id not in self._seen
+        return (unknown and isinstance(card_id, str) and bool(CARD_ID.match(card_id))
+                and time.monotonic() - self.started < self.START_GRACE_SECONDS)
 
     def decide(self, card_id, decision, answer=None):
         """Record the watch's answer. Returns True if the card was live.
@@ -3872,6 +4000,11 @@ class RelayHandler(BaseHTTPRequestHandler):
         if not isinstance(card_id, str) or decision not in VALID_DECISIONS:
             self._send_json({"error": "expected {\"id\", \"decision\"}"}, 400)
             return
+        if self.queue.not_here_yet(card_id):
+            print("relay: holding off %s for %s — not here yet; the bridge "
+                  "tries again" % (decision, card_id), file=sys.stderr)
+            self._send_json({"ok": False, "retry": True}, 503)
+            return
         accepted = self.queue.decide(card_id, decision,
                                      answer=(body or {}).get("answer"))
         # The bridge, signing with the key file, hands on an answer a
@@ -5498,6 +5631,8 @@ def main(argv=None):
           file=sys.stderr)
     stop_slow_parts = _start_slow_parts(args, queue, auth)
     threading.Thread(target=watch_bridge, args=(queue,), daemon=True).start()
+    threading.Thread(target=watch_for_newer_helper, name="release-look",
+                     daemon=True).start()
     _inject_startup_cards(args, queue)
 
     # SIGTERM (pkill, launchd, a relay restart from --ensure) must run the

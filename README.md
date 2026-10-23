@@ -52,12 +52,15 @@ session; there is nothing to keep running and nothing to maintain.
 curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash
 ```
 
-**Staying current** takes no commands either. The helper checks at most
-once an hour, on a session you were starting anyway, and fast-forwards itself. That matters
-more than it sounds: a version of this shipped that discarded every wrist
-approval in silence, and an update that never arrives is not an update. A
-plugin install is left alone — Claude Code manages those itself, and asking
-it to update Tapproval in plain words is enough.
+**Staying current** matters more than it sounds: a version of this shipped
+that discarded every wrist approval in silence, and an update that never
+arrives is not an update. A plugin install is Claude Code's to update, and
+Claude Code leaves auto-update off for every marketplace but Anthropic's
+own, so turn it on once: type `/plugin`, open **Marketplaces**, choose
+**tapproval** and pick **Enable auto-update**. Until you do, the watch's
+Connection screen mentions it once a newer helper has been out a week. A terminal install
+needs nothing: it checks at most once an hour, on a session you were
+starting anyway, and fast-forwards itself.
 
 Every path registers the same permission hook. A reboot never needs a
 hand either: the installer adds a login wake-up, and on the plugin path
@@ -74,9 +77,10 @@ helper installs on a Mac (macOS 13 or later, signed in to iCloud with the
 same Apple Account as the watch) writes the card there, and Apple then
 buzzes your watch. Only an app signed by Apple and running on a Mac can
 write to your iCloud, so this is Mac only. When the bridge is added, macOS
-may show a notice that a background item was added: that is the bridge, and
-it is listed under System Settings → General → Login Items, where it can be
-switched off (`--install --no-bridge` leaves it out altogether).
+shows an "App Background Activity" notice, naming Tapproval's developer as
+the software that can run in the background: that is the bridge. It is
+listed under System Settings → General → Login Items & Extensions, where it
+can be switched off (`--install --no-bridge` leaves it out altogether).
 
 | | Mac | Linux or another computer |
 |---|---|---|

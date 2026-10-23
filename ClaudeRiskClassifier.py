@@ -110,7 +110,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.69"
+__version__ = "1.1.70"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -122,6 +122,17 @@ PROJECT_SITE = "https://tapproval.thoughtfulsteward.org"
 # prompts must never expire on the user — a card stands until it is
 # answered somewhere, and answering it elsewhere retracts it at once.
 RELAY_WAIT_SECONDS = 86400
+# A relay that dies holding a card cuts the hook's connection, and the
+# card was gone from the wrist for good (2026-10-23: a user's two cards,
+# lost to a helper restart). Its replacement is usually listening within
+# seconds, so the hook waits this long for one and posts the card again,
+# at most RELAY_REPOSTS times. Only a cut connection counts: a relay that
+# was never there, or a wait that ran out, still means the terminal asks.
+RELAY_RETURN_SECONDS = 60.0
+RELAY_REPOSTS = 3
+# The socket outlives the card's wait by this much, so the relay's own
+# "nobody answered" arrives before the hook gives up on it.
+RELAY_REPLY_GRACE = 3.0
 # The relay listens here; watch_relay.DEFAULT_PORT says the same, but this
 # file must stand alone, so the number is written once more, once.
 RELAY_PORT = 8977
@@ -2527,6 +2538,40 @@ def _relay_signature(key, method, path, stamp, nonce, body, query=""):
 _relay_proof2 = wire.relay_proof2
 
 
+def _relay_cut(error):
+    """True when a relay took the card and then the connection broke: the
+    relay died holding it. Refused, timed out or unreadable is not a cut."""
+    import http.client
+    import urllib.error
+
+    if isinstance(error, urllib.error.URLError) and isinstance(error.reason, BaseException):
+        error = error.reason
+    return isinstance(error, (ConnectionResetError, ConnectionAbortedError,
+                              BrokenPipeError, http.client.IncompleteRead))
+
+
+def _relay_listening(relay, until):
+    """Wait, until the monotonic time ``until``, for something to listen on
+    the relay's port again. Whatever answers there must still prove the
+    relay's key before its answer counts."""
+    import socket
+    import time
+    import urllib.parse
+
+    parts = urllib.parse.urlsplit(relay)
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return False
+    while time.monotonic() < until:
+        try:
+            socket.create_connection((parts.hostname, port), timeout=1.0).close()
+            return True
+        except OSError:
+            time.sleep(0.25)
+    return False
+
+
 def ask_watch(card, policy, project=None):
     """Offer an escalated card to the watch relay. Returns the verdict.
 
@@ -2556,28 +2601,49 @@ def ask_watch(card, policy, project=None):
     payload = dict(card)
     if project:
         payload["project"] = project
-    # UTF-8, not \u escapes: a plan in Danish or Japanese would otherwise
-    # cost six bytes a letter against the relay's 256 KB body.
-    body = json.dumps({"card": payload, "wait": wait},
-                      ensure_ascii=False).encode("utf-8")
+    # The card's id, chosen here so that a repost keeps it: a tap on the
+    # iCloud copy a dead relay left on the watch then answers this very
+    # card (#795).
+    payload["post_id"] = uuid.uuid4().hex[:12]
     url = relay + "/card"
-    stamp, nonce = int(time.time()), uuid.uuid4().hex
-    mac = _relay_signature(key, "POST", urllib.parse.unquote(
-        urllib.parse.urlsplit(url).path), stamp, nonce, body)
-    request = urllib.request.Request(
-        url, data=body,
-        headers={"Content-Type": "application/json",
-                 "X-Tapproval-Signature": wire.signature_header(stamp, nonce, mac)})
-    try:
-        with urllib.request.urlopen(request, timeout=wait + 3.0) as reply:
-            raw = reply.read()
-            status = reply.status
-            proof = reply.headers.get("X-Tapproval-Proof2") or ""
-        answer = json.loads(raw.decode("utf-8"))
-    except Exception as error:
-        print("ClaudeRiskClassifier: watch relay unavailable (%s)" % error,
-              file=sys.stderr)
-        return "none", None
+    deadline = time.monotonic() + wait
+    reposts = 0
+    while True:
+        # A repost asks only for the time the first post had left.
+        remaining = wait if not reposts else deadline - time.monotonic()
+        # UTF-8, not \u escapes: a plan in Danish or Japanese would otherwise
+        # cost six bytes a letter against the relay's 256 KB body.
+        body = json.dumps({"card": payload, "wait": remaining},
+                          ensure_ascii=False).encode("utf-8")
+        # A fresh nonce each time: the relay refuses one it has seen.
+        stamp, nonce = int(time.time()), uuid.uuid4().hex
+        mac = _relay_signature(key, "POST", urllib.parse.unquote(
+            urllib.parse.urlsplit(url).path), stamp, nonce, body)
+        request = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": "application/json",
+                     "X-Tapproval-Signature": wire.signature_header(stamp, nonce, mac)})
+        try:
+            with urllib.request.urlopen(
+                    request, timeout=remaining + RELAY_REPLY_GRACE) as reply:
+                raw = reply.read()
+                status = reply.status
+                proof = reply.headers.get("X-Tapproval-Proof2") or ""
+            answer = json.loads(raw.decode("utf-8"))
+            break
+        except Exception as error:
+            if not _relay_cut(error) or reposts >= RELAY_REPOSTS:
+                print("ClaudeRiskClassifier: watch relay unavailable (%s)" % error,
+                      file=sys.stderr)
+                return "none", None
+            reposts += 1
+            print("ClaudeRiskClassifier: the relay dropped the card (%s); "
+                  "posting it again when it is back" % error, file=sys.stderr)
+            back_by = min(deadline - 1.0, time.monotonic() + RELAY_RETURN_SECONDS)
+            if not _relay_listening(relay, back_by):
+                print("ClaudeRiskClassifier: no relay came back, so the "
+                      "terminal asks", file=sys.stderr)
+                return "none", None
     if not hmac.compare_digest(proof, _relay_proof2(key, nonce, status, raw)):
         # Something answered on the relay's port without the relay's key.
         print("ClaudeRiskClassifier: the answer did not prove the relay's "

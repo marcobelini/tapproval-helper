@@ -77,8 +77,10 @@ described below. (An older install kept some of these loose in your home
 folder as <code>~/.tapproval-…</code>; the helper moves them into <code>~/.tapproval</code> by
 itself.) None of them leaves your computer.</p>
 <p>To stay current, a helper installed with the one-line installer fetches
-its own new versions from GitHub at most once an hour. That fetch sends
-nothing of yours.</p>
+its own new versions from GitHub at most once an hour. One installed as a
+Claude Code plugin instead asks GitHub once a day for the newest version
+number, so the watch can say when an update is waiting. Neither sends
+anything of yours.</p>
 <p><strong>An audit log</strong>, which prompts appeared and how they were answered, so
 the app can show you your day. It is at <code>~/.claude/risk-audit.jsonl</code>,
 readable only by your own user account. Each line holds the project's

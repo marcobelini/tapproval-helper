@@ -160,6 +160,14 @@ def _no_real_tunnel_record(tmp_path, monkeypatch):
     monkeypatch.setattr(watch_relay, "TUNNEL_LOG", str(tmp_path / "tunnel.log"))
 
 
+@pytest.fixture(autouse=True)
+def _no_real_release_check(monkeypatch):
+    """No test, and no relay a test starts, asks GitHub for the newest
+    helper: a worktree has no .git directory, so its relay would."""
+    monkeypatch.setenv("TAPPROVAL_RELEASES_URL", "")
+    monkeypatch.setattr(watch_relay, "RELEASES_URL", "")
+
+
 # Every module-level cache or memo in the relay and the dashboard, found
 # by name, so a new one is covered the day it is added rather than the
 # day it leaks. Seven were never reset by any test until 2026-10-17
@@ -1934,6 +1942,163 @@ class TestWatchRelayBridge:
         policy = dict(crc.DEFAULT_POLICY, relay=url, relay_wait=0.2)
         assert crc.ask_watch(self.CARD, policy) == ("none", None)
 
+    # A relay that dies holding a card: it took the request, then the
+    # process went away and the kernel closed the socket. A user's two
+    # cards vanished from the wrist that way on 2026-10-23, while their
+    # terminal prompts stayed.
+    @staticmethod
+    def _dying_relay(hold=0.2, accept=1, silent=False):
+        """Listen on a free port, take up to ``accept`` requests, and drop
+        each (or, with ``silent``, hold it unanswered). Returns the port,
+        the list of connections taken, and a stop()."""
+        watch_relay.Auth()          # the key file the hook signs with
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        taken, held = [], []
+
+        def run():
+            for _ in range(accept):
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                data = conn.recv(65536)
+                if not data:
+                    conn.close()        # the hook knocking: is it back yet?
+                    continue
+                head, _, body = data.partition(b"\r\n\r\n")
+                length = int((re.search(rb"(?i)content-length:\s*(\d+)", head)
+                              or [0, b"0"])[1])
+                while len(body) < length:
+                    more = conn.recv(65536)
+                    if not more:
+                        break
+                    body += more
+                taken.append(body)
+                if silent:
+                    held.append(conn)
+                    continue
+                time.sleep(hold)
+                conn.close()
+
+        threading.Thread(target=run, daemon=True).start()
+
+        def stop():
+            listener.close()
+            for conn in held:
+                conn.close()
+
+        return listener.getsockname()[1], taken, stop
+
+    def test_a_relay_that_restarts_gets_the_card_again(self, monkeypatch):
+        """The relay dies with the card, a new one comes up on the same
+        port, and the hook posts the card to it: the wrist gets the
+        question back, and the answer still reaches Claude."""
+        monkeypatch.setattr(crc, "RELAY_RETURN_SECONDS", 10.0)
+        port, taken, stop = self._dying_relay()
+        servers = []
+
+        def restart():
+            _wait_until(lambda: taken, what="the first relay to take the card")
+            stop()
+            time.sleep(0.5)                     # the port stays shut a moment
+            server, queue = watch_relay.serve(port=port, auth=watch_relay.Auth())
+            servers.append(server)
+            _serve(server)
+            cards = _wait_until(lambda: queue.pending(from_watch=True),
+                                what="the card on the new relay")
+            queue.decide(cards[0]["id"], "allow")
+
+        threading.Thread(target=restart, daemon=True).start()
+        policy = dict(crc.DEFAULT_POLICY, relay="http://127.0.0.1:%d" % port,
+                      relay_wait=20.0)
+        try:
+            assert crc.ask_watch(self.CARD, policy) == ("allow", None)
+        finally:
+            for server in servers:
+                server.shutdown()
+                server.server_close()
+
+    def test_a_stale_tap_by_the_old_id_lands_on_the_reposted_card(self, monkeypatch):
+        """#795: the watch may still show the iCloud copy of the card the
+        dead relay held, and a tap on it names that card's id. The repost
+        keeps the id, so the tap answers the question it was meant for."""
+        monkeypatch.setattr(crc, "RELAY_RETURN_SECONDS", 10.0)
+        port, taken, stop = self._dying_relay()
+        servers, seen = [], []
+
+        def restart():
+            _wait_until(lambda: taken, what="the first relay to take the card")
+            old_id = json.loads(taken[0])["card"]["post_id"]
+            stop()
+            time.sleep(0.5)
+            server, queue = watch_relay.serve(port=port, auth=watch_relay.Auth())
+            servers.append(server)
+            _serve(server)
+            cards = _wait_until(lambda: queue.pending(from_watch=True),
+                                what="the card on the new relay")
+            seen.append((old_id, cards[0]["id"]))
+            queue.decide(old_id, "allow")
+
+        threading.Thread(target=restart, daemon=True).start()
+        policy = dict(crc.DEFAULT_POLICY, relay="http://127.0.0.1:%d" % port,
+                      relay_wait=20.0)
+        try:
+            assert crc.ask_watch(self.CARD, policy) == ("allow", None)
+            [(old_id, new_id)] = seen
+            assert re.fullmatch(r"[0-9a-f]{12}", old_id) and new_id == old_id
+        finally:
+            for server in servers:
+                server.shutdown()
+                server.server_close()
+
+    def test_a_relay_that_never_comes_back_is_no_answer(self, monkeypatch):
+        monkeypatch.setattr(crc, "RELAY_RETURN_SECONDS", 1.0)
+        port, taken, stop = self._dying_relay()
+        threading.Thread(target=lambda: (_wait_until(lambda: taken), stop()),
+                         daemon=True).start()
+        policy = dict(crc.DEFAULT_POLICY, relay="http://127.0.0.1:%d" % port,
+                      relay_wait=20.0)
+        started = time.monotonic()
+        assert crc.ask_watch(self.CARD, policy) == ("none", None)
+        assert time.monotonic() - started < 5.0, "it waited out the whole card"
+
+    def test_a_relay_that_keeps_dying_is_given_up_on(self, monkeypatch):
+        monkeypatch.setattr(crc, "RELAY_RETURN_SECONDS", 5.0)
+        port, taken, stop = self._dying_relay(hold=0.05, accept=10)
+        policy = dict(crc.DEFAULT_POLICY, relay="http://127.0.0.1:%d" % port,
+                      relay_wait=20.0)
+        try:
+            assert crc.ask_watch(self.CARD, policy) == ("none", None)
+            assert len(taken) == 1 + crc.RELAY_REPOSTS
+        finally:
+            stop()
+
+    def test_a_relay_that_simply_times_out_is_not_asked_again(self, monkeypatch):
+        """Silence is the wait running out, not a restart: one post."""
+        monkeypatch.setattr(crc, "RELAY_RETURN_SECONDS", 5.0)
+        monkeypatch.setattr(crc, "RELAY_REPLY_GRACE", 0.2)
+        port, taken, stop = self._dying_relay(accept=3, silent=True)
+        policy = dict(crc.DEFAULT_POLICY, relay="http://127.0.0.1:%d" % port,
+                      relay_wait=0.3)
+        try:
+            assert crc.ask_watch(self.CARD, policy) == ("none", None)
+            assert len(taken) == 1
+        finally:
+            stop()
+
+    def test_a_relay_that_was_never_there_costs_no_wait(self, monkeypatch):
+        """Nothing on the port at the first post is a relay that is off,
+        not one restarting: the terminal asks at once, as before."""
+        monkeypatch.setattr(crc, "RELAY_RETURN_SECONDS", 10.0)
+        policy = dict(crc.DEFAULT_POLICY, relay="http://127.0.0.1:1",
+                      relay_wait=20.0)
+        started = time.monotonic()
+        assert crc.ask_watch(self.CARD, policy) == ("none", None)
+        assert time.monotonic() - started < 2.0
+
     def test_relay_rejects_bogus_decisions(self, relay):
         _, queue = relay
         self._watch_is_present(queue)
@@ -2583,6 +2748,22 @@ class TestSelfStartingRelay:
         assert stopped == []
         assert "deferred" in capsys.readouterr().err
 
+    def test_a_card_that_arrives_after_the_look_still_stops_the_swap(self, monkeypatch, capsys):
+        """The first look at /health can be twenty seconds old by the time
+        the old relay is stopped, and a card posted in between died with
+        it. So the relay is asked again right before it is stopped."""
+        monkeypatch.setattr(watch_relay, "_self_update", lambda: None)
+        looks = iter([0, 1])
+        monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: {
+            "version": watch_relay.RELAY_VERSION - 1, "pending": next(looks, 1)})
+        monkeypatch.setattr(watch_relay, "_admin_call", lambda path, timeout=2: {"ok": True})
+        stopped = []
+        monkeypatch.setattr(watch_relay, "_stop_relay",
+                            lambda deadline=8.0: stopped.append(True) or True)
+        assert watch_relay.ensure_running(updated=True) == 0
+        assert stopped == []
+        assert "deferred" in capsys.readouterr().err
+
     @pytest.mark.parametrize("serving, installed", [
         (None, "8720a1b"),        # an older relay that reports no commit
         ("15642ba", None),        # a plugin install: no .git to ask
@@ -2722,6 +2903,85 @@ def _write_transcript(tmp_path, folder, name, lines):
                    for line in lines) + "\n",
         encoding="utf-8")
     return path
+
+
+class TestAStaleTapLands:
+    """#795: when a relay restarts, the watch may still show the iCloud copy
+    of a card the dead relay held. The hook re-posts the card under the id
+    it chose, and a relay that has only just started asks the bridge to
+    try a tap on a card it does not hold yet again (503), so the tap is
+    kept until the repost arrives instead of being dropped."""
+
+    CARD = {"tier": "HIGH", "headline": "Delete build -r", "detail": "rm -r build"}
+
+    def _queued(self, queue, card, wait=2.0):
+        threading.Thread(target=lambda: queue.submit(dict(card), wait), daemon=True).start()
+
+    def test_a_card_keeps_the_id_its_hook_chose(self):
+        queue = watch_relay.CardQueue()
+        self._queued(queue, dict(self.CARD, post_id="0123456789ab"))
+        [card] = _wait_until(queue.pending, what="the card")
+        assert card["id"] == "0123456789ab" and "post_id" not in card
+
+    @pytest.mark.parametrize("post_id", ["../../etc/x", "ABCDEF012345", "0123", 12, None])
+    def test_an_id_that_is_not_ours_is_not_taken(self, post_id):
+        queue = watch_relay.CardQueue()
+        self._queued(queue, dict(self.CARD, post_id=post_id))
+        [card] = _wait_until(queue.pending, what="the card")
+        assert card["id"] != post_id and re.fullmatch(r"[0-9a-f]{12}", card["id"])
+
+    def test_two_cards_never_share_an_id(self):
+        queue = watch_relay.CardQueue()
+        self._queued(queue, dict(self.CARD, post_id="0123456789ab"))
+        self._queued(queue, dict(self.CARD, post_id="0123456789ab"))
+        cards = _wait_until(lambda: len(queue.pending()) == 2 and queue.pending(),
+                            what="both cards")
+        assert len({card["id"] for card in cards}) == 2
+
+    @pytest.fixture
+    def relay(self, fresh_auth):
+        watch_relay.LIMITS.reset()
+        server, queue = watch_relay.serve(port=0, auth=fresh_auth)
+        _serve(server)
+        device = fresh_auth.issue_device("watch-1")
+        yield "http://127.0.0.1:%d" % server.server_address[1], queue, device
+        server.shutdown()
+        server.server_close()
+
+    def _decide(self, base, device, card_id):
+        body = {"id": card_id, "decision": "allow"}
+        headers, _ = TestSignedRequests._signed(None, device, "/decision", body)
+        status, reply, _ = TestSignedRequests._post(None, base, "/decision", body, headers)
+        return status, reply
+
+    def test_a_fresh_relay_asks_for_the_tap_again(self, relay):
+        base, _, device = relay
+        assert self._decide(base, device, "0123456789ab") == (503, {"ok": False, "retry": True})
+
+    def test_after_its_first_minute_the_refusal_is_final(self, relay, monkeypatch):
+        base, _, device = relay
+        monkeypatch.setattr(watch_relay.CardQueue, "START_GRACE_SECONDS", 0.0)
+        assert self._decide(base, device, "0123456789ab") == (200, {"ok": False})
+
+    def test_a_card_that_already_left_is_not_asked_for_again(self, relay):
+        base, queue, device = relay
+        queue.submit(dict(self.CARD, post_id="0123456789ab"), 0.05)
+        assert self._decide(base, device, "0123456789ab") == (200, {"ok": False})
+
+    def test_an_id_no_card_could_have_is_refused_at_once(self, relay):
+        base, _, device = relay
+        assert self._decide(base, device, "ghost") == (200, {"ok": False})
+
+    def test_a_held_tap_still_meets_every_check(self, relay):
+        """The retry goes through decide() like any tap: a lasting grant on
+        a CRITICAL card is refused whenever it arrives."""
+        base, queue, device = relay
+        self._queued(queue, dict(self.CARD, tier="CRITICAL", post_id="0123456789ab"))
+        _wait_until(queue.pending, what="the card")
+        body = {"id": "0123456789ab", "decision": "always"}
+        headers, _ = TestSignedRequests._signed(None, device, "/decision", body)
+        status, reply, _ = TestSignedRequests._post(None, base, "/decision", body, headers)
+        assert (status, reply) == (200, {"ok": False})
 
 
 class TestSignedRequests:
@@ -15265,6 +15525,110 @@ class TestClaudeIsFoundWhoeverStartedTheRelay:
         assert source.count("if not ensure_claude_on_path():") == 2
 
 
+class TestANewerHelperIsSaid:
+    """A plugin install is Claude Code's to update, and Claude Code leaves
+    auto-update off for every marketplace but Anthropic's. A user sat on
+    1.1.52 for weeks, without the bridge that makes a closed watch buzz,
+    until they updated by hand (2026-10-23). The relay now asks GitHub
+    once a day and says so on the wrist — quietly, because releases come
+    often: not with auto-update on, not for a release under a week old,
+    and as news, not as a problem."""
+
+    NOW = 1_800_000_000.0
+    DAY = 24 * 3600.0
+
+    def _check(self, monkeypatch, ours, releases, auto=False):
+        monkeypatch.setattr(watch_relay, "HELPER_VERSION", ours)
+        watch_relay.check_for_newer_helper(releases=lambda: releases,
+                                           auto_update=lambda: auto,
+                                           now=lambda: self.NOW)
+        return watch_relay.conditions()
+
+    def test_a_release_out_a_week_is_said_quietly_with_how_to_get_it(self, monkeypatch):
+        [condition] = self._check(monkeypatch, "1.1.52",
+                                  [("v1.1.69", self.NOW - 8 * self.DAY)])
+        assert condition["key"] == "outdated" and condition["tone"] == "in_hand"
+        assert "/plugin" in condition["detail"] and "auto-update" in condition["detail"]
+
+    def test_a_fresh_release_says_nothing(self, monkeypatch):
+        """Released this morning, updated tomorrow: never nagged."""
+        assert self._check(monkeypatch, "1.1.68",
+                           [("v1.1.69", self.NOW - 2 * self.DAY)]) == []
+
+    def test_one_old_missed_release_is_enough(self, monkeypatch):
+        """Releases every few days must not keep it hidden for ever: what
+        counts is the oldest release this helper is missing."""
+        assert self._check(monkeypatch, "1.1.52", [
+            ("v1.1.69", self.NOW - 1 * self.DAY),
+            ("v1.1.60", self.NOW - 3 * self.DAY),
+            ("v1.1.53", self.NOW - 9 * self.DAY)])
+
+    def test_with_auto_update_on_nothing_is_said_or_asked(self, monkeypatch):
+        asked = []
+        monkeypatch.setattr(watch_relay, "HELPER_VERSION", "1.1.52")
+        watch_relay.note_condition("outdated", "stale")
+        watch_relay.check_for_newer_helper(releases=lambda: asked.append(True) or [],
+                                           auto_update=lambda: True)
+        assert watch_relay.conditions() == [] and asked == []
+
+    @pytest.mark.parametrize("ours", ["1.1.69", "1.1.70", "1.2.0"])
+    def test_a_current_helper_clears_it(self, monkeypatch, ours):
+        watch_relay.note_condition("outdated", "stale")
+        assert self._check(monkeypatch, ours, [("v1.1.69", self.NOW - 30 * self.DAY)]) == []
+
+    def test_versions_compare_as_numbers_not_text(self, monkeypatch):
+        assert self._check(monkeypatch, "1.1.9", [("v1.1.10", self.NOW - 30 * self.DAY)])
+
+    def test_tags_that_are_not_versions_are_passed_over(self, monkeypatch):
+        assert self._check(monkeypatch, "1.1.52", [("nightly", self.NOW - 30 * self.DAY),
+                                                   (None, self.NOW - 30 * self.DAY)]) == []
+
+    def test_a_failed_look_changes_nothing_and_says_so(self, monkeypatch, capsys):
+        monkeypatch.setattr(watch_relay, "HELPER_VERSION", "1.1.52")
+        watch_relay.note_condition("outdated", "as it was", tone="in_hand")
+        capsys.readouterr()
+
+        def offline():
+            raise OSError("no network")
+
+        watch_relay.check_for_newer_helper(releases=offline, auto_update=lambda: False)
+        assert [c["detail"] for c in watch_relay.conditions()] == ["as it was"]
+        assert "could not tell whether a newer helper is out" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("settings, known, expected", [
+        (None, None, False),                                             # nothing said: off
+        (None, {"tapproval": {"autoUpdate": True}}, True),               # the /plugin toggle
+        ({"extraKnownMarketplaces": {"tapproval": {"autoUpdate": False}}},
+         {"tapproval": {"autoUpdate": True}}, False),                    # settings come first
+        (None, {"other": {"autoUpdate": True}}, False),                  # another marketplace
+        ("not json", None, False),
+    ])
+    def test_claude_codes_auto_update_is_read_as_it_reads_it(self, monkeypatch, tmp_path,
+                                                             settings, known, expected):
+        settings_path, plugins = tmp_path / "settings.json", tmp_path / "plugins"
+        plugins.mkdir()
+        for path, data in ((settings_path, settings), (plugins / "known_marketplaces.json", known)):
+            if data is not None:
+                path.write_text(data if isinstance(data, str) else json.dumps(data))
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(settings_path))
+        monkeypatch.setenv("CLAUDE_CODE_PLUGIN_CACHE_DIR", str(plugins))
+        assert watch_relay._auto_update_on() is expected
+
+    def test_a_git_install_is_left_to_its_own_updates(self, monkeypatch, tmp_path):
+        (tmp_path / ".git").mkdir()
+        asked = []
+        monkeypatch.setattr(watch_relay, "RELEASES_URL", "https://example.invalid/latest")
+        monkeypatch.setattr(watch_relay, "check_for_newer_helper",
+                            lambda **k: asked.append(True))
+        watch_relay.watch_for_newer_helper(here=str(tmp_path))
+        assert asked == []
+
+    def test_no_test_asks_github(self):
+        """The suite's own fixture turns the look off, subprocesses too."""
+        assert watch_relay.RELEASES_URL == ""
+        assert os.environ.get("TAPPROVAL_RELEASES_URL") == ""
+
+
 class TestTheReportingItselfIsChecked:
     """Issue #38's other half: three of its cases were checks that could
     not fail — TEST BUILD SUCCEEDED with no test action in the scheme, a CI
@@ -15283,7 +15647,7 @@ class TestTheReportingItselfIsChecked:
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
     VOCABULARY = {"bonjour", "bridge", "bridge_install", "claude", "codex", "crash", "dashboard", "helper",
-                  "icloud_off", "pairing", "port", "signin", "stuck", "tunnel", "update"}
+                  "icloud_off", "outdated", "pairing", "port", "signin", "stuck", "tunnel", "update"}
 
     @staticmethod
     def _module_source(name):
@@ -15357,6 +15721,9 @@ class TestConditionsCarryATone:
         ("tunnel", "The away address changed."),
         ("tunnel", "Answering from away stopped. Reopening it"),
         ("bonjour", "The network announcement stopped"),
+        # A tip, not a fault: the old helper keeps working, and the owner
+        # releases often, so this must never look like something broke.
+        ("outdated", "A newer helper is out."),
     }
 
     @staticmethod
