@@ -3144,6 +3144,7 @@ relay_proof = wire.relay_proof
 relay_proof2 = wire.relay_proof2
 seal_body = wire.seal_body
 open_body = wire.open_body
+ENVELOPE_PATH = wire.ENVELOPE_PATH
 
 
 def seal(token, nonce, secret):
@@ -3292,7 +3293,7 @@ class RelayHandler(BaseHTTPRequestHandler):
     # corrupted the next request), and a request with no key rode the key
     # the one before it proved — on the travel address, where Cloudflare
     # pools connections across callers, a way in (2026-09-27).
-    _PER_REQUEST = ("_body_bytes", "_presented_key", "_signed_nonce")
+    _PER_REQUEST = ("_body_bytes", "_presented_key", "_signed_nonce", "_enveloped")
 
     def parse_request(self):
         for name in self._PER_REQUEST:
@@ -3505,8 +3506,16 @@ class RelayHandler(BaseHTTPRequestHandler):
     def _send_body(self, status, media, body, headers=None):
         """An answer, sealed when the request was: the proofs cover the
         plain body, so the watch checks them after opening it."""
-        wire_body, media = self._sealed_answer(body, media)
-        self.send_response(status)
+        sent_status = status
+        if getattr(self, "_enveloped", False):
+            # The status travels inside, beside the body: Cloudflare sees
+            # every enveloped answer as the same 200 (#645, phase 3).
+            wire_body, media, sent_status = seal_body(
+                self._presented(), wire.wrap_answer(status, body),
+                wire.ENVELOPE_ANSWER_AAD), "application/octet-stream", 200
+        else:
+            wire_body, media = self._sealed_answer(body, media)
+        self.send_response(sent_status)
         self.send_header("Content-Type", media)
         self.send_header("Content-Length", str(len(wire_body)))
         # Proof that this answer comes from a holder of the key the request
@@ -3543,8 +3552,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         """The request body as the route reads it: opened, when sealed. None
         when a sealed body does not open with the signer's key."""
         raw = self._raw_body()
-        if not raw or not self._wants_sealed():
-            return raw
+        if not raw or not self._wants_sealed() or getattr(self, "_enveloped", False):
+            return raw              # an envelope's inner body was opened with it
         return open_body(self._presented(), raw, self._seal_aad())
 
     def _sealed_answer(self, body, media):
@@ -3780,6 +3789,10 @@ class RelayHandler(BaseHTTPRequestHandler):
             return
         path, query = self._route()
         on_tunnel = self.required_token is not None
+        if (on_tunnel and path == ENVELOPE_PATH and method == "POST"
+                and not getattr(self, "_enveloped", False)):
+            self._open_envelope()
+            return
         route = self.ROUTES[method].get(path) if path else None
         if route is not None and on_tunnel and route[1].get("lan_only"):
             # A LAN-only route on the tunnel listener: say nothing about
@@ -3838,6 +3851,35 @@ class RelayHandler(BaseHTTPRequestHandler):
                            "--allow-simulator."}, 403)
             return
         getattr(self, handler)(path, query)
+
+    def _open_envelope(self):
+        """A whole travel request in one sealed body (#645, phase 3): opened
+        with the key that signed it, then dispatched as if it had arrived
+        plain, under every rule a plain one meets. Cloudflare's edge saw
+        only "POST /t/…/e"; the route, the query and the answer's status
+        stay between this computer and the watch."""
+        key = self._presented()
+        if (not key or not getattr(self, "_signed_nonce", None)
+                or self.headers.get(self.SEALED_HEADER) != "1"
+                or not _credential_ok(self.auth, key)):
+            # Nothing sealed can be said to a caller that proved no key.
+            self._send_json({"error": "not paired"}, 403)
+            return
+        inner = open_body(key, self._raw_body(), wire.ENVELOPE_AAD)
+        unwrapped = wire.unwrap_request(inner) if inner is not None else None
+        self._enveloped = True
+        if unwrapped is None:
+            self._send_json({"error": "the envelope did not open"}, 400)
+            return
+        _note_first_seal(key)
+        _note_updated_watch()       # only a 2.1-or-newer watch seals (#820)
+        method, path, query, body = unwrapped
+        self.command = method
+        self.path = "/t/%s%s%s" % (self.required_token, path, "?" + query if query else "")
+        self._body_bytes = body
+        # The local log keeps the route; the secret is still redacted there.
+        self.requestline = "%s %s HTTP/1.1 (sealed)" % (method, self.path)
+        self._dispatch(method)
 
     def do_GET(self):
         self._dispatch("GET")
@@ -3898,6 +3940,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                              # Opens sealed bodies: an away watch learns it
                              # here, on any road, proven like the rest.
                              "seal": 1,
+                             "envelope": 1,
                              "conditions": conditions(),
                              "agents": wired_agents(),
                              # The watch says this, not "Mac" (2026-10-15).
@@ -3998,6 +4041,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         # This helper opens sealed bodies: a 2.1 watch seals the travel
         # road only after hearing so, so an older helper is never sent one.
         answer["seal"] = 1
+        answer["envelope"] = 1
         # The bridge's cue to stop writing readable iCloud copies (#820).
         if watch_has_updated():
             answer["updated_watch"] = 1

@@ -26,11 +26,11 @@
 <p><em>Tapproval answers permission prompts, so a bug in it is a bug in somebody's permission boundary. This page says what it can see, what it promises, what it does not protect against, and every security fix so far. The computer half is open source, so each claim here can be checked in <a href="https://github.com/marcobelini/tapproval-helper">the code</a>.</em></p>
 
 <h2>What Tapproval can see, and where it goes</h2>
-<p>A small helper on your computer, Tapproval Base, sees what Claude Code asks permission for: the command, or the file and what would be written to it. For the session list it also reads Claude Code's transcripts on that computer. It sends a short card to your watch and prints your answer back to Claude Code. There is no server of ours, no account and no telemetry. Cards take one of three routes:</p>
+<p>A small helper on your computer, Tapproval Base, sees what Claude Code asks permission for: the command, or the file and what would be written to it. For the session list it also reads Claude Code's transcripts on that computer. It sends a short card to your watch and prints your answer back to Claude Code. There is no server of ours, no account and no telemetry. Cards take one of three routes, each encrypted from watch app 2.1 (now in beta on TestFlight; earlier versions are signed but not encrypted):</p>
 <ul>
-<li><strong>Your own network.</strong> Watch and computer talk directly. Every request and every answer is signed, so nobody on the network can fake or change one. It is not yet encrypted: someone on the same Wi-Fi could read cards and conversations as they pass. Encrypting this road is the next security change.</li>
-<li><strong>Your own iCloud, on a Mac.</strong> The helper installs a small bridge there, and cards pass through CloudKit's private database, which belongs to your Apple ID. We cannot read it. Installing with <code>--no-bridge</code> leaves it out.</li>
-<li><strong>An encrypted tunnel, if you turn on the travel connection.</strong> Traffic passes through Cloudflare and is not stored there. The address is secret, but it is only an address: every request must still prove a device key.</li>
+<li><strong>Your own network.</strong> Watch and computer talk directly, encrypted. The watch accepts only your computer's own certificate, which it learns from an answer that proves your computer's key, so a stranger on the same Wi-Fi can neither read what passes nor pretend to be your computer. Every request and every answer is also signed, so nobody can fake or change one.</li>
+<li><strong>Your own iCloud, on a Mac.</strong> The helper installs a small bridge there, and cards pass through CloudKit's private database, which belongs to your Apple ID. We cannot read it. A card's details, its plan and the pairing key are stored encrypted, so Apple cannot read them either; only a card's headline and risk level stay readable to Apple, because it needs them to buzz your watch. Installing with <code>--no-bridge</code> leaves it out.</li>
+<li><strong>The travel address, if you turn on the travel connection.</strong> Traffic passes through Cloudflare and is not stored there. Every request and every answer is sealed with a key that only your watch and your computer hold (ChaCha20-Poly1305), so Cloudflare carries it but cannot read it. The address is secret, but it is only an address: every request must still prove a device key.</li>
 </ul>
 <p>The <a href="privacy.html">privacy policy</a> has the same routes, with what each part stores.</p>
 
@@ -50,12 +50,19 @@
 <ul>
 <li><strong>A compromised computer.</strong> A process running as you can talk to the helper. Letting local processes in is what lets Claude Code hand it a prompt in the first place.</li>
 <li><strong>Your Apple ID, on the iCloud route.</strong> With the Mac bridge, the watch learns its first key from your private iCloud. Anyone who controls your Apple ID could answer a prompt, so protect it with two-factor authentication.</li>
-<li><strong>Someone reading your Wi-Fi.</strong> On your own network the traffic is signed but not yet encrypted, so a person on the same network, at a café for example, could read cards and conversations. They could not answer one or alter it. Away from your network, the tunnel is encrypted; iCloud is Apple's.</li>
+<li><strong>A watch app older than 2.1.</strong> Encryption on the Wi-Fi and the travel address needs version 2.1 of the watch app, so a watch that has not updated still talks the old way: signed, not encrypted. The helper keeps that old door open so such a watch keeps working; it will close once watches have moved on. The App Store updates the app on its own for most people.</li>
+<li><strong>What can still be seen from outside.</strong> Someone on the network, or Cloudflare on the travel road, can see that your watch and computer are talking, when, and how much. Apple sees a card's headline and risk level in your iCloud.</li>
 <li><strong>What the audit log holds.</strong> The helper logs command text on your computer, with credential-shaped fragments removed. It never leaves the machine, but it is there.</li>
 </ul>
 
 <h2>Fixes, disclosed</h2>
 <p>Newest first. Each entry says what was wrong, when, who could have used it, and the fix. Starting Claude Code once updates the helper.</p>
+
+<h3>2.1, October 2026: cards and conversations could be read on the way</h3>
+<p><strong>What was wrong.</strong> Between your watch and your computer, what passed was signed but not encrypted. On your Wi-Fi, someone on the same network could read cards and conversations as they passed. On the travel road, Cloudflare could read them, because its edge opens the tunnel's encryption. In iCloud, a card's details and the pairing key were stored where Apple could read them, unless you had turned on Advanced Data Protection. Nobody could answer a card or change one: every request and answer was signed.</p>
+<p><strong>Since when.</strong> From the first public release until watch app 2.1 with helper 1.1.75.</p>
+<p><strong>Who could have used it.</strong> Someone on the same Wi-Fi, such as a café or office network; Cloudflare; Apple. To read, never to answer.</p>
+<p><strong>The fix.</strong> On your Wi-Fi the watch now talks to your computer over TLS and accepts only your computer's own certificate, learned from an answer that proves your computer's key. On the travel road every request and answer is sealed with a key derived from the watch's own key (ChaCha20-Poly1305), so Cloudflare carries only sealed bytes. In iCloud, card details and the pairing key are stored as encrypted fields. Tests show a stranger's certificate, a changed certificate and an unsealed body are all refused, and the check was repeated on a real watch with its iPhone switched off.</p>
 
 <h3>21 October 2026: another account on the same Mac could read your sessions</h3>
 <p><strong>What was wrong.</strong> The helper let any program on the computer in without a key, as long as it connected from the computer itself. That included other user accounts on the same Mac, and anything forwarded into it. They could read your session list, your conversations, and the travel address with its secret.</p>

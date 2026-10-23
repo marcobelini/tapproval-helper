@@ -402,3 +402,55 @@ def open_body(device_key, sealed, aad=b""):
     if len(sealed) < 28:
         return None
     return aead_open(seal_key(device_key), sealed[:12], sealed[12:], aad)
+
+
+# The travel road's envelope (#645, phase 3): the whole request inside one
+# sealed body, so Cloudflare's edge reads neither the route nor the query
+# nor the answer's status, only "POST /t/…/e" and a size.
+ENVELOPE_PATH = "/e"
+ENVELOPE_AAD = b"POST /e"
+ENVELOPE_ANSWER_AAD = b"answer POST /e"
+
+
+def wrap_request(method, path, query, body):
+    import base64
+    import json
+    return json.dumps({"m": method, "p": path, "q": query or "",
+                       "b": base64.b64encode(body or b"").decode("ascii")}).encode("utf-8")
+
+
+def unwrap_request(data):
+    """(method, path, query, body), or None for anything but a GET or POST to
+    a plain path. Never another envelope: one layer is the whole design."""
+    import base64
+    import json
+    try:
+        inner = json.loads(data)
+        method, path, query = inner["m"], inner["p"], inner.get("q", "")
+        body = base64.b64decode(inner.get("b", ""), validate=True)
+    except (ValueError, TypeError, KeyError):   # binascii.Error is a ValueError
+        return None
+    if (method not in ("GET", "POST") or not isinstance(path, str)
+            or not isinstance(query, str) or not path.startswith("/")
+            or path.startswith("//") or path == ENVELOPE_PATH
+            or any(c in path + query for c in " \r\n#")):
+        return None
+    return method, path, query, body
+
+
+def wrap_answer(status, body):
+    import base64
+    import json
+    return json.dumps({"s": int(status),
+                       "b": base64.b64encode(body or b"").decode("ascii")}).encode("utf-8")
+
+
+def unwrap_answer(data):
+    """(status, body), or None."""
+    import base64
+    import json
+    try:
+        inner = json.loads(data)
+        return int(inner["s"]), base64.b64decode(inner.get("b", ""), validate=True)
+    except (ValueError, TypeError, KeyError):   # binascii.Error is a ValueError
+        return None

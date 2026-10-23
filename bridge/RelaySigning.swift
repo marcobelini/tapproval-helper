@@ -139,4 +139,42 @@ enum BodySeal {
         guard let box = try? ChaChaPoly.SealedBox(combined: sealed) else { return nil }
         return try? ChaChaPoly.open(box, using: key(deviceKey), authenticating: aad)
     }
+
+    // The envelope (#645 phase 3): the whole request in one sealed body, as
+    // tapproval_wire.wrap_request writes it, so Cloudflare's edge reads
+    // neither the route, the query nor the answer's status.
+    static let envelopeAAD = Data("POST /e".utf8)
+    static let envelopeAnswerAAD = Data("answer POST /e".utf8)
+
+    /// `…/t/<secret>/pending?x` → `…/t/<secret>/e`; nil off the tunnel.
+    static func envelopeURL(for url: URL) -> URL? {
+        guard var parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let range = parts.path.range(of: #"^/t/[^/]+"#, options: .regularExpression)
+        else { return nil }
+        parts.path = String(parts.path[range]) + "/e"
+        parts.query = nil
+        return parts.url
+    }
+
+    /// The route after the tunnel's `/t/<secret>` prefix.
+    static func innerPath(_ url: URL) -> String {
+        let path = url.path
+        guard let range = path.range(of: #"^/t/[^/]+"#, options: .regularExpression) else { return path }
+        let rest = String(path[range.upperBound...])
+        return rest.isEmpty ? "/" : rest
+    }
+
+    static func wrapRequest(method: String, path: String, query: String, body: Data) -> Data {
+        let inner: [String: String] = ["m": method.uppercased(), "p": path, "q": query,
+                                       "b": body.base64EncodedString()]
+        return (try? JSONSerialization.data(withJSONObject: inner, options: [.sortedKeys])) ?? Data()
+    }
+
+    static func unwrapAnswer(_ data: Data) -> (Int, Data)? {
+        guard let inner = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let status = inner["s"] as? Int,
+              let body = Data(base64Encoded: inner["b"] as? String ?? "")
+        else { return nil }
+        return (status, body)
+    }
 }

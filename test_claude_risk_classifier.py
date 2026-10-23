@@ -7860,8 +7860,9 @@ class TestTheSharedWireModule:
         # Named, not looked up: sys.stdlib_module_names is 3.10+, and CI runs
         # the suite on older interpreters too. A new import here is a choice.
         # struct (2026-10-23): ChaCha20's words, for the sealed travel road.
-        assert names == {"__future__", "hashlib", "json", "os", "re", "hmac", "struct",
-                         "urllib"}, names
+        # base64 (2026-10-23): the travel envelope's inner body (#645 phase 3).
+        assert names == {"__future__", "base64", "hashlib", "json", "os", "re", "hmac",
+                         "struct", "urllib"}, names
 
     def test_it_does_nothing_at_import_but_name_things(self):
         """Top level: the docstring, imports, functions, and constants that
@@ -19970,6 +19971,191 @@ class TestSealedTravelRoad:
         finally:
             server.shutdown()
             server.server_close()
+
+
+class TestTheTravelEnvelope:
+    """#645 phase 3: a whole travel request inside one sealed body, so
+    Cloudflare's edge reads neither the route, the query nor the answer's
+    status: every request is "POST /t/…/e", every answer a 200 of bytes."""
+
+    def _relay(self, fresh_auth):
+        server, _ = watch_relay.serve(port=0, token="tok", auth=fresh_auth)
+        _serve(server)
+        return server, "http://127.0.0.1:%d/t/tok/e" % server.server_address[1]
+
+    def _outer(self, key, inner, sign_key=None, seal_key=None, sealed=True):
+        import uuid
+        data = tapproval_wire.seal_body(seal_key or key, inner, tapproval_wire.ENVELOPE_AAD)
+        stamp, nonce = int(time.time()), uuid.uuid4().hex
+        mac = watch_relay.sign_request(sign_key or key, "POST", "/t/tok/e", stamp, nonce,
+                                       data, query="")
+        headers = {"Content-Type": "application/json",
+                   "X-Tapproval-Signature": "v2 %d %s %s" % (stamp, nonce, mac)}
+        if sealed:
+            headers["X-Tapproval-Sealed"] = "1"
+        return data, headers, nonce
+
+    def _send(self, url, key, method, path, query="", body=b"", **kw):
+        inner = tapproval_wire.wrap_request(method, path, query, body)
+        data, headers, nonce = self._outer(key, inner, **kw)
+        request = urllib.request.Request(url, data=data, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as reply:
+                return reply.status, reply.read(), reply.headers, nonce
+        except urllib.error.HTTPError as error:
+            return error.code, error.read(), error.headers, nonce
+
+    def _open(self, key, raw):
+        opened = tapproval_wire.open_body(key, raw, tapproval_wire.ENVELOPE_ANSWER_AAD)
+        assert opened is not None, "the watch could not open its answer"
+        return tapproval_wire.unwrap_answer(opened)
+
+    def test_the_route_query_and_status_never_cross_in_clear(self, fresh_auth):
+        key = fresh_auth.issue_device("watch-1")
+        server, url = self._relay(fresh_auth)
+        try:
+            inner = tapproval_wire.wrap_request("GET", "/thread", "id=s-1234&after=0", b"")
+            data, _, _ = self._outer(key, inner)
+            for word in (b"thread", b"s-1234", b"after"):
+                assert word not in data
+            status, raw, headers, nonce = self._send(url, key, "POST", "/decision",
+                                                     body=json.dumps({"id": "no-such-card",
+                                                                      "decision": "allow"}).encode())
+            assert status == 200 and headers.get("Content-Type") == "application/octet-stream"
+            for word in (b"decision", b"no-such-card", b"ok"):
+                assert word not in raw
+            inner_status, body = self._open(key, raw)
+            assert inner_status == 200 and json.loads(body) == {"ok": False}
+            assert headers.get("X-Tapproval-Proof2") == watch_relay.relay_proof2(
+                key, nonce, inner_status, body), "the proof covers what the watch reads"
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_refusal_is_said_inside_the_envelope(self, fresh_auth):
+        # A LAN-only route through the tunnel is the same 404 as ever, but
+        # Cloudflare sees a 200 like every other answer.
+        key = fresh_auth.issue_device("watch-1")
+        server, url = self._relay(fresh_auth)
+        try:
+            for path in ("/pair", "/tunnel", "/no-such-route"):
+                status, raw, _, _ = self._send(url, key, "GET", path)
+                assert status == 200
+                assert self._open(key, raw)[0] == 404, path
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_no_key_no_envelope(self, fresh_auth):
+        key = fresh_auth.issue_device("watch-1")
+        server, url = self._relay(fresh_auth)
+        try:
+            status, raw, _, _ = self._send(url, key, "GET", "/health", sign_key="not a key")
+            assert status == 403 and json.loads(raw)["error"]
+            status, _, _, _ = self._send(url, key, "GET", "/health", sealed=False)
+            assert status == 403
+            # Signed by the watch but sealed with another key: nothing opens.
+            status, raw, _, _ = self._send(url, key, "GET", "/health", seal_key="someone else")
+            assert status == 200 and self._open(key, raw)[0] == 400
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_one_layer_only(self, fresh_auth):
+        key = fresh_auth.issue_device("watch-1")
+        server, url = self._relay(fresh_auth)
+        try:
+            status, raw, _, _ = self._send(url, key, "POST", "/e", body=b"{}")
+            assert status == 200 and self._open(key, raw)[0] == 400
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_the_next_request_on_the_connection_is_not_enveloped(self, fresh_auth):
+        # Cloudflare keeps connections open across requests; what one
+        # request proved must not ride into the next (2026-09-27).
+        import http.client
+        key = fresh_auth.issue_device("watch-1")
+        server, _ = self._relay(fresh_auth)
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+            inner = tapproval_wire.wrap_request("GET", "/health", "", b"")
+            data, headers, _ = self._outer(key, inner)
+            conn.request("POST", "/t/tok/e", body=data, headers=headers)
+            first = conn.getresponse()
+            first.read()
+            assert first.status == 200
+            conn.request("GET", "/t/tok/health")
+            second = conn.getresponse()
+            body = second.read()
+            assert second.status == 403, "no key: refused, and plainly"
+            assert second.getheader("Content-Type", "").startswith("application/json")
+            assert json.loads(body)["error"]
+            conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_only_the_tunnel_listener_opens_envelopes(self, fresh_auth):
+        key = fresh_auth.issue_device("watch-1")
+        server, _ = watch_relay.serve(port=0, auth=fresh_auth)
+        _serve(server)
+        try:
+            status, _ = relay_call("http://127.0.0.1:%d/e" % server.server_address[1],
+                                   token=key, body={})
+            assert status == 404
+            status, body = relay_call("http://127.0.0.1:%d/health" % server.server_address[1],
+                                      token=key)
+            assert body.get("envelope") == 1, "a watch learns it here, on any road"
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_an_envelope_says_the_watch_has_updated(self, fresh_auth):
+        key = fresh_auth.issue_device("watch-1")
+        server, url = self._relay(fresh_auth)
+        try:
+            self._send(url, key, "GET", "/health")
+        finally:
+            server.shutdown()
+            server.server_close()
+        assert watch_relay.watch_has_updated()
+
+    def test_unwrap_takes_only_a_plain_route(self):
+        unwrap = tapproval_wire.unwrap_request
+        assert unwrap(tapproval_wire.wrap_request("GET", "/pending", "", b"")) == (
+            "GET", "/pending", "", b"")
+        for bad in (b"not json", b"{}",
+                    json.dumps({"m": "DELETE", "p": "/x", "q": "", "b": ""}).encode(),
+                    json.dumps({"m": "GET", "p": "x", "q": "", "b": ""}).encode(),
+                    json.dumps({"m": "GET", "p": "//evil", "q": "", "b": ""}).encode(),
+                    json.dumps({"m": "GET", "p": "/e", "q": "", "b": ""}).encode(),
+                    json.dumps({"m": "GET", "p": "/a b", "q": "", "b": ""}).encode(),
+                    json.dumps({"m": "GET", "p": "/a", "q": "x\r\nHost: y", "b": ""}).encode(),
+                    json.dumps({"m": "GET", "p": "/a", "q": "", "b": "!!"}).encode()):
+            assert unwrap(bad) is None, bad
+
+    # What the watch's CryptoKit opens (TravelEnvelopeTests in HealthTests.swift):
+    # the same key, nonce and answer must give these exact bytes.
+    VECTOR_KEY = "envelope-test-key"
+    VECTOR_NONCE = bytes(range(12))
+    VECTOR_ANSWER = (404, b'{"error":"not found"}')
+
+    def test_the_answer_vector_the_watch_opens(self):
+        wrapped = tapproval_wire.wrap_answer(*self.VECTOR_ANSWER)
+        sealed = tapproval_wire.seal_body(self.VECTOR_KEY, wrapped,
+                                          tapproval_wire.ENVELOPE_ANSWER_AAD,
+                                          nonce=self.VECTOR_NONCE)
+        swift = self._read_swift_vector()
+        assert sealed.hex() == swift, "the watch's test holds other bytes than these"
+
+    def _read_swift_vector(self):
+        path = os.path.join(_ROOT, "WatchApp", "TapprovalTests", "HealthTests.swift")
+        if not os.path.isfile(path):
+            pytest.skip("no watch app in this layout")
+        with open(path, encoding="utf-8") as handle:
+            source = handle.read()
+        return re.search(r'static let envelopeAnswerHex = "([0-9a-f]+)"', source).group(1)
 
 
 def test_a_test_relay_runs_its_tunnel_on_its_own_port(monkeypatch, fresh_auth):

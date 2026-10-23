@@ -44,9 +44,11 @@
 ## Privacy
 Tapproval collects nothing: no accounts, no analytics, no servers of ours.
 Prompts and conversations travel between the watch and the user's own
-computer: over the user's own network (signed against forgery and
-tampering, not yet encrypted), through the user's own iCloud, or through
-an encrypted tunnel when away.
+computer, encrypted on every road (watch app 2.1): over the user's own
+network (TLS pinned to the computer's own certificate), through the
+user's own iCloud (card details as encrypted fields), or through the
+travel address when away (bodies sealed end to end, so Cloudflare cannot
+read them).
 
 ## Key pages
 - Home: https://tapproval.thoughtfulsteward.org/

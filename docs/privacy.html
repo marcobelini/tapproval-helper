@@ -24,13 +24,17 @@
 no servers of ours. We never see your prompts, your code, your
 conversations, or your taps.</p>
 <h2>Where your data lives</h2>
+<p>What this section calls encrypted is encrypted from watch app 2.1, now
+in beta on TestFlight. Earlier versions sign everything, so nobody can
+fake or change an answer, but do not encrypt it.</p>
 <ul>
 <li><strong>On your own devices.</strong> The watch app talks directly to a small
   helper running on your own computer, over your own network. Prompts,
   sessions and decisions travel between your watch and your computer —
-  nowhere else. On this road every request is signed, so nobody can fake
-  or change an answer, but it is not yet encrypted: someone on the same
-  network could read what passes.</li>
+  nowhere else. On this road it is encrypted, and the watch accepts only
+  your computer's own certificate, so nobody on the same network can read
+  what passes. Every request is also signed, so nobody can fake or change
+  an answer.</li>
 <li><strong>In your own iCloud, on a Mac.</strong> On a Mac the helper installs a small
   bridge, so approval cards also travel through CloudKit's <em>private
   database</em>, storage that belongs to your personal Apple ID. Your answers
@@ -39,14 +43,18 @@ conversations, or your taps.</p>
   your Apple ID finds and proves itself to your computer without your
   Wi-Fi. A card is removed once it has been answered. That is what lets a
   closed watch buzz. Apple hosts it and we cannot read it. It is the same
-  place your own notes and backups live. If you would rather keep
+  place your own notes and backups live. A card's details and your
+  computer's key are stored encrypted, so Apple cannot read them either;
+  only a card's headline and risk level stay readable to Apple, which
+  needs them to buzz your watch. If you would rather keep
   iCloud out of it, install with
   <code>python3 ~/.tapproval/ClaudeRiskClassifier.py --install --no-bridge</code>;
   cards then reach the watch while the app is open.</li>
 <li><strong>Through a tunnel, when you are away from home.</strong> If you turn on the
-  travel connection, your computer opens an encrypted Cloudflare tunnel
-  so your watch can reach it from anywhere. The traffic passes through;
-  nothing is stored there, and only a device holding your computer's key
+  travel connection, your computer opens a Cloudflare tunnel so your
+  watch can reach it from anywhere. What passes is sealed with a key only
+  your watch and your computer hold, so Cloudflare carries it but cannot
+  read it; nothing is stored there, and only a device holding your computer's key
   can ask it anything. The tunnel's address is a secret one. It stays
   the same while your computer runs, and changes when the computer
   restarts.</li>
