@@ -133,7 +133,7 @@ func log(_ message: String) {
                           recordID: CKRecord.ID(recordName: card.id))
     record["tier"] = card.tier
     record["headline"] = card.headline
-    record["detail"] = card.detail
+    record["detail"] = encryptedOnly ? nil : card.detail
     record["project"] = card.project
     record["kind"] = card.kind
     record["options"] = card.options
@@ -144,14 +144,14 @@ func log(_ message: String) {
     // lists, so the facts travel as JSON text.
     let facts = card.facts.flatMap {
         (try? JSONEncoder().encode($0)).flatMap { String(data: $0, encoding: .utf8) } }
-    record["plan"] = card.plan
-    record["facts"] = facts
+    record["plan"] = encryptedOnly ? nil : card.plan
+    record["facts"] = encryptedOnly ? nil : facts
     // What is being done also travels encrypted (#645 S12): CloudKit seals
     // `encryptedValues` with a key in the user's iCloud Keychain, so Apple
     // cannot read it even without Advanced Data Protection. A field is plain
-    // or encrypted for life, hence the new names. The plain copies above stay
-    // for one release, for watches on 2.0, which read only those; headline
-    // and tier stay plain for good, because the alert is built from them.
+    // or encrypted for life, hence the new names. The plain copies above go
+    // once this computer's watch reads these (`encryptedOnly`, #820);
+    // headline and tier stay plain for good: the alert is built from them.
     record.encryptedValues["encDetail"] = card.detail
     record.encryptedValues["encPlan"] = card.plan
     record.encryptedValues["encFacts"] = facts
@@ -321,7 +321,21 @@ func postDecision(cardID: String, verdict: String, answer: String?) async -> Boo
 /// the tailnet address, which it may never have asked at home.
 struct TLSPin: Codable, Equatable { let port: Int; let sha256: String }
 
-struct Tunnel: Codable { let url: String?; let tailscale: String?; let tls: TLSPin? }
+struct Tunnel: Codable {
+    let url: String?; let tailscale: String?; let tls: TLSPin?
+    /// 1 once this computer's watch has shown it runs 2.1 or newer (#820).
+    let updatedWatch: Int?
+    enum CodingKeys: String, CodingKey {
+        case url, tailscale, tls
+        case updatedWatch = "updated_watch"
+    }
+}
+
+/// Whether to stop writing the readable iCloud copies of a card's details
+/// and the pairing key (#820): only once the relay has seen this computer's
+/// watch run 2.1 or newer, which reads the encrypted ones. Until then, and
+/// with a helper that does not say, a watch on 2.0 keeps its details.
+var encryptedOnly = false
 
 var lastMirroredInfo: [String?] = []
 
@@ -366,16 +380,17 @@ func bootstrapToken() -> String? {
     // quota and log noise.
     let pin = tunnel.tls.flatMap {
         (try? JSONEncoder().encode($0)).flatMap { String(data: $0, encoding: .utf8) } }
-    let triple = [tunnel.url, tunnel.tailscale, token, pin]
+    encryptedOnly = tunnel.updatedWatch == 1
+    let triple = [tunnel.url, tunnel.tailscale, token, pin, encryptedOnly ? "sealed" : "both"]
     if triple == lastMirroredInfo { return }
     let id = CKRecord.ID(recordName: "relay-info")
     let record = (try? await cloud { try await $0.record(for: id) })
         ?? CKRecord(recordType: "RelayInfo", recordID: id)
     record["url"] = tunnel.url
     record["tailscale"] = tunnel.tailscale
-    record["token"] = token
-    // Sealed as the card's detail is (#645 S12); the plain copy stays one
-    // release, for watches on 2.0.
+    // Sealed as the card's detail is (#645 S12). The plain copy goes with
+    // the card's (#820); nil also clears the one an earlier save left.
+    record["token"] = encryptedOnly ? nil : token
     record.encryptedValues["encToken"] = token
     // Encrypted only: no watch before this one reads a pin from iCloud.
     record.encryptedValues["encTls"] = pin

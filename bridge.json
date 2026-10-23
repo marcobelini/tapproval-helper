@@ -1,8 +1,8 @@
 {
-  "version": "1.0.2",
-  "file": "bridge/TapprovalBridge-1.0.2.zip",
-  "sha256": "8d43b8685052449bca88ed094d131cead5dcc198d5a3a8077a4db057b5e4be54",
-  "size": 183747,
+  "version": "1.0.3",
+  "file": "bridge/TapprovalBridge-1.0.3.zip",
+  "sha256": "b0fbe943638b717a3363bc968b3c790f8f8380bba5df21f712fb6e77b3db9d0d",
+  "size": 185133,
   "team": "K2RX2Y5896",
   "identifier": "app.tapproval.bridge"
 }

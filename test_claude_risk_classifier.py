@@ -2786,6 +2786,39 @@ class TestSelfStartingRelay:
         assert stopped == []
         assert "already running" in capsys.readouterr().err
 
+    def _plugin_start(self, monkeypatch, running_helper, pending=0):
+        """A plugin install (no commit anywhere) starting a session while a
+        relay of ``running_helper`` serves. Returns whether it was stopped."""
+        monkeypatch.setattr(watch_relay, "_self_update", lambda: None)
+        monkeypatch.setattr(watch_relay, "HELPER_VERSION", "1.1.72")
+        monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: {
+            "version": watch_relay.RELAY_VERSION, "pending": pending, "paired_ever": True,
+            "helper": running_helper, "helper_commit": None})
+        monkeypatch.setattr(watch_relay, "_head_commit", lambda root: None)
+        monkeypatch.setattr(watch_relay, "helper_provenance", lambda here=None: (None, None))
+        monkeypatch.setattr(watch_relay, "_admin_call", lambda path, timeout=2: {"ok": True})
+        monkeypatch.setattr(watch_relay, "RELAY_START_WAIT", 0.0)
+        monkeypatch.setattr(watch_relay.subprocess, "Popen", lambda cmd, **k: object())
+        stopped = []
+        monkeypatch.setattr(watch_relay, "_stop_relay",
+                            lambda deadline=8.0: stopped.append(True) or True)
+        watch_relay.ensure_running()
+        return stopped == [True]
+
+    def test_an_updated_plugin_helper_takes_over_from_the_old_one(self, monkeypatch):
+        """Claude Code updates a plugin install in a new folder and starts
+        sessions from it, while the relay it started earlier keeps serving:
+        no commit to compare, the same protocol, so it served the old code
+        until the computer restarted (2026-10-23). Its version says it."""
+        assert self._plugin_start(monkeypatch, "1.1.70")
+
+    @pytest.mark.parametrize("running", ["1.1.72", "1.1.80", "unknown", None, "nightly"])
+    def test_the_same_newer_or_unreadable_helper_is_left_serving(self, monkeypatch, running):
+        assert not self._plugin_start(monkeypatch, running)
+
+    def test_an_older_plugin_helper_still_waits_for_a_card(self, monkeypatch):
+        assert not self._plugin_start(monkeypatch, "1.1.70", pending=1)
+
     def test_stop_asks_by_pid_then_insists_and_reports_the_truth(self, monkeypatch):
         """pkill -f could not see the relay at all; the pid can always be
         signalled. TERM first; KILL when TERM is ignored; and the return
@@ -2982,6 +3015,97 @@ class TestAStaleTapLands:
         headers, _ = TestSignedRequests._signed(None, device, "/decision", body)
         status, reply, _ = TestSignedRequests._post(None, base, "/decision", body, headers)
         assert (status, reply) == (200, {"ok": False})
+
+
+class TestKeepTheHelperUpToDate:
+    """The watch's "Keep the helper up to date" switch (2026-10-23): a plugin
+    install updates only with Claude Code's auto-update on, which is off for
+    every marketplace but Anthropic's. The wearer turns it on; the relay
+    writes it into Claude Code's own settings, the documented way, and
+    nothing else in that file moves."""
+
+    @pytest.fixture
+    def paths(self, tmp_path, monkeypatch):
+        settings, plugins = tmp_path / "settings.json", tmp_path / "plugins"
+        plugins.mkdir()
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(settings))
+        monkeypatch.setenv("CLAUDE_CODE_PLUGIN_CACHE_DIR", str(plugins))
+        return settings, plugins
+
+    @pytest.fixture
+    def relay(self, fresh_auth, monkeypatch):
+        monkeypatch.setattr(watch_relay, "_plugin_install", lambda here=None: True)
+        watch_relay.LIMITS.reset()
+        server, _ = watch_relay.serve(port=0, auth=fresh_auth)
+        _serve(server)
+        device = fresh_auth.issue_device("watch-1")
+        yield "http://127.0.0.1:%d" % server.server_address[1], device
+        server.shutdown()
+        server.server_close()
+
+    def _switch(self, base, device, on):
+        body = {"on": on}
+        headers, _ = TestSignedRequests._signed(None, device, "/auto-update", body)
+        status, reply, _ = TestSignedRequests._post(None, base, "/auto-update", body, headers)
+        return status, reply
+
+    def test_turning_it_on_writes_claude_codes_own_setting_and_keeps_the_rest(self, paths):
+        settings, plugins = paths
+        settings.write_text(json.dumps({"model": "opus", "hooks": {"Stop": []},
+                                        "extraKnownMarketplaces": {"other": {"source": {"source": "github",
+                                                                                          "repo": "a/b"}}}}))
+        assert watch_relay.set_auto_update(True) == (True, None)
+        data = json.loads(settings.read_text())
+        assert data["extraKnownMarketplaces"]["tapproval"] == {
+            "source": {"source": "github", "repo": "marcobelini/tapproval-helper"}, "autoUpdate": True}
+        assert data["model"] == "opus" and data["hooks"] == {"Stop": []}
+        assert "other" in data["extraKnownMarketplaces"]
+        assert list(settings.parent.glob("settings.json.bak-*")), "no backup before the write"
+
+    def test_the_source_claude_code_recorded_is_the_one_written(self, paths):
+        settings, plugins = paths
+        recorded = {"source": "git", "url": "https://example.test/tapproval-helper.git"}
+        (plugins / "known_marketplaces.json").write_text(json.dumps({"tapproval": {"source": recorded}}))
+        watch_relay.set_auto_update(True)
+        assert json.loads(settings.read_text())["extraKnownMarketplaces"]["tapproval"]["source"] == recorded
+
+    def test_turning_it_off_keeps_the_entry_and_says_false(self, paths):
+        settings, _ = paths
+        watch_relay.set_auto_update(True)
+        assert watch_relay.set_auto_update(False) == (False, None)
+        assert json.loads(settings.read_text())["extraKnownMarketplaces"]["tapproval"]["autoUpdate"] is False
+
+    def test_a_settings_file_it_cannot_read_is_left_alone(self, paths):
+        settings, _ = paths
+        settings.write_text("{ not json")
+        state, why = watch_relay.set_auto_update(True)
+        assert state is None and why
+        assert settings.read_text() == "{ not json"
+
+    def test_the_watch_turns_it_on_and_hears_the_truth(self, paths, relay):
+        base, device = relay
+        assert self._switch(base, device, True) == (200, {"ok": True, "on": True})
+        status, health = relay_call(base + "/health", token=device)
+        assert health.get("auto_update") is True
+
+    def test_a_terminal_install_updates_itself_and_says_so(self, paths, relay, monkeypatch):
+        base, device = relay
+        monkeypatch.setattr(watch_relay, "_plugin_install", lambda here=None: False)
+        status, reply = self._switch(base, device, True)
+        assert status == 409 and reply.get("error")
+        assert not paths[0].exists()
+        assert "auto_update" not in relay_call(base + "/health", token=device)[1]
+
+    def test_a_stranger_cannot_change_it(self, paths, relay):
+        base, _ = relay
+        status, _ = relay_call(base + "/auto-update", method="POST", body={"on": True})
+        assert status in (401, 403)
+        assert not paths[0].exists()
+
+    def test_only_a_yes_or_no_is_taken(self, paths, relay):
+        base, device = relay
+        assert self._switch(base, device, "yes")[0] == 400
+        assert not paths[0].exists()
 
 
 class TestSignedRequests:
@@ -3904,6 +4028,22 @@ class TestAnICloudCardIsTheWholeCard:
         written = set(re.findall(r'record\.encryptedValues\["(\w+)"\] =', mirror))
         assert written == set(self.SEALED.values()), sorted(written)
 
+    def test_the_readable_copies_go_once_the_watch_has_updated(self):
+        # #820: each plain copy of a sealed field is written only while
+        # this computer's watch has not shown it reads the sealed one.
+        bridge = self._read("Bridge", "main.swift")
+        mirror = bridge.split("func mirror(", 1)[1].split("\nfunc ", 1)[0]
+        info = bridge.split("func mirrorRelayInfo(", 1)[1].split("\n}\n", 1)[0]
+        for body, fields in ((mirror, self.SEALED), (info, ["token"])):
+            for field in fields:
+                written = re.findall(r'record\["%s"\] = (.+)' % field, body)
+                assert written and all(w.startswith("encryptedOnly ? nil : ") for w in written), \
+                    (field, written)
+        assert "encryptedOnly = tunnel.updatedWatch == 1" in info
+        assert "encryptedOnly ?" in info.split("let triple", 1)[1].split("\n", 1)[0], \
+            "the flip alone must re-save relay-info, or its plain key stays"
+        assert 'case updatedWatch = "updated_watch"' in bridge
+
     def test_the_pairing_key_travels_sealed(self):
         bridge = self._read("Bridge", "main.swift")
         info = bridge.split("func mirrorRelayInfo(", 1)[1].split("\n}\n", 1)[0]
@@ -3922,7 +4062,7 @@ class TestAnICloudCardIsTheWholeCard:
         info = bridge.split("func mirrorRelayInfo(", 1)[1].split("\n}\n", 1)[0]
         assert 'record.encryptedValues["encTls"] = pin' in info
         assert 'record["tls' not in info
-        assert "pin]" in info, "a changed pin alone must be mirrored"
+        assert "token, pin" in info, "a changed pin alone must be mirrored"
         seed = bridge.split('contains("--seed")', 1)[1].split("for record in specimens", 1)[0]
         assert 'info.encryptedValues["encTls"]' in seed
         cloud = self._read("Tapproval", "CloudRelay.swift")
@@ -12665,6 +12805,8 @@ class TestTheRelayRefusesASimulator:
         ("/say", {"session_id": "x", "text": "hi"}),
         ("/new", {"path": "/x", "text": "hi"}),
         ("/end", {"session_id": "x"}),
+        # A simulator's tap must not change the owner's Claude Code settings.
+        ("/auto-update", {"on": True}),
     ]
 
     @pytest.fixture
@@ -12677,6 +12819,9 @@ class TestTheRelayRefusesASimulator:
                             lambda *a, **k: ran.append("end") or "ended")
         monkeypatch.setattr(watch_relay, "start_session",
                             lambda *a, **k: ran.append("new") or "started")
+        monkeypatch.setattr(watch_relay, "_plugin_install", lambda here=None: True)
+        monkeypatch.setattr(watch_relay, "set_auto_update",
+                            lambda on: ran.append("auto-update") or (on, None))
         allow = getattr(request, "param", False)
         server, _ = watch_relay.serve(port=0, auth=_known_watch(fresh_auth),
                                       allow_simulator=allow)
@@ -12706,7 +12851,7 @@ class TestTheRelayRefusesASimulator:
     def test_the_answering_routes_carry_the_rule(self):
         post = watch_relay.RelayHandler.ROUTES["POST"]
         guarded = {p for p, (_, rules) in post.items() if rules.get("no_simulator")}
-        assert guarded == {"/decision", "/say", "/new", "/end"}
+        assert guarded == {"/decision", "/say", "/new", "/end", "/auto-update"}
 
     @pytest.mark.parametrize("tag", ["1", "yes"])
     @pytest.mark.parametrize("path,body", GUARDED)
@@ -19604,6 +19749,37 @@ class TestEncryptedListener:
             server.shutdown()
             server.server_close()
 
+    def test_a_watch_signing_on_the_encrypted_listener_is_remembered(self, fresh_auth):
+        # Only a 2.1 watch has the pin, so only it signs here (#820). An
+        # unsigned caller (anyone who reaches the port) proves nothing.
+        import http.client
+        import ssl
+        import uuid
+        cert, key = self._identity()
+        server, _ = watch_relay.serve_tls("127.0.0.1", 0, cert, key, auth=fresh_auth)
+        _serve(server)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        def get(headers):
+            conn = http.client.HTTPSConnection("127.0.0.1", server.server_address[1],
+                                               context=context, timeout=5)
+            conn.request("GET", "/health", headers=headers)
+            conn.getresponse().read()
+            conn.close()
+        try:
+            get({})
+            assert not watch_relay.watch_has_updated()
+            device = fresh_auth.issue_device("watch-1")
+            stamp, nonce = int(time.time()), uuid.uuid4().hex
+            mac = watch_relay.sign_request(device, "GET", "/health", stamp, nonce, b"", query="")
+            get({"X-Tapproval-Signature": "v2 %d %s %s" % (stamp, nonce, mac)})
+            assert watch_relay.watch_has_updated()
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_the_pin_rides_only_proven_answers(self, monkeypatch, fresh_auth):
         cert, _ = self._identity()
         info = {"port": 8979, "sha256": watch_relay.tls_fingerprint(cert)}
@@ -19751,6 +19927,37 @@ class TestSealedTravelRoad:
         said = [line for line in capsys.readouterr().err.splitlines() if "seals its messages" in line]
         assert len(said) == 1, said
         assert key not in said[0], "never the key itself"
+
+    def test_a_sealing_watch_is_remembered_and_the_bridge_told(self, fresh_auth):
+        # #820: the bridge stops the readable iCloud copies only once this
+        # computer's own watch has shown it reads the encrypted ones.
+        key = fresh_auth.issue_device("watch-1")
+        server, url = self._relay(fresh_auth)
+        home, _ = watch_relay.serve(port=0, auth=fresh_auth)      # where the bridge asks
+        _serve(home)
+        tunnel = "http://127.0.0.1:%d/tunnel" % home.server_address[1]
+        try:
+            assert "updated_watch" not in relay_call(tunnel, token=fresh_auth.bootstrap)[1]
+            assert not watch_relay.watch_has_updated()
+            self._call(url, key, {"id": "x", "decision": "allow"})
+            assert watch_relay.watch_has_updated()
+            assert relay_call(tunnel, token=fresh_auth.bootstrap)[1]["updated_watch"] == 1
+        finally:
+            for each in (server, home):
+                each.shutdown()
+                each.server_close()
+        assert os.path.dirname(watch_relay.updated_watch_file()).startswith(
+            watch_relay.TAPPROVAL_DIR), "the suite's own folder, never the owner's"
+
+    def test_a_watch_before_2_1_is_never_taken_for_updated(self, fresh_auth):
+        key = fresh_auth.issue_device("watch-1")
+        server, url = self._relay(fresh_auth)
+        try:
+            self._call(url, key, {"id": "x", "decision": "allow"}, sealed=False)
+        finally:
+            server.shutdown()
+            server.server_close()
+        assert not watch_relay.watch_has_updated()
 
     def test_a_watch_before_2_1_is_still_served_plain(self, fresh_auth):
         key = fresh_auth.issue_device("watch-1")

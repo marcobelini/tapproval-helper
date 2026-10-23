@@ -822,16 +822,22 @@ def _helper_releases():
             and release.get("published_at")]
 
 
+def _known_marketplaces_path():
+    claude = os.path.expanduser("~/.claude")
+    plugins = os.environ.get("CLAUDE_CODE_PLUGIN_CACHE_DIR") or os.path.join(claude, "plugins")
+    return os.path.join(plugins, "known_marketplaces.json")
+
+
 def _auto_update_on():
     """Whether Claude Code auto-updates this marketplace, read in its own
     order: the settings file's extraKnownMarketplaces entry, then the
-    /plugin toggle's record. Read only, never written."""
+    /plugin toggle's record. Written only by set_auto_update, when the
+    wearer turns the watch's switch."""
     claude = os.path.expanduser("~/.claude")
-    plugins = os.environ.get("CLAUDE_CODE_PLUGIN_CACHE_DIR") or os.path.join(claude, "plugins")
     for path, entries in (
             (os.environ.get("CLAUDE_SETTINGS_PATH") or os.path.join(claude, "settings.json"),
              lambda data: data.get("extraKnownMarketplaces")),
-            (os.path.join(plugins, "known_marketplaces.json"), lambda data: data)):
+            (_known_marketplaces_path(), lambda data: data)):
         try:
             with open(path, encoding="utf-8") as handle:
                 entry = (entries(json.load(handle)) or {}).get(MARKETPLACE) or {}
@@ -840,6 +846,63 @@ def _auto_update_on():
         if isinstance(entry, dict) and isinstance(entry.get("autoUpdate"), bool):
             return entry["autoUpdate"]
     return False
+
+
+def _plugin_install(here=None):
+    """No checkout beside this file: Claude Code installed it, and only
+    Claude Code updates it. A terminal install pulls its own (_self_update)."""
+    here = here or os.path.dirname(os.path.abspath(__file__))
+    return not os.path.exists(os.path.join(here, ".git"))
+
+
+# Where the helper's marketplace lives, as users add it
+# (`/plugin marketplace add marcobelini/tapproval-helper`), in the shape
+# Claude Code's settings document for extraKnownMarketplaces.
+MARKETPLACE_SOURCE = {"source": "github", "repo": "marcobelini/tapproval-helper"}
+
+
+def set_auto_update(on):
+    """The watch's "Keep the helper up to date" switch (2026-10-23): set
+    `extraKnownMarketplaces.tapproval.autoUpdate` in Claude Code's settings,
+    the documented place, which its /plugin toggle also writes. Only the
+    wearer's tap gets here; nothing else in the file moves, the file is
+    copied aside first, and one it cannot read is left alone.
+
+    Returns (state read back, None) or (None, a sentence for the wrist)."""
+    import ClaudeRiskClassifier as classifier
+
+    path = classifier._settings_path()
+    try:
+        data = classifier._read_settings(path)
+    except (OSError, ValueError):
+        return None, ("Claude Code's settings file could not be read, so it was left as it is. "
+                      "Turn on auto-update in Claude Code: /plugin → Marketplaces → tapproval.")
+    markets = data.setdefault("extraKnownMarketplaces", {})
+    entry = markets.setdefault(MARKETPLACE, {}) if isinstance(markets, dict) else None
+    if not isinstance(entry, dict):
+        return None, ("Claude Code's settings list marketplaces in a form this helper does not know, "
+                      "so they were left as they are.")
+    if not isinstance(entry.get("source"), dict):
+        # The source Claude Code recorded when the marketplace was added,
+        # so declaring it here never sends it to fetch from somewhere new.
+        try:
+            with open(_known_marketplaces_path(), encoding="utf-8") as handle:
+                recorded = (json.load(handle).get(MARKETPLACE) or {}).get("source")
+        except (OSError, ValueError, AttributeError):
+            recorded = None
+        entry["source"] = recorded if isinstance(recorded, dict) else dict(MARKETPLACE_SOURCE)
+    if entry.get("autoUpdate") is not bool(on):
+        entry["autoUpdate"] = bool(on)
+        try:
+            classifier._backup(path)
+            classifier._write_settings(path, data)
+        except OSError as error:
+            print("relay: could not save auto-update (%s)" % error.__class__.__name__,
+                  file=sys.stderr)
+            return None, "Claude Code's settings could not be saved. Try again in a moment."
+    print("relay: auto-update for the helper turned %s from the watch" % ("on" if on else "off"),
+          file=sys.stderr)
+    return _auto_update_on(), None
 
 
 def check_for_newer_helper(releases=_helper_releases, auto_update=_auto_update_on,
@@ -1111,6 +1174,14 @@ def ensure_running(updated=False):
         # when both are known and they differ, the code moved, whoever
         # moved it and whenever.
         if not updated and _serving_older_code(running):
+            updated = True
+        # A plugin install has no commit to compare: Claude Code updates it
+        # in a new folder and starts sessions from there, while the relay
+        # started earlier kept serving the old code until the computer
+        # restarted (2026-10-23). Its version says so. Unreadable on either
+        # side is no reason to replace a working relay.
+        ours, theirs = _version_tuple(HELPER_VERSION), _version_tuple(running.get("helper"))
+        if not updated and ours and theirs and theirs < ours:
             updated = True
         # A relay started before an update is running the old code even
         # when its protocol version matches, so a fresh pull must replace
@@ -3419,6 +3490,10 @@ class RelayHandler(BaseHTTPRequestHandler):
                         header, self.command, unquote(split.path),
                         self._raw_body(), self.auth.credentials(), query=split.query)
                     self._presented_key, self._signed_nonce = key or "", nonce
+                    # Only a 2.1 watch, which has pinned this computer's
+                    # certificate, signs on the encrypted listener.
+                    if key and nonce and isinstance(self.server, _TLSRelayServer):
+                        _note_updated_watch()
             else:
                 self._presented_key = self.headers.get("X-Tapproval-Token", "")
         return self._presented_key
@@ -3455,6 +3530,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         sealed = self.headers.get(self.SEALED_HEADER) == "1" and bool(self._presented())
         if sealed:
             _note_first_seal(self._presented())
+            if self._signed_nonce:
+                _note_updated_watch()
         return sealed
 
     def _seal_aad(self, answer=False):
@@ -3667,6 +3744,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             # not be able to answer its own card or speak into a session.
             "/say": ("_post_say", dict(token=True, no_simulator=True)),
             "/end": ("_post_end", dict(token=True, no_simulator=True)),
+            "/auto-update": ("_post_auto_update", dict(token=True, no_simulator=True)),
             # The watch reporting its own trouble. A device token, like
             # /say: a local process must not be able to file a fault in
             # the watch's name.
@@ -3804,7 +3882,10 @@ class RelayHandler(BaseHTTPRequestHandler):
             # subprocess about twice a minute at worst — and it waits half
             # a second at most: a slow answer lands on the next poll.
             signed_in(wait=HEALTH_SIGNIN_WAIT)
-            self._send_json({"ok": True,
+            # Only a plugin install has the switch to show: a terminal
+            # install updates itself.
+            extra = {"auto_update": _auto_update_on()} if _plugin_install() else {}
+            self._send_json({**extra, "ok": True,
                              "pending": len(self.queue.pending()),
                              "watch_seen_seconds_ago":
                                  self.queue.watch_seen_seconds_ago(),
@@ -3917,6 +3998,9 @@ class RelayHandler(BaseHTTPRequestHandler):
         # This helper opens sealed bodies: a 2.1 watch seals the travel
         # road only after hearing so, so an older helper is never sent one.
         answer["seal"] = 1
+        # The bridge's cue to stop writing readable iCloud copies (#820).
+        if watch_has_updated():
+            answer["updated_watch"] = 1
         self._send_json(answer)
 
     # ---- POST --------------------------------------------------------------
@@ -4016,6 +4100,22 @@ class RelayHandler(BaseHTTPRequestHandler):
         waiting = [card["session_id"] for card in self.queue.pending() if card.get("session_id")]
         self._serialised_send(lambda body: (
             end_session(str(body.get("session_id", ""))[:64], waiting), "ended"), path)
+
+    def _post_auto_update(self, path, query):
+        """The watch's "Keep the helper up to date" switch: {"on": bool}.
+        Answers with what Claude Code's settings now say, not with what was
+        asked, so the switch shows the truth."""
+        on = (self._read_json() or {}).get("on")
+        if not isinstance(on, bool):
+            self._send_json({"error": "expected {\"on\": true or false}"}, 400)
+        elif not _plugin_install():
+            self._send_json({"error": "This helper updates itself whenever Claude Code starts."}, 409)
+        else:
+            state, why = set_auto_update(on)
+            if why:
+                self._send_json({"error": why}, 500)
+            else:
+                self._send_json({"ok": True, "on": state})
 
     def _post_diagnostic(self, path, query):
         """The watch telling this computer something went wrong on it.
@@ -4321,6 +4421,36 @@ def _note_first_seal(key):
             return False
         _SEALING_KEYS.add(mark)
     print("relay: a watch seals its messages (key %s…)" % mark, file=sys.stderr)
+    return True
+
+
+# Whether this computer's watch has shown it runs 2.1 or newer: it signed a
+# request on the encrypted listener, or sealed one on the travel road. Kept
+# on disk, once and for good: from then on the Mac bridge writes a card's
+# details and the pairing key to iCloud encrypted only (#820), and a watch
+# older than 2.1 would see an iCloud card's headline alone. Until then it
+# writes the readable copies too, so nobody on an old watch loses anything.
+def updated_watch_file():
+    return os.path.join(TAPPROVAL_DIR, "data", "updated-watch.json")
+
+
+def watch_has_updated():
+    return os.path.isfile(updated_watch_file())
+
+
+def _note_updated_watch():
+    path = updated_watch_file()
+    if os.path.isfile(path):
+        return False
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as out:
+            json.dump({"since": int(time.time())}, out)
+    except OSError as error:
+        print("relay: could not note an updated watch: %s" % error, file=sys.stderr)
+        return False
+    print("relay: this computer's watch runs 2.1 or newer; iCloud copies "
+          "go encrypted only from now on", file=sys.stderr)
     return True
 
 
