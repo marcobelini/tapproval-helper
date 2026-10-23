@@ -3910,6 +3910,23 @@ class TestAnICloudCardIsTheWholeCard:
         assert 'record.encryptedValues["encToken"] = token' in info
         seed = bridge.split('contains("--seed")', 1)[1].split("for record in specimens", 1)[0]
         assert 'info.encryptedValues["encToken"]' in seed
+        # Under a name of its own: the real "relay-info" already exists in
+        # any account with a bridge, and a save by that name is refused, so
+        # encToken never registered (2026-10-23).
+        assert 'CKRecord.ID(recordName: "relay-info")' not in seed
+
+    def test_the_tls_pin_travels_sealed(self):
+        # #645 S4's certificate pin reaches an away watch through iCloud,
+        # encrypted only, and is seeded so Production can learn it.
+        bridge = self._read("Bridge", "main.swift")
+        info = bridge.split("func mirrorRelayInfo(", 1)[1].split("\n}\n", 1)[0]
+        assert 'record.encryptedValues["encTls"] = pin' in info
+        assert 'record["tls' not in info
+        assert "pin]" in info, "a changed pin alone must be mirrored"
+        seed = bridge.split('contains("--seed")', 1)[1].split("for record in specimens", 1)[0]
+        assert 'info.encryptedValues["encTls"]' in seed
+        cloud = self._read("Tapproval", "CloudRelay.swift")
+        assert 'record.encryptedValues["encTls"]' in cloud
         cloud = self._read("Tapproval", "CloudRelay.swift")
         assert 'sealed(record, "encToken", plain: "token")' in cloud
 
@@ -14720,7 +14737,8 @@ class TestNewSkipsFailCi:
         m = self._module()
         with open(os.path.join(_ROOT, "WatchApp", "expected-skips.txt"), encoding="utf-8") as f:
             allowed = m.read_allowlist(f.read())
-        assert allowed == {"PurchaseCompletesTests": 5, "TLSPinLiveTests": 2}
+        assert allowed == {"PurchaseCompletesTests": 5, "TLSPinLiveTests": 2,
+                           "EncryptionLiveTests": 3}
 
     def _run(self, tmp_path, text):
         self._module()                      # skips in the public layout
@@ -19725,5 +19743,27 @@ class TestSealedTravelRoad:
             assert json.loads(raw) == {"ok": False}
             assert headers.get("Content-Type", "").startswith("application/json")
         finally:
+            server.shutdown()
+            server.server_close()
+
+
+def test_a_test_relay_runs_its_tunnel_on_its_own_port(monkeypatch, fresh_auth):
+    """encryption-e2e.sh's helper must not take the live relay's tunnel port:
+    --tunnel-port reaches both the listener and cloudflared."""
+    seen, real_serve, made = {}, watch_relay.serve, []
+
+    def serve(host, port, **kw):
+        seen["listener"] = port
+        made.append(real_serve(host, 0, **kw))         # bound anywhere free
+        return made[-1]
+
+    monkeypatch.setattr(watch_relay, "serve", serve)
+    monkeypatch.setattr(watch_relay, "start_tunnel",
+                        lambda port, token: seen.setdefault("cloudflared", port) and None)
+    try:
+        watch_relay._start_tunnel(watch_relay.CardQueue(), fresh_auth, port=18998)
+        assert seen == {"listener": 18998, "cloudflared": 18998}
+    finally:
+        for server, _ in made:
             server.shutdown()
             server.server_close()

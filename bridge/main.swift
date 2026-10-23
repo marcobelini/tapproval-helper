@@ -316,7 +316,12 @@ func postDecision(cardID: String, verdict: String, answer: String?) async -> Boo
 // (and the pairing token) into a well-known record lets an away watch
 // re-learn them without ever being on the home Wi-Fi.
 
-struct Tunnel: Codable { let url: String?; let tailscale: String? }
+/// The certificate the relay's encrypted listener answers with, from
+/// /tunnel's "tls" (helper with #645 S4): an away watch learns it here for
+/// the tailnet address, which it may never have asked at home.
+struct TLSPin: Codable, Equatable { let port: Int; let sha256: String }
+
+struct Tunnel: Codable { let url: String?; let tailscale: String?; let tls: TLSPin? }
 
 var lastMirroredInfo: [String?] = []
 
@@ -359,7 +364,9 @@ func bootstrapToken() -> String? {
     // Save only on actual change — the addresses rotate once per relay
     // restart, not per poll, and 288 identical writes a day are pure
     // quota and log noise.
-    let triple = [tunnel.url, tunnel.tailscale, token]
+    let pin = tunnel.tls.flatMap {
+        (try? JSONEncoder().encode($0)).flatMap { String(data: $0, encoding: .utf8) } }
+    let triple = [tunnel.url, tunnel.tailscale, token, pin]
     if triple == lastMirroredInfo { return }
     let id = CKRecord.ID(recordName: "relay-info")
     let record = (try? await cloud { try await $0.record(for: id) })
@@ -370,6 +377,8 @@ func bootstrapToken() -> String? {
     // Sealed as the card's detail is (#645 S12); the plain copy stays one
     // release, for watches on 2.0.
     record.encryptedValues["encToken"] = token
+    // Encrypted only: no watch before this one reads a pin from iCloud.
+    record.encryptedValues["encTls"] = pin
     do {
         _ = try await cloud { try await $0.save(record) }
         lastMirroredInfo = triple
@@ -605,11 +614,16 @@ if seeding || probing {
                             recordID: CKRecord.ID(recordName: "watch-presence"))
     presence["at"] = Date()
     specimens.append(presence)
+    // A record of its own: in an account whose bridge already left the
+    // real "relay-info", saving one by that name is refused ("record to
+    // insert already exists"), and the fields added since never register
+    // (encToken, 2026-10-23).
     let info = CKRecord(recordType: "RelayInfo",
-                        recordID: CKRecord.ID(recordName: "relay-info"))
+                        recordID: CKRecord.ID(recordName: "seed-relay-info"))
     info["url"] = "https://seed.example"; info["tailscale"] = "https://seed"
     info["token"] = "seed"
     info.encryptedValues["encToken"] = "seed"
+    info.encryptedValues["encTls"] = #"{"port":1,"sha256":"seed"}"#
     specimens.append(info)
     for record in specimens {
         do {
@@ -620,7 +634,7 @@ if seeding || probing {
         }
     }
     // The types survive their specimens; leave no seed data behind.
-    for name in ["seed-card", "seed-decision"] {
+    for name in ["seed-card", "seed-decision", "seed-relay-info"] {
         _ = try? await cloud { try await $0.deleteRecord(withID: CKRecord.ID(recordName: name)) }
     }
     exit(0)

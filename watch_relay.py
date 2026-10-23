@@ -5472,6 +5472,9 @@ def _build_parser():
                              "test relay only, never one real cards reach")
     parser.add_argument("--tls-port", type=int, default=TLS_PORT,
                         help=argparse.SUPPRESS)
+    # A test relay's own tunnel port: the live relay holds TUNNEL_PORT.
+    parser.add_argument("--tunnel-port", type=int, default=TUNNEL_PORT,
+                        help=argparse.SUPPRESS)
     parser.add_argument("--tunnel", action="store_true",
                         help="also expose the relay through a Cloudflare "
                              "tunnel so the watch works off Wi-Fi")
@@ -5523,13 +5526,13 @@ def _start_tls(args, queue, auth):
     return server
 
 
-def _start_tunnel(queue, auth, allow_simulator=False):
+def _start_tunnel(queue, auth, allow_simulator=False, port=TUNNEL_PORT):
     """The second listener and the cloudflared process behind it. Two
     independent secrets on the public path: the unguessable rendezvous
     prefix says where, the device token says who."""
     global _TUNNEL_HANDLER
     try:
-        tunnel_server, _ = serve("127.0.0.1", TUNNEL_PORT,
+        tunnel_server, _ = serve("127.0.0.1", port,
                                  queue=queue, token=auth.tunnel_secret,
                                  auth=auth, allow_simulator=allow_simulator)
     except OSError as error:
@@ -5545,14 +5548,14 @@ def _start_tunnel(queue, auth, allow_simulator=False):
             "on this computer, usually another Tapproval still shutting "
             "down. Approvals at home are unaffected.")
         print("relay: tunnel port %d unavailable (%s) — continuing without "
-              "the away route" % (TUNNEL_PORT, error), file=sys.stderr)
+              "the away route" % (port, error), file=sys.stderr)
         return None
     _TUNNEL_HANDLER = tunnel_server.RequestHandlerClass
     threading.Thread(target=tunnel_server.serve_forever, daemon=True).start()
-    handle = start_tunnel(TUNNEL_PORT, auth.tunnel_secret)
+    handle = start_tunnel(port, auth.tunnel_secret)
     if handle is not None:
         threading.Thread(target=watch_tunnel, daemon=True,
-                         args=(handle, TUNNEL_PORT, auth.tunnel_secret)).start()
+                         args=(handle, port, auth.tunnel_secret)).start()
     return handle
 
 
@@ -5752,7 +5755,8 @@ def _start_slow_parts(args, queue, auth):
 
     def tunnel():
         # Not kept: the tunnel outlives this relay on purpose (see main()).
-        _start_tunnel(queue, auth, allow_simulator=args.allow_simulator)
+        _start_tunnel(queue, auth, allow_simulator=args.allow_simulator,
+                      port=getattr(args, "tunnel_port", TUNNEL_PORT))
 
     def bonjour():
         advertiser = _Advertiser(args.port)
