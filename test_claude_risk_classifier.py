@@ -19734,6 +19734,20 @@ class TestSealedTravelRoad:
             server.shutdown()
             server.server_close()
 
+    def test_the_first_sealed_request_from_a_watch_is_said_once(self, fresh_auth, capsys):
+        key = fresh_auth.issue_device("watch-1")
+        watch_relay._SEALING_KEYS.clear()
+        server, url = self._relay(fresh_auth)
+        try:
+            self._call(url, key, {"id": "x", "decision": "allow"})
+            self._call(url, key, {"id": "y", "decision": "allow"})
+        finally:
+            server.shutdown()
+            server.server_close()
+        said = [line for line in capsys.readouterr().err.splitlines() if "seals its messages" in line]
+        assert len(said) == 1, said
+        assert key not in said[0], "never the key itself"
+
     def test_a_watch_before_2_1_is_still_served_plain(self, fresh_auth):
         key = fresh_auth.issue_device("watch-1")
         server, url = self._relay(fresh_auth)

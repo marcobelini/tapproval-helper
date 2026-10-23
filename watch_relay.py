@@ -3452,7 +3452,10 @@ class RelayHandler(BaseHTTPRequestHandler):
     SEALED_HEADER = "X-Tapproval-Sealed"
 
     def _wants_sealed(self):
-        return self.headers.get(self.SEALED_HEADER) == "1" and bool(self._presented())
+        sealed = self.headers.get(self.SEALED_HEADER) == "1" and bool(self._presented())
+        if sealed:
+            _note_first_seal(self._presented())
+        return sealed
 
     def _seal_aad(self, answer=False):
         from urllib.parse import unquote, urlsplit
@@ -4298,6 +4301,24 @@ class _RelayServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
         if _ON_HANDLER_ERROR is not None:
             _ON_HANDLER_ERROR(kind, value, tb)
+
+
+# Which keys have sealed a request since this relay started: the first from
+# each is one line in the log, so "is this watch sealing?" can be answered
+# from the Mac (2026-10-23, the owner's wrist check). Never the key itself.
+_SEALING_KEYS = set()
+_SEALING_LOCK = threading.Lock()
+
+
+def _note_first_seal(key):
+    import hashlib
+    mark = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+    with _SEALING_LOCK:
+        if mark in _SEALING_KEYS:
+            return False
+        _SEALING_KEYS.add(mark)
+    print("relay: a watch seals its messages (key %s…)" % mark, file=sys.stderr)
+    return True
 
 
 class _TLSRelayServer(_RelayServer):
