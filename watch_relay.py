@@ -3814,6 +3814,9 @@ class RelayHandler(BaseHTTPRequestHandler):
                              "helper_commit": (_PROVENANCE or (None, None))[0],
                              "helper_date": (_PROVENANCE or (None, None))[1],
                              "tls": dict(TLS_INFO) if TLS_INFO else None,
+                             # Opens sealed bodies: an away watch learns it
+                             # here, on any road, proven like the rest.
+                             "seal": 1,
                              "conditions": conditions(),
                              "agents": wired_agents(),
                              # The watch says this, not "Mac" (2026-10-15).

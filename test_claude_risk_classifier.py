@@ -3927,6 +3927,10 @@ class TestAnICloudCardIsTheWholeCard:
         assert 'info.encryptedValues["encTls"]' in seed
         cloud = self._read("Tapproval", "CloudRelay.swift")
         assert 'record.encryptedValues["encTls"]' in cloud
+        # ...and the watch uses it: adopting the iCloud note pins it.
+        model = self._read("Tapproval", "RelayModel.swift")
+        adopt = model.split("func adopt(_ info: CloudRelay.RelayAddresses)", 1)[1].split("\n    }\n", 1)[0]
+        assert "Self.adoptPin(from: info)" in adopt
         cloud = self._read("Tapproval", "CloudRelay.swift")
         assert 'sealed(record, "encToken", plain: "token")' in cloud
 
@@ -19781,3 +19785,17 @@ def test_a_test_relay_runs_its_tunnel_on_its_own_port(monkeypatch, fresh_auth):
         for server, _ in made:
             server.shutdown()
             server.server_close()
+
+
+def test_health_says_it_opens_sealed_bodies(fresh_auth):
+    """An away watch learns it seals from /health, the answer it reads on
+    every road (2026-10-23): /tunnel is the home road's alone."""
+    server, _ = watch_relay.serve(port=0, auth=fresh_auth)
+    _serve(server)
+    try:
+        key = fresh_auth.issue_device("watch-1")
+        status, body = relay_call("http://127.0.0.1:%d/health" % server.server_address[1], token=key)
+        assert status == 200 and body.get("seal") == 1
+    finally:
+        server.shutdown()
+        server.server_close()
