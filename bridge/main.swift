@@ -142,9 +142,19 @@ func log(_ message: String) {
     // bridge is installed: Production refuses a record with a field it does
     // not know (RELEASING.md, "The Mac bridge"). CloudKit has no list of
     // lists, so the facts travel as JSON text.
-    record["plan"] = card.plan
-    record["facts"] = card.facts.flatMap {
+    let facts = card.facts.flatMap {
         (try? JSONEncoder().encode($0)).flatMap { String(data: $0, encoding: .utf8) } }
+    record["plan"] = card.plan
+    record["facts"] = facts
+    // What is being done also travels encrypted (#645 S12): CloudKit seals
+    // `encryptedValues` with a key in the user's iCloud Keychain, so Apple
+    // cannot read it even without Advanced Data Protection. A field is plain
+    // or encrypted for life, hence the new names. The plain copies above stay
+    // for one release, for watches on 2.0, which read only those; headline
+    // and tier stay plain for good, because the alert is built from them.
+    record.encryptedValues["encDetail"] = card.detail
+    record.encryptedValues["encPlan"] = card.plan
+    record.encryptedValues["encFacts"] = facts
     record["sessionId"] = card.sessionID
     record["canAlways"] = card.canAlways.map { ($0 ? 1 : 0) as Int64 }
     record["sessionTitle"] = card.sessionTitle
@@ -357,6 +367,9 @@ func bootstrapToken() -> String? {
     record["url"] = tunnel.url
     record["tailscale"] = tunnel.tailscale
     record["token"] = token
+    // Sealed as the card's detail is (#645 S12); the plain copy stays one
+    // release, for watches on 2.0.
+    record.encryptedValues["encToken"] = token
     do {
         _ = try await cloud { try await $0.save(record) }
         lastMirroredInfo = triple
@@ -578,6 +591,8 @@ if seeding || probing {
     card["agent"] = "seed"
     card["multiSelect"] = 1 as Int64
     card["questionHeader"] = "seed"; card["optionDetails"] = ["a", "b"]
+    card.encryptedValues["encDetail"] = "seed"; card.encryptedValues["encPlan"] = "seed"
+    card.encryptedValues["encFacts"] = "[]"
     card["marker"] = 1 as Int64
     if probing { exit(await probeProduction(card) ? 0 : 1) }
     specimens.append(card)
@@ -594,6 +609,7 @@ if seeding || probing {
                         recordID: CKRecord.ID(recordName: "relay-info"))
     info["url"] = "https://seed.example"; info["tailscale"] = "https://seed"
     info["token"] = "seed"
+    info.encryptedValues["encToken"] = "seed"
     specimens.append(info)
     for record in specimens {
         do {

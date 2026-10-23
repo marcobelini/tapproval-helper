@@ -80,6 +80,11 @@ import tapproval_wire as wire
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8977          # also referenced by the classifier's --watch/--status
 TUNNEL_PORT = 8978
+# The encrypted listener for the watch on the home network and the tailnet
+# (#645 S4, the owner's decision of 2026-10-23). The plain one on
+# DEFAULT_PORT stays for loopback, and for watches from before 2.1 until
+# the owner closes that door.
+TLS_PORT = 8979
 # The helper's own files live in ~/.tapproval/data and ~/.tapproval/logs,
 # beside its code. Until 1.1.60 they lay loose in the home folder as
 # ~/.tapproval-*; the relay moves each one once (move_loose_files), and
@@ -488,6 +493,10 @@ def advertise_txt(port):
     # authenticated LAN fetch (/tunnel) or through the owner's own
     # iCloud instead.
     txt["port"] = str(port)
+    if TLS_INFO:
+        # The port only. The fingerprint is never taken from a broadcast:
+        # anyone on the network can answer Bonjour.
+        txt["tls"] = str(TLS_INFO["port"])
     return txt
 
 
@@ -3062,6 +3071,8 @@ _signature_message = wire.signature_message
 sign_request = wire.sign_request
 relay_proof = wire.relay_proof
 relay_proof2 = wire.relay_proof2
+seal_body = wire.seal_body
+open_body = wire.open_body
 
 
 def seal(token, nonce, secret):
@@ -3414,16 +3425,53 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, payload, status=200, headers=None):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self._send_body(status, "application/json; charset=utf-8", body, headers)
+
+    def _send_body(self, status, media, body, headers=None):
+        """An answer, sealed when the request was: the proofs cover the
+        plain body, so the watch checks them after opening it."""
+        wire_body, media = self._sealed_answer(body, media)
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Type", media)
+        self.send_header("Content-Length", str(len(wire_body)))
         # Proof that this answer comes from a holder of the key the request
         # was signed with: the watch trusts an address only after it.
         self._send_proofs(status, body)
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(wire_body)
+
+    # ---- sealed bodies (the travel road, end to end) ----------------------
+    # A watch from 2.1 seals what it sends through the tunnel and asks for a
+    # sealed answer (X-Tapproval-Sealed: 1): Cloudflare's edge, where the
+    # tunnel's TLS ends, then carries bytes only this computer and that
+    # watch can read. Bound to the method and path, so a sealed body cannot
+    # be replayed onto another route. A watch before 2.1 is served plain.
+
+    SEALED_HEADER = "X-Tapproval-Sealed"
+
+    def _wants_sealed(self):
+        return self.headers.get(self.SEALED_HEADER) == "1" and bool(self._presented())
+
+    def _seal_aad(self, answer=False):
+        from urllib.parse import unquote, urlsplit
+        words = "%s %s" % (self.command.upper(), unquote(urlsplit(self.path).path))
+        return (("answer " if answer else "") + words).encode("utf-8")
+
+    def _opened_body(self):
+        """The request body as the route reads it: opened, when sealed. None
+        when a sealed body does not open with the signer's key."""
+        raw = self._raw_body()
+        if not raw or not self._wants_sealed():
+            return raw
+        return open_body(self._presented(), raw, self._seal_aad())
+
+    def _sealed_answer(self, body, media):
+        if not self._wants_sealed():
+            return body, media
+        return (seal_body(self._presented(), body, self._seal_aad(answer=True)),
+                "application/octet-stream")
 
     def _send_proofs(self, status, body):
         """Both proofs, when the request was signed: the nonce-only one for
@@ -3436,7 +3484,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                                           status, body))
 
     def _read_json(self):
-        raw = self._raw_body()
+        raw = self._opened_body()
         if not raw:
             return None
         try:
@@ -3740,13 +3788,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "no such image"}, 404)
             return
         media, data = got
-        self.send_response(200)
-        self.send_header("Content-Type", media)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "private, max-age=3600")
-        self._send_proofs(200, data)
-        self.end_headers()
-        self.wfile.write(data)
+        self._send_body(200, media, data, {"Cache-Control": "private, max-age=3600"})
 
     def _get_health(self, path, query):
         # Liveness is public; the details are not. A pending count plus
@@ -3768,6 +3810,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                              "helper": HELPER_VERSION,
                              "helper_commit": (_PROVENANCE or (None, None))[0],
                              "helper_date": (_PROVENANCE or (None, None))[1],
+                             "tls": dict(TLS_INFO) if TLS_INFO else None,
                              "conditions": conditions(),
                              "agents": wired_agents(),
                              # The watch says this, not "Mac" (2026-10-15).
@@ -3859,9 +3902,16 @@ class RelayHandler(BaseHTTPRequestHandler):
         # LAN only: hand the watch its away-addresses while it's home.
         # Deliberately NOT in the Bonjour TXT record — this fetch is the
         # one place the travel secret changes hands.
-        self._send_json({"url": TUNNEL_URL,
-                         "tailscale": tailscale_url(
-                             self.server.server_address[1])})
+        answer = {"url": TUNNEL_URL,
+                  "tailscale": tailscale_url(self.server.server_address[1])}
+        if TLS_INFO:
+            # Inside a proven answer: the one way a watch learns which
+            # certificate is this computer's (#645 S4).
+            answer["tls"] = dict(TLS_INFO)
+        # This helper opens sealed bodies: a 2.1 watch seals the travel
+        # road only after hearing so, so an older helper is never sent one.
+        answer["seal"] = 1
+        self._send_json(answer)
 
     # ---- POST --------------------------------------------------------------
 
@@ -4248,6 +4298,127 @@ class _RelayServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
         if _ON_HANDLER_ERROR is not None:
             _ON_HANDLER_ERROR(kind, value, tb)
+
+
+class _TLSRelayServer(_RelayServer):
+    """The same relay, encrypted: each connection's TLS handshake runs on
+    its own thread (never in the accept loop, where one slow caller would
+    stall everyone), and a handshake that fails is a caller that went
+    away, counted, never a crash report."""
+    HANDSHAKE_SECONDS = 10
+
+    def __init__(self, address, handler, context):
+        self._tls = context
+        super().__init__(address, handler)
+
+    def process_request_thread(self, request, client_address):
+        import ssl
+        try:
+            request.settimeout(self.HANDSHAKE_SECONDS)
+            wrapped = self._tls.wrap_socket(request, server_side=True)
+            wrapped.settimeout(None)
+        except (ssl.SSLError, OSError) as error:
+            _note_hang_up(error)
+            try:
+                request.close()
+            finally:
+                self._slots.release()
+            return
+        super().process_request_thread(wrapped, client_address)
+
+
+def serve_tls(host, port, cert, key, queue=None, auth=None, allow_simulator=False):
+    """The encrypted listener: the main listener's routes and rules, over
+    TLS 1.2 or newer, with this computer's own certificate."""
+    import ssl
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    # TLS 1.2 (all the LibreSSL in Xcode's Python has): forward-secret,
+    # authenticated ciphers only. TLS 1.3 chooses its own, all of them so.
+    context.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20")
+    context.load_cert_chain(cert, key)
+    queue = queue if queue is not None else CardQueue()
+    handler = type("BoundRelayHandler", (RelayHandler,),
+                   {"queue": queue, "required_token": None,
+                    "auth": auth, "allow_simulator": bool(allow_simulator)})
+    return _TLSRelayServer((host, port), handler, context), queue
+
+
+# ---- the encrypted listener -------------------------------------------------
+
+# Where the certificate and its key live: the data folder, beside the key
+# file, mode 0600. A test points TAPPROVAL_TLS_DIR at a folder of its own.
+def tls_dir():
+    return os.environ.get("TAPPROVAL_TLS_DIR") or os.path.join(TAPPROVAL_DIR, "data")
+
+
+OPENSSL = "/usr/bin/openssl"
+TLS_DAYS = 3650
+
+
+def ensure_tls_identity(folder=None, openssl=None, runner=None):
+    """This computer's own certificate for the encrypted listener: made
+    once, with openssl, then reused, so the fingerprint a watch has pinned
+    stays the same across restarts and updates. Returns (cert, key) paths,
+    or None when it cannot be made (no openssl: some Linux), which is said
+    on the Connection screen. Never raises."""
+    import shutil
+    import subprocess
+    folder = folder or tls_dir()
+    cert = os.path.join(folder, "tls-cert.pem")
+    key = os.path.join(folder, "tls-key.pem")
+    if os.path.exists(cert) and os.path.exists(key):
+        clear_condition("no_tls")
+        return cert, key
+    tool = openssl or (OPENSSL if os.path.exists(OPENSSL) else shutil.which("openssl"))
+    if not tool:
+        note_condition("no_tls", "Messages on your Wi-Fi are not encrypted: this "
+                       "computer has no openssl to make its certificate. Install "
+                       "openssl, then start Claude Code once.")
+        return None
+    try:
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        old = os.umask(0o077)
+        try:
+            (runner or subprocess.run)(
+                # RSA, not EC: macOS's LibreSSL writes an EC key with its
+                # curve spelled out, which the LibreSSL 2.8 inside Xcode's
+                # Python (what the login job runs) cannot handshake with.
+                [tool, "req", "-x509", "-newkey", "rsa:2048", "-sha256",
+                 "-nodes", "-days", str(TLS_DAYS),
+                 "-subj", "/CN=Tapproval", "-keyout", key, "-out", cert],
+                check=True, capture_output=True, timeout=30)
+        finally:
+            os.umask(old)
+        os.chmod(key, 0o600)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        note_condition("no_tls", "Messages on your Wi-Fi are not encrypted: the "
+                       "certificate could not be made (%s)." % type(error).__name__)
+        return None
+    if not (os.path.exists(cert) and os.path.exists(key)):
+        note_condition("no_tls", "Messages on your Wi-Fi are not encrypted: the "
+                       "certificate could not be made.")
+        return None
+    clear_condition("no_tls")
+    return cert, key
+
+
+def tls_fingerprint(cert_path):
+    """SHA-256 of the certificate (DER), lowercase hex: what a watch pins.
+    None when there is no readable certificate."""
+    import hashlib
+    import ssl
+    try:
+        with open(cert_path, encoding="ascii") as handle:
+            der = ssl.PEM_cert_to_DER_cert(handle.read())
+    except (OSError, ValueError, TypeError):
+        return None
+    return hashlib.sha256(der).hexdigest()
+
+
+# Set once the encrypted listener is up: {"port", "sha256"}, served only
+# inside answers the relay proves (/tunnel, a credentialed /health).
+TLS_INFO = None
 
 
 _TAILSCALE_CACHE = {}
@@ -5299,6 +5470,8 @@ def _build_parser():
     parser.add_argument("--allow-simulator", action="store_true",
                         help="take answers from a watch Simulator: for a "
                              "test relay only, never one real cards reach")
+    parser.add_argument("--tls-port", type=int, default=TLS_PORT,
+                        help=argparse.SUPPRESS)
     parser.add_argument("--tunnel", action="store_true",
                         help="also expose the relay through a Cloudflare "
                              "tunnel so the watch works off Wi-Fi")
@@ -5318,6 +5491,36 @@ def _build_parser():
                         help="replace the travel address and every device "
                              "key; paired watches re-pair by themselves")
     return parser
+
+
+def _start_tls(args, queue, auth):
+    """The encrypted listener beside the main one, when the main one faces
+    the network (production binds 0.0.0.0). A relay on loopback only (the
+    tests, the isolated relays) has no one to encrypt for. A missing
+    openssl or a taken port costs the encryption, never the relay, and is
+    said on the Connection screen."""
+    global TLS_INFO
+    if args.host in ("127.0.0.1", "localhost", "::1"):
+        return False                     # loopback only: nobody to encrypt for
+    identity = ensure_tls_identity()
+    if identity is None:
+        return False                     # ensure_tls_identity said why
+    cert, key = identity
+    try:
+        server, _ = serve_tls(args.host, args.tls_port, cert, key, queue=queue,
+                              auth=auth, allow_simulator=args.allow_simulator)
+    except (OSError, ValueError) as error:
+        note_condition("no_tls", "Messages on your Wi-Fi are not encrypted: the "
+                       "encrypted port %d is in use on this computer." % args.tls_port)
+        print("relay: encrypted port %d unavailable (%s)" % (args.tls_port, error),
+              file=sys.stderr)
+        return None
+    TLS_INFO = {"port": args.tls_port, "sha256": tls_fingerprint(cert)}
+    threading.Thread(target=server.serve_forever, name="tls-listener",
+                     daemon=True).start()
+    print("relay: encrypted on https://%s:%d (%s…)" % (
+        args.host, args.tls_port, (TLS_INFO["sha256"] or "")[:12]), file=sys.stderr)
+    return server
 
 
 def _start_tunnel(queue, auth, allow_simulator=False):
@@ -5629,6 +5832,7 @@ def main(argv=None):
         auth.path = AUTH_FILE
     print("relay: listening on http://%s:%d" % (args.host, args.port),
           file=sys.stderr)
+    _start_tls(args, queue, auth)
     stop_slow_parts = _start_slow_parts(args, queue, auth)
     threading.Thread(target=watch_bridge, args=(queue,), daemon=True).start()
     threading.Thread(target=watch_for_newer_helper, name="release-look",

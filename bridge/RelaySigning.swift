@@ -105,3 +105,38 @@ enum RelaySigning {
         bytes.map { String(format: "%02x", $0) }.joined()
     }
 }
+
+/// The travel road's bodies, sealed end to end (#645): ChaCha20-Poly1305
+/// under a key derived from this watch's own key (HKDF-SHA256, the same
+/// derivation as tapproval_wire.seal_key on the computer, checked byte for
+/// byte in both test suites). Cloudflare's edge, where the tunnel's TLS
+/// ends, carries bytes only this watch and its computer can read.
+enum BodySeal {
+    static let header = "X-Tapproval-Sealed"
+    private static let info = Data("tapproval-seal-v1".utf8)
+
+    /// The travel tunnel only: the home road is TLS to the computer itself.
+    static func applies(to url: URL?) -> Bool {
+        (url?.host ?? "").hasSuffix(".trycloudflare.com")
+    }
+
+    static func key(_ deviceKey: String) -> SymmetricKey {
+        HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: Data(deviceKey.utf8)),
+                               info: info, outputByteCount: 32)
+    }
+
+    /// Bound to the method and path, so a sealed body cannot be moved to
+    /// another route; an answer's words differ from its question's.
+    static func aad(_ method: String, _ path: String, answer: Bool = false) -> Data {
+        Data(((answer ? "answer " : "") + method.uppercased() + " " + path).utf8)
+    }
+
+    static func seal(_ body: Data, deviceKey: String, aad: Data) throws -> Data {
+        try ChaChaPoly.seal(body, using: key(deviceKey), authenticating: aad).combined
+    }
+
+    static func open(_ sealed: Data, deviceKey: String, aad: Data) -> Data? {
+        guard let box = try? ChaChaPoly.SealedBox(combined: sealed) else { return nil }
+        return try? ChaChaPoly.open(box, using: key(deviceKey), authenticating: aad)
+    }
+}

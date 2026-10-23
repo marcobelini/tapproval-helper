@@ -3876,11 +3876,42 @@ class TestAnICloudCardIsTheWholeCard:
         seed = bridge.split('contains("--seed")', 1)[1].split("specimens.append(card)", 1)[0]
         seeded = set(re.findall(r'card\["(\w+)"\] =', seed))
         assert written and written <= seeded, sorted(written - seeded)
+        # The encrypted fields are fields like any other to Production.
+        sealed = set(re.findall(r'record\.encryptedValues\["(\w+)"\] =', mirror))
+        seeded = set(re.findall(r'card\.encryptedValues\["(\w+)"\] =', seed))
+        assert sealed and sealed <= seeded, sorted(sealed - seeded)
 
     def test_the_watch_reads_every_field_back(self):
         cloud = self._read("Tapproval", "CloudRelay.swift")
         for field in self.FIELDS.values():
-            assert 'record["%s"]' % field in cloud, field
+            assert ('record["%s"]' % field in cloud
+                    or 'plain: "%s")' % field in cloud), field
+
+    # #645 S12: what is being done travels in CloudKit's encryptedValues,
+    # which Apple cannot read without the wearer's keychain. Each plain field
+    # here -> its sealed twin. headline and tier stay plain: the alert is
+    # built from them on Apple's side.
+    SEALED = {"detail": "encDetail", "plan": "encPlan", "facts": "encFacts"}
+
+    def test_what_is_being_done_travels_sealed(self):
+        bridge = self._read("Bridge", "main.swift")
+        mirror = bridge.split("func mirror(", 1)[1].split("\nfunc ", 1)[0]
+        cloud = self._read("Tapproval", "CloudRelay.swift")
+        for plain, sealed in self.SEALED.items():
+            assert 'record.encryptedValues["%s"] =' % sealed in mirror, sealed
+            # Read sealed first, plain only when a bridge left none.
+            assert 'sealed(record, "%s", plain: "%s")' % (sealed, plain) in cloud, sealed
+        written = set(re.findall(r'record\.encryptedValues\["(\w+)"\] =', mirror))
+        assert written == set(self.SEALED.values()), sorted(written)
+
+    def test_the_pairing_key_travels_sealed(self):
+        bridge = self._read("Bridge", "main.swift")
+        info = bridge.split("func mirrorRelayInfo(", 1)[1].split("\n}\n", 1)[0]
+        assert 'record.encryptedValues["encToken"] = token' in info
+        seed = bridge.split('contains("--seed")', 1)[1].split("for record in specimens", 1)[0]
+        assert 'info.encryptedValues["encToken"]' in seed
+        cloud = self._read("Tapproval", "CloudRelay.swift")
+        assert 'sealed(record, "encToken", plain: "token")' in cloud
 
 
 class TestTheBridgeReadsTheWholeCard:
@@ -7667,7 +7698,9 @@ class TestTheSharedWireModule:
                 names.add(node.module.split(".")[0])
         # Named, not looked up: sys.stdlib_module_names is 3.10+, and CI runs
         # the suite on older interpreters too. A new import here is a choice.
-        assert names == {"__future__", "hashlib", "json", "os", "re", "hmac", "urllib"}, names
+        # struct (2026-10-23): ChaCha20's words, for the sealed travel road.
+        assert names == {"__future__", "hashlib", "json", "os", "re", "hmac", "struct",
+                         "urllib"}, names
 
     def test_it_does_nothing_at_import_but_name_things(self):
         """Top level: the docstring, imports, functions, and constants that
@@ -14681,11 +14714,13 @@ class TestNewSkipsFailCi:
         """Read from the code on 2026-10-12: five of PurchaseCompletesTests'
         twelve call requireTestStore. The iOS run's six skipped until
         2026-10-17, when the iOS 27.0 test store worked on the CI Mac and
-        none did; its suites are unlisted, so a skip there fails CI."""
+        none did; its suites are unlisted, so a skip there fails CI.
+        TLSPinLiveTests (2026-10-23) runs only under WatchApp/tls-e2e.sh,
+        which starts the real helper it needs; anywhere else it skips."""
         m = self._module()
         with open(os.path.join(_ROOT, "WatchApp", "expected-skips.txt"), encoding="utf-8") as f:
             allowed = m.read_allowlist(f.read())
-        assert allowed == {"PurchaseCompletesTests": 5}
+        assert allowed == {"PurchaseCompletesTests": 5, "TLSPinLiveTests": 2}
 
     def _run(self, tmp_path, text):
         self._module()                      # skips in the public layout
@@ -15647,7 +15682,8 @@ class TestTheReportingItselfIsChecked:
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
     VOCABULARY = {"bonjour", "bridge", "bridge_install", "claude", "codex", "crash", "dashboard", "helper",
-                  "icloud_off", "outdated", "pairing", "port", "signin", "stuck", "tunnel", "update"}
+                  "icloud_off", "no_tls", "outdated", "pairing", "port", "signin", "stuck", "tunnel",
+                  "update"}
 
     @staticmethod
     def _module_source(name):
@@ -19442,3 +19478,252 @@ class TestASessionCanBeEndedFromTheWrist:
     def test_the_wait_fits_inside_the_watchs(self):
         """The watch gives an answer 5 s (RelayModel.http)."""
         assert watch_relay.END_WAIT_SECONDS < 5
+
+
+# ---- the encrypted listener (#645 S4) --------------------------------------
+
+_HAS_OPENSSL = os.path.exists("/usr/bin/openssl")
+
+
+@pytest.mark.skipif(not _HAS_OPENSSL, reason="needs /usr/bin/openssl")
+class TestEncryptedListener:
+    """The home road is encrypted: this computer's own certificate, made
+    once, served by a second listener with the main one's routes, and its
+    fingerprint handed out only inside answers the relay proves."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TAPPROVAL_TLS_DIR", str(tmp_path / "tls"))
+        monkeypatch.setattr(watch_relay, "TLS_INFO", None)
+        watch_relay.clear_condition("no_tls")
+        yield
+        watch_relay.clear_condition("no_tls")
+
+    def _identity(self):
+        identity = watch_relay.ensure_tls_identity()
+        assert identity is not None
+        return identity
+
+    def test_the_certificate_is_made_once_and_kept(self):
+        cert, key = self._identity()
+        first = watch_relay.tls_fingerprint(cert)
+        again = watch_relay.ensure_tls_identity()
+        assert again == (cert, key)
+        assert watch_relay.tls_fingerprint(cert) == first, "a restart must not change the pin"
+        assert os.stat(key).st_mode & 0o777 == 0o600
+
+    def test_the_fingerprint_is_the_certificates_sha256(self):
+        import subprocess
+        cert, _ = self._identity()
+        out = subprocess.run(["/usr/bin/openssl", "x509", "-in", cert, "-noout",
+                              "-fingerprint", "-sha256"],
+                             capture_output=True, text=True, check=True).stdout
+        expected = out.strip().split("=", 1)[1].replace(":", "").lower()
+        assert watch_relay.tls_fingerprint(cert) == expected
+
+    def test_no_openssl_is_said_on_the_wrist(self, tmp_path, monkeypatch):
+        import shutil
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+        monkeypatch.setattr(watch_relay, "OPENSSL", str(tmp_path / "no-openssl"))
+        assert watch_relay.ensure_tls_identity(folder=str(tmp_path / "x")) is None
+        assert "no_tls" in {c["key"] for c in watch_relay.conditions()}
+
+    def test_the_encrypted_listener_answers_and_plain_text_does_not(self):
+        import ssl
+        import urllib.request
+        cert, key = self._identity()
+        server, _ = watch_relay.serve_tls("127.0.0.1", 0, cert, key)
+        _serve(server)
+        port = server.server_address[1]
+        try:
+            # As the watch does it: no authority, the certificate itself pinned.
+            import hashlib
+            import http.client
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            conn = http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=5)
+            conn.request("GET", "/health")
+            reply = conn.getresponse()
+            seen = hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
+            assert seen == watch_relay.tls_fingerprint(cert)
+            assert json.loads(reply.read())["ok"] is True
+            assert conn.sock.version() in ("TLSv1.2", "TLSv1.3")
+            name, _, _ = conn.sock.cipher()
+            assert "GCM" in name or "CHACHA20" in name, name
+            conn.close()
+            with pytest.raises((OSError, http.client.HTTPException)):
+                urllib.request.urlopen("http://127.0.0.1:%d/health" % port, timeout=5).read()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_failed_handshake_is_a_caller_gone_not_a_crash(self):
+        import socket
+        cert, key = self._identity()
+        server, _ = watch_relay.serve_tls("127.0.0.1", 0, cert, key)
+        _serve(server)
+        reports = []
+        try:
+            old = watch_relay._ON_HANDLER_ERROR
+            watch_relay._ON_HANDLER_ERROR = lambda *a: reports.append(a)
+            try:
+                with socket.create_connection(server.server_address, timeout=5) as raw:
+                    raw.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                    try:
+                        assert b"HTTP/" not in raw.recv(64), "plain text got an answer"
+                    except OSError:
+                        pass                     # closed on it: the right answer
+                time.sleep(0.2)
+            finally:
+                watch_relay._ON_HANDLER_ERROR = old
+            assert reports == []
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_the_pin_rides_only_proven_answers(self, monkeypatch, fresh_auth):
+        cert, _ = self._identity()
+        info = {"port": 8979, "sha256": watch_relay.tls_fingerprint(cert)}
+        monkeypatch.setattr(watch_relay, "TLS_INFO", info)
+        txt = watch_relay.advertise_txt(8977)
+        assert txt.get("tls") == "8979"
+        assert info["sha256"] not in json.dumps(txt), "never in a broadcast"
+        server, _ = watch_relay.serve(port=0, auth=fresh_auth)
+        _serve(server)
+        try:
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            status, body = relay_call(base + "/tunnel", token=fresh_auth.bootstrap)
+            assert status == 200 and body["tls"] == info
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestSealing:
+    """The travel road's bodies are sealed end to end: ChaCha20-Poly1305 as
+    RFC 8439 writes it, proven against the RFC's own vectors and against
+    bytes Apple's CryptoKit produced (2026-10-23, the watch's side)."""
+    PT = (b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip "
+          b"for the future, sunscreen would be it.")
+
+    def test_rfc8439_chacha20(self):                      # RFC 8439 2.4.2
+        ct = tapproval_wire.chacha20(bytes(range(32)), 1,
+                                     bytes.fromhex("000000000000004a00000000"), self.PT)
+        assert ct.hex().startswith("6e2e359a2568f98041ba0728dd0d6981")
+        assert ct.hex().endswith("8eedf2785e42874d")
+
+    def test_rfc8439_poly1305(self):                      # RFC 8439 2.5.2
+        key = bytes.fromhex("85d6be7857556d337f4452fe42d506a8"
+                            "0103808afb0db2fd4abff6af4149f51b")
+        tag = tapproval_wire.poly1305(key, b"Cryptographic Forum Research Group")
+        assert tag.hex() == "a8061dc1305136c6c22b8baf0c0127a9"
+
+    def test_rfc8439_aead(self):                          # RFC 8439 2.8.2
+        key, nonce = bytes(range(0x80, 0xA0)), bytes.fromhex("070000004041424344454647")
+        aad = bytes.fromhex("50515253c0c1c2c3c4c5c6c7")
+        sealed = tapproval_wire.aead_seal(key, nonce, self.PT, aad)
+        assert sealed[:16].hex() == "d31a8d34648e60db7b86afbc53ef7ec2"
+        assert sealed[-16:].hex() == "1ae10b594f09e26a7e902ecbd0600691"
+        assert tapproval_wire.aead_open(key, nonce, sealed, aad) == self.PT
+
+    def test_a_flipped_bit_or_other_words_open_nothing(self):
+        key, nonce = bytes(range(32)), bytes(12)
+        sealed = tapproval_wire.aead_seal(key, nonce, b"allow", b"POST /decision")
+        assert tapproval_wire.aead_open(key, nonce, sealed[:-1] + bytes([sealed[-1] ^ 1]),
+                                        b"POST /decision") is None
+        assert tapproval_wire.aead_open(key, nonce, sealed, b"POST /say") is None
+        assert tapproval_wire.open_body("another device", tapproval_wire.seal_body(
+            "this device", b"allow")) is None
+
+    # Made on this Mac by CryptoKit (HKDF<SHA256>, ChaChaPoly) on 2026-10-23.
+    CK_DEVICE = "k3y-for-the-test-only-0123456789"
+    CK_KEY = "8588f22788ea5de2aa85537f3dcaed4b58a5561b5190833fa714cc35b286d4a2"
+    CK_SEALED = ("000102030405060708090a0bcc4c5c8920a84a3876607e8d81ffda2c36674622ab0c0d12"
+                 "d2cec9175f36179c7eb7a8ebc7fd9500bcb6dad6daf95a62214446a752159d7cc68ddd39"
+                 "cd6b16a59f0062e253ab207eb347205e75e08be3f892")
+    CK_BODY = b'{"text":"What would that test check?","session_id":"a34518a5-3cc"}'
+
+    def test_the_watch_and_this_computer_derive_the_same_key(self):
+        assert tapproval_wire.seal_key(self.CK_DEVICE).hex() == self.CK_KEY
+
+    def test_cryptokit_and_this_computer_seal_the_same_bytes(self):
+        mine = tapproval_wire.seal_body(self.CK_DEVICE, self.CK_BODY, aad=b"POST /say",
+                                        nonce=bytes(range(12)))
+        assert mine.hex() == self.CK_SEALED
+        assert tapproval_wire.open_body(self.CK_DEVICE, bytes.fromhex(self.CK_SEALED),
+                                        b"POST /say") == self.CK_BODY
+
+
+class TestSealedTravelRoad:
+    """Through the tunnel a 2.1 watch seals what it sends and asks for a
+    sealed answer, so Cloudflare's edge carries bytes it cannot read."""
+
+    def _call(self, url, key, body, sealed=True, wrong_key=None):
+        import uuid
+        from urllib.parse import unquote, urlsplit
+        split = urlsplit(url)
+        plain = json.dumps(body).encode()
+        aad = ("POST " + unquote(split.path)).encode()
+        data = tapproval_wire.seal_body(wrong_key or key, plain, aad) if sealed else plain
+        stamp, nonce = int(time.time()), uuid.uuid4().hex
+        mac = watch_relay.sign_request(key, "POST", split.path, stamp, nonce, data,
+                                       query=split.query)
+        # Labelled JSON even when sealed: the label is the relay's wall
+        # against web pages (_dispatch), and stays one.
+        headers = {"Content-Type": "application/json",
+                   "X-Tapproval-Signature": "v2 %d %s %s" % (stamp, nonce, mac)}
+        if sealed:
+            headers["X-Tapproval-Sealed"] = "1"
+        request = urllib.request.Request(url, data=data, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as reply:
+                return reply.status, reply.read(), reply.headers, nonce, aad
+        except urllib.error.HTTPError as error:
+            return error.code, error.read(), error.headers, nonce, aad
+
+    def _relay(self, fresh_auth):
+        server, _ = watch_relay.serve(port=0, token="tok", auth=fresh_auth)
+        _serve(server)
+        return server, "http://127.0.0.1:%d/t/tok/decision" % server.server_address[1]
+
+    def test_a_sealed_request_is_opened_and_answered_sealed(self, fresh_auth):
+        key = fresh_auth.issue_device("watch-1")
+        server, url = self._relay(fresh_auth)
+        try:
+            status, raw, headers, nonce, aad = self._call(url, key, {"id": "no-such-card",
+                                                                     "decision": "allow"})
+            assert b"no-such-card" not in raw and b"ok" not in raw, "the answer crossed in clear"
+            assert headers.get("Content-Type") == "application/octet-stream"
+            opened = tapproval_wire.open_body(key, raw, b"answer " + aad)
+            assert opened is not None, "the watch could not open its answer"
+            assert json.loads(opened) == {"ok": False}, "the body was opened and judged"
+            assert headers.get("X-Tapproval-Proof2") == watch_relay.relay_proof2(
+                key, nonce, status, opened), "the proof covers what the watch reads"
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_body_sealed_with_another_key_is_not_read(self, fresh_auth):
+        key = fresh_auth.issue_device("watch-1")
+        server, url = self._relay(fresh_auth)
+        try:
+            status, raw, _, _, aad = self._call(url, key, {"id": "x", "decision": "allow"},
+                                                wrong_key="someone else's")
+            assert status == 400
+            assert json.loads(tapproval_wire.open_body(key, raw, b"answer " + aad))["error"]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_watch_before_2_1_is_still_served_plain(self, fresh_auth):
+        key = fresh_auth.issue_device("watch-1")
+        server, url = self._relay(fresh_auth)
+        try:
+            status, raw, headers, _, _ = self._call(url, key, {"id": "x", "decision": "allow"},
+                                                    sealed=False)
+            assert json.loads(raw) == {"ok": False}
+            assert headers.get("Content-Type", "").startswith("application/json")
+        finally:
+            server.shutdown()
+            server.server_close()

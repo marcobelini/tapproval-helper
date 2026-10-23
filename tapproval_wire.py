@@ -277,3 +277,128 @@ def strip_wrist_echo(text):
     twice, reworded."""
     m = _WRIST_ECHO.match(text)
     return text[m.end():] if m else text
+
+
+# ---- sealing a body end to end (#645, the travel road) ----------------------
+#
+# The travel tunnel's TLS ends at Cloudflare's edge, so its bodies are
+# sealed too: ChaCha20-Poly1305 (RFC 8439) under a key derived from the
+# device key, opened only by the watch and this computer. The watch uses
+# CryptoKit's ChaChaPoly; the standard library has no cipher, so this is
+# RFC 8439 written out, held to the RFC's own test vectors and to bytes
+# CryptoKit produced (test_claude_risk_classifier.py, TestSealing).
+
+_MASK32 = 0xFFFFFFFF
+
+
+def _rotl(value, count):
+    return ((value << count) & _MASK32) | (value >> (32 - count))
+
+
+def _quarter(s, a, b, c, d):
+    s[a] = (s[a] + s[b]) & _MASK32
+    s[d] = _rotl(s[d] ^ s[a], 16)
+    s[c] = (s[c] + s[d]) & _MASK32
+    s[b] = _rotl(s[b] ^ s[c], 12)
+    s[a] = (s[a] + s[b]) & _MASK32
+    s[d] = _rotl(s[d] ^ s[a], 8)
+    s[c] = (s[c] + s[d]) & _MASK32
+    s[b] = _rotl(s[b] ^ s[c], 7)
+
+
+def chacha20_block(key, counter, nonce):
+    """RFC 8439 2.3: one 64-byte block of key stream."""
+    import struct
+    if len(key) != 32 or len(nonce) != 12:
+        raise ValueError("chacha20: 32-byte key, 12-byte nonce")
+    state = ([0x61707865, 0x3320646E, 0x79622D32, 0x6B206574]
+             + list(struct.unpack("<8L", key)) + [counter & _MASK32]
+             + list(struct.unpack("<3L", nonce)))
+    working = state[:]
+    for _ in range(10):
+        _quarter(working, 0, 4, 8, 12)
+        _quarter(working, 1, 5, 9, 13)
+        _quarter(working, 2, 6, 10, 14)
+        _quarter(working, 3, 7, 11, 15)
+        _quarter(working, 0, 5, 10, 15)
+        _quarter(working, 1, 6, 11, 12)
+        _quarter(working, 2, 7, 8, 13)
+        _quarter(working, 3, 4, 9, 14)
+    # Indexes, not zip(strict=): the login job's Python is 3.9.
+    return struct.pack("<16L", *((working[i] + state[i]) & _MASK32 for i in range(16)))
+
+
+def chacha20(key, counter, nonce, data):
+    """RFC 8439 2.4: data XOR the key stream from block ``counter`` on."""
+    out = bytearray(len(data))
+    for start in range(0, len(data), 64):
+        block = chacha20_block(key, counter + start // 64, nonce)
+        chunk = data[start:start + 64]
+        out[start:start + len(chunk)] = bytes(chunk[i] ^ block[i] for i in range(len(chunk)))
+    return bytes(out)
+
+
+def poly1305(key, message):
+    """RFC 8439 2.5: the one-time authenticator."""
+    r = int.from_bytes(key[:16], "little") & 0x0FFFFFFC0FFFFFFC0FFFFFFC0FFFFFFF
+    s = int.from_bytes(key[16:32], "little")
+    prime = (1 << 130) - 5
+    acc = 0
+    for start in range(0, len(message), 16):
+        chunk = message[start:start + 16] + b"\x01"
+        acc = (acc + int.from_bytes(chunk, "little")) * r % prime
+    return ((acc + s) & ((1 << 128) - 1)).to_bytes(16, "little")
+
+
+def _aead_mac_data(aad, ciphertext):
+    import struct
+    def pad(data):
+        return b"\x00" * (-len(data) % 16)
+    return (aad + pad(aad) + ciphertext + pad(ciphertext)
+            + struct.pack("<QQ", len(aad), len(ciphertext)))
+
+
+def aead_seal(key, nonce, plaintext, aad=b""):
+    """RFC 8439 2.8: ciphertext followed by its 16-byte tag."""
+    one_time = chacha20_block(key, 0, nonce)[:32]
+    ciphertext = chacha20(key, 1, nonce, plaintext)
+    return ciphertext + poly1305(one_time, _aead_mac_data(aad, ciphertext))
+
+
+def aead_open(key, nonce, sealed, aad=b""):
+    """The plaintext, or None when the tag does not match: never a guess."""
+    import hmac
+    if len(sealed) < 16:
+        return None
+    ciphertext, tag = sealed[:-16], sealed[-16:]
+    one_time = chacha20_block(key, 0, nonce)[:32]
+    if not hmac.compare_digest(poly1305(one_time, _aead_mac_data(aad, ciphertext)), tag):
+        return None
+    return chacha20(key, 1, nonce, ciphertext)
+
+
+SEAL_INFO = b"tapproval-seal-v1"
+
+
+def seal_key(device_key):
+    """The sealing key for one device: HKDF-SHA256 (RFC 5869) of its key,
+    so the key that signs is never the key that encrypts."""
+    import hashlib
+    import hmac
+    secret = device_key.encode("utf-8") if isinstance(device_key, str) else device_key
+    prk = hmac.new(b"\x00" * 32, secret, hashlib.sha256).digest()
+    return hmac.new(prk, SEAL_INFO + b"\x01", hashlib.sha256).digest()
+
+
+def seal_body(device_key, body, aad=b"", nonce=None):
+    """nonce || sealed: what crosses the tunnel in place of ``body``."""
+    import os
+    nonce = nonce if nonce is not None else os.urandom(12)
+    return nonce + aead_seal(seal_key(device_key), nonce, body, aad)
+
+
+def open_body(device_key, sealed, aad=b""):
+    """The body, or None when it was not sealed with this device's key."""
+    if len(sealed) < 28:
+        return None
+    return aead_open(seal_key(device_key), sealed[:12], sealed[12:], aad)
