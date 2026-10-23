@@ -50,9 +50,27 @@ longer. A problem that is not yet fixed is not described in public.
   then runs under that session's permission mode and hook. It is never
   posted to a session in bypass or plan mode, and a command is never
   posted there.
-- **Cards travel through your own private iCloud or an encrypted tunnel**
-  when you are away from home. The tunnel carries them in transit only; in
-  iCloud a card waits in your own private database until it is answered.
+- **Cards travel through your own private iCloud or a tunnel** when you
+  are away from home. The tunnel carries them in transit only; in iCloud a
+  card waits in your own private database until it is answered.
+- **Encryption needs watch app 2.1.** From 2.1, with a helper of 1.1.74 or
+  later: on the local network and the tailnet the watch uses TLS to the
+  helper's own certificate, which it learns only from an answer carrying
+  the relay's proof and then pins per host; on the travel tunnel, where
+  Cloudflare ends TLS, each body is sealed end to end (ChaCha20-Poly1305,
+  key derived from the device key, bound to method and path), so
+  Cloudflare sees only ciphertext. Request signing stays on every direct
+  road. In iCloud, with Mac bridge 1.0.2, a card's details, the device key
+  and the certificate fingerprint are in CloudKit's encrypted fields; the
+  headline and risk tier stay readable, because Apple builds the
+  notification from them. **What is accepted, for now:** the helper keeps
+  its plain listener and plain tunnel bodies for watches before 2.1, and
+  writes readable iCloud copies on a Mac until that Mac's own watch has
+  shown it runs 2.1 (bridge 1.0.3). On those paths a watch before 2.1 is
+  protected by the signing alone: someone who can see the traffic, such
+  as Cloudflare on the tunnel or Apple in iCloud without Advanced Data
+  Protection, could read what it carries. Closing the plain paths is a
+  later release's decision.
 - **On the iCloud route, your Apple ID is the key.** With the Mac bridge
   the helper installs on a Mac, the watch learns its first key from your
   private iCloud, and
@@ -109,5 +127,7 @@ private database, which only your Apple Account can read.
 
 - Loopback alone opens only `/health`; a local caller shows the key file, and every other caller presents a device key.
 - The travel tunnel's secret path is an address, never a credential.
+- A watch learns the helper's certificate only from an answer the relay
+  has proven, never from the network alone.
 - Failure is closed: anything unparsed, unreachable or ambiguous ends in the
   prompt appearing where it always would.

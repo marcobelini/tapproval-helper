@@ -23,7 +23,9 @@ session open on your computer goes into that session, so its terminal and
 the Claude app on your phone show it, and Claude's answer opens with
 "*⌚ …*" and your words. What you type in the terminal or on the phone shows
 on the watch. If what you asked for needs your yes first, Claude asks it
-back as a question card on your wrist.
+back as a question card on your wrist. You can end a session from the
+watch too (Reply › More › End session): Claude Code stops on the computer,
+and the conversation stays there to pick up later.
 
 *(Technical id: `tapproval-helper` — the repo and plugin keep that name;
 the product name is Tapproval Base.)*
@@ -57,8 +59,11 @@ that discarded every wrist approval in silence, and an update that never
 arrives is not an update. A plugin install is Claude Code's to update, and
 Claude Code leaves auto-update off for every marketplace but Anthropic's
 own, so turn it on once: type `/plugin`, open **Marketplaces**, choose
-**tapproval** and pick **Enable auto-update**. Until you do, the watch's
-Connection screen mentions it once a newer helper has been out a week. A terminal install
+**tapproval** and pick **Enable auto-update**. From watch app 2.1 you can
+do the same from the wrist instead: **Settings → Auto-update → Helper**
+writes that very setting, and only when you turn the switch. Until it is
+on, the watch's Connection screen mentions it, quietly, once a newer
+helper has been out a week. A terminal install
 needs nothing: it checks at most once an hour, on a session you were
 starting anyway, and fast-forwards itself.
 
@@ -180,10 +185,21 @@ log was deliberately left in place.
   the signed build cannot be reproduced bit for bit (see `SECURITY.md`).
 - **No Tapproval servers, ever.** No accounts, no telemetry. At home,
   prompts travel directly between your computer and your watch. Away
-  from home they ride your tailnet or an encrypted tunnel (Cloudflare)
-  hidden behind a secret path — in transit only, stored nowhere. On a
-  Mac, a card can also wait in your own private iCloud database until it
-  is answered; only your Apple ID can read it.
+  from home they ride your tailnet or a tunnel (Cloudflare) hidden behind
+  a secret path — in transit only, stored nowhere. On a Mac, a card can
+  also wait in your own private iCloud database until it is answered.
+- **Encrypted end to end, from watch app 2.1.** On your Wi-Fi and over
+  Tailscale the watch talks to this computer over an encrypted
+  connection, using a certificate the computer made for itself that the
+  watch accepts only after the computer has proven it holds your pairing
+  key. On the travel address every message is sealed with a key only your
+  watch and your computer hold, so Cloudflare carries scrambled data it
+  cannot read. In iCloud, a card's details and the pairing key sit in
+  encrypted fields locked with your own iCloud Keychain, so Apple cannot
+  read them; only the headline and the risk mark stay readable, because
+  Apple builds the buzz from them. A watch before 2.1 keeps working,
+  unencrypted, until it updates, and the readable iCloud copies it needs
+  stop on each Mac once that Mac's watch runs 2.1.
 - **`127.0.0.1` is not a computer of ours.** You will see that address in
   the code and in the hook it installs. It is called *loopback*, and it is
   the one address every computer reserves for itself: it means "this
