@@ -8,6 +8,46 @@
 import CloudKit
 import Foundation
 import Security
+import ServiceManagement
+
+// The login item (1.1.0). The bridge registers its own, from the job file
+// sealed inside this signed app (Contents/Library/LaunchAgents), so System
+// Settings → Login Items lists it as "Tapproval" with the App Store logo.
+// A job file the helper wrote into ~/Library/LaunchAgents was listed under
+// the name on the signing certificate — the developer's legal name —
+// whatever it said (tested 2026-10-24). Only an app can register itself, so
+// the helper's installer asks through these switches, and reads the one
+// word printed first: enabled, requires-approval (the user switched it off
+// in Login Items), not-registered or not-found.
+let loginItem = SMAppService.agent(plistName: "com.tapproval.bridge.plist")
+
+func loginWord(_ status: SMAppService.Status) -> String {
+    switch status {
+    case .enabled: return "enabled"
+    case .requiresApproval: return "requires-approval"
+    case .notRegistered: return "not-registered"
+    case .notFound: return "not-found"
+    @unknown default: return "unknown"
+    }
+}
+
+if let flag = CommandLine.arguments.dropFirst().first,
+   ["--register", "--unregister", "--login-status"].contains(flag) {
+    var failure: Error?
+    do {
+        if flag == "--register" { try loginItem.register() }
+        if flag == "--unregister" { try loginItem.unregister() }
+    } catch {
+        failure = error
+    }
+    print(loginWord(loginItem.status))
+    if let failure {
+        FileHandle.standardError.write(Data("\(flag): \(failure.localizedDescription)\n".utf8))
+    }
+    // A register refused because the user switched Tapproval off is their
+    // choice kept, not a failure.
+    exit(failure == nil || loginItem.status == .requiresApproval ? 0 : 1)
+}
 
 let relayBase = URL(string: "http://127.0.0.1:8977")!
 let database = CKContainer(identifier: "iCloud.app.tapproval")
@@ -705,6 +745,60 @@ if CommandLine.arguments.contains("--check-alerts") {
         print("probe delete FAILED, remove \(probeID) by hand: \(error.localizedDescription)")
     }
     exit(ok ? 0 : 1)
+}
+
+// --agent: started by the login item. Its job file is sealed in the app and
+// cannot name a home folder, so the bridge sends its own output to
+// bridge.log beside the app, where the helper's job file used to send it.
+if CommandLine.arguments.contains("--agent") {
+    let logPath = Bundle.main.bundleURL.deletingLastPathComponent()
+        .appendingPathComponent("bridge.log").path
+    let fd = open(logPath, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+    if fd >= 0 {
+        dup2(fd, STDOUT_FILENO)
+        dup2(fd, STDERR_FILENO)
+        close(fd)
+    }
+    wakeRelay()
+}
+
+/// Wake the relay at login, in place of the relay's own job file (which
+/// Login Items listed under the interpreter's name). The helper writes
+/// which Python and which watch_relay.py; the bridge runs exactly that with
+/// --ensure, once, and does not wait: --ensure starts the relay in a
+/// session of its own and returns at once if it is already up.
+func wakeRelay() {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    let file = home + "/.tapproval/data/relay-start.json"
+    guard let data = FileManager.default.contents(atPath: file) else { return }
+    guard let start = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let python = start["python"] as? String,
+          let relay = start["relay"] as? String else {
+        log("relay-start.json unreadable; the relay starts with the next Claude Code session")
+        return
+    }
+    // Only the helper's own relay, run by a real interpreter: this file
+    // can make the bridge start a program, so it starts nothing else.
+    // The two places the helper lives: a terminal install, a plugin install
+    // (bridge_install.RELAY_HOMES says the same).
+    let real = URL(fileURLWithPath: relay).resolvingSymlinksInPath().path
+    guard [home + "/.tapproval/", home + "/.claude/plugins/"].contains(where: real.hasPrefix),
+          (real as NSString).lastPathComponent == "watch_relay.py",
+          FileManager.default.fileExists(atPath: real),
+          python.hasPrefix("/"),
+          FileManager.default.isExecutableFile(atPath: python) else {
+        log("relay-start.json names something other than the helper's relay; not started")
+        return
+    }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: python)
+    process.arguments = [real, "--ensure"]
+    do {
+        try process.run()
+        log("woke the relay")
+    } catch {
+        log("could not wake the relay: \(error.localizedDescription)")
+    }
 }
 
 let startingICloud = iCloudName(try? await CKContainer(

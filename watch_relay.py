@@ -1049,6 +1049,14 @@ def run_bridge_update():
         return 1
     print("bridge: %s installed" % version, file=sys.stderr)
     _admin_call("/admin/bridge-ok", timeout=2)
+    # A bridge from 1.1.0 wakes the relay at login itself; the relay's own
+    # job, listed under the interpreter's name in Login Items, then goes.
+    try:
+        import ClaudeRiskClassifier as classifier
+        classifier.wake_relay_at_login()
+    except Exception as error:
+        print("bridge: the relay's wake-up was not handed over — %s" % error,
+              file=sys.stderr)
     return 0
 
 
@@ -3982,6 +3990,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             # subprocess about twice a minute at worst — and it waits half
             # a second at most: a slow answer lands on the next poll.
             signed_in(wait=HEALTH_SIGNIN_WAIT)
+            check_login_item()
             # Only a plugin install has the switch to show. A terminal
             # install updates itself and says so, or Settings had no
             # Auto-update section at all and read as missing (2026-10-24).
@@ -5122,8 +5131,42 @@ def note_bridge_icloud(status):
     return True
 
 
+# The bridge's login item (1.1.0), asked at most this often: the answer is a
+# subprocess, and /health is polled.
+LOGIN_ITEM_EVERY = 300.0
+_LOGIN_ITEM = {"at": 0.0}
+
+
+def check_login_item(now=None):
+    """Say on the wrist when the user switched Tapproval off in Login Items:
+    the bridge then never starts, so a closed watch stops buzzing, and
+    nothing else would tell them why. Their switch is respected — the
+    helper never turns it back on — so the sentence says where it is."""
+    now = time.time() if now is None else now
+    if now - _LOGIN_ITEM["at"] >= LOGIN_ITEM_EVERY:
+        _LOGIN_ITEM["at"] = now
+        _LOGIN_ITEM["word"] = None
+        try:
+            import bridge_install
+            app = bridge_install.app_path()
+            if os.path.isdir(app) and bridge_install.registers_itself(app):
+                _LOGIN_ITEM["word"] = bridge_install.login_item("login-status", app)
+        except Exception as error:
+            print("relay: could not ask the bridge's login item: %s" % error,
+                  file=sys.stderr)
+    if _LOGIN_ITEM.get("word") == "requires-approval":
+        note_condition(
+            "login_item_off",
+            "Tapproval is switched off in Login Items on this Mac, so your "
+            "watch cannot buzz while Tapproval is closed. Turn it on in "
+            "System Settings, General, Login Items.")
+    else:
+        clear_condition("login_item_off")
+
+
 def _bridge_apps():
-    """Where a Mac bridge may be installed: the installer's place, then the
+    """Where a Mac bridge may be installed: the installer's place (under its
+    name from 1.1.0, then the older one), then the
     one it lived in until 2026-10-16, a bridge until the first install into
     the new place retires it. Asked of bridge_install, so the relay and the
     installer cannot disagree (and honour the same overrides).
@@ -5133,8 +5176,8 @@ def _bridge_apps():
     on the same account pairs through iCloud; the first-run door still
     opens, for a watch on another account (see Auth.__init__)."""
     import bridge_install
-    return (bridge_install.app_path(),
-            os.path.join(bridge_install.legacy_dir(), bridge_install.APP_NAME))
+    return (bridge_install.app_path(), bridge_install.old_app_path(),
+            os.path.join(bridge_install.legacy_dir(), bridge_install.OLD_APP_NAME))
 
 
 def bridge_installed():

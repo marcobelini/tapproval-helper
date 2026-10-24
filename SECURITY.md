@@ -114,8 +114,9 @@ private database, which only your Apple Account can read.
   shasum -a 256 ~/.tapproval/bridge/TapprovalBridge-*.zip   # compare with bridge.json
   # on a plugin install the zip is under
   # ~/.claude/plugins/cache/tapproval/tapproval-helper/*/bridge/
-  codesign -dv ~/.tapproval/bridge-app/TapprovalBridge.app   # TeamIdentifier=K2RX2Y5896
-  spctl -a -t exec -vv ~/.tapproval/bridge-app/TapprovalBridge.app  # Notarized Developer ID
+  codesign -dv ~/.tapproval/bridge-app/Tapproval.app   # TeamIdentifier=K2RX2Y5896
+  spctl -a -t exec -vv ~/.tapproval/bridge-app/Tapproval.app  # Notarized Developer ID
+  # (TapprovalBridge.app before bridge 1.1.0)
   ```
 
 - **Turning it off.**

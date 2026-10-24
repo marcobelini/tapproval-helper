@@ -110,7 +110,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.79"
+__version__ = "1.1.80"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -3520,6 +3520,23 @@ def install_launch_agent():
     return True
 
 
+def wake_relay_at_login():
+    """Make sure something wakes the relay at login. A bridge from 1.1.0
+    does it, as part of the one "Tapproval" item in Login Items, and the
+    relay's own job — which macOS lists under the interpreter's name,
+    "Python" or "Xcode" — goes. Otherwise the relay's own job does it.
+    True when one of them is in place."""
+    try:
+        import bridge_install
+        if bridge_install.mac_supported() and bridge_install.wake_relay(
+                sys.executable, _relay_path()):
+            remove_launch_agent()
+            return True
+    except Exception:
+        pass
+    return install_launch_agent()
+
+
 def remove_launch_agent():
     """Take the login wake-up out again — part of a clean exit."""
     if sys.platform != "darwin":
@@ -3987,11 +4004,12 @@ def run_install(then_watch=False, bridge=None):
     if not starters:
         hooks.pop("SessionStart", None)
 
-    # Even a no-op re-run repairs a missing login wake-up: installs from
-    # before it existed get it the next time anything runs --install.
-    agent = bool(relay_command) and install_launch_agent()
     codex = install_codex()
     closed = _bridge_step(bridge)
+    # Even a no-op re-run repairs a missing login wake-up: installs from
+    # before it existed get it the next time anything runs --install.
+    # After the bridge, which may take the wake-up over.
+    agent = bool(relay_command) and wake_relay_at_login()
 
     if not changed:
         print("Already installed, and the paths are correct.")
@@ -4076,8 +4094,13 @@ def _bridge_step(choice=None):
         return ("  Closed watch : the iCloud bridge could not be installed "
                 "(%s). It tries again when Claude Code next starts."
                 % error.strerror)
-    return ("  Closed watch : buzzes through your own iCloud (bridge %s, "
+    said = ("  Closed watch : buzzes through your own iCloud (bridge %s, "
             "just installed)" % pin["version"])
+    if bridge_install.registers_itself():
+        said += ("\n  Login Items  : macOS lists it as Tapproval. It carries "
+                 "cards to your watch through iCloud and wakes the relay "
+                 "after a restart.")
+    return said
 
 
 def _say_codex(codex):
@@ -4192,6 +4215,7 @@ def _remove_bridge():
     if not bridge_install.mac_supported():
         return False
     if not (os.path.exists(bridge_install.app_path())
+            or os.path.exists(bridge_install.old_app_path())
             or os.path.exists(bridge_install.agent_path())):
         return False
     return bridge_install.remove()

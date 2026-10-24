@@ -13,7 +13,7 @@ echo "  3. Delete ~/.tapproval (the helper, its data and its logs), and the"
 echo "     ~/.tapproval-* files older versions kept beside it"
 echo "  4. Forget the paired watch (its key is in ~/.tapproval/data)"
 echo "     — after a reinstall, pair it again from Settings"
-echo "  5. On a Mac, stop the iCloud bridge and remove its login job (the"
+echo "  5. On a Mac, stop the iCloud bridge and remove its login item (the"
 echo "     bridge itself lives in ~/.tapproval and goes with it)"
 echo "  Your audit log stays, so your own history remains yours."
 echo ""
@@ -36,6 +36,12 @@ pkill -f "cloudflared tunnel.*127.0.0.1:8978" 2>/dev/null || true
 # Its job is stopped first: the app itself lives in ~/.tapproval/bridge-app,
 # removed just below, and ~/.tapproval-bridge is where it lived before.
 if [ "$(uname -s)" = "Darwin" ]; then
+  # From 1.1.0 the bridge registered its own login item; only it can take
+  # it out again, or Login Items keeps a "Tapproval" row for a deleted app.
+  BRIDGE_APP="$HOME/.tapproval/bridge-app/Tapproval.app"
+  if [ -x "$BRIDGE_APP/Contents/MacOS/Tapproval" ]; then
+    "$BRIDGE_APP/Contents/MacOS/Tapproval" --unregister >/dev/null 2>&1 || true
+  fi
   launchctl bootout "gui/$(id -u)/com.tapproval.bridge" 2>/dev/null || true
   rm -f "$HOME/Library/LaunchAgents/com.tapproval.bridge.plist"
   # The relay's login wake-up too: only --uninstall removed it, and that

@@ -33,7 +33,19 @@ import tempfile
 import time
 
 LABEL = "com.tapproval.bridge"
-APP_NAME = "TapprovalBridge.app"
+APP_NAME = "Tapproval.app"
+# What bridges before 1.1.0 were called. They were started by a job file in
+# ~/Library/LaunchAgents, and macOS files such a job under the name on the
+# signing certificate — the developer's legal name — whatever the file says
+# (tested 2026-10-24). From 1.1.0 the bridge registers its own login item,
+# so System Settings → Login Items says "Tapproval" with the App Store logo.
+OLD_APP_NAME = "TapprovalBridge.app"
+REGISTERS_ITSELF = (1, 1, 0)
+# The login item's words for itself (Bridge/main.swift, --login-status).
+# requires-approval is the user's own switch in Login Items, turned off:
+# respected, never turned back on behind their back.
+LOGIN_ON = ("enabled", "requires-approval")
+LOGIN_WORDS = LOGIN_ON + ("not-registered", "not-found")
 MAX_BYTES = 20 * 1024 * 1024
 # The bridge's own deployment target (MACOSX_DEPLOYMENT_TARGET).
 MIN_MACOS = (13, 0)
@@ -65,6 +77,24 @@ def legacy_dir():
 
 def app_path():
     return os.path.join(bridge_dir(), APP_NAME)
+
+
+def old_app_path():
+    """Where a bridge before 1.1.0 is installed, until the update replaces it."""
+    return os.path.join(bridge_dir(), OLD_APP_NAME)
+
+
+def current_app():
+    """The bridge installed here: the new name, else the old one."""
+    return app_path() if os.path.isdir(app_path()) else old_app_path()
+
+
+def relay_start_path():
+    """The file a self-registering bridge reads at start-up to wake the
+    relay, in place of the relay's own login job. The path is fixed in the
+    bridge; the override is for the suite."""
+    return (os.environ.get("TAPPROVAL_RELAY_START")
+            or os.path.expanduser("~/.tapproval/data/relay-start.json"))
 
 
 def pin_path():
@@ -157,15 +187,53 @@ def read_pin(path=None):
             "path": os.path.join(os.path.dirname(os.path.abspath(path)), file)}
 
 
+def _info(app):
+    try:
+        with open(os.path.join(app, "Contents", "Info.plist"), "rb") as handle:
+            info = plistlib.load(handle)
+    except Exception:
+        return {}
+    return info if isinstance(info, dict) else {}
+
+
 def installed_version(app=None):
     """The installed bridge's CFBundleShortVersionString, or None."""
-    info = os.path.join(app or app_path(), "Contents", "Info.plist")
-    try:
-        with open(info, "rb") as handle:
-            value = plistlib.load(handle).get("CFBundleShortVersionString")
-    except Exception:
-        return None
+    value = _info(app or current_app()).get("CFBundleShortVersionString")
     return value if isinstance(value, str) else None
+
+
+def registers_itself(app=None):
+    """Does this bridge register its own login item (1.1.0 and later)?"""
+    try:
+        version = tuple(int(part) for part in
+                        (installed_version(app) or "").split("."))
+    except ValueError:
+        return False
+    return version >= REGISTERS_ITSELF
+
+
+def executable(app):
+    """The program inside a bridge: Tapproval from 1.1.0, TapprovalBridge
+    before, as its Info.plist says when it says."""
+    name = _info(app).get("CFBundleExecutable")
+    if not (isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9]+", name)):
+        name = "Tapproval" if registers_itself(app) else "TapprovalBridge"
+    return os.path.join(app, "Contents", "MacOS", name)
+
+
+def login_item(action, app=None):
+    """Ask a bridge from 1.1.0 to register, unregister or describe its own
+    login item. Returns its one word (``enabled``, ``requires-approval``,
+    ``not-registered``, ``not-found``), or None when it could not answer.
+    Only the bridge can do this: macOS lets an app register only itself."""
+    app = app or current_app()
+    status, out = RUN([executable(app), "--" + action], timeout=30)
+    if status is None:
+        return None
+    # Its word is the first line; anything after it is the reason it gave.
+    lines = (out or "").strip().splitlines()
+    word = lines[0].strip() if lines else ""
+    return word if word in LOGIN_WORDS else None
 
 
 def state(pin=None, platform_name=None, mac_version=None):
@@ -270,17 +338,16 @@ def verify(app, pin):
         raise InstallError("Gatekeeper does not accept it as notarized")
 
 
-def write_agent(home=None):
-    """The login job, with the keys the developer's own job has carried
-    since the bridge began: start at login, restart if it ever stops.
-    ``home`` is the folder whose bridge it runs: bridge_dir() unless a
-    failed first install hands the job back to the old place."""
-    home = home or bridge_dir()
-    log = os.path.join(home, "bridge.log")
+def write_agent(app=None):
+    """The login job file, for a bridge before 1.1.0, with the keys the
+    developer's own job has carried since the bridge began: start at login,
+    restart if it ever stops. ``app`` is the bridge it runs: the installed
+    one unless a failed install hands the job back to an older one."""
+    app = app or current_app()
+    log = os.path.join(os.path.dirname(app), "bridge.log")
     job = {
         "Label": LABEL,
-        "ProgramArguments": [os.path.join(home, APP_NAME, "Contents", "MacOS",
-                                          "TapprovalBridge")],
+        "ProgramArguments": [executable(app)],
         "RunAtLoad": True,
         "KeepAlive": True,
         "StandardOutPath": log,
@@ -315,6 +382,46 @@ def unload_agent():
     if agent_is_real():
         RUN(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LABEL)],
             timeout=10)
+
+
+def _drop_agent_file():
+    """Take the old-style job away: stopped, and its file gone, so Login
+    Items has no entry left under the certificate's name."""
+    unload_agent()
+    try:
+        os.remove(agent_path())
+    except FileNotFoundError:
+        pass
+
+
+def start(app):
+    """Start the bridge at ``app`` and have it start at every login.
+    From 1.1.0 it registers its own login item (and the old job file goes);
+    before, the job file does it. True when macOS took it.
+
+    A login item already registered is restarted, not registered again: the
+    registration outlives the bundle being replaced in place (tested
+    2026-10-24), and keeping it keeps the user's own switch. Off in Login
+    Items stays off, and counts as taken."""
+    if not registers_itself(app):
+        write_agent(app)
+        return load_agent()
+    _drop_agent_file()
+    word = login_item("login-status", app)
+    if word not in LOGIN_ON:
+        word = login_item("register", app)
+    elif word == "enabled" and agent_is_real():
+        # The bundle was swapped under the running bridge: run the new one.
+        RUN(["launchctl", "kickstart", "-k",
+             "gui/%d/%s" % (os.getuid(), LABEL)], timeout=10)
+    return word in LOGIN_ON
+
+
+def stop(app):
+    """Before a swap: stop a bridge that runs from a job file. One that
+    registered itself keeps its login item and is restarted by start()."""
+    if not registers_itself(app):
+        unload_agent()
 
 
 def install(pin, wait_for_bridge=None):
@@ -352,30 +459,31 @@ def _install(pin, wait_for_bridge, home):
                                % (installed_version(new), pin["version"]))
 
         app = app_path()
+        was = current_app()     # an older bridge may still have the old name
         previous = app + ".previous"
-        had_previous = os.path.isdir(app)
+        had_previous = os.path.isdir(was)
         if had_previous:
-            unload_agent()
+            stop(was)
             shutil.rmtree(previous, ignore_errors=True)
+            shutil.rmtree(old_app_path() + ".previous", ignore_errors=True)
             try:
-                os.rename(app, previous)
+                os.rename(was, previous)
             except OSError as error:
                 # Nothing swapped yet: the bridge that was stopped for the
                 # swap starts again, rather than waiting for the next login.
-                load_agent()
+                start(was)
                 raise InstallError("%s, so the previous one is back"
                                    % (error.strerror or error)) from error
         try:
             os.rename(new, app)
-            write_agent()
-            if not load_agent():
-                raise InstallError("launchd did not take the login job")
+            if not start(app):
+                raise InstallError("macOS did not take its login item")
             if wait_for_bridge is not None and not wait_for_bridge():
                 raise InstallError("the new bridge did not start")
         except (InstallError, OSError) as error:
             # Every failure after the swap undoes it. Left half-done, the
             # new bridge would read as "current" and never be retried.
-            _roll_back(app, previous, had_previous)
+            _roll_back(app, previous, had_previous, was)
             reason = getattr(error, "strerror", None) or str(error)
             raise InstallError(
                 "%s, so the previous one is back" % reason if had_previous
@@ -386,20 +494,25 @@ def _install(pin, wait_for_bridge, home):
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def _roll_back(app, previous, had_previous):
-    """Put back what was there before the swap: the previous bridge and its
-    job, or nothing at all."""
+def _roll_back(app, previous, had_previous, was):
+    """Put back what was there before the swap: the previous bridge, under
+    its own name and started its own way, or nothing at all."""
+    if os.path.isdir(app) and registers_itself(app) and (
+            not had_previous or not registers_itself(previous)):
+        # Its login item would point at nothing, or outrank the job file
+        # the older bridge goes back to.
+        login_item("unregister", app)
     unload_agent()
     shutil.rmtree(app, ignore_errors=True)
+    legacy = os.path.join(legacy_dir(), OLD_APP_NAME)
     if had_previous and os.path.isdir(previous):
-        os.rename(previous, app)
-        write_agent()
-        load_agent()
-    elif os.path.isdir(os.path.join(legacy_dir(), APP_NAME)):
+        os.rename(previous, was)
+        start(was)
+    elif os.path.isdir(legacy):
         # The first install into the new place failed on a Mac whose bridge
         # still runs from the old one: give the job back to that bridge,
         # or the Mac would be left with none.
-        write_agent(legacy_dir())
+        write_agent(legacy)
         load_agent()
     else:
         try:
@@ -415,13 +528,17 @@ def _retire_legacy():
     old = legacy_dir()
     if os.path.realpath(old) == os.path.realpath(bridge_dir()):
         return
-    for name in (APP_NAME, APP_NAME + ".previous"):
+    for name in (OLD_APP_NAME, OLD_APP_NAME + ".previous"):
         shutil.rmtree(os.path.join(old, name), ignore_errors=True)
 
 
 def remove():
-    """Stop the bridge and take it and its login job away, from the old
-    place as well. True when nothing of it is left running or installed."""
+    """Stop the bridge and take it, its login item or job and the relay's
+    start-up file away, from the old place as well. True when nothing of it
+    is left running or installed."""
+    for app in (app_path(), old_app_path()):
+        if os.path.isdir(app) and registers_itself(app):
+            login_item("unregister", app)
     unload_agent()
     try:
         os.remove(agent_path())
@@ -429,12 +546,58 @@ def remove():
         pass
     except OSError:
         return False
-    shutil.rmtree(app_path(), ignore_errors=True)
-    # The copy kept for a rollback is a whole bridge too (2026-10-24 review).
-    shutil.rmtree(app_path() + ".previous", ignore_errors=True)
+    forget_relay()
+    for app in (app_path(), old_app_path()):
+        shutil.rmtree(app, ignore_errors=True)
+        # The copy kept for a rollback is a whole bridge too (2026-10-24 review).
+        shutil.rmtree(app + ".previous", ignore_errors=True)
     _retire_legacy()
-    return not (os.path.exists(app_path())
-                or os.path.exists(os.path.join(legacy_dir(), APP_NAME)))
+    return not (os.path.exists(app_path()) or os.path.exists(old_app_path())
+                or os.path.exists(os.path.join(legacy_dir(), OLD_APP_NAME)))
+
+
+def wake_relay(python, relay):
+    """Hand the relay's wake-up at login to the bridge: write the file it
+    reads at start-up. True when the installed bridge registered itself and
+    so now wakes the relay; then the relay's own job file can go, and with
+    it the Login Items row filed under the interpreter's name. A Mac whose
+    bridge is older, off or missing keeps that job (False)."""
+    if not (relay_may_be_woken(relay) and os.path.isdir(app_path())
+            and registers_itself(app_path())
+            and login_item("login-status", app_path()) in LOGIN_ON):
+        forget_relay()
+        return False
+    path = relay_start_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"python": python, "relay": relay}, handle)
+    except OSError:
+        return False
+    return True
+
+
+# Where the bridge agrees to start a relay from (Bridge/main.swift, wakeRelay):
+# a terminal install and a plugin install, under the user's home.
+RELAY_HOMES = ("~/.tapproval/", "~/.claude/plugins/")
+
+
+def relay_may_be_woken(relay, home=None):
+    """Would the bridge start this relay? The same rule it applies, so a
+    relay it would refuse keeps its own job instead of losing its wake-up."""
+    home = home or os.path.expanduser("~")
+    real = os.path.realpath(relay)
+    return (os.path.basename(real) == "watch_relay.py" and os.path.isfile(real)
+            and any(real.startswith(os.path.join(home, place[2:]))
+                    for place in RELAY_HOMES))
+
+
+def forget_relay():
+    """The bridge no longer wakes the relay."""
+    try:
+        os.remove(relay_start_path())
+    except OSError:
+        pass
 
 
 def set_off(off):

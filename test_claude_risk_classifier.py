@@ -391,6 +391,8 @@ def _no_real_bridge(tmp_path, monkeypatch):
     monkeypatch.setenv("TAPPROVAL_BRIDGE_AGENT_PATH",
                        str(tmp_path / "com.tapproval.bridge.plist"))
     monkeypatch.setenv("TAPPROVAL_BRIDGE_PIN", str(tmp_path / "no-bridge.json"))
+    # The file that hands the relay's wake-up to the bridge: never the real one.
+    monkeypatch.setenv("TAPPROVAL_RELAY_START", str(tmp_path / "relay-start.json"))
 
     def no_commands(command, timeout=60):
         raise AssertionError("a test ran %r for real" % (command,))
@@ -15109,6 +15111,27 @@ class TestTheLocalFallbackRunsWhatCiRuns:
         shared = watch.index("sharing the first one listed")
         assert own < shared, "look for CI's own simulator before borrowing one"
 
+    def test_a_run_by_hand_never_shares_cis_simulators(self):
+        """On CI's names a run by hand killed a CI run's test host and held
+        its flows lock, and CI failed with no test to blame (#871)."""
+        import subprocess
+        _, local = self._files()
+        start = local.index('  CI_SIM="Tapproval CI"')
+        naming = local[start:local.index("\n", local.index("CI_SIM=", start + 20)) + 1]
+        script = naming + 'echo "$CI_SIM|$CI_SIM Flows|$CI_SIM iPhone"\n'
+
+        def names(**env):
+            run_env = {k: v for k, v in os.environ.items() if k != "GITHUB_ACTIONS"}
+            run_env.update(env)
+            return subprocess.run(["bash", "-c", script], env=run_env, capture_output=True,
+                                  text=True, check=True).stdout.strip().split("|")
+        assert names(GITHUB_ACTIONS="true") == [
+            "Tapproval CI", "Tapproval CI Flows", "Tapproval CI iPhone"]
+        assert names() == ["Tapproval Local", "Tapproval Local Flows", "Tapproval Local iPhone"]
+        # Every simulator name the script uses comes from that one choice.
+        assert local.count('"Tapproval CI') == 1, "a CI simulator named outside the choice"
+        assert 'FLOWS_SIM_PREFIX="$CI_SIM Flows"' in local and 'IOS_SIM="$CI_SIM iPhone"' in local
+
     def test_a_run_that_dies_without_a_failing_test_says_why(self):
         """The output filter keeps assertions and totals. A killed test host
         fails no assertion, so the reason was in the part thrown away."""
@@ -16315,8 +16338,8 @@ class TestTheReportingItselfIsChecked:
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
     VOCABULARY = {"bonjour", "bridge", "bridge_install", "claude", "codex", "crash", "dashboard", "helper",
-                  "icloud_off", "no_tls", "outdated", "pairing", "port", "signin", "stuck", "tunnel",
-                  "update"}
+                  "icloud_off", "login_item_off", "no_tls", "outdated", "pairing", "port", "signin",
+                  "stuck", "tunnel", "update"}
 
     @staticmethod
     def _module_source(name):
@@ -19054,11 +19077,30 @@ class _FakeMac:
         self.team, self.ident, self.developer_id = "K2RX2Y5896", "app.tapproval.bridge", True
         self.gatekeeper = (0, "x: accepted\nsource=Notarized Developer ID")
         self.ran = []
+        # A bridge from 1.1.0 registering its own login item: which bundles
+        # are registered, what macOS says (the user may have switched it
+        # off), and whether macOS takes a registration at all.
+        self.registered, self.switched_off, self.refuses = set(), False, False
+        self.login_calls = []
+
+    def _login_item(self, command):
+        app = command[0].split("/Contents/MacOS/")[0]
+        action = command[1]
+        self.login_calls.append((os.path.basename(app), action))
+        if action == "--register" and not self.refuses:
+            self.registered.add(app)
+        elif action == "--unregister":
+            self.registered.discard(app)
+        if app not in self.registered:
+            return 0, "not-registered"
+        return 0, "requires-approval" if self.switched_off else "enabled"
 
     def __call__(self, command, timeout=60):
         self.ran.append(command[0])
+        if "/Contents/MacOS/" in command[0]:
+            return self._login_item(command)
         if command[0] == "ditto":
-            _make_app(os.path.join(command[-1], "TapprovalBridge.app"), self.version)
+            _make_app(os.path.join(command[-1], bridge_install.APP_NAME), self.version)
             return 0, ""
         if command[:2] == ["codesign", "--verify"]:
             if self.verify:
@@ -19350,6 +19392,185 @@ class TestTheHelperInstallsTheMacBridge:
         crc.main(["--install", "--bridge"])
         crc.main(["--install"])
         assert seen == [False, True, None]
+
+    # -- its own login item, from 1.1.0 (Login Items says "Tapproval") ---------
+
+    def _job_file(self):
+        """The old-style job file, as a bridge before 1.1.0 left it."""
+        with open(bridge_install.agent_path(), "wb") as handle:
+            plistlib.dump({"Label": bridge_install.LABEL}, handle)
+
+    def _install_v(self, version, **kw):
+        self.mac.version = version
+        return self._install(_bridge_zip_pin(version=version), **kw)
+
+    def test_a_bridge_from_1_1_registers_itself_and_the_job_file_goes(self):
+        """A job file in ~/Library/LaunchAgents is listed under the name on
+        the signing certificate, the owner's legal name (2026-10-24)."""
+        self._job_file()
+        assert self._install_v("1.1.0") == "1.1.0"
+        assert bridge_install.app_path() in self.mac.registered
+        assert ("Tapproval.app", "--register") in self.mac.login_calls
+        assert not os.path.exists(bridge_install.agent_path())
+
+    def test_a_bridge_before_1_1_still_gets_its_job_file(self):
+        self._install_v("1.0.3")
+        assert os.path.exists(bridge_install.agent_path())
+        assert self.mac.login_calls == []
+
+    def test_an_update_keeps_the_login_item_and_the_users_switch(self):
+        """Registering again could turn back on what the user switched off
+        in Login Items. The registration outlives the swap; it is kept."""
+        self._install_v("1.1.0")
+        self.mac.switched_off = True
+        self.mac.login_calls.clear()
+        assert self._install_v("1.1.1") == "1.1.1"
+        assert self.mac.login_calls == [("Tapproval.app", "--login-status")]
+        assert bridge_install.login_item("login-status") == "requires-approval"
+
+    def test_the_bridge_under_its_old_name_is_replaced(self):
+        old = bridge_install.old_app_path()
+        _make_app(old, "1.0.3")
+        self._job_file()
+        assert self._install_v("1.1.0") == "1.1.0"
+        assert not os.path.exists(old)
+        assert bridge_install.installed_version() == "1.1.0"
+        assert bridge_install.installed_version(bridge_install.app_path() + ".previous") == "1.0.3"
+        assert not os.path.exists(bridge_install.agent_path())
+
+    @pytest.mark.parametrize("failure", ["silent", "refused"])
+    def test_a_failed_move_puts_the_old_bridge_back_under_its_name(self, failure):
+        import plistlib as pl
+        old = bridge_install.old_app_path()
+        _make_app(old, "1.0.3")
+        if failure == "refused":
+            self.mac.refuses = True
+        with pytest.raises(bridge_install.InstallError) as refused:
+            self._install_v("1.1.0", wait_for_bridge=lambda: failure != "silent")
+        assert "previous one is back" in str(refused.value)
+        assert bridge_install.installed_version(old) == "1.0.3"
+        assert not os.path.exists(bridge_install.app_path())
+        assert self.mac.registered == set(), "no login item left pointing at nothing"
+        with open(bridge_install.agent_path(), "rb") as handle:
+            job = pl.load(handle)
+        assert job["ProgramArguments"] == [os.path.join(old, "Contents", "MacOS", "TapprovalBridge")]
+
+    def test_removing_unregisters_the_login_item(self):
+        self._install_v("1.1.0")
+        Path(bridge_install.relay_start_path()).write_text("{}")
+        assert bridge_install.remove()
+        assert self.mac.registered == set()
+        assert not os.path.exists(bridge_install.app_path())
+        assert not os.path.exists(bridge_install.relay_start_path())
+
+    def test_the_login_items_word_is_its_first_line(self, monkeypatch):
+        monkeypatch.setattr(bridge_install, "RUN", lambda c, timeout=60: (
+            1, "requires-approval\n--register: Operation not permitted"))
+        assert bridge_install.login_item("register", "/x/Tapproval.app") == "requires-approval"
+        monkeypatch.setattr(bridge_install, "RUN", lambda c, timeout=60: (1, "boom"))
+        assert bridge_install.login_item("register", "/x/Tapproval.app") is None
+        monkeypatch.setattr(bridge_install, "RUN", lambda c, timeout=60: (None, "gone"))
+        assert bridge_install.login_item("login-status", "/x/Tapproval.app") is None
+
+    def test_switched_off_in_login_items_is_said_on_the_wrist(self, monkeypatch):
+        """The bridge never starts, so a closed watch stops buzzing; the
+        helper keeps the user's switch, so the wrist says where it is."""
+        monkeypatch.setattr(watch_relay, "_LOGIN_ITEM", {"at": 0.0})
+        self._install_v("1.1.0")
+        self.mac.switched_off = True
+        calls = len(self.mac.login_calls)
+        watch_relay.check_login_item(now=1e12)
+        said = [c for c in watch_relay.conditions() if c["key"] == "login_item_off"]
+        assert said and "Login Items" in said[0]["detail"]
+        assert self.mac.login_calls[calls:] == [("Tapproval.app", "--login-status")], \
+            "asked, never turned back on"
+        watch_relay.check_login_item(now=1e12 + 1)
+        assert len(self.mac.login_calls) == calls + 1, "asked at most every few minutes"
+        self.mac.switched_off = False
+        watch_relay.check_login_item(now=1e12 + watch_relay.LOGIN_ITEM_EVERY)
+        assert not [c for c in watch_relay.conditions() if c["key"] == "login_item_off"]
+
+    # -- the bridge wakes the relay, and the relay's own job goes ---------------
+
+    def _relay_here(self, tmp_path, monkeypatch, place=".tapproval"):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        relay = tmp_path / place / "watch_relay.py"
+        relay.parent.mkdir(parents=True, exist_ok=True)
+        relay.write_text("# relay\n")
+        monkeypatch.setattr(crc, "_relay_path", lambda: str(relay))
+        return relay
+
+    def test_a_registered_bridge_takes_the_relays_wake_up(self, tmp_path, monkeypatch):
+        """One "Tapproval" row: the relay's job was listed under the
+        interpreter's name ("Python", or "Xcode" on the owner's Mac)."""
+        relay = self._relay_here(tmp_path, monkeypatch)
+        Path(crc._launch_agent_path()).write_text("old relay job")
+        self._install_v("1.1.0")
+        assert crc.wake_relay_at_login()
+        with open(bridge_install.relay_start_path(), encoding="utf-8") as handle:
+            assert json.load(handle) == {"python": sys.executable, "relay": str(relay)}
+        assert not os.path.exists(crc._launch_agent_path())
+
+    @pytest.mark.parametrize("why", ["older bridge", "no bridge", "relay elsewhere"])
+    def test_otherwise_the_relay_keeps_its_own_job(self, tmp_path, monkeypatch, why):
+        self._relay_here(tmp_path, monkeypatch,
+                         "elsewhere" if why == "relay elsewhere" else ".tapproval")
+        Path(bridge_install.relay_start_path()).write_text("{}")
+        if why == "older bridge":
+            self._install_v("1.0.3")
+        elif why == "relay elsewhere":
+            self._install_v("1.1.0")
+        assert crc.wake_relay_at_login()
+        assert os.path.exists(crc._launch_agent_path())
+        assert not os.path.exists(bridge_install.relay_start_path())
+
+    @pytest.mark.private_layout
+    def test_the_bridge_and_the_installer_agree_on_where_a_relay_may_be(self):
+        swift = self._swift()
+        homes = re.search(r"\[home \+ \"(/[^\"]+)\", home \+ \"(/[^\"]+)\"\]", swift).groups()
+        assert tuple("~" + h for h in homes) == bridge_install.RELAY_HOMES
+        assert '"watch_relay.py"' in swift and '"--ensure"' in swift
+
+    @staticmethod
+    def _swift():
+        path = os.path.join(_ROOT, "WatchApp", "Bridge", "main.swift")
+        if not os.path.isfile(path):
+            pytest.skip("the bridge's source lives in the product repo")
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    @pytest.mark.private_layout
+    def test_the_sealed_login_item_names_the_bridge_and_keeps_the_relay(self):
+        import plistlib as pl
+        path = os.path.join(_ROOT, "WatchApp", "Bridge", "com.tapproval.bridge.plist")
+        if not os.path.isfile(path):
+            pytest.skip("the bridge's source lives in the product repo")
+        with open(path, "rb") as handle:
+            job = pl.load(handle)
+        assert job["Label"] == bridge_install.LABEL
+        assert job["BundleProgram"] == "Contents/MacOS/Tapproval"
+        assert job["ProgramArguments"][1:] == ["--agent"]
+        assert job["RunAtLoad"] and job["KeepAlive"]
+        assert job["AbandonProcessGroup"], "the relay it wakes outlives a bridge restart"
+        assert 'SMAppService.agent(plistName: "com.tapproval.bridge.plist")' in self._swift()
+        project = os.path.join(_ROOT, "WatchApp", "Tapproval.xcodeproj", "project.pbxproj")
+        with open(project, encoding="utf-8") as handle:
+            text = handle.read()
+        assert "dstPath = Contents/Library/LaunchAgents;" in text
+        assert text.count("PRODUCT_BUNDLE_IDENTIFIER = app.tapproval.bridge;\n"
+                          "\t\t\t\tPRODUCT_NAME = Tapproval;") == 2, \
+            "the name Login Items shows is the bundle's"
+
+    @pytest.mark.private_layout
+    def test_the_bridge_wears_the_app_store_icon(self):
+        icons = os.path.join(_ROOT, "WatchApp")
+        store = os.path.join(icons, "Tapproval", "Assets.xcassets", "AppIcon.appiconset", "icon1024.png")
+        bridge = os.path.join(icons, "Bridge", "Assets.xcassets", "AppIcon.appiconset",
+                              "icon_512x512@2x.png")
+        if not os.path.isfile(store):
+            pytest.skip("the icons live in the product repo")
+        with open(store, "rb") as a, open(bridge, "rb") as b:
+            assert a.read() == b.read(), "regenerate the bridge's icon set from the App Store icon"
 
     def test_uninstall_removes_the_bridge(self):
         self._install()

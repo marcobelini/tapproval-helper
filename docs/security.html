@@ -45,6 +45,7 @@
 
 <h2>The Mac bridge</h2>
 <p>On a Mac the helper installs a small app that copies waiting cards into your private iCloud and carries answers back. It ships inside the helper itself, so nothing is downloaded from anywhere else, and it is installed only when three checks agree: the file's SHA-256 matches the one pinned in the helper's own code, the signature is the developer's Developer ID (team K2RX2Y5896, bundle id app.tapproval.bridge), and Apple has notarized it. A copy that fails any check is thrown away. Its source is published in the helper's repository. It is built and signed on the developer's Mac, so it cannot be rebuilt bit for bit from that source: the signature and Apple's notarization are what tie it to the developer.</p>
+<p><strong>What runs in the background.</strong> One item: System Settings → General → Login Items &amp; Extensions lists it as Tapproval, with the app's icon. It is the bridge, and it starts the helper's relay after a restart. Switching it off there is respected: the helper never turns it back on, and your watch says it is off. Cards then reach the watch only while Tapproval is open on it. The bridge's own instructions for starting at login are sealed inside the signed app.</p>
 
 <h2>What it does not protect against</h2>
 <ul>

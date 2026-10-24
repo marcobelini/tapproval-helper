@@ -83,10 +83,12 @@ helper installs on a Mac (macOS 13 or later, signed in to iCloud with the
 same Apple Account as the watch) writes the card there, and Apple then
 buzzes your watch. Only an app signed by Apple and running on a Mac can
 write to your iCloud, so this is Mac only. When the bridge is added, macOS
-shows an "App Background Activity" notice, naming Tapproval's developer as
-the software that can run in the background: that is the bridge. It is
-listed under System Settings → General → Login Items & Extensions, where it
-can be switched off (`--install --no-bridge` leaves it out altogether).
+shows an "App Background Activity" notice saying "Tapproval" can run in the
+background: that is the bridge. It is listed as Tapproval, with the app's
+icon, under System Settings → General → Login Items & Extensions, where it
+can be switched off; it also wakes the relay after a restart.
+`--install --no-bridge` leaves it out altogether. (Bridges before 1.1.0 were
+listed under the developer's name instead.)
 
 | | Mac | Linux or another computer |
 |---|---|---|
@@ -142,7 +144,8 @@ that cannot see it), fall back to the installer:
    to enforce mode and point it at the local relay, add a per-user login
    wake-up, start the relay, and, on a Mac, install the signed iCloud
    bridge that ships in this repository (`bridge/`, checked against
-   `bridge.json`) with its per-user login job `com.tapproval.bridge`. No
+   `bridge.json`), which registers its own per-user login item, listed as
+   Tapproval (`com.tapproval.bridge`). No
    sudo, no dependencies beyond Python 3 and git. If it appears to do
    anything else, STOP and tell your user.
 2. Run it: `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash`
