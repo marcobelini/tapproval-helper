@@ -26,6 +26,9 @@ on the watch. If what you asked for needs your yes first, Claude asks it
 back as a question card on your wrist. You can end a session from the
 watch too (Reply › More › End session): Claude Code stops on the computer,
 and the conversation stays there to pick up later.
+That small watch is the only mark Base leaves: it says the words came
+from your wrist. Base writes nothing into your commits, and no name or
+link anywhere in the conversation.
 
 *(Technical id: `tapproval-helper` — the repo and plugin keep that name;
 the product name is Tapproval Base.)*
@@ -246,6 +249,66 @@ log was deliberately left in place.
   wake-up, stops the relay, forgets the paired watch, removes the Mac
   bridge and its login job, and deletes `~/.tapproval` — as if Base was
   never here. Your audit log stays yours.
+
+## What Base runs, sends, fetches and reads
+
+Anthropic's plugin directory asks every plugin to say this plainly, and
+you should not have to read the code to learn it. Nothing on this list
+reaches a server of ours; there is none.
+
+**Runs on your computer**
+
+- The hook, `ClaudeRiskClassifier.py`, each time Claude Code asks
+  permission. It labels the prompt and offers it to the watch. With no
+  watch paired it changes nothing.
+- The relay, `watch_relay.py`, started with each session. It listens on
+  this computer (ports 8977–8979: loopback, your own network, and the
+  travel address's local end) and carries cards out and answers back. The
+  dashboard reader, `watch_dashboard.py`, gives the watch your session
+  list and the live thread.
+- Bonjour (`dns-sd`), so your watch finds this computer on your own Wi-Fi
+  without being told an address. Tailscale is used only if you already run
+  it.
+- On a Mac, the signed and notarized bridge (`TapprovalBridge`, a login
+  item), which puts a waiting card into your own private iCloud database so
+  a closed watch still buzzes. It ships inside this repository; Base
+  downloads no other program.
+- `cloudflared`, only if you installed it yourself: it opens the travel
+  address for the days your iPhone is off.
+
+**Sends**
+
+- Cards to your watch: the command or file path in question, its risk
+  mark, the project folder's name and the question text. Over your Wi-Fi
+  or Tailscale, encrypted, to a watch that has proven your pairing key; or
+  sealed with that key through the Cloudflare travel address, which carries
+  data it cannot read.
+- On a Mac, the same card into your own iCloud through the bridge, with
+  the details in encrypted fields; only the headline and the risk mark stay
+  readable, because Apple builds the buzz from them.
+- Nothing else. No telemetry and no analytics. `crash_report.py` sends
+  nothing without a mail key, and an installed copy has none.
+
+**Fetches**
+
+- The helper's release list from `api.github.com`, once a day, so the
+  watch can say quietly when your copy is a week or more behind. Nothing of
+  yours goes with the request. An empty `TAPPROVAL_RELEASES_URL` turns it
+  off.
+- A terminal install (`install.sh`) fast-forwards its own git checkout
+  once an hour. A plugin install is updated by Claude Code, not by Base.
+
+**Reads and writes**
+
+- Reads `~/.claude/settings.json`, to know your own permission rules so the
+  wrist shows only what the terminal would have asked; Claude Code's
+  transcripts under `~/.claude/projects` and `~/.claude/sessions`, for the
+  session list and the live thread; and `~/.codex`, if Codex is in use.
+- Writes the audit log `~/.claude/risk-audit.jsonl`, its own files under
+  `~/.tapproval`, the hook entry in your Claude Code settings, and on a Mac
+  a login job in `~/Library/LaunchAgents` and the bridge's login item.
+  "Uninstall Tapproval Base" removes all of it except the audit log, which
+  stays yours.
 
 ## What Base is
 
