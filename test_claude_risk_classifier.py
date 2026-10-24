@@ -21290,3 +21290,82 @@ class TestWhatTheShellUnquotes:
     def test_git_internals_in_any_case(self):
         assert crc.classify_path("/Users/u/proj/.GIT/hooks/pre-commit",
                                  "/Users/u/proj") == (Risk.CRITICAL, ["git-internals"])
+
+
+class TestWordsMeanTheSameForEveryTool:
+    """#872: what a word means lives in the ontology, with a tool's own
+    words beside it, instead of in rules keyed on a binary's name. Each row
+    here read a different tier from its siblings on 2026-10-24."""
+
+    @pytest.mark.parametrize("command, tier", [
+        # Publishing to a public registry is publishing, whichever tool.
+        ("gem push x.gem", Risk.CRITICAL),
+        ("helm push chart oci://registry.example/x", Risk.CRITICAL),
+        ("poetry publish", Risk.CRITICAL),
+        ("npm unpublish left-pad", Risk.CRITICAL),
+        ("cargo yank --version 1.0.0", Risk.CRITICAL),
+        # Every docker prune deletes what nothing uses, not only system's.
+        ("docker image prune -a", Risk.HIGH),
+        ("docker volume prune", Risk.HIGH),
+        # One list of the machine's own roots, for find and rm alike.
+        ("find /Users -delete", Risk.CRITICAL),
+        ("find /bin -delete", Risk.CRITICAL),
+        ("find /opt -delete", Risk.CRITICAL),
+        ("rm -rf /System", Risk.CRITICAL),
+        ("rm -rf /Library", Risk.CRITICAL),
+    ])
+    def test_now_reads(self, command, tier):
+        assert crc.classify_bash(command)[0] == tier, crc.classify_bash(command)
+
+    @pytest.mark.parametrize("command, tier", [
+        # A shell's or a VM's exec is not a stored procedure.
+        ("lima exec vm ls", Risk.MEDIUM),
+        ("ssh host 'exec ls'", Risk.MEDIUM),
+        ("limactl shell vm exec ls", Risk.MEDIUM),
+        # /usrlocal is not /usr: roots match by whole path component.
+        ("find /usrlocal -delete", Risk.HIGH),
+    ])
+    def test_false_alarms_read_as_what_they_are(self, command, tier):
+        risk, rules = crc.classify_bash(command)
+        assert risk == tier and "sql-mutation" not in rules, (risk, rules)
+
+    @pytest.mark.parametrize("command, tier", [
+        ("sqlcmd -Q 'EXEC sp_x'", Risk.HIGH),
+        ("echo 'EXEC sp_x' | sqlcmd -S db", Risk.HIGH),
+        ("psql -c \"DELETE FROM t\"", Risk.HIGH),
+        ("docker exec web ls", Risk.MEDIUM),
+        ("npm publish", Risk.CRITICAL),
+        ("docker push img", Risk.CRITICAL),
+        ("docker system prune -a", Risk.HIGH),
+        ("git stash clear", Risk.HIGH),
+        ("git remote set-url origin https://example.invalid/r.git", Risk.MEDIUM),
+        ("git push origin main", Risk.HIGH),
+        ("find . -delete", Risk.HIGH),
+        ("find ~ -delete", Risk.CRITICAL),
+        ("rm -rf /usr", Risk.CRITICAL),
+        ("find /usr/local -name x -delete", Risk.CRITICAL),
+        ("poetry add requests", Risk.MEDIUM),
+        ("npm install", Risk.MEDIUM),
+        ("gem list", Risk.MEDIUM),
+    ])
+    def test_these_stay_where_they_were(self, command, tier):
+        assert crc.classify_bash(command)[0] == tier, crc.classify_bash(command)
+
+    def test_exec_in_a_file_or_an_mcp_call_is_still_sql(self):
+        """No program name to go by there: EXEC counts as it did."""
+        result = crc.classify({"tool_name": "mcp__db__query",
+                               "tool_input": {"sql": "EXEC sp_drop_all"}})
+        assert result["risk"] >= Risk.HIGH, result
+
+    def test_git_words_belong_to_git(self):
+        for word in ("set-url", "set-head", "set-branches"):
+            assert word not in crc.EFFECT_WORDS, word
+            assert word in crc.TOOL_EFFECT_WORDS["git"], word
+
+    def test_a_tools_words_only_ever_raise(self):
+        """A tool's own entry may sharpen a shared word, never soften it."""
+        for tool, words in crc.TOOL_EFFECT_WORDS.items():
+            for word, meaning in words.items():
+                effect = meaning[0] if isinstance(meaning, tuple) else meaning
+                shared = crc.EFFECT_WORDS.get(word)
+                assert shared is None or effect >= shared, (tool, word)

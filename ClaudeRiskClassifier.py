@@ -110,7 +110,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.80"
+__version__ = "1.1.81"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -251,13 +251,18 @@ SQL_DESTRUCTIVE = re.compile(
 )
 SQL_MUTATION = re.compile(
     r"\b(INSERT\s+INTO|UPDATE\s+\S+\s+SET|DELETE\s+FROM|MERGE\s+INTO|"
-    r"ALTER\s+(TABLE|PROCEDURE)|CREATE\s+(OR\s+ALTER\s+)?PROCEDURE|"
-    # A stored procedure, not a shell's exec: find's `-exec` and a container
-    # tool's `exec` made `docker exec web ls` an SQL mutation (2026-10-24).
-    r"(?<!-)(?<!docker\s)(?<!podman\s)(?<!nerdctl\s)(?<!kubectl\s)(?<!compose\s)"
-    r"(?<!container\s)(?<!oc\s)EXEC(UTE)?\s+)",
+    r"ALTER\s+(TABLE|PROCEDURE)|CREATE\s+(OR\s+ALTER\s+)?PROCEDURE)",
     re.I,
 )
+# A stored procedure — but `exec` is also every shell's, VM's and container
+# tool's word: a list of binaries it did not mean grew to seven and still
+# read `ssh host 'exec ls'` as SQL (#872, 2026-10-24). In a command it
+# counts only beside an SQL client; in a file or an MCP call, where there is
+# no program to go by, it counts as it always did. find's `-exec` never.
+SQL_EXEC = re.compile(r"(?<!-)\bEXEC(UTE)?\s+", re.I)
+SQL_CLIENTS = frozenset(
+    "sqlcmd psql mysql mariadb sqlite3 osql isql duckdb snowsql bq mongosh cqlsh "
+    "clickhouse-client".split())
 
 # Shell operators we split on to classify each segment independently.
 # A lone `&` between words runs the next command too: `echo hi & rm -rf ~`
@@ -414,12 +419,34 @@ EFFECT_WORDS = {
     "flushdb": Effect.DESTROY, "deprovision": Effect.DESTROY, "teardown": Effect.DESTROY,
     "publish": Effect.PUBLISH, "deploy": Effect.PUBLISH, "upload": Effect.PUBLISH,
     "grant": Effect.GRANT, "revoke": Effect.GRANT, "rotate": Effect.GRANT,
-    "set-url": Effect.MUTATE, "set-head": Effect.MUTATE, "set-branches": Effect.MUTATE,
     "scale": Effect.MUTATE, "apply": Effect.MUTATE,
     # `rclone sync` and `aws s3 sync --delete` make the destination match
     # the source, which means deleting whatever the source does not have.
     "sync": Effect.MUTATE,
 }
+
+# A tool's own words, beside the shared ones: what a word means to that
+# tool alone, and, where it reaches further than the tool usually does, how
+# far. `set-url` is git's, not every tool's; a registry's `push` is public,
+# though the same tool's `add` changes only the project. Each entry may only
+# sharpen a shared word, never soften it (#872, 2026-10-24).
+_REGISTRY_WORDS = {
+    "publish": (Effect.PUBLISH, Reach.PUBLIC), "push": (Effect.PUBLISH, Reach.PUBLIC),
+    "upload": (Effect.PUBLISH, Reach.PUBLIC),
+    # Gone for everyone who depends on it, in one step.
+    "unpublish": (Effect.DESTROY, Reach.PUBLIC), "yank": (Effect.DESTROY, Reach.PUBLIC),
+}
+TOOL_EFFECT_WORDS = {
+    "git": {"set-url": Effect.MUTATE, "set-head": Effect.MUTATE,
+            "set-branches": Effect.MUTATE,
+            # `stash clear`, `reflog expire`: work thrown away, as reset --hard.
+            "clear": Effect.DESTROY, "expire": Effect.DESTROY},
+    # Every prune deletes what nothing uses — images, volumes, networks —
+    # not only `system prune`'s (#872).
+    "docker": dict(_REGISTRY_WORDS, prune=Effect.DESTROY),
+}
+for _registry in ("npm", "pnpm", "yarn", "cargo", "poetry", "gem", "twine", "helm"):
+    TOOL_EFFECT_WORDS[_registry] = dict(_REGISTRY_WORDS)
 
 # Flags that carry an effect. Deliberately few and unambiguous: a flag like
 # `-d` means "delete" to git and "data" to curl and "dictionary order" to
@@ -473,6 +500,28 @@ def _names_a_secret(word):
 
 
 _HOME_ITSELF = re.compile(r"^(~|\$\{?HOME\}?)/?\*?$")
+# The machine's own folders: one list for every tool. find and rm kept two
+# that disagreed — `find /Users -delete` read HIGH beside `rm -rf /Users`'s
+# CRITICAL, and `rm -rf /System` HIGH beside find's — and a bare prefix took
+# /usrlocal for /usr (#872, 2026-10-24).
+SYSTEM_ROOTS = ("/System", "/Library", "/usr", "/etc", "/var", "/bin", "/sbin", "/boot",
+                "/dev", "/lib", "/opt", "/root", "/srv", "/private")
+# Every account's home at once: the machine, not one project.
+MACHINE_ROOTS = ("/Users", "/home")
+
+
+def _root_reach(word):
+    """How far a path argument reaches: SYSTEM for the root or anything in
+    a system folder, MACHINE for the folder of every home, else None."""
+    path = word.strip("'\"")
+    if path in ("/", "//", "/*"):
+        return Reach.SYSTEM
+    bare = path.rstrip("*").rstrip("/") or "/"
+    if any(bare == root or bare.startswith(root + "/") for root in SYSTEM_ROOTS):
+        return Reach.SYSTEM
+    if bare in MACHINE_ROOTS:
+        return Reach.MACHINE
+    return None
 
 
 def _ontology_risk(segment):
@@ -491,17 +540,22 @@ def _ontology_risk(segment):
     reach = TOOL_REACH.get(tool, Reach.PROJECT)
     # An absolute root argument means the blast radius is the machine, not
     # the project — `find / -delete` is not `find . -delete`.
-    if any(w == "/" or w.startswith(("/System", "/Library", "/usr", "/etc", "/var"))
-           for w in words[1:]):
-        reach = max(reach, Reach.SYSTEM)
+    for w in words[1:]:
+        further = _root_reach(w)
+        if further is not None:
+            reach = max(reach, further)
     # The home directory itself is everything the user has on this machine:
     # `find ~ -delete` is not `find . -delete` (2026-10-05 review).
     if any(_HOME_ITSELF.match(w.strip("'\"")) for w in words[1:]):
         reach = max(reach, Reach.MACHINE)
 
     effect = None
+    own = TOOL_EFFECT_WORDS.get(tool, {})
     for word in words[1:]:
-        named = EFFECT_WORDS.get(word.lower()) or EFFECT_FLAGS.get(word)
+        named = own.get(word.lower()) or EFFECT_WORDS.get(word.lower()) or EFFECT_FLAGS.get(word)
+        if isinstance(named, tuple):
+            named, further = named
+            reach = max(reach, further)
         if named is not None:
             effect = named if effect is None else max(effect, named)
 
@@ -811,7 +865,8 @@ GIT_RE = re.compile(
 # Targets that mean "wipe the machine" or "wipe my home directory".
 CATASTROPHIC_TARGETS = re.compile(
     r"^(/|//|/\*|~|~/|~/\*|\$\{?HOME\}?/?|\$\{?HOME\}?/\*|\.|\.\.|\*|"
-    r"/(bin|boot|dev|etc|home|lib|opt|root|sbin|srv|usr|var|Users|Windows)/?\*?)$"
+    r"(%s)/?\*?)$" % "|".join(re.escape(root) for root in
+                              SYSTEM_ROOTS + MACHINE_ROOTS + ("/Windows",))
 )
 
 
@@ -1153,6 +1208,10 @@ def classify_bash(command):
     for rule_id, pattern, level in WHOLE_LINE_RULES + SITE_RULES:
         if pattern.search(command):
             bump(rule_id, level)
+    if SQL_EXEC.search(command) and any(
+            os.path.basename(_first_token(segment)).lower() in SQL_CLIENTS
+            for segment in _segments(command)):
+        bump("sql-mutation", Risk.HIGH)
 
     # A command substitution runs its OWN command — `echo $(rm -rf /)` is a
     # catastrophic delete wearing an echo. The segment splitter doesn't
@@ -1523,7 +1582,7 @@ def _scan_content(content, risk, rules):
     if content:
         if SQL_DESTRUCTIVE.search(content):
             return max(risk, Risk.CRITICAL), rules + ["sql-destructive"]
-        if SQL_MUTATION.search(content):
+        if SQL_MUTATION.search(content) or SQL_EXEC.search(content):
             return max(risk, Risk.HIGH), rules + ["sql-mutation"]
         for rule_id, pattern, level in SITE_RULES:
             if pattern.search(content):
