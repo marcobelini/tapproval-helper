@@ -3106,6 +3106,7 @@ class TestKeepTheHelperUpToDate:
         assert self._switch(base, device, True) == (200, {"ok": True, "on": True})
         status, health = relay_call(base + "/health", token=device)
         assert health.get("auto_update") is True
+        assert "self_update" not in health, "a plugin install updates through Claude Code"
 
     def test_a_terminal_install_updates_itself_and_says_so(self, paths, relay, monkeypatch):
         base, device = relay
@@ -3113,7 +3114,11 @@ class TestKeepTheHelperUpToDate:
         status, reply = self._switch(base, device, True)
         assert status == 409 and reply.get("error")
         assert not paths[0].exists()
-        assert "auto_update" not in relay_call(base + "/health", token=device)[1]
+        health = relay_call(base + "/health", token=device)[1]
+        assert "auto_update" not in health
+        # Said, so Settings has an Auto-update section with no switch
+        # rather than none at all (2026-10-24).
+        assert health.get("self_update") is True
 
     def test_a_stranger_cannot_change_it(self, paths, relay):
         base, _ = relay

@@ -3982,9 +3982,11 @@ class RelayHandler(BaseHTTPRequestHandler):
             # subprocess about twice a minute at worst — and it waits half
             # a second at most: a slow answer lands on the next poll.
             signed_in(wait=HEALTH_SIGNIN_WAIT)
-            # Only a plugin install has the switch to show: a terminal
-            # install updates itself.
-            extra = {"auto_update": _auto_update_on()} if _plugin_install() else {}
+            # Only a plugin install has the switch to show. A terminal
+            # install updates itself and says so, or Settings had no
+            # Auto-update section at all and read as missing (2026-10-24).
+            extra = ({"auto_update": _auto_update_on()} if _plugin_install()
+                     else {"self_update": True})
             self._send_json({**extra, "ok": True,
                              "pending": len(self.queue.pending()),
                              "watch_seen_seconds_ago":
