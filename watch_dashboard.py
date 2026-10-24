@@ -22,8 +22,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -852,12 +854,22 @@ def _notice(text, tone, entry):
 #
 # In memory, not on disk: these are the user's own screens, and the
 # relay's promise is that nothing about a session is written anywhere new.
+# (Making one wrist-sized puts it in a private temp folder for the moment
+# sips takes, removed straight after: _wrist_sized.)
 # Bounded twice — a count and a total size — because a long session of
 # screenshots must not grow the helper until the Mac notices.
-_IMAGES = OrderedDict()      # ref -> (media_type, base64 str)
+_IMAGES = OrderedDict()      # ref -> (media_type, base64 str, or bytes once wrist-sized)
 IMAGE_CACHE_MAX = 24
 IMAGE_CACHE_BYTES = 24 * 1024 * 1024
 IMAGE_MAX_BYTES = 6 * 1024 * 1024        # one picture; a watch shows less
+# What the watch is sent: the longest side at most this many pixels, as a
+# JPEG. A full-size screenshot (half a megabyte, 2000 px tall) did not
+# finish crossing a slow wrist link inside the watch's ten seconds, and
+# the wrist said "Picture no longer held" for pictures the relay still had
+# (2026-10-24). 1200 px is still sharp in the full-screen, zoomable view.
+IMAGE_WRIST_EDGE = 1200
+IMAGE_WRIST_QUALITY = 70
+SIPS = "/usr/bin/sips"       # macOS's own; elsewhere the original is sent
 # The most of one turn the thread view carries, cut at a word and marked.
 # A wrist-sent message (watch_relay.SEND_CHARS) must fit in it whole, or
 # the watch's echo of a long message would never find its own turn.
@@ -891,14 +903,68 @@ def remember_image(part):
 
 def image_bytes(ref):
     """``(media_type, bytes)`` for a reference the watch asks for, or None.
-    Never raises — an unreadable picture is a missing one."""
-    got = _IMAGES.get(str(ref or ""))
+    Wrist-sized the first time it is asked for, and kept that way, so the
+    work is done once and the cache holds the smaller copy. Never raises —
+    an unreadable picture is a missing one."""
+    ref = str(ref or "")
+    got = _IMAGES.get(ref)
     if not got:
         return None
+    media, data = got
+    if isinstance(data, bytes):
+        return media, data
     try:
-        return got[0], base64.b64decode(got[1])
+        raw = base64.b64decode(data)
     except Exception:
         return None
+    media, raw = _wrist_sized(media, raw)
+    with _CACHE_LOCK:
+        if ref in _IMAGES:
+            _IMAGES[ref] = (media, raw)
+    return media, raw
+
+
+def _wrist_sized(media, raw):
+    """``(media_type, bytes)`` no larger than the watch can use: the longest
+    side capped at IMAGE_WRIST_EDGE, as a JPEG, by macOS's ``sips``. The
+    original whenever that is not smaller, or anything fails — no sips, as
+    on Linux, a picture sips cannot read, a slow run. Never raises.
+
+    sips reads and writes files, so the picture spends a moment in a
+    private folder (mkdtemp: 0700, this user only) that is removed before
+    returning, whatever happened."""
+    if not os.path.exists(SIPS):
+        return media, raw
+    folder = None
+    try:
+        folder = tempfile.mkdtemp(prefix="tapproval-picture-")
+        source = os.path.join(folder, "in")
+        target = os.path.join(folder, "out.jpg")
+        with open(source, "wb") as handle:
+            handle.write(raw)
+        sized = subprocess.run([SIPS, "-g", "pixelWidth", "-g", "pixelHeight", source],
+                               capture_output=True, text=True, timeout=5)
+        sides = [int(n) for n in re.findall(r"pixel(?:Width|Height):\s*(\d+)", sized.stdout)]
+        if sized.returncode != 0 or len(sides) != 2:
+            return media, raw
+        command = [SIPS, "-s", "format", "jpeg",
+                   "-s", "formatOptions", str(IMAGE_WRIST_QUALITY)]
+        if max(sides) > IMAGE_WRIST_EDGE:
+            command += ["-Z", str(IMAGE_WRIST_EDGE)]
+        done = subprocess.run(command + [source, "--out", target],
+                              capture_output=True, timeout=10)
+        if done.returncode != 0 or not os.path.exists(target):
+            return media, raw
+        with open(target, "rb") as handle:
+            small = handle.read()
+        if 0 < len(small) < len(raw):
+            return "image/jpeg", small
+        return media, raw
+    except Exception:
+        return media, raw
+    finally:
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 def _message_parts(content):

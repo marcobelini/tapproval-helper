@@ -10659,6 +10659,85 @@ class TestPicturesReachTheWrist:
         assert turns[0]["images"] == [watch_dashboard.remember_image(self.PART)]
 
 
+class TestPicturesAreWristSized:
+    """A full-size screenshot did not finish crossing a slow wrist link in
+    the watch's ten seconds, and the wrist said "Picture no longer held"
+    for pictures the relay still had (2026-10-24). The relay now sends a
+    JPEG no longer than IMAGE_WRIST_EDGE on its longest side."""
+
+    @pytest.fixture(autouse=True)
+    def _empty_cache(self):
+        watch_dashboard._IMAGES.clear()
+        yield
+        watch_dashboard._IMAGES.clear()
+
+    @staticmethod
+    def _png(width, height):
+        """A real, noisy PNG — noise so it does not compress to nothing."""
+        import struct
+        import zlib
+        rows = b"".join(b"\x00" + os.urandom(width * 3) for _ in range(height))
+        def chunk(kind, data):
+            return (struct.pack(">I", len(data)) + kind + data
+                    + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+        return (b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+    def _remember(self, raw, media="image/png"):
+        return watch_dashboard.remember_image(
+            {"type": "image", "source": {"type": "base64", "media_type": media,
+                                         "data": base64.b64encode(raw).decode()}})
+
+    @pytest.mark.skipif(not os.path.exists(watch_dashboard.SIPS), reason="sips is macOS's")
+    def test_a_tall_screenshot_reaches_the_wrist_small_and_as_a_jpeg(self, tmp_path):
+        raw = self._png(462, 1000)
+        ref = self._remember(raw)
+        import unittest.mock as mock
+        with mock.patch.object(watch_dashboard, "IMAGE_WRIST_EDGE", 500):
+            media, sent = watch_dashboard.image_bytes(ref)
+        assert media == "image/jpeg" and sent[:2] == b"\xff\xd8"
+        assert len(sent) < len(raw) / 3, (len(raw), len(sent))
+        probe = tmp_path / "sent.jpg"
+        probe.write_bytes(sent)
+        out = subprocess.run([watch_dashboard.SIPS, "-g", "pixelHeight", str(probe)],
+                             capture_output=True, text=True).stdout
+        assert "pixelHeight: 500" in out, out
+
+    @pytest.mark.skipif(not os.path.exists(watch_dashboard.SIPS), reason="sips is macOS's")
+    def test_the_small_copy_is_what_the_cache_keeps(self, monkeypatch):
+        ref = self._remember(self._png(300, 300))
+        first = watch_dashboard.image_bytes(ref)
+        assert watch_dashboard._IMAGES[ref] == first
+        monkeypatch.setattr(watch_dashboard, "_wrist_sized",
+                            lambda *_: pytest.fail("made wrist-sized twice"))
+        assert watch_dashboard.image_bytes(ref) == first
+
+    def test_without_sips_the_original_is_sent(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(watch_dashboard, "SIPS", str(tmp_path / "no-sips"))
+        raw = self._png(40, 40)
+        assert watch_dashboard.image_bytes(self._remember(raw)) == ("image/png", raw)
+
+    def test_a_picture_sips_cannot_read_is_sent_as_it_came(self):
+        raw = b"\x89PNG\r\n\x1a\nnot really"
+        assert watch_dashboard.image_bytes(self._remember(raw)) == ("image/png", raw)
+
+    def test_a_failing_sips_leaves_nothing_behind(self, monkeypatch, tmp_path):
+        made = []
+        real = watch_dashboard.tempfile.mkdtemp
+        monkeypatch.setattr(watch_dashboard.tempfile, "mkdtemp",
+                            lambda **kw: made.append(real(dir=str(tmp_path), **kw)) or made[-1])
+        def boom(*a, **kw):
+            raise subprocess.TimeoutExpired("sips", 5)
+        monkeypatch.setattr(watch_dashboard.subprocess, "run", boom)
+        fake = tmp_path / "sips"
+        fake.write_text("", encoding="utf-8")
+        monkeypatch.setattr(watch_dashboard, "SIPS", str(fake))
+        raw = self._png(40, 40)
+        assert watch_dashboard._wrist_sized("image/png", raw) == ("image/png", raw)
+        assert made and not any(os.path.exists(m) for m in made), "the private copy must go"
+
+
 class TestTheImageRouteIsNotOpenToTheRoom:
     """The pictures are the user's own screens. Loopback is not a person:
     /image needs a device key, exactly like /say and /thread's siblings."""
@@ -14621,7 +14700,8 @@ class TestCiRunsWhatTheChangeCanBreak:
     (about ten of CI's sixteen minutes); anything else, or anything it
     cannot tell, runs everything. Checked on real merge commits."""
 
-    def _scope(self, tmp_path, changed, event="pull_request", merge=True):
+    def _scope(self, tmp_path, changed, event="pull_request", merge=True,
+               ref="refs/pull/1/merge"):
         import shutil
         import subprocess
         _ci_files("ci-scope.sh")
@@ -14657,6 +14737,7 @@ class TestCiRunsWhatTheChangeCanBreak:
         run_env = {k: v for k, v in env.items() if not k.startswith("GITHUB_")}
         if event:
             run_env["GITHUB_EVENT_NAME"] = event
+            run_env["GITHUB_REF"] = ref
         done = subprocess.run(["bash", str(repo / "ci-scope.sh")], cwd=repo, env=run_env,
                               capture_output=True, text=True, timeout=30)
         assert done.returncode == 0, done.stderr
@@ -14678,9 +14759,32 @@ class TestCiRunsWhatTheChangeCanBreak:
         for path in ("ci-local.sh", "ci-scope.sh", ".github/workflows/tests.yml"):
             assert self._scope(tmp_path / path.replace("/", "_"), [path])[0] == "full", path
 
-    def test_a_push_runs_everything(self, tmp_path):
-        """main and release branches are always tested in full."""
-        assert self._scope(tmp_path, ["watch_relay.py"], event="push")[0] == "full"
+    def test_a_merge_to_main_is_judged_like_its_pr(self, tmp_path):
+        """It re-ran the full flows on what its PR had just passed, ten
+        minutes a merge (2026-10-24)."""
+        assert self._scope(tmp_path, ["watch_relay.py"], event="push",
+                           ref="refs/heads/main")[0] == "light"
+        assert self._scope(tmp_path / "w", ["WatchApp/Tapproval/X.swift"], event="push",
+                           ref="refs/heads/main")[0] == "full"
+
+    def test_a_release_branch_runs_everything(self, tmp_path):
+        assert self._scope(tmp_path, ["watch_relay.py"], event="push",
+                           ref="refs/heads/release/2.2")[0] == "full"
+
+    def test_a_push_that_is_not_a_merge_runs_everything(self, tmp_path):
+        scope, why = self._scope(tmp_path, ["watch_relay.py"], event="push",
+                                 ref="refs/heads/main", merge=False)
+        assert scope == "full" and "merge commit" in why
+
+    @pytest.mark.parametrize("path", [
+        "WatchApp/asc/desk.py", "WatchApp/BUILD_NUMBER", "WatchApp/NOTES.md",
+        "APP_STORE.md", "design/x/y.html"])
+    def test_what_the_flows_cannot_see_is_light(self, tmp_path, path):
+        """A "Ship build N" PR ran the full ten minutes for one digit."""
+        assert self._scope(tmp_path, [path])[0] == "light", path
+
+    def test_the_tree_record_counts_as_ci(self, tmp_path):
+        assert self._scope(tmp_path, ["ci-tree-cache.sh"])[0] == "full"
 
     def test_a_run_by_hand_runs_everything(self, tmp_path):
         assert self._scope(tmp_path, ["watch_relay.py"], event=None)[0] == "full"
@@ -14689,6 +14793,142 @@ class TestCiRunsWhatTheChangeCanBreak:
         """A shallow or odd checkout cannot say what the PR changed."""
         scope, why = self._scope(tmp_path, ["watch_relay.py"], merge=False)
         assert scope == "full" and "merge commit" in why
+
+    # -- the tree record (ci-tree-cache.sh) ----------------------------------
+
+    def _tree_repo(self, tmp_path):
+        import shutil
+        import subprocess
+        _ci_files("ci-tree-cache.sh")
+        repo = tmp_path / "repo"
+        repo.mkdir(parents=True)
+        shutil.copy(os.path.join(_ROOT, "ci-tree-cache.sh"), repo / "ci-tree-cache.sh")
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid",
+                   GIT_CONFIG_GLOBAL=os.devnull)
+        for args in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "x"]):
+            subprocess.run(["git", *args], cwd=repo, env=env, check=True, capture_output=True)
+        state = tmp_path / "state"
+
+        def run(action, scope, ci=True, run_id="7"):
+            run_env = {k: v for k, v in env.items() if not k.startswith("GITHUB_")}
+            run_env["TAPPROVAL_CI_STATE"] = str(state)
+            if ci:
+                run_env.update(GITHUB_ACTIONS="true", GITHUB_RUN_ID=run_id)
+            return subprocess.run(["bash", str(repo / "ci-tree-cache.sh"), action, scope],
+                                  cwd=repo, env=run_env, capture_output=True, text=True,
+                                  timeout=30)
+        return run, state
+
+    def test_a_tree_that_passed_is_not_tested_again(self, tmp_path):
+        run, _ = self._tree_repo(tmp_path)
+        assert run("check", "full").returncode == 1, "nothing recorded yet"
+        assert run("record", "full", run_id="41").returncode == 0
+        again = run("check", "full")
+        assert again.returncode == 0 and "run 41" in again.stdout
+        assert run("check", "light").returncode == 0, "a full pass covers a light run"
+
+    def test_a_light_pass_does_not_excuse_a_full_run(self, tmp_path):
+        run, _ = self._tree_repo(tmp_path)
+        run("record", "light")
+        assert run("check", "light").returncode == 0
+        assert run("check", "full").returncode == 1
+
+    def test_a_run_by_hand_never_skips_and_never_records(self, tmp_path):
+        """Its working copy may hold changes HEAD's tree does not."""
+        run, state = self._tree_repo(tmp_path)
+        assert run("record", "full", ci=False).returncode == 1
+        assert not (state / "passed-trees").exists()
+        run("record", "full")
+        assert run("check", "full", ci=False).returncode == 1
+
+    def test_the_record_stays_short(self, tmp_path):
+        run, state = self._tree_repo(tmp_path)
+        state.mkdir()
+        (state / "passed-trees").write_text("".join("%040d full 1 x\n" % i for i in range(300)))
+        run("record", "full")
+        assert len((state / "passed-trees").read_text().splitlines()) == 200
+
+    def test_ci_local_asks_before_testing_and_records_after(self):
+        (local,) = _ci_files("ci-local.sh")
+        ask = local.index('./ci-tree-cache.sh check "$SCOPE"')
+        assert ask < local.index("uvx --quiet --python"), "asked before any work"
+        assert '[ "$WHICH" = all ] && ./ci-tree-cache.sh record "$SCOPE"' in local
+
+    # -- a cancelled run leaves nothing behind ---------------------------------
+
+    def test_stop_tree_stops_a_process_and_what_it_started(self, tmp_path):
+        import subprocess
+        _ci_files("WatchApp/stop-tree.sh")
+        marker = tmp_path / "child.pid"
+        parent = subprocess.Popen(["bash", "-c", "sleep 300 & echo $! > %s; wait" % marker])
+        for _ in range(50):
+            if marker.exists() and marker.read_text().strip():
+                break
+            time.sleep(0.1)
+        child = int(marker.read_text())
+        subprocess.run(["bash", os.path.join(_ROOT, "WatchApp", "stop-tree.sh"),
+                        str(parent.pid)], check=True, timeout=30)
+        parent.wait(timeout=10)
+        time.sleep(0.2)
+        with pytest.raises(OSError):
+            os.kill(child, 0)
+
+    def _flows_lock(self, tmp_path, env):
+        """watch-flows.sh's lock block, run on its own in a scratch folder."""
+        import shutil
+        import subprocess
+        (flows,) = _ci_files("WatchApp/watch-flows.sh")
+        start = flows.index('LOCK="${TMPDIR')
+        end = flows.index('[ -n "${GITHUB_RUN_ID:-}" ] && echo "$GITHUB_RUN_ID" > "$LOCK/run"')
+        end = flows.index("\n", end) + 1
+        shutil.copy(os.path.join(_ROOT, "WatchApp", "stop-tree.sh"), tmp_path / "stop-tree.sh")
+        script = 'set -u\nPREFIX="Test Flows"\n' + flows[start:end] + 'echo TOOK\n'
+        run_env = {k: v for k, v in os.environ.items() if not k.startswith("GITHUB_")}
+        run_env.update(TMPDIR=str(tmp_path) + "/", FLOWS_LOCK_WAIT="1", **env)
+        return subprocess.run(["bash", "-c", script], cwd=tmp_path, env=run_env,
+                              capture_output=True, text=True, timeout=60)
+
+    def _held_lock(self, tmp_path, run_id=None):
+        import subprocess
+        holder = subprocess.Popen(["sleep", "300"])
+        lock = tmp_path / "tapproval-flows-Test-Flows.lock"
+        lock.mkdir()
+        (lock / "pid").write_text(str(holder.pid))
+        if run_id:
+            (lock / "run").write_text(run_id)
+        return holder
+
+    def test_ci_takes_over_the_flows_a_cancelled_run_left(self, tmp_path):
+        """A live holder from another CI run is a leftover: this Mac has one
+        runner. Waiting it out failed every merge for a morning."""
+        holder = self._held_lock(tmp_path, run_id="111")
+        try:
+            done = self._flows_lock(tmp_path, {"GITHUB_RUN_ID": "222"})
+            assert done.returncode == 0 and "TOOK" in done.stdout, done.stderr
+            assert holder.wait(timeout=10) is not None, "the leftover still runs"
+            lock = tmp_path / "tapproval-flows-Test-Flows.lock"
+            assert (lock / "run").read_text().strip() == "222"
+        finally:
+            holder.kill()
+
+    def test_a_run_by_hand_is_still_waited_for(self, tmp_path):
+        holder = self._held_lock(tmp_path)          # no run id: by hand
+        try:
+            done = self._flows_lock(tmp_path, {"GITHUB_RUN_ID": "222"})
+            assert done.returncode == 1 and "another flows run" in done.stderr
+            assert holder.poll() is None, "a run by hand was stopped"
+        finally:
+            holder.kill()
+
+    def test_both_scripts_stop_their_children_when_cancelled(self):
+        (local, flows) = _ci_files("ci-local.sh", "WatchApp/watch-flows.sh")
+        for script in (local, flows):
+            assert "trap stop TERM INT HUP" in script
+            assert "stop-tree.sh" in script
+        # The flows in the background and waited on: a foreground job holds
+        # the cancel until it ends.
+        assert 'WatchApp/watch-flows.sh &\n      CHILDREN+=("$!")\n      wait "$!"' in local
 
     def test_ci_local_says_what_it_left_out(self):
         (local,) = _ci_files("ci-local.sh")
