@@ -64,15 +64,35 @@ def decide(tool_name, tool_input, crc=None, cwd=None):
     """Ask the wrist about one tool call. Returns the permission decision.
 
     Never raises: a permission tool that throws is a session that stops
-    with a stack trace where an answer should be.
+    with a stack trace where an answer should be. Reading the wrist's
+    answer sat outside the guard (2026-10-24 review), so the guard is here,
+    around all of it.
     """
+    try:
+        return _decide(tool_name, tool_input, crc, cwd)
+    except Exception as error:                          # never a stack trace
+        return deny("Tapproval could not ask your watch (%s). Answer this at "
+                    "the keyboard." % error)
+
+
+def _decide(tool_name, tool_input, crc, cwd):
     crc = crc or _classifier()
+    # Claude Code sends no cwd; this server runs in the session's folder,
+    # and without one no write was ever "outside the project" (2026-10-24).
+    if not cwd:
+        try:
+            cwd = os.getcwd()
+        except OSError:             # a folder deleted under the run
+            cwd = None
     if crc is None:
         return deny("Tapproval could not read its own classifier on this "
                     "computer, so it cannot describe this command to your "
                     "watch. Answer it at the keyboard.")
     if not isinstance(tool_input, dict):
-        tool_input = {}
+        # Read as `{}`, a malformed call was judged as an empty one, which
+        # a threshold could allow (2026-10-24 review). Unreadable is no.
+        return deny("Tapproval could not read this tool call. Answer it at "
+                    "the keyboard.")
     try:
         policy = crc.load_policy()
         if not str(policy.get("relay") or "").strip():
@@ -85,7 +105,7 @@ def decide(tool_name, tool_input, crc=None, cwd=None):
         # default "NONE" nothing is waved through and every prompt travels
         # — which is the honest default, not the quiet one. CRITICAL is
         # never auto-allowed here either; `decide` holds that.
-        verdict, reason = crc.decide(result["risk"], policy)
+        verdict, reason = crc.decide(result["risk"], policy, tool=tool_name)
         # Shadow mode allows nothing, as in the hook: the threshold was
         # applied here whatever the mode said (2026-09-30 review).
         if verdict == "allow" and str(policy.get("mode", "shadow")).lower() != "enforce":
@@ -227,8 +247,17 @@ def serve(stdin=None, stdout=None, crc=None):
         try:
             message = json.loads(line)
         except ValueError:
-            continue                                    # not ours to answer
-        reply = handle(message, crc=crc)
+            # Unanswered, a request Claude Code thinks it sent waits out its
+            # own timeout. JSON-RPC's parse error answers it at once.
+            reply = {"jsonrpc": "2.0", "id": None,
+                     "error": {"code": -32700, "message": "not JSON"}}
+        else:
+            try:
+                reply = handle(message, crc=crc)
+            except Exception as error:      # one bad message never ends the server
+                reply = {"jsonrpc": "2.0",
+                         "id": message.get("id") if isinstance(message, dict) else None,
+                         "error": {"code": -32603, "message": str(error)}}
         if reply is None:
             continue
         stdout.write(json.dumps(reply) + "\n")

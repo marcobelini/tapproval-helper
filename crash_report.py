@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -102,7 +103,8 @@ FROM_ENV = "TAPPROVAL_CRASH_REPORT_FROM"
 
 _seen = {}                       # fingerprint -> {count, notified}
 _window_start = 0.0
-_sent_in_window = 0
+_sent_in_window = 0               # sends tried, refused ones included
+_state_lock = threading.Lock()   # the relay reports from every request thread
 
 
 def _clip(value, limit):
@@ -329,21 +331,28 @@ def report(message, stack, source="process", helper=None, now=None,
             except Exception:
                 pass
 
-        if stamp - _window_start > DEDUPE_WINDOW:
-            _window_start, _sent_in_window = stamp, 0
-            _seen.clear()
-        key = fingerprint(entry["message"], entry["stack"])
-        seen = _seen.setdefault(key, {"count": 0, "notified": False})
-        seen["count"] += 1
-        if seen["notified"]:
-            return "duplicate", entry
-        if _sent_in_window >= MAX_SENDS_PER_WINDOW:
-            return "rate_limited", entry
+        with _state_lock:
+            if stamp - _window_start > DEDUPE_WINDOW:
+                _window_start, _sent_in_window = stamp, 0
+                _seen.clear()
+            key = fingerprint(entry["message"], entry["stack"])
+            seen = _seen.setdefault(key, {"count": 0, "notified": False})
+            seen["count"] += 1
+            if seen["notified"]:
+                return "duplicate", entry
+            if _sent_in_window >= MAX_SENDS_PER_WINDOW:
+                return "rate_limited", entry
+            count = seen["count"]
 
-        reason = send(entry, seen["count"], settings=settings, opener=opener)
-        if reason == "sent":
-            seen["notified"] = True
-            _sent_in_window += 1
+        reason = send(entry, count, settings=settings, opener=opener)
+        with _state_lock:
+            if reason == "sent":
+                seen["notified"] = True
+            # A refused send counts too: offline, a crash loop tried a fresh
+            # 5-second POST on every repeat, on the request thread that
+            # crashed, with no limit (2026-10-24 review).
+            if reason in ("sent", "send_failed"):
+                _sent_in_window += 1
         return reason, entry
     except Exception as error:                       # the last line of defence
         print("crash_report: reporter itself failed (%s)" % error,

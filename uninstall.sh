@@ -38,6 +38,11 @@ pkill -f "cloudflared tunnel.*127.0.0.1:8978" 2>/dev/null || true
 if [ "$(uname -s)" = "Darwin" ]; then
   launchctl bootout "gui/$(id -u)/com.tapproval.bridge" 2>/dev/null || true
   rm -f "$HOME/Library/LaunchAgents/com.tapproval.bridge.plist"
+  # The relay's login wake-up too: only --uninstall removed it, and that
+  # removes nothing on a plugin install or when it fails, leaving a job
+  # that points at a deleted file (2026-10-24 review).
+  launchctl bootout "gui/$(id -u)/com.tapproval.relay" 2>/dev/null || true
+  rm -f "$HOME/Library/LaunchAgents/com.tapproval.relay.plist"
 fi
 rm -rf "$HOME/.tapproval-bridge"
 rm -rf "$HOME/.tapproval"
@@ -51,7 +56,7 @@ rm -f "$HOME/.tapproval-token" "$HOME/.tapproval-auth.json" \
       "$HOME/.tapproval-relay.pid" "$HOME/.tapproval-tunnel.json" \
       "$HOME/.tapproval-tunnel.log" "$HOME/.tapproval-crashes.jsonl"
 # The copies install.sh set aside when it replaced an older checkout.
-rm -rf "$HOME"/.tapproval.superseded-*
+rm -rf "$HOME"/.tapproval.superseded-* "$HOME"/.tapproval.fresh-*
 
 echo ""
 echo "TAPPROVAL_BASE_REMOVED"

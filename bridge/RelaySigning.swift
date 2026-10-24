@@ -113,6 +113,8 @@ enum RelaySigning {
 /// ends, carries bytes only this watch and its computer can read.
 enum BodySeal {
     static let header = "X-Tapproval-Sealed"
+    /// Set on the answer the callers see when it came in an envelope.
+    static let envelopedField = "X-Tapproval-Enveloped"
     private static let info = Data("tapproval-seal-v1".utf8)
 
     /// The travel tunnel only: the home road is TLS to the computer itself.

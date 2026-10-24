@@ -19,6 +19,7 @@ What it trusts, in order:
 Any check that fails throws the copy away and leaves the bridge that was
 already here running. Standard library only, like every helper file.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -325,6 +326,15 @@ def install(pin, wait_for_bridge=None):
     Returns the version installed."""
     home = bridge_dir()
     os.makedirs(home, exist_ok=True)
+    # One install at a time: the relay's background update and --install
+    # could interleave their renames, and the loser's rollback deleted the
+    # winner's bridge (2026-10-24 review). The second waits its turn.
+    with open(os.path.join(home, ".install.lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _install(pin, wait_for_bridge, home)
+
+
+def _install(pin, wait_for_bridge, home):
     staging = tempfile.mkdtemp(prefix="staging-", dir=home)
     try:
         archive = os.path.join(staging, "bridge.zip")
@@ -347,7 +357,14 @@ def install(pin, wait_for_bridge=None):
         if had_previous:
             unload_agent()
             shutil.rmtree(previous, ignore_errors=True)
-            os.rename(app, previous)
+            try:
+                os.rename(app, previous)
+            except OSError as error:
+                # Nothing swapped yet: the bridge that was stopped for the
+                # swap starts again, rather than waiting for the next login.
+                load_agent()
+                raise InstallError("%s, so the previous one is back"
+                                   % (error.strerror or error)) from error
         try:
             os.rename(new, app)
             write_agent()
@@ -413,6 +430,8 @@ def remove():
     except OSError:
         return False
     shutil.rmtree(app_path(), ignore_errors=True)
+    # The copy kept for a rollback is a whole bridge too (2026-10-24 review).
+    shutil.rmtree(app_path() + ".previous", ignore_errors=True)
     _retire_legacy()
     return not (os.path.exists(app_path())
                 or os.path.exists(os.path.join(legacy_dir(), APP_NAME)))

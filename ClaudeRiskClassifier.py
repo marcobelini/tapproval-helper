@@ -110,7 +110,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.76"
+__version__ = "1.1.77"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -251,7 +251,11 @@ SQL_DESTRUCTIVE = re.compile(
 )
 SQL_MUTATION = re.compile(
     r"\b(INSERT\s+INTO|UPDATE\s+\S+\s+SET|DELETE\s+FROM|MERGE\s+INTO|"
-    r"ALTER\s+(TABLE|PROCEDURE)|CREATE\s+(OR\s+ALTER\s+)?PROCEDURE|EXEC(UTE)?\s+)",
+    r"ALTER\s+(TABLE|PROCEDURE)|CREATE\s+(OR\s+ALTER\s+)?PROCEDURE|"
+    # A stored procedure, not a shell's exec: find's `-exec` and a container
+    # tool's `exec` made `docker exec web ls` an SQL mutation (2026-10-24).
+    r"(?<!-)(?<!docker\s)(?<!podman\s)(?<!nerdctl\s)(?<!kubectl\s)(?<!compose\s)"
+    r"(?<!container\s)(?<!oc\s)EXEC(UTE)?\s+)",
     re.I,
 )
 
@@ -265,9 +269,8 @@ SQL_MUTATION = re.compile(
 # one. `|&` is a pipe (stderr too), so it splits like `|`.
 SEGMENT_SPLIT = re.compile(r"\s*(?:\|\||&&|\|&|;|\||\n|(?<![<>&|])&(?![&>]))\s*")
 
-# Leading VAR=value assignments before the real command.
-ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
-_ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=\S*\s+")
+# Leading VAR=value assignments before the real command; group 1 the name.
+ENV_ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=\S*\s+")
 # Variables that change how a command formats or reports, never which
 # program runs. Any other prefix can: PATH, DYLD_INSERT_LIBRARIES,
 # BASH_ENV, GIT_PAGER and GIT_SSH_COMMAND each ran a program of the
@@ -283,7 +286,7 @@ def _assigned_names(segment):
     """The names a segment assigns before its command: `A=1 B=2 ls`."""
     names, text = [], segment.strip()
     while True:
-        match = _ASSIGNMENT.match(text)
+        match = ENV_ASSIGN.match(text)
         if not match:
             return names
         names.append(match.group(1))
@@ -294,8 +297,6 @@ def _assigned_names(segment):
 # Bash classification
 # --------------------------------------------------------------------------
 
-# Commands that cannot mutate anything on their own. A redirect or command
-# substitution elsewhere in the segment still bumps the tier.
 # --------------------------------------------------------------------------
 # The effect ontology
 # --------------------------------------------------------------------------
@@ -426,8 +427,9 @@ EFFECT_WORDS = {
 EFFECT_FLAGS = {
     "-D": Effect.DESTROY, "--delete": Effect.DESTROY, "--purge": Effect.DESTROY,
     "--prune": Effect.DESTROY,
-    # find's own spelling of destruction: `-delete`, and `-exec rm`.
-    "-delete": Effect.DESTROY, "-exec": Effect.DESTROY,
+    # find's own spelling of destruction. `-exec` is judged by the command
+    # it runs instead (_find_runs): `-exec grep` destroys nothing.
+    "-delete": Effect.DESTROY,
 }
 
 # Words that name a credential. Their presence makes the RESOURCE sensitive,
@@ -517,6 +519,8 @@ def _ontology_risk(segment):
     return ("effect:%s@%s" % (effect.name.lower(), reach.name.lower()), risk)
 
 
+# Commands that cannot mutate anything on their own. A redirect or command
+# substitution elsewhere in the segment still bumps the tier.
 READ_ONLY_COMMANDS = frozenset(
     """
     ls ll la cat bat head tail wc grep egrep fgrep rg ag find fd pwd cd which
@@ -575,7 +579,8 @@ CONDITIONALLY_SAFE = {
     # -i alone or in a cluster: `sed -ri`, `-ni`, `-Ei` and `-ie` (suffix
     # "e") all edit in place, and read SAFE when only `-i` was matched.
     "sed": re.compile(r"(^|\s)-[A-Za-z]*i"),
-    "ruff": re.compile(r"\b(format|--fix)\b"),
+    # `\b--fix` never matched: there is no word boundary before a `-`.
+    "ruff": re.compile(r"\bformat\b|(^|\s)--fix\b"),
     "npm": re.compile(r"\bnpm\s+(?!test\b|ls\b|list\b|view\b|outdated\b)"),
 }
 
@@ -732,7 +737,7 @@ WHOLE_LINE_RULES = [
                 r"(\$\(|<\(|`)\s*(curl|wget)\b"), Risk.CRITICAL),
     ("fork-bomb", re.compile(r":\s*\(\s*\)\s*\{.*\}\s*;\s*:"), Risk.CRITICAL),
     ("history-rewrite", re.compile(r"\bgit\s+filter-(branch|repo)\b"), Risk.CRITICAL),
-    ("cmd-substitution", re.compile(r"\$\(|[<>]\(|`"), Risk.MEDIUM),  # inner cmd classified in classify_bash()
+    ("cmd-substitution", re.compile(r"\$\(|[<>]\(|(?<!\S)=\(|`"), Risk.MEDIUM),  # inner cmd classified in classify_bash()
     # Any `>` that is not a descriptor copy (`2>&1`, `>&2`) or /dev/null.
     # The lookbehind used to skip every `>` after a digit, which took
     # `1> ~/.zshrc` and `2> f` for `2>&1` and left them SAFE (2026-09-30).
@@ -786,7 +791,7 @@ SEGMENT_RULES = [
     ("runs-project-code", TEST_RUNNER, Risk.MEDIUM),
 ]
 
-RM_RE = re.compile(r"\brm\b((?:\s+-{1,2}[A-Za-z-]+)*)\s*(.*)")
+RM_RE = re.compile(r"\brm\b((?:\s+-{1,2}[A-Za-z-]+)*)\s*(.*)", re.I)
 # Any -r/-R among the flags. The tier and the wrist headline both ask,
 # and they must agree on the answer.
 RM_RECURSIVE = re.compile(r"-[A-Za-z]*[rR]")
@@ -813,7 +818,8 @@ CATASTROPHIC_TARGETS = re.compile(
 # Contents of an innermost `$(…)` (no nested parens) or a backtick pair.
 # Innermost-first means nested substitutions surface one layer per pass and
 # recursion in classify_bash() reaches the rest.
-_SUBSTITUTION_RE = re.compile(r"[$<>]\(([^()]*)\)|`([^`]*)`")
+# zsh's `=(…)` too, which only starts a word: `a=(b c)` is an array.
+_SUBSTITUTION_RE = re.compile(r"(?:[$<>]|(?<!\S)=)\(([^()]*)\)|`([^`]*)`")
 
 
 def _segments(command):
@@ -828,9 +834,14 @@ def _segments(command):
 _LEADING_PAREN = re.compile(r"^\(\s*")
 
 
+_ENV_ASSIGNS = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+")
+
+
 def _tokens(segment):
-    """Words of a segment, with env assignments and a leading '(' stripped."""
-    stripped = ENV_ASSIGN.sub("", segment.strip())
+    """Words of a segment, with env assignments and a leading '(' stripped.
+    All of them: `LANG=C TZ=UTC git push -f` took `tz=utc` for the command
+    and read MEDIUM (2026-10-24 review)."""
+    stripped = _ENV_ASSIGNS.sub("", segment.strip())
     stripped = _LEADING_PAREN.sub("", stripped)
     return stripped.split()
 
@@ -858,18 +869,28 @@ def _rm_risk(segment):
     return ("rm-file", Risk.MEDIUM)
 
 
+# Config keys whose value is a program git runs later.
+_GIT_CONFIG_RUNS = re.compile(
+    r"(^|\s)(core\.(pager|fsmonitor|sshcommand|hookspath|editor|askpass|gitproxy)"
+    r"|pager\.\S+|(diff|merge)\.\S+\.(command|cmd|textconv|driver)"
+    r"|filter\.\S+\.(clean|smudge|process)|sequence\.editor|credential\.helper"
+    r"|gpg\.(\S+\.)?program|uploadpack\.packobjectshook)(\s|$)", re.I)
+
+
 def _git_risk(segment):
     """Classify a ``git`` invocation by subcommand."""
     match = GIT_RE.search(segment)
     if not match:
         return None
     sub, rest = match.group(1).lower(), match.group(2) or ""
-    forced = bool(re.search(r"(--force(?!-with-lease)|(^|\s)-f\b|\s\+)", rest))
+    forced = bool(re.search(r"(--force(?!-with-lease)|(^|\s)-[A-Za-z]*f[A-Za-z]*\b|\s\+)",
+                            rest))
     # Options that choose a program git will run: a pager, a diff tool, an
     # ssh command, a remote's upload-pack. Each ran behind a SAFE "git log"
     # (2026-09-30). -C only changes the directory and stays a read.
     opening = segment[match.start():match.start(1)]
-    runs = bool(re.search(r"(^|\s)(-c\s*\S|--exec-path|--git-dir|--work-tree)", opening)
+    runs = bool(re.search(r"(^|\s)(-c\s*\S|--config-env|--exec-path|--git-dir|--work-tree)",
+                          opening)
                 or re.search(r"(^|\s)(--upload-pack|--receive-pack|--exec|--ext-diff)\b"
                              r"|(^|\s)-u\s", rest))
 
@@ -886,6 +907,8 @@ def _git_risk(segment):
         return ("git-reset-hard", Risk.HIGH)
     if sub == "clean" and re.search(r"-[a-z]*f", rest):
         return ("git-clean-force", Risk.HIGH)
+    if _git_discards_work(sub, rest):
+        return ("git-discards-work", Risk.HIGH)
     if sub in GIT_READ_ONLY and runs:
         return ("git-runs-a-program", Risk.MEDIUM)
     if sub == "config":
@@ -894,6 +917,11 @@ def _git_risk(segment):
         if "!" in rest:
             # A `!`-alias stores a shell command that later runs as `git x`.
             return ("git-config-shell-alias", Risk.CRITICAL)
+        if _GIT_CONFIG_RUNS.search(rest) and len(
+                [w for w in rest.split() if not w.startswith("-")]) >= 2:
+            # A setting naming a program git runs later, as a `!` alias
+            # does — behind a SAFE `git status` (2026-10-24 review).
+            return ("git-config-names-a-program", Risk.HIGH)
         if re.search(r"(^|\s)--(unset|unset-all|remove-section|rename-section|replace-all"
                      r"|add|edit)\b|(^|\s)-e\b", rest):
             # Deletions and edits name one key or none, so the two-word
@@ -909,6 +937,9 @@ def _git_risk(segment):
             "add", "set-url", "remove", "rm", "rename", "set-head", "prune",
             "update", "set-branches"):
         return ("git-write", Risk.MEDIUM)
+    if sub == "symbolic-ref" and (len(words) >= 2 or re.search(
+            r"(^|\s)(-d|--delete)\b", rest)):
+        return ("git-write", Risk.MEDIUM)
     if sub == "branch" and (
             re.search(r"(^|\s)(-[fmMcCdDu]\b|--(force|move|copy|delete|set-upstream-to|"
                       r"unset-upstream|edit-description)\b)", rest)
@@ -922,9 +953,51 @@ def _git_risk(segment):
     return ("git-other", Risk.MEDIUM)
 
 
+def _find_runs(segment):
+    """The commands a find's -exec, -execdir, -ok and -okdir run."""
+    try:
+        words = shlex.split(segment)
+    except ValueError:
+        words = segment.split()
+    runs, current = [], None
+    for word in words:
+        if current is None:
+            if word in ("-exec", "-execdir", "-ok", "-okdir"):
+                current = []
+        elif word in (";", "\\;", "+"):
+            runs.append(current)
+            current = None
+        else:
+            current.append(word)
+    if current:
+        runs.append(current)
+    return [" ".join(shlex.quote(w) for w in run) for run in runs if run]
+
+
+def _git_discards_work(sub, rest):
+    """Does this throw away uncommitted work or history, as `reset --hard`
+    does? Each read MEDIUM beside reset's HIGH until 2026-10-24."""
+    if sub == "checkout":
+        # Forced, or naming paths: `git checkout -- x` and `git checkout .`.
+        return bool(re.search(r"(^|\s)(-[A-Za-z]*f[A-Za-z]*|--force|--)(\s|$)|(^|\s)\.(\s|$)",
+                              rest))
+    if sub == "restore":
+        # Only `--staged` alone keeps the working tree.
+        staged = re.search(r"(^|\s)(-S|--staged)\b", rest)
+        worktree = re.search(r"(^|\s)(-W|--worktree)\b", rest)
+        return bool(worktree or not staged)
+    if sub == "stash":
+        return bool(re.match(r"\s*clear\b", rest))
+    if sub == "update-ref":
+        return bool(re.search(r"(^|\s)-d\b", rest))
+    if sub == "reflog":
+        return bool(re.match(r"\s*(expire|delete)\b", rest))
+    return False
+
+
 # Commands that run the command after them. `env rm -rf ~` is `rm -rf ~`;
 # judged by its lead word it read HIGH instead of CRITICAL (2026-09-25).
-_PASS_THROUGH = frozenset("env command builtin nice nohup exec time timeout sudo".split())
+_PASS_THROUGH = frozenset("env command builtin nice nohup exec time timeout sudo doas".split())
 # `if true; then rm -rf ~; fi` splits into segments led by these words.
 _SHELL_KEYWORDS = frozenset("if then else elif do while until !".split())
 _SHELLS = frozenset("sh bash zsh dash ksh fish".split())
@@ -969,13 +1042,17 @@ def _unwrapped(segment):
         return " ".join(words[1:]) or None
     if lead in _SHELLS:
         try:
-            args = shlex.split(" ".join(words[1:]))
+            args, whole = shlex.split(" ".join(words[1:])), True
         except ValueError:
-            return None
+            # `bash -c "rm -rf ~; echo done"` reaches here cut at its `;`,
+            # an unclosed quote: the script is whatever follows -c here.
+            args, whole = re.sub(r"['\"]", "", " ".join(words[1:])).split(), False
         for i, arg in enumerate(args):
             if arg == "-c" or (arg.startswith("-") and not arg.startswith("--")
                                and "c" in arg[1:]):
-                return args[i + 1] if i + 1 < len(args) else None
+                if i + 1 >= len(args):
+                    return None
+                return args[i + 1] if whole else " ".join(args[i + 1:])
         return None
     if lead == "xargs":
         # `xargs rm -rf` runs rm. Skip xargs' own options to reach it.
@@ -1003,9 +1080,9 @@ def _unwrapped(segment):
 # would have allowed them.
 READ_TOOL_ESCAPES = {
     "awk": re.compile(r"system\s*\(|\|\s*[\"']|\|&|>{1,2}\s*[\"']|getline\s*<"
-                      r"|(^|\s)(-f\s*\S|--file\b)").search,
+                      r"|(^|\s)(-[fi]\s*\S|--file\b|--include\b)|@include\b").search,
     "rg": re.compile(r"(^|\s)--pre(=|\s)").search,
-    "find": re.compile(r"(^|\s)-(fprint0?|fprintf|fls|execdir|ok|okdir)(\s|$)").search,
+    "find": re.compile(r"(^|\s)-(fprint0?|fprintf|fls)(\s|$)").search,
     "tree": re.compile(r"(^|\s)(-o|--output)(\s|=)").search,
     # -o alone, attached (`-ofile`) or in a cluster (`-uo file`).
     "sort": re.compile(r"(^|\s)--output(\s|=)|(^|\s)-[A-Za-z]*o|--compress-program").search,
@@ -1013,7 +1090,12 @@ READ_TOOL_ESCAPES = {
     "fd": re.compile(r"(^|\s)(-[A-Za-z]*[xX]|--exec|--exec-batch)(\s|=|$)").search,
     # sed's own commands write (`w file`, `s/a/b/w file`) and run (`e`).
     "sed": re.compile(r"(^|\s)--in-place\b|(^|[\s;{}'\"/\d$])[wW]\s+\S"
-                      r"|(^|[\s;{}'\"/\d$])e(\s|['\";]|$)").search,
+                      r"|(^|[\s;{}'\"/\d$])e(\s|['\";]|$)"
+                      # A script file holds the same commands, unseen.
+                      r"|(^|\s)(-[A-Za-z]*f|--file\b)").search,
+    # A config file names plugins, and both import them.
+    "mypy": re.compile(r"(^|\s)--config-file\b").search,
+    "flake8": re.compile(r"(^|\s)--(config|append-config)\b").search,
     # Setting the clock or the machine's name, not reading them.
     "date": re.compile(r"(^|\s)(-s|--set)\b|(^|\s)\d{6,}(\s|$)").search,
     "hostname": lambda segment: any(not w.startswith("-") for w in _tokens(segment)[1:]),
@@ -1035,6 +1117,22 @@ CREDENTIAL_READS = re.compile(
     r"|dump-keychain\b|export\b)"
     r"|\bps\b(\s+-\S+)*(\s+-[a-zA-Z]*E[a-zA-Z]*|\s+[acehjlmrSTuvwxX]*e[acehjlmrSTuvwxX]*)(?=\s|$)"
     r"|\bjq\b[^|;&]*\$ENV\b")
+
+
+_QUOTING = re.compile(r"['\"\\]")
+
+
+def _bare_flags(segment):
+    """The segment with its flags as the program receives them. The shell
+    drops quotes and backslashes, so `find ~ '-delete'` deletes, and
+    `sed '-i'` edits in place; every flag test here matched the quoted
+    spelling and read SAFE (2026-10-24 review). Only words that come out
+    as a flag (or git's `+ref`) are touched: unquoting everything would
+    turn a commit message into commands."""
+    words = segment.split()
+    bare = [_QUOTING.sub("", w) for w in words]
+    bare = [bare[i] if bare[i][:1] in ("-", "+") else w for i, w in enumerate(words)]
+    return " ".join(bare) if bare != words else segment
 
 
 def classify_bash(command):
@@ -1086,11 +1184,21 @@ def classify_bash(command):
                 bump("sudo", Risk.HIGH)
             continue
 
+        segment = _bare_flags(segment)
         token = os.path.basename(_first_token(segment)).lower()
 
         escape = READ_TOOL_ESCAPES.get(token)
         if escape is not None and escape(segment):
             bump("read-tool-writes-or-runs", Risk.MEDIUM)
+
+        if token == "find":
+            # Judged by what it runs, once per match: a read stays a
+            # MEDIUM (it still runs a command), anything more is HIGH or
+            # whatever the command is on its own, if that is worse.
+            for inner in _find_runs(segment):
+                sub_risk, sub_rules = classify_bash(inner)
+                bump("find-exec:" + (sub_rules[0] if sub_rules else "?"),
+                     Risk.MEDIUM if sub_risk <= Risk.LOW else max(sub_risk, Risk.HIGH))
 
         if any(name not in HARMLESS_ENV and not name.startswith("LC_")
                for name in _assigned_names(segment)):
@@ -1166,6 +1274,19 @@ INSTRUCTION_PATH = re.compile(
     r"|(^|[/\\])\.claude[/\\](commands|agents|skills|hooks)[/\\]", re.I)
 
 
+TEMP_ROOT = re.compile(r"(/private)?/tmp/", re.I)
+
+
+def _within(path, cwd):
+    """Is ``path`` inside ``cwd``? None when either cannot be resolved."""
+    try:
+        absolute = os.path.normcase(os.path.abspath(str(path)))
+        root = os.path.normcase(os.path.abspath(str(cwd)))
+    except (ValueError, OSError):
+        return None
+    return absolute == root or absolute.startswith(root.rstrip(os.sep) + os.sep)
+
+
 def classify_path(path, cwd=None):
     """Classify a filesystem write target. Returns ``(Risk, [rule_id, ...])``."""
     if not path:
@@ -1180,7 +1301,7 @@ def classify_path(path, cwd=None):
         normalised = os.path.normpath(normalised).replace("\\", "/")
         path = normalised
 
-    if re.search(r"(^|/)\.git/", normalised):
+    if re.search(r"(^|/)\.git/", normalised, re.I):
         return Risk.CRITICAL, ["git-internals"]
     if SECRET_PATH.search(normalised):
         return Risk.CRITICAL, ["secret-file"]
@@ -1193,17 +1314,19 @@ def classify_path(path, cwd=None):
         # A .sql file is something a database eventually executes.
         return Risk.HIGH, ["sql-artifact"]
 
-    if SCRATCH_PATH.search(normalised):
+    # Scratch only where scratch lives: the system's temp folder, or a
+    # tmp/.cache inside the project. ~/.cache/pre-commit holds hooks that
+    # run on the next commit (2026-10-24).
+    if SCRATCH_PATH.search(normalised) and (
+            not cwd or TEMP_ROOT.match(normalised) or _within(path, cwd)):
         return Risk.LOW, ["scratch-file"]
 
     if cwd:
-        try:
-            absolute = os.path.normcase(os.path.abspath(str(path)))
-            root = os.path.normcase(os.path.abspath(str(cwd)))
-            if not absolute.startswith(root.rstrip(os.sep) + os.sep) and absolute != root:
-                return Risk.HIGH, ["outside-project"]
-        except (ValueError, OSError):
+        inside = _within(path, cwd)
+        if inside is None:
             return Risk.HIGH, ["unresolvable-path"]
+        if not inside:
+            return Risk.HIGH, ["outside-project"]
 
     if INSTRUCTION_PATH.search(normalised):
         return Risk.MEDIUM, ["agent-instructions"]
@@ -1216,6 +1339,21 @@ def classify_path(path, cwd=None):
 # --------------------------------------------------------------------------
 # Tool dispatch
 # --------------------------------------------------------------------------
+
+def _read_tool_risk(tool, tool_input):
+    """A read tool is SAFE unless it reads a secret, which is HIGH, as
+    `cat` of the same file is: Read on ~/.ssh/id_rsa was SAFE, and whoever
+    reads the relay's key file can answer a card (2026-10-24 review).
+    Grep's pattern is what it searches for, not where, so only Glob's
+    counts."""
+    keys = ("file_path", "notebook_path", "path") + (("pattern",) if tool == "Glob" else ())
+    for key in keys:
+        value = tool_input.get(key)
+        # A folder named on its own (`~/.aws`) is the folder's contents.
+        if isinstance(value, str) and SECRET_PATH.search(value.replace("\\", "/") + "/"):
+            return Risk.HIGH, ["secret-read"]
+    return Risk.SAFE, ["read-only-tool"]
+
 
 READ_ONLY_TOOLS = frozenset(
     "Read Glob Grep NotebookRead TodoWrite TaskList TaskGet ListMcpResources "
@@ -1280,11 +1418,11 @@ def _mcp_risk(tool):
     words = [w for w in _MCP_WORDS.split(_MCP_CAMEL.sub("_", name).lower()) if w]
     if not words:
         return Risk.MEDIUM, ["mcp-unknown"]
-    verb = words[0]
-    effect = MCP_EFFECT.get(verb)
-    if effect is None:
-        effect = next((MCP_EFFECT[v] for v in _MCP_VERB_PREFIXES
-                       if verb.startswith(v)), None)
+    # `search_and_delete` does both: every verb a name chains counts.
+    verbs = [words[0]] + [words[i + 1] for i in range(len(words) - 1)
+                          if words[i] in ("and", "then")]
+    effects = [effect for effect in map(_mcp_verb_effect, verbs) if effect is not None]
+    effect = max(effects) if effects else None
     secret = _words_name_a_secret(words)
     if effect is None and not secret:
         return Risk.MEDIUM, ["mcp-unknown"]
@@ -1360,6 +1498,26 @@ def _patch_risk(patch, cwd):
     return _scan_content(added, risk, rules)
 
 
+def _mcp_verb_effect(verb):
+    effect = MCP_EFFECT.get(verb)
+    if effect is None:
+        effect = next((MCP_EFFECT[v] for v in _MCP_VERB_PREFIXES
+                       if verb.startswith(v)), None)
+    return effect
+
+
+def _strings_in(value):
+    """Every string inside a tool's input, however deep."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _strings_in(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _strings_in(item)
+
+
 def _scan_content(content, risk, rules):
     """A benign path can still carry a destructive payload."""
     if content:
@@ -1401,7 +1559,7 @@ def classify(event):
                                       if isinstance(e, dict))
         risk, rules = _scan_content(content, risk, rules)
     elif tool in READ_ONLY_TOOLS:
-        risk, rules = Risk.SAFE, ["read-only-tool"]
+        risk, rules = _read_tool_risk(tool, tool_input)
     elif tool == "WebSearch":
         risk, rules = Risk.LOW, ["web-search"]
     elif tool == "WebFetch":
@@ -1409,7 +1567,9 @@ def classify(event):
     elif tool in ("Task", "Agent", "Workflow"):
         risk, rules = Risk.MEDIUM, ["spawns-agents"]
     elif tool.startswith("mcp__"):
-        risk, rules = _mcp_risk(tool)
+        # The name says what kind of call; the input says what it does: a
+        # `query` carrying DROP TABLE read LOW (2026-10-24 review).
+        risk, rules = _scan_content(" ".join(_strings_in(tool_input)), *_mcp_risk(tool))
     elif not tool:
         risk, rules = Risk.MEDIUM, ["missing-tool-name"]
     else:
@@ -1524,8 +1684,14 @@ def _bash_headline(command, limit):
 
 
 def _card_budgets(policy):
-    return (int(policy.get("headline_chars", HEADLINE_CHARS)),
-            int(policy.get("detail_chars", DETAIL_CHARS)))
+    """The policy's card lengths, the defaults when unset or unreadable:
+    an unreadable one raised, and every prompt lost its card."""
+    def chars(name, default):
+        try:
+            return int(policy.get(name, default))
+        except (TypeError, ValueError):
+            return default
+    return chars("headline_chars", HEADLINE_CHARS), chars("detail_chars", DETAIL_CHARS)
 
 
 # Secrets that show up in ordinary commands. The card and the audit log
@@ -1771,21 +1937,7 @@ def _plan_marked(plan):
             if code:
                 lines.append("  " + (code if "`" in code else "`%s`" % code))
             continue
-        if not raw.strip() or wire.MD_HR.match(raw) or wire.MD_TABLE_SEP.match(raw):
-            if not raw.strip() and lines and lines[-1]:
-                lines.append("")
-            continue
-        text = wire.flatten_line(raw, keep_inline=True).strip()
-        if not text:
-            continue
-        if wire.MD_HEADING.match(raw):
-            text = "**%s**" % text.replace("**", "")
-            if lines and lines[-1]:
-                lines.append("")   # set apart, as the phone sets it
-        elif wire.MD_BULLET.match(raw) or wire.MD_NUMBER.match(raw):
-            depth = (len(raw) - len(raw.lstrip(" "))) // 2
-            text = "  " * min(depth, 3) + text
-        lines.append(text)
+        wire.mark_line(raw, lines)
     while lines and not lines[-1]:
         lines.pop()
     return "\n".join(lines)
@@ -1842,14 +1994,7 @@ def _transcript_tail(transcript_path):
     return text
 
 
-def _json_object(line):
-    """One transcript or audit line as a dict, or None: not JSON, or JSON
-    that is not an object (callers .get() on what comes back)."""
-    try:
-        entry = json.loads(line)
-    except ValueError:
-        return None
-    return entry if isinstance(entry, dict) else None
+_json_object = wire.json_object
 
 
 def _transcript_plan_path(transcript_path):
@@ -2247,7 +2392,12 @@ def load_policy(env=None):
     return policy
 
 
-def decide(risk, policy):
+# Their "allow" is an answer only the person can give: a plan approved, a
+# question answered. No threshold stands in for that.
+PERSON_ONLY_TOOLS = frozenset(("ExitPlanMode", "AskUserQuestion"))
+
+
+def decide(risk, policy, tool=None):
     """Map a risk tier to a decision. Returns ``(decision, reason)``.
 
     With the default "NONE" threshold nothing is auto-allowed: the tiers
@@ -2267,7 +2417,7 @@ def decide(risk, policy):
         if str(policy.get("critical_action", "escalate")).lower() == "deny":
             return "deny", "Blocked: classified CRITICAL"
         return "escalate", "CRITICAL — needs a human"
-    if threshold is not None and risk <= threshold:
+    if threshold is not None and risk <= threshold and tool not in PERSON_ONLY_TOOLS:
         return "allow", "Auto-allowed: %s at or below %s" % (risk.name, threshold.name)
     return "escalate", "%s — needs a human" % risk.name
 
@@ -2487,7 +2637,7 @@ def build_response(event, policy, agent=None):
         row = dont_ask_row(event)
         if row:
             card["always_label"] = row[0]
-    decision, reason = decide(risk, policy)
+    decision, reason = decide(risk, policy, tool=result["tool"])
 
     shadow = str(policy.get("mode", "shadow")).lower() != "enforce"
     effective = "escalate" if shadow else decision
@@ -2616,13 +2766,12 @@ def ask_watch(card, policy, project=None):
         body = json.dumps({"card": payload, "wait": remaining},
                           ensure_ascii=False).encode("utf-8")
         # A fresh nonce each time: the relay refuses one it has seen.
-        stamp, nonce = int(time.time()), uuid.uuid4().hex
-        mac = _relay_signature(key, "POST", urllib.parse.unquote(
-            urllib.parse.urlsplit(url).path), stamp, nonce, body)
+        signature, nonce = wire.signed_header(
+            key, "POST", urllib.parse.unquote(urllib.parse.urlsplit(url).path), body)
         request = urllib.request.Request(
             url, data=body,
             headers={"Content-Type": "application/json",
-                     "X-Tapproval-Signature": wire.signature_header(stamp, nonce, mac)})
+                     "X-Tapproval-Signature": signature})
         try:
             with urllib.request.urlopen(
                     request, timeout=remaining + RELAY_REPLY_GRACE) as reply:
@@ -3104,7 +3253,10 @@ def run_hook(stdin=None, stdout=None, agent=None):
     except Exception as error:  # fail closed to the human, never crash the session
         print("ClaudeRiskClassifier: %s" % error, file=sys.stderr)
         response = ESCALATE_FALLBACK
-    stdout.write(json.dumps(response, ensure_ascii=False))
+    # ASCII: the decision is already made, and a stdout that cannot
+    # encode a plan's accents raised here, which Claude Code reads as a
+    # non-blocking hook (2026-10-24 review).
+    stdout.write(json.dumps(response))
     return 0
 
 
@@ -3116,7 +3268,7 @@ def run_explain(target, tool):
     result = classify(event)
     card = wrist_card(result["tool"], result["tool_input"], result["risk"],
                       *_card_budgets(policy))
-    decision, reason = decide(result["risk"], policy)
+    decision, reason = decide(result["risk"], policy, tool=result["tool"])
 
     print("tool      : %s" % tool)
     print("input     : %s" % target)
@@ -4261,19 +4413,15 @@ def _relay_json(path, timeout=1):
     """GET a path on the local relay as JSON, or None when nothing answers.
     Signed with the key file: loopback alone opens only /health (S2)."""
     try:
-        import time
         import urllib.parse
         import urllib.request
-        import uuid
         url = RELAY_URL + path
         headers = {}
         key = _relay_key({})
         if key:
             split = urllib.parse.urlsplit(url)
-            stamp, nonce = int(time.time()), uuid.uuid4().hex
-            mac = _relay_signature(key, "GET", urllib.parse.unquote(split.path),
-                                   stamp, nonce, b"", split.query)
-            headers["X-Tapproval-Signature"] = wire.signature_header(stamp, nonce, mac)
+            headers["X-Tapproval-Signature"], _ = wire.signed_header(
+                key, "GET", urllib.parse.unquote(split.path), b"", split.query)
         request = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(request, timeout=timeout) as reply:
             return json.loads(reply.read())

@@ -698,9 +698,7 @@ def _admin_signature(path, body, auth_file=None):
     bootstrap = wire.read_bootstrap(auth_file or AUTH_FILE)
     if not bootstrap:
         return {}
-    stamp, nonce = int(time.time()), uuid.uuid4().hex
-    mac = sign_request(bootstrap, "POST", path, stamp, nonce, body, query="")
-    return {"X-Tapproval-Signature": wire.signature_header(stamp, nonce, mac)}
+    return {"X-Tapproval-Signature": wire.signed_header(bootstrap, "POST", path, body)[0]}
 
 
 def _admin_call(path, timeout=5):
@@ -833,9 +831,12 @@ def _auto_update_on():
     order: the settings file's extraKnownMarketplaces entry, then the
     /plugin toggle's record. Written only by set_auto_update, when the
     wearer turns the watch's switch."""
-    claude = os.path.expanduser("~/.claude")
+    import ClaudeRiskClassifier as classifier
+
+    # The path set_auto_update writes, from the same helper: this read had
+    # its own rule, which skipped expanduser (2026-10-24 review).
     for path, entries in (
-            (os.environ.get("CLAUDE_SETTINGS_PATH") or os.path.join(claude, "settings.json"),
+            (classifier._settings_path(),
              lambda data: data.get("extraKnownMarketplaces")),
             (_known_marketplaces_path(), lambda data: data)):
         try:
@@ -1362,7 +1363,8 @@ class CardQueue:
                        else uuid.uuid4().hex[:12])
             entry["id"] = card_id
             self._pending[card_id] = entry
-            self._seen.add(card_id)
+            if time.monotonic() - self.started < self.START_GRACE_SECONDS:
+                self._seen.add(card_id)     # only not_here_yet() reads it
             self._lock.notify_all()
         # T0 of the buzz-when-closed latency measurement (with the bridge's
         # "mirrored" line and the watch's "alert delivered" line).
@@ -1384,25 +1386,34 @@ class CardQueue:
         started = time.monotonic()
         next_probe = 0.0
         reason = None
-        while reason is None:
-            now = time.monotonic()
-            if now >= next_probe:
-                next_probe = now + self.PROBE_SECONDS
-                if caller_alive is not None and not caller_alive():
-                    reason = "hook-gone"
-                    break
-                if resolved_elsewhere is not None and resolved_elsewhere():
-                    reason = "answered-elsewhere"
-                    break
+        try:
+            while reason is None:
+                now = time.monotonic()
+                if now >= next_probe:
+                    next_probe = now + self.PROBE_SECONDS
+                    if caller_alive is not None and not caller_alive():
+                        reason = "hook-gone"
+                        break
+                    if resolved_elsewhere is not None and resolved_elsewhere():
+                        reason = "answered-elsewhere"
+                        break
+                with self._lock:
+                    remaining = deadline - time.monotonic()
+                    if card_id in self._decisions:
+                        reason = "answered-here"
+                    elif remaining <= 0 or self.wall_clock() >= wall_deadline:
+                        reason = "expired"
+                    else:
+                        self._lock.wait(max(0.05, min(
+                            remaining, next_probe - time.monotonic())))
+        except BaseException:
+            # A probe that raised: the hook gets no answer and falls back to
+            # the terminal, so the wrist must not keep a card that takes
+            # taps nothing will act on.
             with self._lock:
-                remaining = deadline - time.monotonic()
-                if card_id in self._decisions:
-                    reason = "answered-here"
-                elif remaining <= 0 or self.wall_clock() >= wall_deadline:
-                    reason = "expired"
-                else:
-                    self._lock.wait(max(0.05, min(
-                        remaining, next_probe - time.monotonic())))
+                self._pending.pop(card_id, None)
+                self._decisions.pop(card_id, None)
+            raise
         with self._lock:
             # Whatever happened, the card is no longer pending: either it
             # was decided, or it expired and the watch must not answer a
@@ -1567,7 +1578,7 @@ try:
     from watch_dashboard import (  # noqa: E402
         activity_summary, card_session_title, recap_summary, _find_transcript, image_bytes,
         inbox_ready,
-        _json_object, _message_of, _parse_thread, _read_appended,
+        _message_of, _parse_thread, _read_appended,
         project_root, prompts_at_the_mac, recent_sessions, resolve_session,
         session_registry, session_state, shape, thread_after, thread_tool_id,
         thread_wake_at, transcript_origin, transcripts_newest_first,
@@ -1578,11 +1589,13 @@ except Exception as _error:  # noqa: BLE001 — any import-time failure, not onl
     def _dashboard_unavailable(*_args, **_kwargs):
         raise DashboardUnavailable(_DASHBOARD_ERROR)
 
-    (activity_summary, recap_summary, _find_transcript, image_bytes, _json_object,
-     _message_of, _parse_thread, _read_appended, project_root, prompts_at_the_mac,
-     recent_sessions, resolve_session, session_state, shape, thread_after,
-     thread_tool_id, thread_wake_at, transcript_origin, transcripts_newest_first,
-     usage_summary) = (_dashboard_unavailable,) * 20
+    # A chain, not a tuple with a count typed beside it: a name added to
+    # the import has one more place to go, not two.
+    activity_summary = recap_summary = _find_transcript = image_bytes = \
+        _message_of = _parse_thread = _read_appended = project_root = \
+        prompts_at_the_mac = recent_sessions = resolve_session = session_state = \
+        shape = thread_after = thread_tool_id = thread_wake_at = transcript_origin = \
+        transcripts_newest_first = usage_summary = _dashboard_unavailable
 
     def card_session_title(_session_id):
         return None             # an unknown title: the card goes out as it came
@@ -1594,6 +1607,11 @@ except Exception as _error:  # noqa: BLE001 — any import-time failure, not onl
         return False            # the old route, which needs nothing from here
 
     THREAD_TURN_LIMIT = 14      # watch_dashboard's own value
+
+
+# A transcript line as a dict: wire's, so the card watcher reads lines
+# whether or not the dashboard imported.
+_json_object = wire.json_object
 
 
 def check_dashboard_is_loaded():
@@ -2371,6 +2389,7 @@ SKILL_BUILTINS = {
     "security-review": "Checks the changes for vulnerabilities.",
 }
 _SKILLS_CACHE = {}          # cwd -> (expires, rows)
+SKILLS_CACHE_MAX = 32
 SKILLS_CACHE_SECONDS = 60.0
 
 
@@ -2526,6 +2545,8 @@ def known_skills(cwd=None, home=None, now=None):
                            "argument_hint": required_argument(meta.get("argument-hint"))}
     rows = [dict(name="/" + name, **meta) for name, meta in sorted(found.items())]
     _SKILLS_CACHE[key] = (now + SKILLS_CACHE_SECONDS, rows)
+    while len(_SKILLS_CACHE) > SKILLS_CACHE_MAX:     # one per folder, for weeks
+        _SKILLS_CACHE.pop(next(iter(_SKILLS_CACHE)), None)
     return rows
 
 
@@ -2817,7 +2838,9 @@ class _PromptResolver:
                 self.first_read = False
                 self._adopt_the_one_open_call()
             return resolved
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
+            # TypeError: a line whose id is a list or an object, which no
+            # set or dict here can hold. Not answered, as for a bad line.
             return False
 
     def _located(self):
@@ -3111,8 +3134,12 @@ def authorize_request(client_ip, path, header_token,
         return bool(tunnel_authed) and _credential_ok(auth, header_token)
     if path == "/health":            # liveness only; the body is trimmed
         return True
-    if _is_loopback(client_ip):
-        return bool(local_proof)
+    if local_proof:
+        return True
+    # Loopback without the local proof is a proxy's forward or another
+    # account: a device key still opens it, as from anywhere else. A
+    # forwarded watch with a real key read 403 here while /decision took
+    # the same request (2026-10-24 review).
     return _credential_ok(auth, header_token)
 
 
@@ -3138,7 +3165,6 @@ _NONCE_LOCK = threading.Lock()
 
 # The message, the signature and both proofs are tapproval_wire's, the
 # hook's too: one rule, not two copies held equal by a test.
-_signature_message = wire.signature_message
 sign_request = wire.sign_request
 relay_proof = wire.relay_proof
 relay_proof2 = wire.relay_proof2
@@ -3171,14 +3197,22 @@ def verify_signature(header, method, path, body, candidates, now=None, query="")
         return None, None
     if version not in ("v1", "v2") or not (16 <= len(nonce) <= 64) or not mac:
         return None, None
+    # The signed fields are joined by newlines, so a decoded path holding
+    # one (`/x%0Aq`) could sign as another request's path and query: v1 of
+    # `P\nQ` is v2 of P with query Q (2026-10-24 review). No route has one.
+    if any(ord(c) < 32 or ord(c) == 127 for c in str(path)):
+        return None, None
     signed_query = query if version == "v2" else None
     moment = time.time() if now is None else now
     if abs(moment - stamp) > SIGNATURE_WINDOW_SECONDS:
         return None, None
+    # Bytes, never str: compare_digest raises on a str with non-ASCII in
+    # it, and a header is whatever latin-1 a stranger sent.
+    mac = mac.encode("utf-8", "replace")
     match = None
     for token in candidates:
-        if token and hmac.compare_digest(
-                sign_request(token, method, path, stamp, nonce, body, signed_query), mac):
+        if token and hmac.compare_digest(sign_request(
+                token, method, path, stamp, nonce, body, signed_query).encode("ascii"), mac):
             match = token
             break
     if match is None:
@@ -3459,6 +3493,16 @@ class RelayHandler(BaseHTTPRequestHandler):
     # too; the route after it stays readable (/t/…/health).
     _TUNNEL_SECRET_IN_LOG = re.compile(r"/t/[^/\s\"'?#]+")
 
+    def log_request(self, code="-", size="-"):
+        # The bridge asks every two seconds: answered, it is 40,000 lines a
+        # day that say nothing and push the ones that do out of the log.
+        from urllib.parse import urlsplit
+        split = urlsplit(self.path)
+        if (code == 200 and self.command == "GET" and split.path == "/pending"
+                and "source=bridge" in split.query):
+            return
+        super().log_request(code, size)
+
     def log_message(self, fmt, *args):  # quiet: diagnostics only on stderr
         line = self._TUNNEL_SECRET_IN_LOG.sub("/t/…", fmt % args)
         print("relay: %s" % line, file=sys.stderr)
@@ -3499,6 +3543,15 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self._presented_key = self.headers.get("X-Tapproval-Token", "")
         return self._presented_key
 
+    def _over_limit(self, bucket, key, count, seconds, error):
+        """True, with the 429 already sent, once ``key`` is past ``count``
+        requests in ``seconds``."""
+        allowed, retry = LIMITS.allow(bucket, key, count, seconds)
+        if not allowed:
+            self._send_json({"error": error}, 429,
+                            headers={"Retry-After": str(int(retry))})
+        return not allowed
+
     def _send_json(self, payload, status=200, headers=None):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self._send_body(status, "application/json; charset=utf-8", body, headers)
@@ -3537,7 +3590,10 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def _wants_sealed(self):
         sealed = self.headers.get(self.SEALED_HEADER) == "1" and bool(self._presented())
-        if sealed:
+        # Only a key this relay issued is a watch that seals: every refusal
+        # answers through here, so a made-up key would otherwise be one more
+        # entry and one more log line each time.
+        if sealed and _credential_ok(self.auth, self._presented()):
             _note_first_seal(self._presented())
             if self._signed_nonce:
                 _note_updated_watch()
@@ -3602,6 +3658,11 @@ class RelayHandler(BaseHTTPRequestHandler):
         if auth is None or not hasattr(auth, "claim_window"):
             self._send_json({"error": "pairing closed"}, 403)
             return
+        if not auth.window_open():
+            # Before the checks below: telling this Mac's own addresses
+            # apart runs ifconfig, and a shut door has nothing to protect.
+            self._refuse_pairing(auth)
+            return
         if self._from_this_machine():
             # No watch pairs from this Mac. A process here that could open
             # the window (`--pair`) and claim it from 127.0.0.1 held a key
@@ -3630,18 +3691,18 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "allow this watch on your computer",
                              "waiting": True}, 403)
             return
-        allowed, retry = LIMITS.allow("pair", client, 5, 600)
-        if not allowed:
+        if self._over_limit("pair", client, 5, 600, "too many attempts"):
             # A burst is an attack, not a retry: shut the door rather than
             # let it be ground down for the rest of the window.
             auth.close_window()
-            self._send_json({"error": "too many attempts"}, 429,
-                            headers={"Retry-After": str(int(retry))})
             return
         token = auth.claim_window(client)
         if token:
             self._send_json({"token": token})
             return
+        self._refuse_pairing(auth)
+
+    def _refuse_pairing(self, auth):
         if auth.paired_ever and not auth.window_open():
             self._send_json({"error": "already paired",
                              "devices": len(auth.devices)}, 403)
@@ -3662,10 +3723,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "pairing closed"}, 403)
             return
         client = self.client_address[0]
-        allowed, retry = LIMITS.allow("pair", client, 5, 600)
-        if not allowed:
-            self._send_json({"error": "too many attempts"}, 429,
-                            headers={"Retry-After": str(int(retry))})
+        if self._over_limit("pair", client, 5, 600, "too many attempts"):
             return
         presented = self._presented()
         if not (auth.is_bootstrap(presented) or auth.matches(presented)):
@@ -4102,10 +4160,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             # the first one had already run. Answer it, run nothing.
             self._send_json(dict(replay, repeat=True))
             return
-        allowed, retry = LIMITS.allow("say", who, 6, 60)
-        if not allowed:
-            self._send_json({"error": "too many messages"}, 429,
-                            headers={"Retry-After": str(int(retry))})
+        if self._over_limit("say", who, 6, 60, "too many messages"):
             return
         gate = LIMITS.gate("say", 1)
         if not gate.acquire(blocking=False):
@@ -4319,11 +4374,15 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, queue=None, token=None,
     Simulator answer cards and speak into sessions: a test relay only.
     """
     queue = queue if queue is not None else CardQueue()
-    handler = type("BoundRelayHandler", (RelayHandler,),
-                   {"queue": queue, "required_token": token,
-                    "auth": auth, "allow_simulator": bool(allow_simulator)})
-    server = _RelayServer((host, port), handler)
+    server = _RelayServer((host, port), _bound_handler(queue, token, auth, allow_simulator))
     return server, queue
+
+
+def _bound_handler(queue, token, auth, allow_simulator):
+    """A RelayHandler class carrying one listener's queue and credentials."""
+    return type("BoundRelayHandler", (RelayHandler,),
+                {"queue": queue, "required_token": token,
+                 "auth": auth, "allow_simulator": bool(allow_simulator)})
 
 
 # Set by install_crash_reporting: how a request handler's crash is reported.
@@ -4536,9 +4595,7 @@ def serve_tls(host, port, cert, key, queue=None, auth=None, allow_simulator=Fals
     context.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20")
     context.load_cert_chain(cert, key)
     queue = queue if queue is not None else CardQueue()
-    handler = type("BoundRelayHandler", (RelayHandler,),
-                   {"queue": queue, "required_token": None,
-                    "auth": auth, "allow_simulator": bool(allow_simulator)})
+    handler = _bound_handler(queue, None, auth, allow_simulator)
     return _TLSRelayServer((host, port), handler, context), queue
 
 

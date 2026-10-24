@@ -49,6 +49,18 @@ def signature_message(method, path, stamp, nonce, body=b"", query=None):
     return "\n".join(parts).encode("utf-8")
 
 
+def signed_header(token, method, path, body=b"", query=""):
+    """A fresh v2 X-Tapproval-Signature for one request, and its nonce (the
+    relay's proof answers to it). ``path`` percent-decoded, as the relay
+    reads it. The hook, the relay's own admin calls and --status each
+    built this by hand (2026-10-24 review)."""
+    import time
+    nonce = os.urandom(16).hex()
+    stamp = int(time.time())
+    mac = sign_request(token, method, path, stamp, nonce, body, query)
+    return signature_header(stamp, nonce, mac), nonce
+
+
 def sign_request(token, method, path, stamp, nonce, body=b"", query=None):
     import hmac      # here, not at the top: most prompts sign nothing
     return hmac.new(str(token).encode("utf-8"),
@@ -174,6 +186,30 @@ def flatten_line(line, keep_inline=False):
     return MD_ESCAPE.sub(r"\1", line)
 
 
+def mark_line(raw, out):
+    """One prose line onto ``out`` as the phone shows it, in what a watch
+    can draw: the inline marks kept, a heading as a bold line with air
+    above it, a nested point indented two spaces a level, a rule or a
+    table's separator dropped, and one blank line for any run of them.
+    The hook's plan card and the dashboard's thread both read prose
+    through here, so the two read alike."""
+    if not raw.strip() or MD_HR.match(raw) or MD_TABLE_SEP.match(raw):
+        if not raw.strip() and out and out[-1]:
+            out.append("")
+        return
+    text = flatten_line(raw, keep_inline=True).strip()
+    if not text:
+        return
+    if MD_HEADING.match(raw):
+        text = "**%s**" % text.replace("**", "")
+        if out and out[-1]:
+            out.append("")
+    elif MD_BULLET.match(raw) or MD_NUMBER.match(raw):
+        depth = (len(raw) - len(raw.lstrip(" "))) // 2
+        text = "  " * min(depth, 3) + text
+    out.append(text)
+
+
 def unwrap(lines):
     """Markdown lines with each wrapped paragraph or point joined into one
     line, as Markdown itself reads them. The watch draws a line at a time,
@@ -268,6 +304,7 @@ def wrist_words(content):
 # left?*", italics optional — standing alone as the reply's first line;
 # a hint with the reply on the same line is left whole rather than cut.
 _WRIST_ECHO = re.compile(r"\A\s*([*_]?)\u231a[^\n]*?\1[ \t]*(?:\n\s*|\Z)")
+_SENTENCE_BREAK = re.compile(r"[.?!]\s+\S")
 
 
 def strip_wrist_echo(text):
@@ -276,7 +313,29 @@ def strip_wrist_echo(text):
     shows the wearer's own bubble, so there it would say their words
     twice, reworded."""
     m = _WRIST_ECHO.match(text)
-    return text[m.end():] if m else text
+    if not m:
+        return text
+    # Without italics nothing marks where the hint ends: "⌚ What's left?
+    # Two things." is the hint and the answer on one line, and cutting it
+    # lost the answer (2026-10-24 review). A hint is one phrase.
+    if not m.group(1) and _SENTENCE_BREAK.search(text[:m.end()].strip()):
+        return text
+    return text[m.end():]
+
+
+def json_object(line):
+    """One transcript or audit line as a dict, or None.
+
+    Every reader parsed a line and then called .get on it; a line that is
+    JSON but not an object ([], a string, a number) raised AttributeError
+    inside functions documented never to raise (2026-09-25 review). The
+    hook and the dashboard each had a copy, and the hook's had stopped
+    catching TypeError and RecursionError (2026-10-24 review)."""
+    try:
+        entry = json.loads(line)
+    except (ValueError, TypeError, RecursionError):
+        return None
+    return entry if isinstance(entry, dict) else None
 
 
 # ---- sealing a body end to end (#645, the travel road) ----------------------
@@ -383,7 +442,6 @@ SEAL_INFO = b"tapproval-seal-v1"
 def seal_key(device_key):
     """The sealing key for one device: HKDF-SHA256 (RFC 5869) of its key,
     so the key that signs is never the key that encrypts."""
-    import hashlib
     import hmac
     secret = device_key.encode("utf-8") if isinstance(device_key, str) else device_key
     prk = hmac.new(b"\x00" * 32, secret, hashlib.sha256).digest()
@@ -392,7 +450,6 @@ def seal_key(device_key):
 
 def seal_body(device_key, body, aad=b"", nonce=None):
     """nonce || sealed: what crosses the tunnel in place of ``body``."""
-    import os
     nonce = nonce if nonce is not None else os.urandom(12)
     return nonce + aead_seal(seal_key(device_key), nonce, body, aad)
 
@@ -414,7 +471,6 @@ ENVELOPE_ANSWER_AAD = b"answer POST /e"
 
 def wrap_request(method, path, query, body):
     import base64
-    import json
     return json.dumps({"m": method, "p": path, "q": query or "",
                        "b": base64.b64encode(body or b"").decode("ascii")}).encode("utf-8")
 
@@ -423,7 +479,6 @@ def unwrap_request(data):
     """(method, path, query, body), or None for anything but a GET or POST to
     a plain path. Never another envelope: one layer is the whole design."""
     import base64
-    import json
     try:
         inner = json.loads(data)
         method, path, query = inner["m"], inner["p"], inner.get("q", "")
@@ -440,7 +495,6 @@ def unwrap_request(data):
 
 def wrap_answer(status, body):
     import base64
-    import json
     return json.dumps({"s": int(status),
                        "b": base64.b64encode(body or b"").decode("ascii")}).encode("utf-8")
 
@@ -448,7 +502,6 @@ def wrap_answer(status, body):
 def unwrap_answer(data):
     """(status, body), or None."""
     import base64
-    import json
     try:
         inner = json.loads(data)
         return int(inner["s"]), base64.b64decode(inner.get("b", ""), validate=True)

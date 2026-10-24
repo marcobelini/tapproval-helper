@@ -180,18 +180,7 @@ def _usage_entries(path, horizon=None):
         return state["entries"]
 
 
-def _json_object(line):
-    """One transcript or audit line as a dict, or None.
-
-    Every reader here parsed a line and then called .get on it; a line that
-    is JSON but not an object ([], a string, a number) raised
-    AttributeError inside functions documented never to raise (2026-09-25
-    review). One parse, one rule, for all of them."""
-    try:
-        entry = json.loads(line)
-    except (ValueError, TypeError):
-        return None
-    return entry if isinstance(entry, dict) else None
+_json_object = wire.json_object
 
 
 def _message_of(entry):
@@ -303,7 +292,9 @@ def session_registry(sessions_dir=None):
         try:
             with open(os.path.join(root, name), encoding="utf-8") as handle:
                 data = json.load(handle)
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
+            continue
+        if not isinstance(data, dict):
             continue
         session_id, pid = data.get("sessionId"), data.get("pid")
         if not session_id or not pid:
@@ -925,11 +916,11 @@ def _message_parts(content):
             if not isinstance(part, dict):
                 continue
             kind = part.get("type")
-            if kind == "text" and not text:
+            if kind == "text" and not text and isinstance(part.get("text"), str):
                 # Without the harness's own note, so a part that is ONLY a
                 # reminder counts as empty and the person's text after it
                 # — same part or the next — is what both screens read.
-                text = _SYSTEM_REMINDER.sub("", part.get("text", ""))
+                text = _SYSTEM_REMINDER.sub("", part["text"])
             elif kind == shape("type.tool_use") and tool is None:
                 tool = part
             elif kind == "image":
@@ -952,7 +943,7 @@ def _fold_meta(state, line, scan_lines):
     entry = _json_object(line)
     if entry is None:
         return
-    if state["cwd"] is None and entry.get("cwd"):
+    if state["cwd"] is None and isinstance(entry.get("cwd"), str) and entry["cwd"]:
         state["cwd"] = entry["cwd"]
     message = _message_of(entry)
     if message.get("role") != "user" or entry.get(shape("key.is_meta")):
@@ -1289,21 +1280,6 @@ def _find_transcript(prefix, projects_dir=None):
 # plain lines a 40mm screen can show: structure kept (one line per list
 # item or paragraph), markers gone.
 # The patterns are tapproval_wire's, the hook's too.
-_MD_FENCE = wire.MD_FENCE
-_MD_HEADING = wire.MD_HEADING
-_MD_QUOTE = wire.MD_QUOTE
-_MD_BULLET = wire.MD_BULLET
-_MD_NUMBER = wire.MD_NUMBER
-_MD_HR = wire.MD_HR
-_MD_TABLE_SEP = wire.MD_TABLE_SEP
-_MD_IMAGE = wire.MD_IMAGE
-_MD_LINK = wire.MD_LINK
-_MD_CODE = wire.MD_CODE
-_MD_STRONG = wire.MD_STRONG
-_MD_EM = wire.MD_EM
-_MD_STRIKE = wire.MD_STRIKE
-_MD_HTML = wire.MD_HTML
-_MD_ESCAPE = wire.MD_ESCAPE
 
 
 def blocks(markdown, always=False):
@@ -1327,7 +1303,7 @@ def blocks(markdown, always=False):
     nothing but prose still has a shape worth sending. Never raises.
     """
     lines = str(markdown or "").splitlines()
-    if not always and not any(_MD_FENCE.match(line) for line in lines):
+    if not always and not any(wire.MD_FENCE.match(line) for line in lines):
         return []
     out, prose, code, lang = [], [], [], ""
     fence_len, fence_is_prose = 0, False
@@ -1340,7 +1316,7 @@ def blocks(markdown, always=False):
 
     for raw in lines:
         line = raw.rstrip()
-        fence = _MD_FENCE.match(line)
+        fence = wire.MD_FENCE.match(line)
         if fence:
             marker = len(fence.group(1))
             if fence_len == 0:
@@ -1372,36 +1348,15 @@ def blocks(markdown, always=False):
     return out
 
 
-# One line read, and wrapped lines joined: tapproval_wire's rules, which the
-# hook's plan card applies too.
-_flatten_line = wire.flatten_line
-_unwrap = wire.unwrap
-
-
 def _marked_lines(lines):
     """Prose lines as the phone shows them, in what a watch can draw: the
     inline marks kept, a heading as a bold line with air above it, a
     nested point indented two spaces a level, block markup read, and a
-    wrapped paragraph one line (``_unwrap``). The hook's ``_plan_marked``
-    applies the same rules to a plan."""
+    wrapped paragraph one line (``wire.unwrap``). The hook's ``_plan_marked``
+    applies the same rules to a plan (both through ``wire.mark_line``)."""
     out = []
-    for raw in _unwrap(lines):
-        raw = raw.expandtabs(4)
-        if not raw.strip() or _MD_HR.match(raw) or _MD_TABLE_SEP.match(raw):
-            if not raw.strip() and out and out[-1]:
-                out.append("")
-            continue
-        text = _flatten_line(raw, keep_inline=True).strip()
-        if not text:
-            continue
-        if _MD_HEADING.match(raw):
-            text = "**%s**" % text.replace("**", "")
-            if out and out[-1]:
-                out.append("")
-        elif _MD_BULLET.match(raw) or _MD_NUMBER.match(raw):
-            depth = (len(raw) - len(raw.lstrip(" "))) // 2
-            text = "  " * min(depth, 3) + text
-        out.append(text)
+    for raw in wire.unwrap(lines):
+        wire.mark_line(raw.expandtabs(4), out)
     while out and not out[-1]:
         out.pop()
     return "\n".join(out)
@@ -1420,7 +1375,7 @@ def plain_text(markdown):
     out, fence_len, fence_is_prose = [], 0, False
     for raw in str(markdown).splitlines():
         line = raw.rstrip()
-        fence = _MD_FENCE.match(line)
+        fence = wire.MD_FENCE.match(line)
         if fence:
             marker = len(fence.group(1))
             if fence_len == 0:
@@ -1441,13 +1396,13 @@ def plain_text(markdown):
             if not out or out[-1] != "[code]":
                 out.append("[code]")
             continue
-        if not line.strip() or _MD_HR.match(line) or _MD_TABLE_SEP.match(line):
+        if not line.strip() or wire.MD_HR.match(line) or wire.MD_TABLE_SEP.match(line):
             # A blank line is a paragraph break — the phone shows the gap,
             # so the wrist must too. One is enough.
             if not line.strip() and out and out[-1]:
                 out.append("")
             continue
-        line = " ".join(_flatten_line(line).split())
+        line = " ".join(wire.flatten_line(line).split())
         if line:
             out.append(line)
     while out and not out[-1]:

@@ -30,11 +30,34 @@ if [ -d "$DIR/.git" ]; then
       # The installed Mac bridge, the helper's data (the paired watches'
       # keys among it) and its logs live in the checkout but are not part
       # of it (gitignored): they move with the install, not with the old copy.
+      # Each step is checked: under set -e a move that failed halfway
+      # stopped the script with the watches' keys in $fresh, where nothing
+      # looks (2026-10-24 review). On any failure what moved goes back.
+      superseded="$DIR.superseded-$(date +%Y%m%d-%H%M%S)"
+      swapped=yes
       for kept in bridge-app data logs; do
-        if [ -d "$DIR/$kept" ]; then mv "$DIR/$kept" "$fresh/$kept"; fi
+        if [ -d "$DIR/$kept" ] && ! mv "$DIR/$kept" "$fresh/$kept"; then
+          swapped=no
+          break
+        fi
       done
-      mv "$DIR" "$DIR.superseded-$(date +%Y%m%d-%H%M%S)"
-      mv "$fresh" "$DIR"
+      if [ "$swapped" = yes ] && mv "$DIR" "$superseded"; then
+        if ! mv "$fresh" "$DIR"; then
+          mv "$superseded" "$DIR"
+          swapped=no
+        fi
+      else
+        swapped=no
+      fi
+      if [ "$swapped" = no ]; then
+        for kept in bridge-app data logs; do
+          if [ -d "$fresh/$kept" ] && [ ! -e "$DIR/$kept" ]; then
+            mv "$fresh/$kept" "$DIR/$kept" || true
+          fi
+        done
+        rm -rf "$fresh"
+        echo "update: could not swap in the fresh copy; keeping the one installed" >&2
+      fi
     else
       rm -rf "$fresh"
       echo "update: could not fetch a fresh copy either; keeping the one installed" >&2
