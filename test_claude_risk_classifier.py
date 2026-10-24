@@ -19082,6 +19082,10 @@ class _FakeMac:
         # off), and whether macOS takes a registration at all.
         self.registered, self.switched_off, self.refuses = set(), False, False
         self.login_calls = []
+        # macOS's quirk (2026-10-24): with an old job file of the same label
+        # booted out and deleted, the status still reads "enabled" though
+        # launchd holds no job. A Mac moving from 1.0.3 starts this way.
+        self.stale_enabled = False
 
     def _login_item(self, command):
         app = command[0].split("/Contents/MacOS/")[0]
@@ -19091,9 +19095,15 @@ class _FakeMac:
             self.registered.add(app)
         elif action == "--unregister":
             self.registered.discard(app)
+            self.stale_enabled = False
         if app not in self.registered:
-            return 0, "not-registered"
+            return 0, "enabled" if self.stale_enabled else "not-registered"
         return 0, "requires-approval" if self.switched_off else "enabled"
+
+    def _launchctl_print(self):
+        if self.registered and not self.switched_off:
+            return 0, "\tmanaged_by = com.apple.xpc.ServiceManagement\n"
+        return 113, 'Could not find service "com.tapproval.bridge"'
 
     def __call__(self, command, timeout=60):
         self.ran.append(command[0])
@@ -19113,6 +19123,8 @@ class _FakeMac:
             return (0, "") if met else (3, "failed to satisfy specified code requirement(s)")
         if command[0] == "spctl":
             return self.gatekeeper
+        if command[:2] == ["launchctl", "print"]:
+            return self._launchctl_print()     # reads only
         if command[0] == "launchctl":
             raise AssertionError("launchd must not be touched with the agent path overridden")
         raise AssertionError("unexpected command %r" % (command,))
@@ -19412,6 +19424,41 @@ class TestTheHelperInstallsTheMacBridge:
         assert bridge_install.app_path() in self.mac.registered
         assert ("Tapproval.app", "--register") in self.mac.login_calls
         assert not os.path.exists(bridge_install.agent_path())
+
+    def test_a_false_enabled_from_the_old_job_still_registers(self):
+        """Helper 1.1.80 took macOS's "enabled" — left from the old job file
+        of the same label — as registered, kickstarted a job that did not
+        exist, and every Mac moving from 1.0.3 rolled back (2026-10-24)."""
+        _make_app(bridge_install.old_app_path(), "1.0.3")
+        self._job_file()
+        self.mac.stale_enabled = True
+        assert self._install_v("1.1.0", wait_for_bridge=lambda: bool(self.mac.registered)) \
+            == "1.1.0"
+        assert ("Tapproval.app", "--register") in self.mac.login_calls
+        assert bridge_install.job_registered()
+
+    def test_an_update_leaves_the_registered_job_running(self, monkeypatch):
+        """Same label: booting out "the old job" on an update stopped the
+        bridge's own login item, and the update registered it again."""
+        stopped = []
+        monkeypatch.setattr(bridge_install, "unload_agent", lambda: stopped.append(1))
+        self._job_file()
+        self._install_v("1.1.0")
+        assert stopped, "the old job file's job is stopped on the move"
+        stopped.clear()
+        self.mac.login_calls.clear()
+        self._install_v("1.1.1")
+        assert not stopped
+        assert ("Tapproval.app", "--register") not in self.mac.login_calls
+
+    def test_a_registration_macos_does_not_hold_is_a_failure(self):
+        """No job in launchd after the register: rolled back, not "installed"."""
+        _make_app(bridge_install.old_app_path(), "1.0.3")
+        self.mac.stale_enabled, self.mac.refuses = True, True
+        with pytest.raises(bridge_install.InstallError) as refused:
+            self._install_v("1.1.0")
+        assert "previous one is back" in str(refused.value)
+        assert bridge_install.installed_version() == "1.0.3"
 
     def test_a_bridge_before_1_1_still_gets_its_job_file(self):
         self._install_v("1.0.3")

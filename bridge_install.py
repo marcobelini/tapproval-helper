@@ -386,8 +386,13 @@ def unload_agent():
 
 def _drop_agent_file():
     """Take the old-style job away: stopped, and its file gone, so Login
-    Items has no entry left under the certificate's name."""
-    unload_agent()
+    Items has no entry left under the certificate's name.
+
+    Only that job: the bridge's own login item has the same label, and
+    booting it out on every update threw the registration away and made
+    the update register again (seen on a stand-in, 2026-10-24)."""
+    if os.path.exists(agent_path()) or not job_registered():
+        unload_agent()
     try:
         os.remove(agent_path())
     except FileNotFoundError:
@@ -402,19 +407,37 @@ def start(app):
     A login item already registered is restarted, not registered again: the
     registration outlives the bundle being replaced in place (tested
     2026-10-24), and keeping it keeps the user's own switch. Off in Login
-    Items stays off, and counts as taken."""
+    Items stays off, and counts as taken.
+
+    "enabled" alone proves nothing: with the old job file booted out and
+    deleted, macOS still answers "enabled" for its label while launchd holds
+    no job at all (helper 1.1.80 kickstarted that nothing, and every Mac
+    moving from 1.0.3 rolled back, 2026-10-24). Registered means launchd
+    holds the label as a ServiceManagement job; a register, even over that
+    false "enabled", makes one (tested on this Mac the same day)."""
     if not registers_itself(app):
         write_agent(app)
         return load_agent()
     _drop_agent_file()
     word = login_item("login-status", app)
-    if word not in LOGIN_ON:
-        word = login_item("register", app)
-    elif word == "enabled" and agent_is_real():
-        # The bundle was swapped under the running bridge: run the new one.
-        RUN(["launchctl", "kickstart", "-k",
-             "gui/%d/%s" % (os.getuid(), LABEL)], timeout=10)
-    return word in LOGIN_ON
+    if word == "requires-approval":
+        return True
+    if word == "enabled" and job_registered():
+        if agent_is_real():
+            # The bundle was swapped under the running bridge: run the new one.
+            RUN(["launchctl", "kickstart", "-k",
+                 "gui/%d/%s" % (os.getuid(), LABEL)], timeout=10)
+        return True
+    word = login_item("register", app)
+    return word == "requires-approval" or (word == "enabled" and job_registered())
+
+
+def job_registered():
+    """Does launchd hold the bridge's label as a job the bridge registered
+    itself (not a job file's)? Read only, so it is asked even in the suite."""
+    status, out = RUN(["launchctl", "print", "gui/%d/%s" % (os.getuid(), LABEL)],
+                      timeout=10)
+    return status == 0 and "managed_by = com.apple.xpc.ServiceManagement" in (out or "")
 
 
 def stop(app):
