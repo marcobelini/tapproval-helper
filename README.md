@@ -65,7 +65,8 @@ writes that very setting, and only when you turn the switch. Until it is
 on, the watch's Connection screen mentions it, quietly, once a newer
 helper has been out a week. A terminal install
 needs nothing: it checks at most once an hour, on a session you were
-starting anyway, and fast-forwards itself.
+starting anyway, and fast-forwards itself; from watch app 2.2,
+**Settings → Auto-update** says so.
 
 Every path registers the same permission hook. A reboot never needs a
 hand either: the installer adds a login wake-up, and on the plugin path

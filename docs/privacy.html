@@ -17,15 +17,15 @@
 <header class="top"><a href="./" style="display:flex;align-items:center;gap:12px;color:inherit"><img src="img/icon.png" alt=""><strong>Tapproval</strong></a></header>
 <main class="policy">
 <h1>Tapproval Privacy Policy</h1>
-<p><em>Last updated: 23 October 2026</em></p>
+<p><em>Last updated: 24 October 2026</em></p>
 <p>Tapproval is built so that your data stays yours.</p>
 <h2>What Tapproval collects</h2>
 <p><strong>Nothing.</strong> Tapproval has no accounts, no analytics, no tracking, and
 no servers of ours. We never see your prompts, your code, your
 conversations, or your taps.</p>
 <h2>Where your data lives</h2>
-<p>What this section calls encrypted is encrypted from watch app 2.1, now
-in beta on TestFlight. Earlier versions sign everything, so nobody can
+<p>What this section calls encrypted is encrypted from watch app 2.1, on
+the App Store since 24 October 2026. Earlier versions sign everything, so nobody can
 fake or change an answer, but do not encrypt it.</p>
 <ul>
 <li><strong>On your own devices.</strong> The watch app talks directly to a small
@@ -86,6 +86,11 @@ iCloud bridge. Beside Claude Code's own files it keeps the audit log
 described below. (An older install kept some of these loose in your home
 folder as <code>~/.tapproval-…</code>; the helper moves them into <code>~/.tapproval</code> by
 itself.) None of them leaves your computer.</p>
+<p>A picture in a conversation is sent to the watch from memory. To send a
+smaller copy, the helper writes it briefly to a private temporary folder
+that only your account can open, makes the copy there with macOS's own
+<code>sips</code>, and deletes the folder straight away. The copy then lives only in
+the helper's memory.</p>
 <p>To stay current, a helper installed with the one-line installer fetches
 its own new versions from GitHub at most once an hour. One installed as a
 Claude Code plugin instead asks GitHub once a day for the newest version
