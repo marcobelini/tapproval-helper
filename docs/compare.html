@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Approve Claude Code remotely: 5 options compared</title>
-<meta name="description" content="Remote Control, Happy, Omnara, claude-watch and Tapproval compared for approving Claude Code away from the desk: price, Apple Watch, accounts, servers.">
+<title>Approve Claude Code remotely: the options compared (October 2026)</title>
+<meta name="description" content="Remote Control, Happy, Omnara, claude-watch, Chums, Taphaptic, ntfy scripts, Pushary and Tapproval compared for approving Claude Code away from the desk: price, Apple Watch, accounts, servers, and who Remote Control leaves out.">
 <link rel="canonical" href="https://tapproval.thoughtfulsteward.org/compare.html">
 <meta property="og:site_name" content="Tapproval">
 <meta property="og:type" content="article">
@@ -15,7 +15,7 @@
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="img/icon.png">
 <link rel="stylesheet" href="style.css">
-<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "Approve Claude Code away from your desk: Tapproval, Remote Control, Happy, Omnara compared", "datePublished": "2026-09-25", "dateModified": "2026-10-17", "author": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "mainEntityOfPage": "https://tapproval.thoughtfulsteward.org/compare.html"}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "Approve Claude Code away from your desk: Tapproval, Remote Control, Happy, Omnara compared", "datePublished": "2026-09-25", "dateModified": "2026-10-24", "author": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "mainEntityOfPage": "https://tapproval.thoughtfulsteward.org/compare.html"}</script>
 </head>
 <body>
 <div class="wrap">
@@ -23,29 +23,48 @@
   <nav><a href="./">Home</a><a href="apple-watch-claude-code.html">Setup guide</a><a href="claude-code-permission-hook.html">How the hook works</a><a href="https://apps.apple.com/app/tapproval/id6805869018">App Store</a></nav></header>
 <main class="policy">
 <h1>Approving Claude Code away from your desk: the options compared</h1>
-<p><em>Written by the maker of Tapproval, so read it with that in mind. Every claim about another product links to its source; facts as of 25 September 2026.</em></p>
+<p><em>Written by the maker of Tapproval, so read it with that in mind. Every claim about another product links to its source; facts as of 24 October 2026.</em></p>
 <p>Claude Code stops and waits whenever it needs permission. Several tools now let you answer from somewhere other than the terminal. They differ more than their descriptions suggest: some need an account and a server in the middle, some need a particular plan, and only a few reach the Apple Watch.</p>
 
 <h2>Side by side</h2>
 <div class="scroll"><table>
-<tr><th></th><th>Tapproval</th><th>Claude Remote Control</th><th>Happy</th><th>Omnara</th><th>claude-watch</th></tr>
-<tr><td>Price</td><td>100 answers free, then $5 once</td><td>Free app; needs a Pro, Max, Team or Enterprise plan</td><td>Free; long voice sessions paid</td><td>No platform fee; managed compute paid</td><td>Free</td></tr>
-<tr><td>Apple Watch</td><td>Watch app, built for the wrist</td><td>No watch app; the iPhone notification is mirrored</td><td>No</td><td>Yes, in the iOS app</td><td>Watch and iPhone app</td></tr>
-<tr><td>iPhone / Android / web</td><td>Watch only</td><td>iOS, Android, web</td><td>iOS, Android, web, Mac</td><td>iOS; others not checked</td><td>iPhone</td></tr>
-<tr><td>Account</td><td>None</td><td>claude.ai account</td><td>Created automatically, no email</td><td>Required</td><td>None</td></tr>
-<tr><td>Server in the middle</td><td>None of ours: direct, or a tunnel sealed end to end</td><td>Anthropic's</td><td>Hosted relay, self-hostable</td><td>Hosted, self-hostable</td><td>None (local network only)</td></tr>
-<tr><td>Open source</td><td>The computer half</td><td>No</td><td>Yes (MIT)</td><td>Yes (Apache-2.0)</td><td>Yes (MIT)</td></tr>
-<tr><td>Install</td><td>App Store + one sentence to Claude Code</td><td>Built in</td><td>App store + <code>happy</code> command</td><td>App store + login</td><td>Build it yourself in Xcode</td></tr>
-<tr><td>Risk shown on each prompt</td><td>Yes, five tiers</td><td>No</td><td>No</td><td>Not checked</td><td>No</td></tr>
+<tr><th></th><th>Tapproval</th><th>Claude Remote Control</th><th>Happy</th><th>Omnara</th><th>claude-watch</th><th>Chums</th></tr>
+<tr><td>Price</td><td>100 answers free, then $5 once</td><td>Free app; needs a Pro, Max, Team or Enterprise plan</td><td>Free; long voice sessions paid</td><td>No platform fee; managed compute paid</td><td>Free</td><td>Free, open source</td></tr>
+<tr><td>Apple Watch</td><td>Watch app, built for the wrist</td><td>No watch app; the iPhone notification is mirrored</td><td>No</td><td>Yes, in the iOS app</td><td>Watch and iPhone app</td><td>Watch and iPhone app</td></tr>
+<tr><td>iPhone / Android / web</td><td>Watch only</td><td>iOS, Android, web</td><td>iOS, Android, web, Mac</td><td>iOS; others not checked</td><td>iPhone</td><td>iPhone</td></tr>
+<tr><td>Account</td><td>None</td><td>claude.ai account</td><td>Created automatically, no email</td><td>Required</td><td>None</td><td>None</td></tr>
+<tr><td>Server in the middle</td><td>None of ours: direct, or a tunnel sealed end to end</td><td>Anthropic's</td><td>Hosted relay, self-hostable</td><td>Hosted, self-hostable</td><td>None (local network only)</td><td>None: a hub on your own Mac (Apple silicon)</td></tr>
+<tr><td>Open source</td><td>The computer half</td><td>No</td><td>Yes (MIT)</td><td>Yes (Apache-2.0)</td><td>Yes (MIT)</td><td>Yes (Apache-2.0)</td></tr>
+<tr><td>Install</td><td>App Store + one sentence to Claude Code</td><td>Built in</td><td>App store + <code>happy</code> command</td><td>App store + login</td><td>Build it yourself in Xcode</td><td>Build it yourself in Xcode</td></tr>
+<tr><td>Risk shown on each prompt</td><td>Yes, five tiers</td><td>No</td><td>No</td><td>Not checked</td><td>No</td><td>Not checked</td></tr>
 </table></div>
 
 <h2>Which one fits</h2>
 <ul>
 <li><strong>You already pay for Claude Pro or Max and mostly carry your phone:</strong> start with Anthropic's <a href="https://code.claude.com/docs/en/remote-control">Remote Control</a>. It is built in and needs nothing installed.</li>
 <li><strong>You want Android, the web or a desktop client:</strong> <a href="https://happy.engineering/">Happy</a> or <a href="https://github.com/omnara-ai/omnara">Omnara</a>. Happy is the most widely used. Omnara has moved towards managed agents in its own cloud.</li>
-<li><strong>You want to build your own:</strong> <a href="https://github.com/shobhit99/claude-watch">claude-watch</a> is a good open-source start.</li>
+<li><strong>You want to build your own:</strong> <a href="https://github.com/shobhit99/claude-watch">claude-watch</a> (watch and Mac on the same Wi-Fi) or <a href="https://github.com/lcoutodemos/chums">Chums</a> (Claude Code and Codex, a hub on your own Mac) are good open-source starts. Both are source code you sign and build yourself.</li>
+<li><strong>You want a push on your phone and nothing on your wrist:</strong> <a href="https://github.com/yuuichieguchi/claude-remote-approver">claude-remote-approver</a> turns each prompt into an ntfy notification with Approve and Deny buttons, free and open source; <a href="https://pushary.com/claude-code-notifications">Pushary</a> does the same as a hosted service at $9.99 a month.</li>
 <li><strong>You want the watch to be the whole interface</strong>, with no account, no server of ours in the middle, and each prompt marked with how risky it is: that is what <a href="./">Tapproval</a> is for. By default it approves nothing on its own; every card waits for your tap.</li>
 </ul>
+
+<h2>Also seen</h2>
+<ul>
+<li><a href="https://github.com/dzzzgnr/taphaptic">Taphaptic</a>: lifecycle notifications from Claude Code and Codex to a watch app, through a relay and Apple's push service. Its README says prompts, transcripts and tool arguments are not sent, only a minimal event. MIT. Whether it is on the App Store is not stated on the page.</li>
+<li><a href="https://github.com/yuuichieguchi/claude-remote-approver">claude-remote-approver</a>: a hook that pushes each permission prompt to the ntfy app on iOS or Android, with Approve, Always Approve and Deny buttons; falls back to the terminal after 120 seconds. No account; Node.js. MIT.</li>
+<li><a href="https://pushary.com/claude-code-notifications">Pushary</a>: a hosted service that installs Claude Code hooks and pushes the question to your phone, "Tap yes or no from your lock screen". iPhone, Android and Mac; $9.99 a month after a three-day trial. No watch mentioned.</li>
+</ul>
+
+<h2>Who Remote Control's own documentation rules out</h2>
+<p>Anthropic's Remote Control is the built-in way to answer from a phone, and for many people the right one. Its <a href="https://code.claude.com/docs/en/remote-control">requirements page</a> also says, in its own words, who cannot use it, and that is where the independent tools still have a job:</p>
+<ul>
+<li>"available on Pro, Max, Team, and Enterprise plans. API keys are not supported."</li>
+<li>Not available when you use "Amazon Bedrock, Google Cloud's Agent Platform, or Microsoft Foundry", or point <code>ANTHROPIC_BASE_URL</code> at a gateway or proxy.</li>
+<li>Not available with <code>CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC</code> or <code>DISABLE_GROWTHBOOK</code> set.</li>
+<li>"While Remote Control is connected, the session transcript, including your messages, Claude's responses, and tool activity, is stored on Anthropic servers." Organizations with Zero Data Retention or the HIPAA configuration cannot enable it.</li>
+<li>The page names claude.ai/code, the Claude app for iOS and Android, Desktop and VS Code. It does not mention the Apple Watch; the phone's notification is mirrored to the wrist as any notification is.</li>
+</ul>
+<p>Tapproval sits on the other side of each line: it works with an API key or a gateway, keeps the conversation between your computer and your watch, and puts the risk mark on the card before you tap. It is not a replacement for Remote Control's typing and reading on a phone; it is the wrist half.</p>
 
 <h2>How the approval actually travels</h2>
 <p>All of these rely on the same thing underneath: Claude Code's hooks, or its own Remote Control channel. A tool that answers from outside the terminal uses the <code>PermissionRequest</code> hook, and the decision it prints has a shape that is easy to get wrong. A wrong shape is ignored without an error. <a href="claude-code-permission-hook.html">How the hook works</a> covers the exact shape.</p>
@@ -56,6 +75,11 @@
 <li>Happy: <a href="https://github.com/slopus/happy">github.com/slopus/happy</a>, <a href="https://happy.engineering/docs/guides/self-hosting/">self-hosting</a>, <a href="https://github.com/slopus/happy/blob/main/docs/paid-voice.md">paid voice</a></li>
 <li>Omnara: <a href="https://github.com/omnara-ai/omnara">github.com/omnara-ai/omnara</a>, <a href="https://www.omnara.com/pricing">pricing</a>, <a href="https://apps.apple.com/us/app/id6748426727">App Store</a></li>
 <li>claude-watch: <a href="https://github.com/shobhit99/claude-watch">github.com/shobhit99/claude-watch</a></li>
+<li>Chums: <a href="https://github.com/lcoutodemos/chums">github.com/lcoutodemos/chums</a></li>
+<li>Taphaptic: <a href="https://github.com/dzzzgnr/taphaptic">github.com/dzzzgnr/taphaptic</a></li>
+<li>claude-remote-approver: <a href="https://github.com/yuuichieguchi/claude-remote-approver">github.com/yuuichieguchi/claude-remote-approver</a></li>
+<li>Pushary: <a href="https://pushary.com/claude-code-notifications">pushary.com/claude-code-notifications</a></li>
+<li>Remote Control requirements, data handling and platforms, read 2026-10-24: <a href="https://code.claude.com/docs/en/remote-control">code.claude.com/docs/en/remote-control</a></li>
 </ul>
 <p>Something here out of date or unfair? Write to <a href="mailto:tapproval@thoughtfulsteward.org">tapproval@thoughtfulsteward.org</a> and it will be corrected.</p>
 <p style="margin-top:28px"><a class="cta" href="apple-watch-claude-code.html">Set up Tapproval</a></p>
