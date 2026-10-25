@@ -27,7 +27,8 @@
 ## What it needs
 - An Apple Watch running watchOS 10 or later.
 - Claude Code on a Mac or a Linux machine.
-- The free, open-source helper (MIT licence), which Claude Code installs
+- Tapproval Base, the free, open-source helper (MIT licence; the
+  tapproval-helper plugin and repository), which Claude Code installs
   when told: "Install the Tapproval plugin from marcobelini/tapproval-helper".
 - Works on the same Wi-Fi, or away from home through a private travel address.
 
@@ -55,6 +56,7 @@ read them).
 - Setup guide: https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html
 - The PermissionRequest hook's decision shape: https://tapproval.thoughtfulsteward.org/claude-code-permission-hook.html
 - Ways to approve Claude Code away from the desk, compared: https://tapproval.thoughtfulsteward.org/compare.html
+- Claude Code notifications on Apple Watch, the three ways: https://tapproval.thoughtfulsteward.org/claude-code-apple-watch-notifications.html
 - Security: https://tapproval.thoughtfulsteward.org/security.html
 - Changelog: https://tapproval.thoughtfulsteward.org/changelog.html
 - Privacy policy: https://tapproval.thoughtfulsteward.org/privacy.html

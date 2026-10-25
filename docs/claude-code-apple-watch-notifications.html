@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Code notifications on Apple Watch: what works</title>
+<meta name="description" content="Three ways to get Claude Code's alerts on an Apple Watch: Remote Control's push, a notify-only hook, or a watch app that answers. What each needs, and what happens without your iPhone.">
+<link rel="canonical" href="https://tapproval.thoughtfulsteward.org/claude-code-apple-watch-notifications.html">
+<meta property="og:site_name" content="Tapproval">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Claude Code notifications on Apple Watch: what works">
+<meta property="og:description" content="Remote Control's push, a notify-only hook, or a watch app that answers: what each needs, and what happens without your iPhone.">
+<meta property="og:url" content="https://tapproval.thoughtfulsteward.org/claude-code-apple-watch-notifications.html">
+<meta property="og:image" content="https://tapproval.thoughtfulsteward.org/img/share.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="apple-itunes-app" content="app-id=6805869018">
+<link rel="icon" href="img/icon.png">
+<link rel="stylesheet" href="style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@graph": [{"@type": "Article", "headline": "Claude Code notifications on Apple Watch: what works", "datePublished": "2026-10-25", "dateModified": "2026-10-25", "author": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "mainEntityOfPage": "https://tapproval.thoughtfulsteward.org/claude-code-apple-watch-notifications.html"}, {"@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can Claude Code send notifications to an Apple Watch?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, through the iPhone. With Remote Control on, Claude Code can push to the Claude app on your iPhone, and the watch shows that notification while the iPhone is locked or asleep. The Claude app has no Apple Watch app, so the session itself is answered on the phone."}}, {"@type": "Question", "name": "Do Claude Code notifications reach the watch when my iPhone is not with me?", "acceptedAnswer": {"@type": "Answer", "text": "Not an iPhone app's notifications: Apple sends them to the iPhone when the watch and the iPhone are disconnected. Only a watch app that reaches your computer over the internet itself keeps working then."}}, {"@type": "Question", "name": "Can I answer a Claude Code permission prompt on the watch?", "acceptedAnswer": {"@type": "Answer", "text": "Only with a watch app built for it, which receives the prompt from a PermissionRequest hook on your computer and sends the answer back. Tapproval is one; the comparison page lists others."}}]}]}</script>
+</head>
+<body>
+<div class="wrap">
+<header class="top"><a href="./" style="display:flex;align-items:center;gap:12px;color:inherit"><img src="img/icon.png" alt=""><strong>Tapproval</strong></a>
+  <nav><a href="./">Home</a><a href="apple-watch-claude-code.html">Setup guide</a><a href="compare.html">Compare</a><a href="https://apps.apple.com/app/tapproval/id6805869018">App Store</a></nav></header>
+<main class="policy">
+<h1>Claude Code notifications on your Apple Watch</h1>
+<p><em>Written by the maker of Tapproval, one of the options below, so read it with that in mind. Every claim about another product links to its source; facts as of 25 October 2026.</em></p>
+<p>Claude Code stops whenever it needs you: a command to allow, a question to answer, a plan to approve. If you have stepped away, the session simply waits. There are three ways to have your Apple Watch tell you. They differ in one thing that matters more than it sounds: whether the watch can only <em>tell</em> you, or can also <em>answer</em>.</p>
+
+<h2 id="remote-control">1. Remote Control's push, through your iPhone</h2>
+<p>Claude Code's own <a href="https://code.claude.com/docs/en/remote-control#mobile-push-notifications">Remote Control</a> can push a notification to the Claude app on your phone, "typically when a long-running task finishes or when it needs a decision from you". To turn it on:</p>
+<ul>
+<li>Install the Claude app on your iPhone and sign in with the account you use for Claude Code.</li>
+<li>Start Remote Control in the session: <code>/remote-control</code>.</li>
+<li>Type <code>/config</code> and turn on <strong>Push when actions required</strong> (permission prompts and questions), <strong>Push when Claude decides</strong>, or both.</li>
+</ul>
+<p>Remote Control needs a <a href="https://code.claude.com/docs/en/remote-control#requirements">Pro, Max, Team or Enterprise plan</a>; an API key does not work. Your watch shows the Claude app's notification the way it shows any iPhone app's: <a href="https://support.apple.com/en-us/108369">while the iPhone is locked or asleep</a>. The <a href="https://apps.apple.com/us/app/claude-by-anthropic/id6473753684">Claude app</a> runs on iPhone and iPad and has no Apple Watch app, so the prompt itself is answered on the phone.</p>
+<p><strong>Good fit</strong> if you already pay for Claude and carry your phone. It is built in and installs nothing on the watch.</p>
+
+<h2 id="notify-hook">2. A notification hook that pings your phone</h2>
+<p>Claude Code runs a <a href="https://code.claude.com/docs/en/hooks">Notification hook</a> when it is waiting for you. A short script there can send a push through a service such as ntfy or Pushover, which your watch then shows like any other phone notification. Small open-source projects do exactly this, for example <a href="https://github.com/scottmatthews7/claude-watch">scottmatthews7/claude-watch</a>, which notifies when a task finishes.</p>
+<p>It works with any plan and any computer. Most such scripts only tell you, and you still go to the terminal or the phone. Some add Allow and Deny buttons to the notification, such as <a href="https://github.com/yuuichieguchi/claude-remote-approver">claude-remote-approver</a>.</p>
+
+<h2 id="watch-app">3. A watch app that answers</h2>
+<p>The third kind puts the prompt itself on the watch and sends your answer back. On the computer, a <a href="claude-code-permission-hook.html">PermissionRequest hook</a> hands each prompt to a small relay; the watch app shows it, and one tap answers. Tapproval works this way: each prompt arrives marked with one of five risk tiers, worked out on your computer, so a force-push to main shows as CRITICAL before you tap. The first 100 answers are free, then $5 once.</p>
+<p>Other watch projects exist, several of them source code you build yourself. <a href="compare.html">The comparison page</a> sets them side by side, with price, account and server for each.</p>
+
+<h2 id="no-phone">When your iPhone is not with you</h2>
+<p>This is where the three part ways. Apple routes an iPhone app's notifications to the watch only while the two are connected: <a href="https://support.apple.com/en-us/108369">"when your devices are disconnected, your notifications will appear on your iPhone instead of your Apple Watch."</a> Leave the phone at home and options 1 and 2 go quiet on the wrist.</p>
+<p>A watch app can reach your computer on its own over the internet, on Wi-Fi or cellular. Tapproval does that through a private travel address and through your own iCloud, so prompts still arrive and answers still land with the phone switched off. The <a href="apple-watch-claude-code.html#pair">setup guide</a> covers how it finds the computer.</p>
+
+<h2 id="both">Using Remote Control and a watch app together</h2>
+<p>They combine. The one thing to know: with <strong>Push when actions required</strong> on, the Claude app also pushes for prompts the watch app has already answered, so one prompt can buzz twice (<a href="https://github.com/anthropics/claude-code/issues/96126">claude-code#96126</a>). The setup guide explains <a href="apple-watch-claude-code.html">which switch keeps one buzz</a>, and what that costs.</p>
+
+<h2>Side by side</h2>
+<div class="scroll"><table>
+<thead><tr><th></th><th>Remote Control push</th><th>Notification hook</th><th>Watch app (Tapproval)</th></tr></thead>
+<tbody>
+<tr><td>Answer on the watch</td><td>No, on the phone</td><td>Only where the script adds buttons</td><td>Yes, one tap</td></tr>
+<tr><td>Works with the iPhone away</td><td>No</td><td>No</td><td>Yes</td></tr>
+<tr><td>Needs</td><td>Pro, Max, Team or Enterprise plan, Claude app</td><td>A script and a push service</td><td>The app and its open-source helper</td></tr>
+<tr><td>Price</td><td>Included in the plan</td><td>Free, or the push service's price</td><td>100 answers free, then $5 once</td></tr>
+<tr><td>Risk shown on the prompt</td><td>No</td><td>No</td><td>Yes, five tiers</td></tr>
+</tbody></table></div>
+
+<p style="margin-top:36px"><a class="cta" href="https://apps.apple.com/app/tapproval/id6805869018">Get Tapproval on the App Store</a> <a class="cta quiet" href="apple-watch-claude-code.html">Setup guide</a></p>
+</main>
+<footer>
+  <p>Tapproval is an independent app and is not affiliated with, endorsed by or sponsored by Anthropic. Claude and Claude Code are trademarks of Anthropic, PBC. Apple Watch and App Store are trademarks of Apple Inc.</p>
+  <p>© 2026 Tapproval · <a href="./">Home</a> · <a href="security.html">Security</a> · <a href="privacy.html">Privacy policy</a> · <a href="mailto:tapproval@thoughtfulsteward.org">tapproval@thoughtfulsteward.org</a></p>
+</footer>
+</div>
+</body>
+</html>
