@@ -13121,13 +13121,57 @@ class TestNewSessionFromTheWatch:
         assert all(r["first"] is True for r in rows)
         assert all(isinstance(r["minutes_ago"], int) for r in rows)
 
-    def test_the_first_session_list_never_mixes_into_a_real_one(self, tmp_path, monkeypatch):
-        """One transcript anywhere, and the picker is the transcripts' again."""
+    def test_a_new_repository_joins_a_list_the_transcripts_gave(self, tmp_path, monkeypatch):
+        """A repository Claude Code has never run in is offered beside the
+        transcripts' projects, in order of recency (the owner, 2026-10-25:
+        a new repository was missing from the picker). Until then one
+        transcript anywhere hid every repository the folders held."""
         monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
-        self._home(tmp_path, monkeypatch, "Developer/stranger")
+        home = self._home(tmp_path, monkeypatch, "Developer/stranger")
+        new = home / "Developer" / "stranger"
+        os.utime(new, (time.time() - 600, time.time() - 600))   # between acme and pantri
         rows = watch_relay.known_projects(projects_dir=self._projects(tmp_path))
-        assert [r["name"] for r in rows] == ["acme", "pantri"]
-        assert not any(r.get("first") for r in rows)
+        assert [r["name"] for r in rows] == ["acme", "stranger", "pantri"]
+        assert [bool(r.get("first")) for r in rows] == [False, True, False]
+        assert rows[1]["path"] == str(new)
+
+    @staticmethod
+    def _origin(repo, url):
+        (repo / ".git" / "config").write_text(
+            '[core]\n\tbare = false\n[remote "origin"]\n\turl = %s\n' % url, encoding="utf-8")
+
+    def test_a_copy_or_a_worktree_of_a_listed_repository_is_not_offered(
+            self, tmp_path, monkeypatch):
+        """~/Developer holds spare clones (ClaudeWatch-pill) and worktrees
+        (ClaudeWatch-before); offering them would bury the list as the
+        session worktrees once did (2026-09-23)."""
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
+        home = self._home(tmp_path, monkeypatch, "Developer/acme-pill", "Developer/fresh")
+        root = self._projects(tmp_path)
+        (tmp_path / "acme" / ".git").mkdir()
+        self._origin(tmp_path / "acme", "git@github.com:owner/acme.git")
+        self._origin(home / "Developer" / "acme-pill", "https://github.com/Owner/acme")
+        tree = home / "Developer" / "acme-before"
+        tree.mkdir()
+        (tree / ".git").write_text("gitdir: %s\n" % (tmp_path / "acme" / ".git"), encoding="utf-8")
+        names = [r["name"] for r in watch_relay.known_projects(projects_dir=root)]
+        assert sorted(names) == ["acme", "fresh", "pantri"]
+
+    def test_two_clones_of_a_new_repository_are_offered_once(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
+        home = self._home(tmp_path, monkeypatch, "Developer/new-old", "Developer/new")
+        for name in ("new", "new-old"):
+            self._origin(home / "Developer" / name, "https://github.com/o/new.git")
+        names = [r["name"] for r in watch_relay.known_projects(projects_dir=self._projects(tmp_path))]
+        assert names.count("new") + names.count("new-old") == 1
+        assert "new" in names, "the newer clone is the one offered"
+
+    def test_the_merged_list_keeps_its_limit(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
+        self._home(tmp_path, monkeypatch, *("Developer/r%02d" % i for i in range(30)))
+        rows = watch_relay.known_projects(projects_dir=self._projects(tmp_path), limit=25)
+        assert len(rows) == 25
+        assert rows == sorted(rows, key=lambda r: r["minutes_ago"])
 
     def test_with_no_repositories_the_code_folders_themselves_are_offered(
             self, tmp_path, monkeypatch):
@@ -19855,12 +19899,19 @@ def _write_pin(pin):
 _REAL_MAC_SUPPORTED = bridge_install.mac_supported
 
 
-def _make_app(path, version):
+def _make_app(path, version, item_label=None):
+    """A bridge bundle as the installer reads it; ``item_label`` seals a
+    login item under that label, as bridges from 1.1.0 carry."""
     import plistlib
     contents = os.path.join(path, "Contents")
     os.makedirs(os.path.join(contents, "MacOS"), exist_ok=True)
     with open(os.path.join(contents, "Info.plist"), "wb") as handle:
         plistlib.dump({"CFBundleShortVersionString": version}, handle)
+    if item_label:
+        agents = os.path.join(contents, "Library", "LaunchAgents")
+        os.makedirs(agents, exist_ok=True)
+        with open(os.path.join(agents, bridge_install.LABEL + ".plist"), "wb") as handle:
+            plistlib.dump({"Label": item_label}, handle)
 
 
 class _FakeMac:
@@ -19878,37 +19929,43 @@ class _FakeMac:
         # A bridge from 1.1.0 registering its own login item: which bundles
         # are registered, what macOS says (the user may have switched it
         # off), and whether macOS takes a registration at all.
-        self.registered, self.switched_off, self.refuses = set(), False, False
+        # Registered login items by label, as macOS keeps them: label -> bundle.
+        self.registered, self.switched_off, self.refuses = {}, False, False
         self.login_calls = []
         # macOS's quirk (2026-10-24): with an old job file of the same label
         # booted out and deleted, the status still reads "enabled" though
         # launchd holds no job. A Mac moving from 1.0.3 starts this way.
         self.stale_enabled = False
+        # The label the next unpacked bridge seals its login item under.
+        self.item_label = None
 
     def _login_item(self, command):
         app = command[0].split("/Contents/MacOS/")[0]
         action = command[1]
         self.login_calls.append((os.path.basename(app), action))
         if action == "--register" and not self.refuses:
-            self.registered.add(app)
+            self.registered[bridge_install.item_label(app)] = app
         elif action == "--unregister":
-            self.registered.discard(app)
+            self.registered.pop(bridge_install.item_label(app), None)
             self.stale_enabled = False
-        if app not in self.registered:
+        if bridge_install.item_label(app) not in self.registered:
             return 0, "enabled" if self.stale_enabled else "not-registered"
         return 0, "requires-approval" if self.switched_off else "enabled"
 
-    def _launchctl_print(self):
-        if self.registered and not self.switched_off:
+    def _launchctl_print(self, command):
+        label = command[2].rsplit("/", 1)[-1]
+        held = set(self.registered)
+        if label in held and not self.switched_off:
             return 0, "\tmanaged_by = com.apple.xpc.ServiceManagement\n"
-        return 113, 'Could not find service "com.tapproval.bridge"'
+        return 113, 'Could not find service "%s"' % label
 
     def __call__(self, command, timeout=60):
         self.ran.append(command[0])
         if "/Contents/MacOS/" in command[0]:
             return self._login_item(command)
         if command[0] == "ditto":
-            _make_app(os.path.join(command[-1], bridge_install.APP_NAME), self.version)
+            _make_app(os.path.join(command[-1], bridge_install.APP_NAME), self.version,
+                      self.item_label)
             return 0, ""
         if command[:2] == ["codesign", "--verify"]:
             if self.verify:
@@ -19922,7 +19979,7 @@ class _FakeMac:
         if command[0] == "spctl":
             return self.gatekeeper
         if command[:2] == ["launchctl", "print"]:
-            return self._launchctl_print()     # reads only
+            return self._launchctl_print(command)     # reads only
         if command[0] == "launchctl":
             raise AssertionError("launchd must not be touched with the agent path overridden")
         raise AssertionError("unexpected command %r" % (command,))
@@ -20219,7 +20276,7 @@ class TestTheHelperInstallsTheMacBridge:
         the signing certificate, the owner's legal name (2026-10-24)."""
         self._job_file()
         assert self._install_v("1.1.0") == "1.1.0"
-        assert bridge_install.app_path() in self.mac.registered
+        assert bridge_install.app_path() in self.mac.registered.values()
         assert ("Tapproval.app", "--register") in self.mac.login_calls
         assert not os.path.exists(bridge_install.agent_path())
 
@@ -20235,11 +20292,46 @@ class TestTheHelperInstallsTheMacBridge:
         assert ("Tapproval.app", "--register") in self.mac.login_calls
         assert bridge_install.job_registered()
 
+    def test_a_bridge_on_the_old_label_moves_to_the_new_one(self):
+        """1.1.0 sealed its item under the old job's label, which macOS could
+        not start wherever it remembered the old job (2026-10-25). 1.1.1 has
+        its own: only the old bridge can take its item away, before the swap."""
+        self.mac.item_label = bridge_install.LABEL
+        self._install_v("1.1.0")
+        assert bridge_install.item_label(bridge_install.app_path()) == bridge_install.LABEL
+        self.mac.item_label = bridge_install.ITEM_LABEL
+        self.mac.login_calls.clear()
+        assert self._install_v("1.1.1") == "1.1.1"
+        calls = self.mac.login_calls
+        assert ("Tapproval.app", "--unregister") in calls
+        assert calls.index(("Tapproval.app", "--unregister")) < calls.index(("Tapproval.app", "--register"))
+        assert set(self.mac.registered) == {bridge_install.ITEM_LABEL}
+        assert bridge_install.job_registered()
+
+    def test_a_failed_move_off_the_old_label_leaves_one_item(self):
+        self.mac.item_label = bridge_install.LABEL
+        self._install_v("1.1.0")
+        self.mac.item_label = bridge_install.ITEM_LABEL
+        with pytest.raises(bridge_install.InstallError):
+            self._install_v("1.1.1", wait_for_bridge=lambda: False)
+        assert bridge_install.installed_version() == "1.1.0"
+        assert set(self.mac.registered) == {bridge_install.LABEL}
+
+    def test_the_sealed_label_is_read_from_each_bridge(self, tmp_path):
+        old, new, none = tmp_path / "old.app", tmp_path / "new.app", tmp_path / "none.app"
+        _make_app(str(old), "1.1.0", bridge_install.LABEL)
+        _make_app(str(new), "1.1.1", bridge_install.ITEM_LABEL)
+        _make_app(str(none), "1.1.1")
+        assert bridge_install.item_label(str(old)) == "com.tapproval.bridge"
+        assert bridge_install.item_label(str(new)) == "com.tapproval.bridge.login"
+        assert bridge_install.item_label(str(none)) == bridge_install.ITEM_LABEL
+
     def test_an_update_leaves_the_registered_job_running(self, monkeypatch):
         """Same label: booting out "the old job" on an update stopped the
         bridge's own login item, and the update registered it again."""
         stopped = []
         monkeypatch.setattr(bridge_install, "unload_agent", lambda: stopped.append(1))
+        self.mac.item_label = bridge_install.LABEL   # 1.1.0's: the old job's label
         self._job_file()
         self._install_v("1.1.0")
         assert stopped, "the old job file's job is stopped on the move"
@@ -20295,7 +20387,7 @@ class TestTheHelperInstallsTheMacBridge:
         assert "previous one is back" in str(refused.value)
         assert bridge_install.installed_version(old) == "1.0.3"
         assert not os.path.exists(bridge_install.app_path())
-        assert self.mac.registered == set(), "no login item left pointing at nothing"
+        assert self.mac.registered == {}, "no login item left pointing at nothing"
         with open(bridge_install.agent_path(), "rb") as handle:
             job = pl.load(handle)
         assert job["ProgramArguments"] == [os.path.join(old, "Contents", "MacOS", "TapprovalBridge")]
@@ -20329,7 +20421,7 @@ class TestTheHelperInstallsTheMacBridge:
         self._install_v("1.1.0")
         Path(bridge_install.relay_start_path()).write_text("{}")
         assert bridge_install.remove()
-        assert self.mac.registered == set()
+        assert self.mac.registered == {}
         assert not os.path.exists(bridge_install.app_path())
         assert not os.path.exists(bridge_install.relay_start_path())
 
@@ -20438,7 +20530,8 @@ class TestTheHelperInstallsTheMacBridge:
             pytest.skip("the bridge's source lives in the product repo")
         with open(path, "rb") as handle:
             job = pl.load(handle)
-        assert job["Label"] == bridge_install.LABEL
+        assert job["Label"] == bridge_install.ITEM_LABEL != bridge_install.LABEL, \
+            "its own label: under the old job's, macOS could not start it"
         assert job["BundleProgram"] == "Contents/MacOS/Tapproval"
         assert job["ProgramArguments"][1:] == ["--agent"]
         assert job["RunAtLoad"] and job["KeepAlive"]
@@ -22260,3 +22353,70 @@ class TestWordsMeanTheSameForEveryTool:
                 effect = meaning[0] if isinstance(meaning, tuple) else meaning
                 shared = crc.EFFECT_WORDS.get(word)
                 assert shared is None or effect >= shared, (tool, word)
+
+
+@pytest.mark.private_layout
+class TestTheLoginItemCheckLeavesNothing:
+    """e2e_login_item.py registers login items on a real Mac. macOS keeps a
+    row for every identity it ever sees and offers no way to delete one, only
+    `sfltool resetbtm`, which wipes every app's approvals and needs a restart;
+    the owner was asked for that five times on 2026-10-24. So the check runs
+    under one fixed stand-in identity, sweeps its own leftovers before and
+    after every run, and cleans up on every exit path."""
+
+    def _mod(self):
+        # By name: the public helper layout has no e2e_login_item.py at the
+        # root, and TestStandardLibraryOnly reads every import statement.
+        return importlib.import_module("e2e_login_item")
+
+    def test_one_fixed_identity_never_the_real_one(self):
+        e2e = self._mod()
+        assert e2e.IDENT == "app.tapproval.e2e"
+        assert e2e.NOJOB_IDENT == "app.tapproval.e2e-nojob"
+        assert "secrets" not in open(e2e.__file__).read(), "a random identity adds a row per run"
+
+    def test_stale_leftovers_are_found_and_swept_and_nothing_else(self, tmp_path):
+        e2e = self._mod()
+        agents = tmp_path / "LaunchAgents"
+        agents.mkdir()
+        (agents / "app.tapproval.e2e.plist").write_text("x")
+        (agents / "app.tapproval.e2e-nojob.plist").write_text("x")
+        (agents / "app.tapproval.e2e-a82f083c.plist").write_text("x")   # a 2026-10-25 leftover
+        (agents / "com.tapproval.desk.plist").write_text("live")
+        home = tmp_path / "e2e-login-item"
+        (home / "d290f67c" / "main").mkdir(parents=True)
+        (home / "lock").write_text("1")
+        loaded = ("PID\tStatus\tLabel\n-\t0\tcom.tapproval.desk\n"
+                  "-\t0\tapp.tapproval.e2e-a82f083c\n123\t0\tapp.tapproval.e2e.login\n")
+        ran = []
+
+        def fake_run(command, **kw):
+            ran.append(command)
+            class Done:
+                returncode = 0
+                stderr = ""
+                stdout = loaded if command[:2] == ["launchctl", "list"] else ""
+            return Done()
+
+        found = e2e.stale_leftovers(str(agents), str(home), run=fake_run)
+        assert sorted(os.path.basename(p) for p in found["plists"]) == [
+            "app.tapproval.e2e-a82f083c.plist", "app.tapproval.e2e-nojob.plist", "app.tapproval.e2e.plist"]
+        assert sorted(found["labels"]) == ["app.tapproval.e2e-a82f083c", "app.tapproval.e2e.login"]
+        assert [os.path.basename(f) for f in found["folders"]] == ["d290f67c"]
+
+        e2e.sweep(found, run=fake_run)
+        assert sorted(p.name for p in agents.iterdir()) == ["com.tapproval.desk.plist"]
+        assert sorted(p.name for p in home.iterdir()) == ["lock"], "another run's lock is not ours"
+        booted = [c[2] for c in ran if c[:2] == ["launchctl", "bootout"]]
+        assert sorted(booted) == ["gui/%d/app.tapproval.e2e-a82f083c" % os.getuid(),
+                                  "gui/%d/app.tapproval.e2e.login" % os.getuid()]
+        assert not [c for c in ran if "sfltool" in c], "the sweep never resets anything"
+
+    def test_the_check_cleans_up_on_every_exit_path(self):
+        src = open(self._mod().__file__).read()
+        main = src[src.index("def main("):]
+        assert "finally:" in main and "clean_up(" in main.split("finally:", 1)[1], \
+            "clean_up must run from finally, not only on the happy path"
+        assert "signal.SIGTERM" in src and "signal.signal(" in src, \
+            "a killed run must still reach finally"
+        assert "resetbtm" not in main, "the check never proposes the reset"

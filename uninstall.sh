@@ -54,6 +54,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
     "$BRIDGE_APP/Contents/MacOS/Tapproval" --unregister >/dev/null 2>&1 || true
   fi
   launchctl bootout "gui/$(id -u)/com.tapproval.bridge" 2>/dev/null || true
+  launchctl bootout "gui/$(id -u)/com.tapproval.bridge.login" 2>/dev/null || true
   rm -f "$HOME/Library/LaunchAgents/com.tapproval.bridge.plist"
   # The relay's login wake-up too: only --uninstall removed it, and that
   # removes nothing on a plugin install or when it fails, leaving a job

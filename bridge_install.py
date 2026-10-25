@@ -33,6 +33,13 @@ import tempfile
 import time
 
 LABEL = "com.tapproval.bridge"
+# The login item's own label, from bridge 1.1.1. Under the old job file's
+# label (1.1.0) macOS registered it and then could not start it — "spawn
+# failed", exit 78 — wherever it still held its record of the old job,
+# which is every Mac that ran a bridge before 1.1.0 (e2e_login_item.py,
+# 2026-10-25). Each bridge's sealed job file says its own label; this is
+# the one a bridge with none readable is taken to have.
+ITEM_LABEL = "com.tapproval.bridge.login"
 APP_NAME = "Tapproval.app"
 # What bridges before 1.1.0 were called. They were started by a job file in
 # ~/Library/LaunchAgents, and macOS files such a job under the name on the
@@ -391,12 +398,25 @@ def _drop_agent_file():
     Only that job: the bridge's own login item has the same label, and
     booting it out on every update threw the registration away and made
     the update register again (seen on a stand-in, 2026-10-24)."""
-    if os.path.exists(agent_path()) or not job_registered():
+    if os.path.exists(agent_path()) or not _job_is_items(LABEL):
         unload_agent()
     try:
         os.remove(agent_path())
     except FileNotFoundError:
         pass
+
+
+def item_label(app):
+    """The label a self-registering bridge's sealed job file gives its login
+    item: com.tapproval.bridge for 1.1.0, its own from 1.1.1."""
+    sealed = os.path.join(app, "Contents", "Library", "LaunchAgents", LABEL + ".plist")
+    try:
+        with open(sealed, "rb") as handle:
+            label = plistlib.load(handle).get("Label")
+    except Exception:
+        label = None
+    return label if isinstance(label, str) and re.fullmatch(r"[A-Za-z0-9.\-]+", label) \
+        else ITEM_LABEL
 
 
 def start(app):
@@ -422,29 +442,38 @@ def start(app):
     word = login_item("login-status", app)
     if word == "requires-approval":
         return True
-    if word == "enabled" and job_registered():
+    if word == "enabled" and job_registered(app):
         if agent_is_real():
             # The bundle was swapped under the running bridge: run the new one.
             RUN(["launchctl", "kickstart", "-k",
-                 "gui/%d/%s" % (os.getuid(), LABEL)], timeout=10)
+                 "gui/%d/%s" % (os.getuid(), item_label(app))], timeout=10)
         return True
     word = login_item("register", app)
-    return word == "requires-approval" or (word == "enabled" and job_registered())
+    return word == "requires-approval" or (word == "enabled" and job_registered(app))
 
 
-def job_registered():
-    """Does launchd hold the bridge's label as a job the bridge registered
-    itself (not a job file's)? Read only, so it is asked even in the suite."""
-    status, out = RUN(["launchctl", "print", "gui/%d/%s" % (os.getuid(), LABEL)],
+def job_registered(app=None):
+    """Does launchd hold this bridge's login item as a job the bridge
+    registered itself (not a job file's)? Read only, so it is asked even in
+    the suite."""
+    return _job_is_items(item_label(app or current_app()))
+
+
+def _job_is_items(label):
+    status, out = RUN(["launchctl", "print", "gui/%d/%s" % (os.getuid(), label)],
                       timeout=10)
     return status == 0 and "managed_by = com.apple.xpc.ServiceManagement" in (out or "")
 
 
-def stop(app):
+def stop(app, replacement=None):
     """Before a swap: stop a bridge that runs from a job file. One that
-    registered itself keeps its login item and is restarted by start()."""
+    registered itself keeps its login item and is restarted by start() —
+    unless the bridge replacing it seals its item under another label (1.1.0
+    to 1.1.1): then only the old bridge can take its own away."""
     if not registers_itself(app):
         unload_agent()
+    elif replacement is not None and item_label(app) != item_label(replacement):
+        login_item("unregister", app)
 
 
 def install(pin, wait_for_bridge=None):
@@ -486,7 +515,7 @@ def _install(pin, wait_for_bridge, home):
         previous = app + ".previous"
         had_previous = os.path.isdir(was)
         if had_previous:
-            stop(was)
+            stop(was, replacement=new)
             shutil.rmtree(previous, ignore_errors=True)
             shutil.rmtree(old_app_path() + ".previous", ignore_errors=True)
             try:
@@ -530,9 +559,10 @@ def _roll_back(app, previous, had_previous, was):
     none): the caller is already raising, and a second error thrown from
     here would hide the first."""
     if os.path.isdir(app) and registers_itself(app) and (
-            not had_previous or not registers_itself(previous)):
-        # Its login item would point at nothing, or outrank the job file
-        # the older bridge goes back to.
+            not had_previous or not registers_itself(previous)
+            or item_label(previous) != item_label(app)):
+        # Its login item would point at nothing, outrank the job file the
+        # older bridge goes back to, or sit beside that bridge's own item.
         login_item("unregister", app)
     unload_agent()
     shutil.rmtree(app, ignore_errors=True)

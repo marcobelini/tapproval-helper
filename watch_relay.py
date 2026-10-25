@@ -2466,7 +2466,7 @@ def _is_repository(path):
     return os.path.isdir(marker) or os.path.isfile(marker)
 
 
-def first_projects(limit=25, home=None):
+def first_projects(limit=25, home=None, repositories_only=False):
     """What *New session* offers on a Mac whose transcripts offer nothing:
     the repositories in the person's code folders (`CODE_ROOTS`), newest
     first; failing those, the code folders that exist; failing those, the
@@ -2476,7 +2476,9 @@ def first_projects(limit=25, home=None):
 
     Each row carries ``first: True`` so a watch can one day say where the
     list came from. Nothing under a scratch root, and nothing a symlink
-    carries outside the home folder. Never raises.
+    carries outside the home folder. ``repositories_only`` returns the
+    repositories alone, or nothing: what `known_projects` adds to a list
+    the transcripts already gave. Never raises.
     """
     now = time.time()
     home = os.path.realpath(home or FIRST_SESSION_HOME or os.path.expanduser("~"))
@@ -2523,6 +2525,9 @@ def first_projects(limit=25, home=None):
             if (not name.startswith(".") and os.path.isdir(path)
                     and inside_home(path) and _is_repository(path) and fresh(path)):
                 repos.append(row(path))
+    if repositories_only:
+        repos.sort(key=lambda r: r["minutes_ago"])
+        return repos[:limit]
     rows = repos or [row(r) for r in roots]
     if not rows:
         home_row = row(home)
@@ -2580,7 +2585,49 @@ def known_projects(projects_dir=None, limit=25):
     # A Mac that has never run Claude Code where a person sits (a fresh
     # install, or only unattended loops so far) has nothing to offer from
     # its transcripts — and the first session has to start somewhere.
-    return rows or first_projects(limit)
+    if not rows:
+        return first_projects(limit)
+    # Nor has a repository made since: the transcripts know only where
+    # Claude Code already ran, and a new repository was missing from the
+    # picker it was made to be started from (the owner, 2026-10-25). So
+    # the code folders' repositories join the list — but not a worktree
+    # (a `.git` file), which is its repository's, nor a second copy of a
+    # repository already offered: on this Mac most of ~/Developer is
+    # spare clones, and they would bury the list as worktrees once did.
+    listed = {os.path.realpath(r["path"]) for r in rows}
+    remotes = {_origin(r["path"]) for r in rows} - {None}
+    for found in first_projects(limit, repositories_only=True):
+        path = found["path"]
+        if os.path.realpath(path) in listed or not os.path.isdir(os.path.join(path, ".git")):
+            continue
+        remote = _origin(path)
+        if remote in remotes:
+            continue
+        if remote:
+            remotes.add(remote)
+        rows.append(found)
+    rows.sort(key=lambda r: r["minutes_ago"])
+    return rows[:limit]
+
+
+def _origin(path):
+    """A repository's `origin`, as "host/owner/name" in lower case, so two
+    clones of one repository compare equal whichever way they were cloned
+    (https or ssh, with `.git` or without). None when there is none, or
+    the config cannot be read. Never raises."""
+    try:
+        with open(os.path.join(path, ".git", "config"), encoding="utf-8",
+                  errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    section = re.search(r'^\s*\[remote "origin"\](.*?)(?=^\s*\[|\Z)', text, re.M | re.S)
+    url = section and re.search(r"^\s*url\s*=\s*(\S+)", section.group(1), re.M)
+    if not url:
+        return None
+    where = re.sub(r"^[a-z+]+://", "", url.group(1).lower())
+    where = re.sub(r"^[^@/]*@", "", where).replace(":", "/", 1)
+    return re.sub(r"(\.git)?/*$", "", where) or None
 
 
 def start_session(path, text, projects_dir=None, platform=None):

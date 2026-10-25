@@ -4,11 +4,13 @@
      Contents/Library/LaunchAgents and registered by the bridge itself
      (main.swift, - -register), so Login Items lists it as "Tapproval".
      AbandonProcessGroup: the relay the bridge wakes must outlive a bridge
-     restart, an update included. -->
+     restart, an update included. Its label is its own (1.1.1): under the
+     old job file's label macOS registered it and could not start it,
+     "spawn failed", wherever it still remembered the old job. -->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.tapproval.bridge</string>
+	<string>com.tapproval.bridge.login</string>
 	<key>BundleProgram</key>
 	<string>Contents/MacOS/Tapproval</string>
 	<key>ProgramArguments</key>
