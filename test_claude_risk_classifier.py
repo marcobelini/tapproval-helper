@@ -4205,6 +4205,34 @@ class TestTheBridgeSigns:
         assert "v2: true" in signed and "v2: false" not in signed
 
 
+@pytest.mark.private_layout
+class TestOurDoubleTapStaysInsideASession:
+    """Our own double tap (DoubleTapScrollsDown) is for inside a session:
+    the thread, a card, the reply and End-session sheets, where a pinch at
+    the end must stay put. Everywhere else is watchOS's own, which goes
+    round to the top and never darkened the screen the way ours does (the
+    owner's wrist, build 186, 2026-10-25). A new screen outside a session
+    that copies the modifier brings the dim back."""
+
+    INSIDE = {"SessionDetail.swift", "Cards.swift"}
+
+    def test_only_screens_inside_a_session_take_the_double_tap(self):
+        folder = os.path.join(_ROOT, "WatchApp", "Tapproval")
+        if not os.path.isdir(folder):
+            pytest.skip("no watch app in this layout")
+        using = set()
+        for name in os.listdir(folder):
+            if not name.endswith(".swift"):
+                continue
+            with open(os.path.join(folder, name), encoding="utf-8") as handle:
+                source = handle.read()
+            if (".modifier(DoubleTapScrollsDown(" in source
+                    or ".doubleTapStop()" in source
+                    or ".doubleTapContent()" in source):
+                using.add(name)
+        assert using == self.INSIDE
+
+
 def _signing_vectors():
     path = os.path.join(_ROOT, "WatchApp", "Shared", "signing-vectors.json")
     if not os.path.isfile(path):
@@ -8810,6 +8838,101 @@ class TestWorkflowsAreTasks:
         assert running == 0
 
 
+class TestClaudeCodeSaysWhetherATurnIsRunning:
+    """Claude Code writes each session's turn into its registry file:
+    "busy" from a prompt until the turn ends, "idle" after. The helper
+    guessed from 20 seconds of transcript silence instead, and nothing is
+    written while the model thinks: on 2026-10-25 a session thinking for
+    91 seconds read IDLE on the owner's wrist, and a turn that had ended
+    with a tool call never answered read WORKING. The registry's word
+    wins where it says one; without it, the old rule stands."""
+
+    @pytest.mark.parametrize("args,expected", [
+        # Thinking, nothing written for 90 s: still the turn.
+        (dict(active=90, turn="busy"), ("running", "turn")),
+        (dict(active=90, tool="Bash", turn="busy"), ("running", "tool")),
+        (dict(active=90, tool="Bash", at_mac=True, turn="busy"), ("asking", "terminal")),
+        # The turn is over: a tool call never answered is a leftover, and
+        # the lines Claude Code adds after the turn are not Claude writing.
+        (dict(active=300, tool="Bash", turn="idle"), ("idle", "")),
+        (dict(active=3, turn="idle"), ("idle", "")),
+        # What outlives a turn still counts.
+        (dict(active=300, tasks=2, turn="idle"), ("running", "tasks")),
+        (dict(active=300, card=True, turn="idle"), ("asking", "card")),
+        # No word from the registry: the old rule.
+        (dict(active=90), ("idle", "")),
+        (dict(active=3), ("running", "writing")),
+    ])
+    def test_the_rule(self, args, expected):
+        import watch_dashboard as wd
+        assert wd.session_state(
+            active_seconds_ago=args.get("active"), running_tool=args.get("tool"),
+            running_tasks=args.get("tasks", 0), card_waiting=args.get("card", False),
+            waiting_at_mac=args.get("at_mac", False), turn=args.get("turn")) == expected
+
+    @staticmethod
+    def _registry(tmp_path, monkeypatch, status):
+        import watch_dashboard as wd
+        sessions = tmp_path / "sessions"
+        sessions.mkdir(exist_ok=True)
+        entry = {"pid": os.getpid(), "sessionId": "cccc3333-full", "entrypoint": "cli"}
+        if status is not None:
+            entry["status"] = status
+        (sessions / "1.json").write_text(json.dumps(entry), encoding="utf-8")
+        monkeypatch.setattr(wd, "CLAUDE_SESSIONS", str(sessions))
+        return str(sessions)
+
+    @pytest.mark.parametrize("status,turn", [
+        ("busy", "busy"), ("shell", "busy"), ("idle", "idle"),
+        # Waiting for the person is told apart by the audit log, as before.
+        ("waiting", None), ("something-new", None), (None, None), (3, None),
+    ])
+    def test_the_registry_status_is_read_as_a_turn(self, tmp_path, monkeypatch, status, turn):
+        import watch_dashboard as wd
+        root = self._registry(tmp_path, monkeypatch, status)
+        assert wd.session_registry(sessions_dir=root)["cccc3333-full"]["turn"] == turn
+        # The thread asks by the short id the list sends.
+        assert wd.registry_turn("cccc3333") == turn
+        assert wd.registry_turn("") is None
+        assert wd.registry_turn("dddd") is None
+
+    def _quiet_session(self, tmp_path, monkeypatch, status):
+        import watch_dashboard as wd
+        self._registry(tmp_path, monkeypatch, status)
+        monkeypatch.setattr(wd, "live_sessions", lambda: {"cccc3333-full": "Terminal"})
+        monkeypatch.setattr(wd, "_task_output_files", lambda *a, **k: {})
+        proj = tmp_path / "projects" / "-Users-x-Developer-Acme"
+        proj.mkdir(parents=True)
+        path = proj / "cccc3333-full.jsonl"
+        path.write_text("".join(json.dumps(line) + "\n" for line in [
+            {"cwd": "/x", "message": {"role": "user", "content": "Think hard"}}]))
+        past = time.time() - 90
+        os.utime(path, (past, past))
+        wd._THREAD_STATE.clear()
+        return str(tmp_path / "projects")
+
+    def test_a_session_thinking_quietly_is_working_on_the_list(self, tmp_path, monkeypatch):
+        import watch_dashboard as wd
+        projects = self._quiet_session(tmp_path, monkeypatch, "busy")
+        row = wd.recent_sessions(projects_dir=projects)[0]
+        assert (row["state"], row["state_reason"]) == ("running", "turn")
+
+    def test_without_the_registrys_word_the_list_keeps_the_old_rule(self, tmp_path, monkeypatch):
+        import watch_dashboard as wd
+        projects = self._quiet_session(tmp_path, monkeypatch, None)
+        row = wd.recent_sessions(projects_dir=projects)[0]
+        assert (row["state"], row["state_reason"]) == ("idle", "")
+
+    def test_the_thread_reads_the_same_turn(self):
+        """The thread's header shows the list's state; both must ask the
+        registry, or a session reads WORKING on one screen and IDLE on
+        the next."""
+        source = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "watch_relay.py"), encoding="utf-8").read()
+        call = source[source.index("state, reason = session_state("):]
+        assert "turn=registry_turn(session_id)" in call[:400]
+
+
 class TestAScheduledSessionSaysWhenItComesBack:
     """A session that set a wake-up (a /loop, a check for later) is not
     idle: something will happen without anyone. ScheduleWakeup's result
@@ -11677,8 +11800,12 @@ class TestWhatWeKnowAboutTheTranscript:
         # Code, not the comments that tell the story of each string.
         outside = "\n".join(line for line in outside.splitlines()
                              if not line.lstrip().startswith("#"))
+        # The helper's own words to the watch that an upstream string
+        # happens to share: the session list's "status" (where a session
+        # is driven from) is ours, the registry's is Claude Code's.
+        ours = {"status"}
         for name, (text, _, _) in watch_dashboard.UPSTREAM_SHAPES.items():
-            if len(text) < 6 or text.startswith("<"):
+            if len(text) < 6 or text.startswith("<") or text in ours:
                 continue                 # too short to mean anything bare
             assert '"%s"' % text not in outside, (name, text)
         named = {text for text, _, _ in watch_dashboard.UPSTREAM_SHAPES.values()}
@@ -22504,3 +22631,16 @@ class TestTheLoginItemCheckLeavesNothing:
         assert "signal.SIGTERM" in src and "signal.signal(" in src, \
             "a killed run must still reach finally"
         assert "resetbtm" not in main, "the check never proposes the reset"
+
+    def test_the_check_asks_the_owner_for_nothing_and_plants_nothing_in_his_name(self):
+        """`sfltool dumpbtm` asked the owner for an administrator password on
+        every call, and an old job running the team-signed stand-in was filed
+        in Login Items under the certificate's name, his own (2026-10-25)."""
+        import ast
+        src = open(self._mod().__file__).read()
+        strings = {n.value for n in ast.walk(ast.parse(src))
+                   if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        assert "sfltool" not in strings, "no sfltool call: it asks for a password"
+        move = src[src.index("def move_from_job_file("):src.index("def update_in_place(")]
+        assert '"ProgramArguments": ["/usr/bin/true"]' in move
+        assert "executable(app)" not in move, "the planted job runs no team-signed program"

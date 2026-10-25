@@ -343,8 +343,34 @@ def session_registry(sessions_dir=None):
             "pid": int(pid),
             "started_at": _started_seconds(data.get(shape("registry.started_at"))),
             "socket": str(data.get(shape("registry.messaging_socket")) or ""),
+            "turn": _registry_turn(data),
         }
     return registry
+
+
+def _registry_turn(data):
+    """Claude Code's own word on whether a turn is running: "busy" or
+    "idle", or None where it says nothing this helper reads. "shell" (a
+    command the person runs in the session) is busy; "waiting" (for the
+    person) is left to the audit log, which can tell a prompt at the Mac
+    from a card."""
+    status = data.get(shape("registry.status"))
+    if status in (shape("registry.status_busy"), shape("registry.status_shell")):
+        return "busy"
+    if status == shape("registry.status_idle"):
+        return "idle"
+    return None
+
+
+def registry_turn(session_id, sessions_dir=None):
+    """_registry_turn for a session the watch names by its short id, or
+    None. Never raises."""
+    if not session_id:
+        return None
+    for full, entry in session_registry(sessions_dir).items():
+        if full.startswith(session_id):
+            return entry.get("turn")
+    return None
 
 
 def _started_seconds(value):
@@ -615,6 +641,18 @@ UPSTREAM_SHAPES = {
         ("startedAt", "When the registry says a session's process started, "
          "in milliseconds: a task output file born after it belongs to the "
          "live process, which writes the exit marker itself.", "2026-10-14"),
+    "registry.status":
+        ("status", "The session registry's word on the turn, rewritten as "
+         "it changes: busy from a prompt until the turn ends, idle after, "
+         "also waiting and shell (Claude Code 2.1.308). The transcript says "
+         "nothing while the model thinks.", "2026-10-25"),
+    "registry.status_busy":
+        ("busy", "A turn is running, thinking included.", "2026-10-25"),
+    "registry.status_idle":
+        ("idle", "The turn is over: a tool call it left unanswered is a "
+         "leftover, not work.", "2026-10-25"),
+    "registry.status_shell":
+        ("shell", "A command the person runs in the session.", "2026-10-25"),
     "registry.name_source":
         ("nameSource", "How the registry says a session's name came about.",
          "2026-09-03"),
@@ -2209,7 +2247,7 @@ STATE_TOOL_SECONDS = 1800
 
 
 def session_state(active_seconds_ago, running_tool, running_tasks,
-                  card_waiting, waiting_at_mac, wake_at=None):
+                  card_waiting, waiting_at_mac, wake_at=None, turn=None):
     """The one state a session is in, and why: ``(state, reason)``.
 
     ``running`` — Claude writing (``writing``), a tool call in flight
@@ -2224,17 +2262,29 @@ def session_state(active_seconds_ago, running_tool, running_tasks,
     20 seconds of transcript silence: a session with background tasks
     still running read as idle, and so did a prompt that went to the
     terminal (2026-10-01).
+
+    ``turn`` is Claude Code's own word from the registry ("busy", "idle"
+    or None). Where it says one, it decides whether a turn is running:
+    nothing is written while the model thinks, so a 91-second think read
+    idle, and a turn that ended on an unanswered tool call read running
+    (2026-10-25). Background tasks and wake-ups outlive a turn and are
+    still read from the transcript.
     """
     if card_waiting:
         return "asking", "card"
     quiet = active_seconds_ago if active_seconds_ago is not None else float("inf")
-    tool_live = bool(running_tool) and quiet <= STATE_TOOL_SECONDS
+    tool_live = bool(running_tool) and (
+        turn == "busy" if turn else quiet <= STATE_TOOL_SECONDS)
+    if turn == "idle":
+        quiet = float("inf")
     if tool_live and waiting_at_mac:
         return "asking", "terminal"
     if quiet < STATE_WRITING_SECONDS:
         return "running", "writing"
     if tool_live:
         return "running", "tool"
+    if turn == "busy":
+        return "running", "turn"
     if running_tasks:
         return "running", "tasks"
     if wake_at and wake_at > time.time():
@@ -2357,7 +2407,7 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
             max(0, int(time.time() - mtime)), running_tool, running_tasks,
             card_waiting=session_id in waiting,
             waiting_at_mac=thread_tool_id(path) in at_mac,
-            wake_at=wake_at)
+            wake_at=wake_at, turn=registry.get(session_id, {}).get("turn"))
         repo = repo_slug(cwd)
         # The app's own title wins outright — a /rename, or the title the
         # desktop app gave it, which is what the phone shows too. Otherwise

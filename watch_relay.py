@@ -1590,7 +1590,7 @@ try:
         activity_summary, card_session_title, recap_summary, _find_transcript, image_bytes,
         inbox_ready,
         _message_of, _parse_thread, _read_appended,
-        project_root, prompts_at_the_mac, recent_sessions, resolve_session,
+        project_root, prompts_at_the_mac, recent_sessions, registry_turn, resolve_session,
         session_registry, session_state, shape, thread_after, thread_tool_id,
         thread_wake_at, transcript_origin, transcripts_newest_first,
         THREAD_TURN_LIMIT, usage_summary)
@@ -1613,6 +1613,9 @@ except Exception as _error:  # noqa: BLE001 — any import-time failure, not onl
 
     def session_registry(*_args, **_kwargs):
         return {}               # nobody live: the send guard can only ever ask
+
+    def registry_turn(*_args, **_kwargs):
+        return None             # no word from Claude Code: the old rule
 
     def inbox_ready(*_args, **_kwargs):
         return False            # the old route, which needs nothing from here
@@ -4127,7 +4130,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         state, reason = session_state(
             active, tool_now, running, card_waiting,
             bool(path_on_disk) and thread_tool_id(path_on_disk) in prompts_at_the_mac(),
-            wake_at=wake_at)
+            wake_at=wake_at, turn=registry_turn(session_id))
         reply = {"turns": turns,
                  "running_tasks": running,
                  "running_tool": tool_now,
