@@ -2630,6 +2630,81 @@ def _origin(path):
     return re.sub(r"(\.git)?/*$", "", where) or None
 
 
+# Claude Code's own config, where it records which folders a person has
+# trusted. Overridable, so no test — nor a relay a test starts — writes the
+# real one.
+CLAUDE_CONFIG = os.environ.get("TAPPROVAL_CLAUDE_CONFIG") or os.path.join(
+    os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~"), ".claude.json")
+
+# What the wrist reads when a session opened but waits on the Mac for its
+# folder to be trusted. A whole sentence, because a watch shows any status
+# it has no words of its own for as it stands.
+AWAITS_TRUST = "On your Mac, Claude asks once whether to trust this folder."
+
+
+def _trusts(projects, path):
+    """True if Claude Code's ``projects`` table trusts ``path`` or a folder
+    above it, as Claude Code itself decides."""
+    for folder in {path, os.path.realpath(path)}:
+        while True:
+            entry = projects.get(folder)
+            if isinstance(entry, dict) and entry.get("hasTrustDialogAccepted") is True:
+                return True
+            parent = os.path.dirname(folder)
+            if parent == folder:
+                break
+            folder = parent
+    return False
+
+
+def trust_folder(path, config=None):
+    """Make sure Claude Code will not stop a new session in ``path`` at its
+    "Do you trust the files in this folder?" question. True when it will
+    not; False when it will, and the wearer must answer it at the Mac.
+
+    A folder Claude Code has never opened asks first, before it writes a
+    transcript, so a session started there never reaches the watch's list:
+    on 2026-10-25 a repository made that afternoon, offered by the picker
+    since #942, spun on the wrist as "Check Marco's Mac" while two Terminal
+    windows sat on the question. The wearer chose the folder, from their
+    own code folders, on purpose — so the relay records the trust Claude
+    Code would have asked for (the owner, 2026-10-25), touching that one
+    key and nothing else in the file. Never raises.
+    """
+    config = config or CLAUDE_CONFIG
+    try:
+        with open(config, encoding="utf-8") as handle:
+            settings = json.load(handle)
+        projects = settings.setdefault("projects", {}) if isinstance(settings, dict) else None
+        if not isinstance(projects, dict):
+            raise ValueError("not Claude Code's config")
+        if _trusts(projects, path):
+            return True
+        entry = projects.setdefault(path, {})
+        if not isinstance(entry, dict):
+            raise ValueError("an entry that is not a table")
+        entry["hasTrustDialogAccepted"] = True
+        handle, temp = tempfile.mkstemp(prefix=".claude.json.", dir=os.path.dirname(config))
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as out:
+                json.dump(settings, out, indent=2, ensure_ascii=False)
+            os.chmod(temp, os.stat(config).st_mode & 0o777)
+            os.replace(temp, config)
+        except BaseException:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+            raise
+    except (OSError, ValueError) as error:
+        print("relay: new session: %s awaits trust (%s)"
+              % (os.path.basename(path.rstrip("/")), error), file=sys.stderr)
+        return False
+    print("relay: new session: trusted %s" % os.path.basename(path.rstrip("/")),
+          file=sys.stderr)
+    return True
+
+
 def start_session(path, text, projects_dir=None, platform=None):
     """Open a REAL Claude Code session on this Mac, in ``path``, with ``text``
     as its first message. Returns a short status; "started" on success.
@@ -2664,6 +2739,7 @@ def start_session(path, text, projects_dir=None, platform=None):
         return "claude not on PATH"
     if signed_in() is False:
         return "signed out"
+    started = "started" if trust_folder(path) else AWAITS_TRUST
     # shlex.quote stops the shell reading the text; "--" stops claude
     # reading it as a flag, which quoting alone does not.
     # The unset is for a Terminal that is already carrying some session's
@@ -2704,7 +2780,7 @@ def start_session(path, text, projects_dir=None, platform=None):
         opened = subprocess.run(["open", command_file], capture_output=True,
                                 text=True, timeout=8)
         if opened.returncode == 0:
-            return "started"
+            return started
         also = (opened.stderr or opened.stdout or "").strip().splitlines()
         not_opened = also[-1] if also else "no reason given"
     except (OSError, subprocess.SubprocessError) as error:
@@ -2715,7 +2791,7 @@ def start_session(path, text, projects_dir=None, platform=None):
              'end tell' % _applescript_literal(script))
     ok, why = _run_osascript(apple)
     if ok:
-        return "started"
+        return started
     return "could not open Terminal: %s (nor a .command file: %s)" % (
         why, not_opened)
 

@@ -168,6 +168,17 @@ def _no_real_release_check(monkeypatch):
     monkeypatch.setattr(watch_relay, "RELEASES_URL", "")
 
 
+@pytest.fixture(autouse=True)
+def _no_real_claude_config(tmp_path, monkeypatch):
+    """No test may write Claude Code's own config: starting a session in a
+    folder it has never trusted records the trust there (#942's gap).
+    Each test gets an empty one of its own."""
+    config = tmp_path / "claude.json"
+    config.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("TAPPROVAL_CLAUDE_CONFIG", str(config))
+    monkeypatch.setattr(watch_relay, "CLAUDE_CONFIG", str(config))
+
+
 # Every module-level cache or memo in the relay and the dashboard, found
 # by name, so a new one is covered the day it is added rather than the
 # day it leaks. Seven were never reset by any test until 2026-10-17
@@ -13218,6 +13229,69 @@ class TestNewSessionFromTheWatch:
                                          projects_dir=str(empty),
                                          platform="darwin") == "unknown project"
 
+    def test_a_new_repository_is_trusted_before_its_session_opens(self, tmp_path, monkeypatch):
+        """A folder Claude Code has never opened asks "Do you trust the
+        files in this folder?" before it writes a transcript, so the
+        session never reached the wrist's list (2026-10-25). The relay
+        records the trust first, and leaves every other key as it was."""
+        home = self._home(tmp_path, monkeypatch, "Developer/acme")
+        empty = tmp_path / "projects"
+        empty.mkdir()
+        config = tmp_path / "claude.json"
+        others = {"numStartups": 7, "projects": {"/elsewhere": {"allowedTools": ["Bash"]}},
+                  "oauthAccount": {"emailAddress": "someone@example.invalid"}}
+        config.write_text(json.dumps(others), encoding="utf-8")
+        config.chmod(0o600)
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
+        import subprocess as sp
+        def fake_run(cmd, **kw):
+            if cmd[0] == "open":
+                os.unlink(cmd[1])
+            return sp.CompletedProcess(cmd, 0, "", "")
+        monkeypatch.setattr(watch_relay.subprocess, "run", fake_run)
+        repo = str(home / "Developer" / "acme")
+        assert watch_relay.start_session(repo, "Begin", projects_dir=str(empty),
+                                         platform="darwin") == "started"
+        written = json.loads(config.read_text(encoding="utf-8"))
+        assert written["projects"][repo] == {"hasTrustDialogAccepted": True}
+        del written["projects"][repo]
+        assert written == others
+        assert oct(config.stat().st_mode & 0o777) == oct(0o600)
+
+    def test_a_folder_under_a_trusted_one_is_left_alone(self, tmp_path):
+        config = tmp_path / "claude.json"
+        before = json.dumps({"projects": {str(tmp_path): {"hasTrustDialogAccepted": True}}})
+        config.write_text(before, encoding="utf-8")
+        assert watch_relay.trust_folder(str(tmp_path / "Developer" / "acme"), str(config))
+        assert config.read_text(encoding="utf-8") == before
+
+    def test_an_already_trusted_folder_is_not_rewritten(self, tmp_path):
+        config = tmp_path / "claude.json"
+        before = json.dumps({"projects": {"/r": {"hasTrustDialogAccepted": True}}})
+        config.write_text(before, encoding="utf-8")
+        assert watch_relay.trust_folder("/r", str(config))
+        assert config.read_text(encoding="utf-8") == before
+
+    @pytest.mark.parametrize("content", [None, "{not json", "[]", '{"projects": []}'])
+    def test_a_config_it_cannot_read_is_never_written_and_the_wrist_is_told(
+            self, tmp_path, monkeypatch, content):
+        """Unreadable or unrecognised: touch nothing, open the session
+        anyway, and tell the wearer the question waits at the Mac rather
+        than let the row spin."""
+        config = tmp_path / "claude.json"
+        if content is None:
+            config.unlink()
+        else:
+            config.write_text(content, encoding="utf-8")
+        status, calls, _line, _lines = self._start(tmp_path, monkeypatch)
+        assert status == watch_relay.AWAITS_TRUST
+        assert "open" in calls, "the session still opens, waiting on the question"
+        if content is None:
+            assert not config.exists()
+        else:
+            assert config.read_text(encoding="utf-8") == content
+
     def test_refuses_anything_but_a_mac(self, tmp_path):
         assert watch_relay.start_session("/x", "go", platform="linux") == "new sessions need a Mac"
 
@@ -19910,7 +19984,7 @@ def _make_app(path, version, item_label=None):
     if item_label:
         agents = os.path.join(contents, "Library", "LaunchAgents")
         os.makedirs(agents, exist_ok=True)
-        with open(os.path.join(agents, bridge_install.LABEL + ".plist"), "wb") as handle:
+        with open(os.path.join(agents, bridge_install.SEALED_JOB), "wb") as handle:
             plistlib.dump({"Label": item_label}, handle)
 
 
@@ -20317,6 +20391,16 @@ class TestTheHelperInstallsTheMacBridge:
         assert bridge_install.installed_version() == "1.1.0"
         assert set(self.mac.registered) == {bridge_install.LABEL}
 
+    def test_the_sealed_label_does_not_follow_the_old_jobs_label(self, tmp_path, monkeypatch):
+        """e2e_login_item.py relabels the old job for its stand-in. The sealed
+        file was looked up as LABEL + ".plist", so the relabel sent the read to
+        a file that does not exist, and the fallback hid a bridge sealed under
+        the shared label (seen 2026-10-25)."""
+        shared = tmp_path / "shared.app"
+        _make_app(str(shared), "1.1.0", bridge_install.LABEL)
+        monkeypatch.setattr(bridge_install, "LABEL", "app.tapproval.e2e")
+        assert bridge_install.item_label(str(shared)) == "com.tapproval.bridge"
+
     def test_the_sealed_label_is_read_from_each_bridge(self, tmp_path):
         old, new, none = tmp_path / "old.app", tmp_path / "new.app", tmp_path / "none.app"
         _make_app(str(old), "1.1.0", bridge_install.LABEL)
@@ -20536,7 +20620,7 @@ class TestTheHelperInstallsTheMacBridge:
         assert job["ProgramArguments"][1:] == ["--agent"]
         assert job["RunAtLoad"] and job["KeepAlive"]
         assert job["AbandonProcessGroup"], "the relay it wakes outlives a bridge restart"
-        assert 'SMAppService.agent(plistName: "com.tapproval.bridge.plist")' in self._swift()
+        assert 'SMAppService.agent(plistName: "%s")' % bridge_install.SEALED_JOB in self._swift()
         project = os.path.join(_ROOT, "WatchApp", "Tapproval.xcodeproj", "project.pbxproj")
         with open(project, encoding="utf-8") as handle:
             text = handle.read()

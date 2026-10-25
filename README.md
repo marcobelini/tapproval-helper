@@ -77,7 +77,9 @@ your first Claude Code session brings Base back by itself.
 
 Then install **Tapproval** on your Apple Watch and open it once on the
 same Wi-Fi — it finds this computer by itself, pairs automatically, and
-quietly learns how to reach it when you're away from home.
+quietly learns how to reach it when you're away from home. Downloaded it
+on your iPhone and it isn't on the watch? Open the Watch app on the
+iPhone and tap **Install** next to Tapproval under **Available Apps**.
 
 **A buzz while Tapproval is closed needs a Mac.** watchOS pauses apps in
 the background, and a closed app wakes only for a notification from Apple.

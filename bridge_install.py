@@ -40,6 +40,11 @@ LABEL = "com.tapproval.bridge"
 # 2026-10-25). Each bridge's sealed job file says its own label; this is
 # the one a bridge with none readable is taken to have.
 ITEM_LABEL = "com.tapproval.bridge.login"
+# The sealed job file's name inside the app, whatever label it carries: the
+# name main.swift asks SMAppService for. Not LABEL + ".plist": a caller that
+# relabels the old job (e2e_login_item.py does) then read the wrong file and
+# fell back to ITEM_LABEL, which hid a bridge sealed under the shared label.
+SEALED_JOB = "com.tapproval.bridge.plist"
 APP_NAME = "Tapproval.app"
 # What bridges before 1.1.0 were called. They were started by a job file in
 # ~/Library/LaunchAgents, and macOS files such a job under the name on the
@@ -409,7 +414,7 @@ def _drop_agent_file():
 def item_label(app):
     """The label a self-registering bridge's sealed job file gives its login
     item: com.tapproval.bridge for 1.1.0, its own from 1.1.1."""
-    sealed = os.path.join(app, "Contents", "Library", "LaunchAgents", LABEL + ".plist")
+    sealed = os.path.join(app, "Contents", "Library", "LaunchAgents", SEALED_JOB)
     try:
         with open(sealed, "rb") as handle:
             label = plistlib.load(handle).get("Label")
