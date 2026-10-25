@@ -75,20 +75,27 @@ enum RelaySigning {
     }
 
     /// A key the relay sealed for the holder of `key` (seal), or nil.
+    /// The pad the relay sealed enrolment answers with until helper 1.1.84:
+    /// kept so a watch can still pair to an older helper.
     static func unseal(_ sealed: String, key: String, nonce: String) -> String? {
         let pad = Data(HMAC<SHA256>.authenticationCode(
             for: Data("tapproval-seal\n\(nonce)".utf8),
             using: SymmetricKey(data: Data(key.utf8))))
+        guard let bytes = data(fromHex: sealed), bytes.count <= pad.count else { return nil }
+        return String(bytes: zip(bytes, pad).map { $0 ^ $1 }, encoding: .utf8)
+    }
+
+    /// The bytes a hex string spells, or nil for anything that is not hex.
+    static func data(fromHex hex: String) -> Data? {
         var bytes: [UInt8] = []
-        var index = sealed.startIndex
-        while index < sealed.endIndex {
-            let next = sealed.index(index, offsetBy: 2, limitedBy: sealed.endIndex) ?? sealed.endIndex
-            guard let byte = UInt8(sealed[index..<next], radix: 16) else { return nil }
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            let next = hex.index(index, offsetBy: 2, limitedBy: hex.endIndex) ?? hex.endIndex
+            guard let byte = UInt8(hex[index..<next], radix: 16) else { return nil }
             bytes.append(byte)
             index = next
         }
-        guard bytes.count <= pad.count else { return nil }
-        return String(bytes: zip(bytes, pad).map { $0 ^ $1 }, encoding: .utf8)
+        return Data(bytes)
     }
 
     private static func mac(_ key: String, _ message: String) -> String {
@@ -145,6 +152,12 @@ enum BodySeal {
     // The envelope (#645 phase 3): the whole request in one sealed body, as
     // tapproval_wire.wrap_request writes it, so Cloudflare's edge reads
     // neither the route, the query nor the answer's status.
+    /// The enrolment answer's seal (helper 1.1.84, 2026-10-25 review): the
+    /// issued key under this same ChaCha20 seal, keyed from the bootstrap
+    /// that signed the enrolment and bound to that request's nonce — the
+    /// relay's `wire.enrol_seal`, asked for with "seal": 2.
+    static func enrolAAD(nonce: String) -> Data { Data("enrol \(nonce)".utf8) }
+
     static let envelopeAAD = Data("POST /e".utf8)
     static let envelopeAnswerAAD = Data("answer POST /e".utf8)
 

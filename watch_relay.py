@@ -3078,7 +3078,13 @@ ENVELOPE_PATH = wire.ENVELOPE_PATH
 def seal(token, nonce, secret):
     """``secret`` (a 32-character hex key) encrypted for the holder of
     ``token``: XOR with an HMAC-derived pad unique to this nonce. How a key
-    issued in answer to a signed request crosses plain HTTP."""
+    issued in answer to a signed request crossed plain HTTP until 2.3.
+
+    Legacy: a watch from 2.3 asks for the shared ChaCha20 seal instead
+    (`wire.enrol_seal`, "seal": 2 in the enrolment body), and this pad is
+    kept only for watches that cannot open that — every App Store version
+    up to 2.2. Dropping it strands those watches at their next pairing, so
+    when is the owner's decision (CLAUDE.md, constraint 4)."""
     import hashlib
     pad = hmac.new(str(token).encode("utf-8"),
                    ("tapproval-seal\n%s" % nonce).encode("utf-8"),
@@ -3650,7 +3656,12 @@ class RelayHandler(BaseHTTPRequestHandler):
             # A key from the pairing window is traded in, not multiplied.
             auth.revoke_token(presented)
         if getattr(self, "_signed_nonce", None):
-            # Signed: the new key crosses plain HTTP sealed for the signer.
+            # Signed: the new key crosses plain HTTP sealed for the signer —
+            # with the shared ChaCha20 seal when the watch can open it
+            # (2.3, "seal": 2), the XOR pad for the watches before.
+            if body.get("seal") == 2:
+                self._send_json({"sealed2": wire.enrol_seal(presented, self._signed_nonce, token)})
+                return
             self._send_json({"sealed": seal(presented, self._signed_nonce, token)})
             return
         self._send_json({"token": token})

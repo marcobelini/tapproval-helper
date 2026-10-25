@@ -470,6 +470,32 @@ def open_body(device_key, sealed, aad=b""):
     return aead_open(seal_key(device_key), sealed[:12], sealed[12:], aad)
 
 
+# The key an enrolment issues, sealed for the holder of the bootstrap that
+# signed the request and bound to that request's nonce: ChaCha20-Poly1305
+# like every other sealed byte, in place of the relay's hand-rolled XOR pad
+# (2026-10-25 review). A watch asks for it with "seal": 2 in the enrolment
+# body; the pad stays in the relay for watches that cannot open this yet.
+ENROL_AAD = b"enrol "
+
+
+def enrol_seal(bootstrap, nonce, token, seal_nonce=None):
+    """``token`` sealed for ``bootstrap``'s holder, as hex, for the request
+    that carried ``nonce``."""
+    return seal_body(bootstrap, str(token).encode("utf-8"),
+                     ENROL_AAD + str(nonce).encode("utf-8"), nonce=seal_nonce).hex()
+
+
+def enrol_open(bootstrap, nonce, sealed_hex):
+    """The token out of ``enrol_seal``'s answer, or None when it was not
+    sealed for this bootstrap and this request."""
+    try:
+        raw = bytes.fromhex(str(sealed_hex))
+    except ValueError:
+        return None
+    opened = open_body(bootstrap, raw, ENROL_AAD + str(nonce).encode("utf-8"))
+    return opened.decode("utf-8", "replace") if opened else None
+
+
 # The travel road's envelope (#645, phase 3): the whole request inside one
 # sealed body, so Cloudflare's edge reads neither the route nor the query
 # nor the answer's status, only "POST /t/…/e" and a size.

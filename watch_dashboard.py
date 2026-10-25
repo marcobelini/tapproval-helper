@@ -1368,6 +1368,53 @@ def _find_transcript(prefix, projects_dir=None):
 # The patterns are tapproval_wire's, the hook's too.
 
 
+def _fenced_segments(markdown):
+    """Walk a reply fence by fence: ``("prose", "", lines)`` and
+    ``("code", lang, lines)`` in reading order, the lines as written.
+
+    The one fence state machine ``plain_text`` and ``blocks`` share, so a
+    fix to it reaches both readers at once. An opener's length is
+    remembered: four-backtick fences exist precisely to CONTAIN ``` lines,
+    so only a marker at least as long closes the block, and a shorter one
+    inside is content. A ``markdown`` (or ``md``) fence is prose in
+    disguise: its lines join the prose around it, its markers go, and a
+    shorter fence inside it is a bare marker line, dropped. A code fence
+    opened and never closed is still code; one closed with nothing in it
+    is still a code segment, empty. Never raises.
+    """
+    prose, code, lang = [], [], ""
+    fence_len, fence_is_prose = 0, False
+    for raw in str(markdown or "").splitlines():
+        fence = wire.MD_FENCE.match(raw)
+        if fence:
+            marker = len(fence.group(1))
+            if fence_len == 0:
+                fence_len = marker
+                fence_is_prose = fence.group(2).lower() in ("markdown", "md")
+                if not fence_is_prose:
+                    lang = fence.group(2).lower()
+                    if prose:
+                        yield "prose", "", prose
+                        prose = []
+                continue
+            if marker >= fence_len:
+                if not fence_is_prose:
+                    yield "code", lang, code
+                    code = []
+                fence_len, fence_is_prose = 0, False
+                continue
+            if fence_is_prose:
+                continue
+        if fence_len and not fence_is_prose:
+            code.append(raw)
+            continue
+        prose.append(raw)   # trailing spaces can be a hard break
+    if code:
+        yield "code", lang, code
+    if prose:
+        yield "prose", "", prose
+
+
 def blocks(markdown, always=False):
     """The same reply as ``plain_text`` gives, but with its code kept.
 
@@ -1378,7 +1425,8 @@ def blocks(markdown, always=False):
     them natively is better than one that strips them; a watch that does
     not simply shows the marks. Code blocks are verbatim, one per fence,
     with the language the fence named. A ``markdown`` fence is prose in
-    disguise and lands in a text block, as in ``plain_text``.
+    disguise and lands in a text block, as in ``plain_text``; the two
+    read the fences through one walker, ``_fenced_segments``.
 
     Text blocks keep the reply's shape as the phone shows it (2026-10-12):
     bold, emphasis and code marks, a heading as a bold line, and nested
@@ -1391,46 +1439,15 @@ def blocks(markdown, always=False):
     lines = str(markdown or "").splitlines()
     if not always and not any(wire.MD_FENCE.match(line) for line in lines):
         return []
-    out, prose, code, lang = [], [], [], ""
-    fence_len, fence_is_prose = 0, False
-
-    def flush_prose():
-        text = _marked_lines(prose)
+    out = []
+    for kind, lang, segment in _fenced_segments(markdown):
+        if kind == "code":
+            out.append({"kind": "code", "lang": lang,
+                        "text": "\n".join(segment).strip("\n")})
+            continue
+        text = _marked_lines(segment)
         if text:
             out.append({"kind": "text", "text": text})
-        prose.clear()
-
-    for raw in lines:
-        line = raw.rstrip()
-        fence = wire.MD_FENCE.match(line)
-        if fence:
-            marker = len(fence.group(1))
-            if fence_len == 0:
-                fence_len = marker
-                fence_is_prose = fence.group(2).lower() in ("markdown", "md")
-                lang = "" if fence_is_prose else fence.group(2).lower()
-                if not fence_is_prose:
-                    flush_prose()
-                continue
-            if marker >= fence_len:
-                if not fence_is_prose:
-                    out.append({"kind": "code", "lang": lang,
-                                "text": "\n".join(code).strip("\n")})
-                    code.clear()
-                fence_len, fence_is_prose = 0, False
-                continue
-            if fence_is_prose:
-                # A shorter fence inside a prose fence is a bare marker
-                # line; plain_text loses it to the inline-code strip.
-                continue
-        if fence_len and not fence_is_prose:
-            code.append(raw)
-            continue
-        prose.append(raw)   # trailing spaces can be a hard break
-    if code:
-        # An unclosed fence at the end of a reply is still code.
-        out.append({"kind": "code", "lang": lang, "text": "\n".join(code).strip("\n")})
-    flush_prose()
     return out
 
 
@@ -1454,43 +1471,30 @@ def plain_text(markdown):
     Headings, quotes, bullets, rules, tables, links, images, code fences,
     emphasis and HTML tags all reduce to their readable content; list
     items and paragraphs keep their own lines so structure survives
-    without markers. Never raises; returns "" for empty input.
+    without markers. Fences are read by ``_fenced_segments``, the walker
+    ``blocks`` uses too. Never raises; returns "" for empty input.
     """
     if not markdown:
         return ""
-    out, fence_len, fence_is_prose = [], 0, False
-    for raw in str(markdown).splitlines():
-        line = raw.rstrip()
-        fence = wire.MD_FENCE.match(line)
-        if fence:
-            marker = len(fence.group(1))
-            if fence_len == 0:
-                # Opening fence. Remember its length: four-backtick fences
-                # exist precisely to CONTAIN ``` lines, so only a marker at
-                # least as long as the opener closes the block. A
-                # ```markdown block is prose in disguise and flattens.
-                fence_len = marker
-                fence_is_prose = fence.group(2).lower() in ("markdown", "md")
-                continue
-            if marker >= fence_len:
-                fence_len, fence_is_prose = 0, False
-                continue
-            # A shorter fence inside a longer one is content, not a fence.
-        if fence_len and not fence_is_prose:
+    out = []
+    for kind, _lang, segment in _fenced_segments(markdown):
+        if kind == "code":
             # A code block is unreadable at watch size — mark it instead,
             # once per block (the phone shows a box; this is our box).
-            if not out or out[-1] != "[code]":
+            if segment and (not out or out[-1] != "[code]"):
                 out.append("[code]")
             continue
-        if not line.strip() or wire.MD_HR.match(line) or wire.MD_TABLE_SEP.match(line):
-            # A blank line is a paragraph break — the phone shows the gap,
-            # so the wrist must too. One is enough.
-            if not line.strip() and out and out[-1]:
-                out.append("")
-            continue
-        line = " ".join(wire.flatten_line(line).split())
-        if line:
-            out.append(line)
+        for raw in segment:
+            line = raw.rstrip()
+            if not line.strip() or wire.MD_HR.match(line) or wire.MD_TABLE_SEP.match(line):
+                # A blank line is a paragraph break — the phone shows the gap,
+                # so the wrist must too. One is enough.
+                if not line.strip() and out and out[-1]:
+                    out.append("")
+                continue
+            line = " ".join(wire.flatten_line(line).split())
+            if line:
+                out.append(line)
     while out and not out[-1]:
         out.pop()
     return "\n".join(out)

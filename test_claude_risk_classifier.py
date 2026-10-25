@@ -3513,6 +3513,32 @@ class TestSignedRequests:
         issued = bytes(sealed[i] ^ pad[i] for i in range(32)).decode()
         assert fresh_auth.matches(issued)
 
+    def test_a_watch_that_asks_gets_the_shared_seal_and_the_rest_the_pad(self, fresh_auth):
+        """The relay's own XOR pad was a second sealing primitive beside
+        wire.seal_body (2026-10-25 review). A 2.3 watch asks for the shared
+        seal with "seal": 2 and gets `sealed2`; an older body still gets
+        `sealed`, so no watch on the App Store is stranded."""
+        watch_relay.LIMITS.reset()
+        server, _ = watch_relay.serve(port=0, auth=fresh_auth)
+        _serve(server)
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        try:
+            body = {"device_id": "watch-4", "label": "Test", "seal": 2}
+            headers, nonce = self._signed(fresh_auth.bootstrap, "/enroll", body)
+            status, reply, _ = self._post(base, "/enroll", body, headers)
+            assert status == 200 and set(reply) == {"sealed2"}, reply
+            token = tapproval_wire.enrol_open(fresh_auth.bootstrap, nonce, reply["sealed2"])
+            assert token and fresh_auth.matches(token)
+            assert tapproval_wire.enrol_open(fresh_auth.bootstrap, "f" * 16, reply["sealed2"]) is None, \
+                "sealed for another request"
+            body = {"device_id": "watch-5", "label": "Test"}
+            headers, nonce = self._signed(fresh_auth.bootstrap, "/enroll", body)
+            status, reply, _ = self._post(base, "/enroll", body, headers)
+            assert status == 200 and set(reply) == {"sealed"}, reply
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_what_a_watch_says_about_itself_is_bounded(self, fresh_auth):
         """`source` went into auth.json uncut: a key holder could put a
         quarter megabyte there per enrolment, rewritten atomically on
@@ -3632,7 +3658,9 @@ class TestAnE2ERunRefusesATakenPort:
     there and stop if it does; tls-, encryption- and auto-update-e2e.sh
     started theirs regardless, so a relay already on the port made the
     "is it up yet" wait succeed at once and the run tested the wrong relay
-    (2026-10-25 review)."""
+    (2026-10-25 review). Since the pieces they share moved into e2e-lib.sh,
+    the asking is e2e_refuse_taken_port and the starting e2e_start_relay;
+    each script still asks every port it names before it starts."""
 
     def _scripts(self):
         scripts = sorted(glob.glob(os.path.join(_ROOT, "WatchApp", "*-e2e.sh")))
@@ -3640,23 +3668,74 @@ class TestAnE2ERunRefusesATakenPort:
             pytest.skip("no e2e scripts in this layout")
         return scripts
 
+    def _library(self):
+        path = os.path.join(_ROOT, "WatchApp", "e2e-lib.sh")
+        if not os.path.isfile(path):
+            pytest.skip("no e2e library in this layout")
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_the_library_asks_health_and_is_the_one_place_a_relay_starts(self):
+        lib = self._library()
+        asks = re.search(r"^e2e_refuse_taken_port\(\) \{\n(.*?)^\}", lib, re.M | re.S).group(1)
+        assert "e2e_port_taken" in asks and "something already answers on" in asks
+        assert "return 1" in asks and "exit" not in asks, "the caller decides to stop"
+        taken = re.search(r"^e2e_port_taken\(\) \{\n(.*?)^\}", lib, re.M | re.S).group(1)
+        assert taken.count("curl") == 2 and taken.count("/health") == 2, "plain and encrypted"
+        starts = [m.start() for m in re.finditer(r"watch_relay\.py", lib)]
+        body = re.search(r"^e2e_start_relay\(\) \{\n(.*?)^\}", lib, re.M | re.S)
+        assert len(starts) == 1 and body.start() < starts[0] < body.end()
+        assert "E2E_RELAY_PID=$!" in body.group(1), "the pid, never a name, for the stop"
+        assert "-u CLAUDE_RISK_RELAY " in body.group(1), "never the session's own relay"
+
     def test_every_e2e_script_asks_its_ports_before_starting_its_relay(self):
         for path in self._scripts():
             with open(path, encoding="utf-8") as handle:
                 text = handle.read()
-            ports = re.findall(r"(?:^|;)\s*([A-Z_]+)=(\d{4,5})\s*(?:;|$)", text, re.M)
+            # A lookahead for the ";": "PLAIN=18994; TLS=18995" is two ports.
+            ports = re.findall(r"(?:^|;)\s*([A-Z_]+)=(\d{4,5})\s*(?=;|$)", text, re.M)
             assert ports, "%s names no port" % path
-            start = text.find("watch_relay.py --")
-            assert start > 0, "%s starts no relay" % path
-            before = text[:start]
-            guard = re.search(r"^[^\n]*curl[^\n]*/health[^\n]*$", before, re.M)
+            starts = [i for i in (text.find("\ne2e_start_relay "), text.find("watch_relay.py --"))
+                      if i > 0]
+            assert starts, "%s starts no relay" % path
+            before = text[:min(starts)]
+            guard = re.search(r"^e2e_refuse_taken_port [^\n]*$", before, re.M)
             assert guard, "%s starts its relay without asking the port" % path
-            guard = before[guard.start():before.find("exit 1", guard.start()) + 6]
-            assert guard.endswith("exit 1"), path
+            assert guard.group(0).endswith(" || exit 1"), path
             for name, _ in ports:
-                named = "$%s" % name in guard or (
-                    "$BASE" in guard and re.search(r"^BASE=.*\$%s\b" % name, before, re.M))
-                assert named, "%s: the guard does not ask port %s" % (path, name)
+                assert '"$%s"' % name in guard.group(0), (
+                    "%s: the guard does not ask port %s" % (path, name))
+
+    def test_the_scripts_and_the_library_cannot_drift_apart(self):
+        """Every e2e_* name a script uses is a function the library defines,
+        and every function the library defines is used by a script (or by
+        the library itself): a rename on one side fails here, not at the
+        next hand run."""
+        lib = self._library()
+        defined = set(re.findall(r"^(e2e_[a-z_]+)\(\) \{", lib, re.M))
+
+        def calls(text):
+            # Code only: a comment naming a function is not a call, nor is
+            # the name in front of "()" in its own definition (one-liners too).
+            code = re.sub(r"^\s*#[^\n]*$", "", text, flags=re.M)
+            code = re.sub(r"^e2e_[a-z_]+\(\)", "", code, flags=re.M)
+            return set(re.findall(r"\b(e2e_[a-z_]+)\b", code))
+
+        sourcing, used = [], calls(lib)
+        for path in self._scripts():
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+            if "e2e-lib.sh" not in text:
+                continue
+            sourcing.append(os.path.basename(path))
+            assert '. "$(dirname "$0")/e2e-lib.sh" || exit 1\n' in text, path
+            assert text.index('. "$(dirname "$0")/e2e-lib.sh"') < text.index('cd "$(dirname "$0")"'), (
+                "%s: sourced before the cd, while $0's folder still resolves" % path)
+            names = calls(text)
+            assert names - defined == set(), "%s calls what the library lacks" % path
+            used |= names
+        assert {"pill-e2e.sh", "place-e2e.sh"} <= set(sourcing), sourcing
+        assert defined - used == set(), "the library defines what nothing calls"
 
     def test_the_wait_for_a_sibling_run_names_this_folder_not_a_checkout(self):
         """pill-e2e.sh waited for another simulator run by the name of the
@@ -7148,6 +7227,21 @@ class TestPlainTextForTheWatch:
         md = "````markdown\n# PKT-003 — bygget\n## Runde 2\n````"
         assert watch_dashboard.plain_text(md) == "PKT-003 — bygget\nRunde 2"
 
+    def test_both_readers_split_an_odd_fence_the_same_way(self):
+        """``plain_text`` and ``blocks`` read fences through one walker, so
+        a shorter fence inside a prose fence is a bare marker line to both:
+        dropped, whatever language or tilde it carries. Before 2026-10-25
+        the two carried the walker twice, and ``plain_text`` alone let
+        ``py`` and ``~~~`` through from such a line."""
+        md = "````markdown\n# T\n```py\ninner\n```\n~~~\ntail\n````"
+        assert watch_dashboard.plain_text(md) == "T\ninner\ntail"
+        # (``blocks`` unwraps a paragraph into one line, as the phone shows it)
+        assert watch_dashboard.blocks(md) == [{"kind": "text", "text": "**T**\ninner tail"}]
+        # and a real code fence after it is still code to both
+        md += "\n```sh\nls\n```"
+        assert watch_dashboard.plain_text(md) == "T\ninner\ntail\n[code]"
+        assert watch_dashboard.blocks(md)[1] == {"kind": "code", "lang": "sh", "text": "ls"}
+
     def test_code_fence_becomes_one_marker(self):
         """Code renders as a box on the phone; the wrist shows one [code]
         marker per block instead of verbatim lines."""
@@ -8429,6 +8523,23 @@ class TestTheSharedWireModule:
         assert done.returncode != 0
         assert done.stdout.strip() == "", "no decision may be printed"
         assert "tapproval_wire" in done.stderr
+
+    def test_the_enrolment_seal_is_the_shared_one_and_bound_to_its_request(self):
+        """One sealing primitive (2026-10-25 review): the issued key crosses
+        under seal_body's ChaCha20, keyed from the bootstrap and bound to the
+        enrolment's nonce, so an answer cannot be replayed into another."""
+        boot, nonce, token = "b" * 32, "0123456789abcdef", "a" * 32
+        sealed = tapproval_wire.enrol_seal(boot, nonce, token)
+        assert tapproval_wire.enrol_open(boot, nonce, sealed) == token
+        assert tapproval_wire.enrol_open(boot, "fedcba9876543210", sealed) is None
+        assert tapproval_wire.enrol_open("c" * 32, nonce, sealed) is None
+        assert tapproval_wire.enrol_open(boot, nonce, "not hex") is None
+        assert tapproval_wire.enrol_open(boot, nonce, sealed[:20]) is None
+        # It is seal_body: a fixed nonce gives a fixed vector, the one the
+        # watch's test opens.
+        fixed = tapproval_wire.enrol_seal("k" * 32, nonce, token, seal_nonce=bytes(range(12)))
+        assert tapproval_wire.open_body("k" * 32, bytes.fromhex(fixed),
+                                        tapproval_wire.ENROL_AAD + nonce.encode()) == token.encode()
 
     @pytest.mark.parametrize("path, query", [
         ("/a", "b\nc"), ("/a\nb", "c"), ("/a\rb", None), ("/a", "b\r"), ("/a\nb", None)])
