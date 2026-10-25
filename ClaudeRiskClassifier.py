@@ -110,7 +110,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.82"
+__version__ = "1.1.83"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -219,6 +219,14 @@ SECRET_PATH = re.compile(
     r"\.claude\.json\b|[/\\]Cookies\b|[/\\]Login\\? Data\b|Messages[/\\]chat\.db|PRIVATE KEY)",
     re.I,
 )
+
+# A wildcard the shell expands before the tool sees it. Inside a hidden
+# folder of the home directory — `~/.ss?/id_rs?`, `~/.config/*/hosts.yml`,
+# `~/.s{sh}/id_{rsa}` — it names a secret store the literal list above
+# cannot see, so it reads as one. Wildcards over visible files are left
+# alone: `cat *.md` is not a credential read (2026-10-25 review).
+SECRET_GLOB = re.compile(
+    r"(?:^|[\s='\"])(?:~|\$\{?HOME\}?|/Users/[^/\s]+|/home/[^/\s]+)/\.[^\s]*[*?\[{]")
 
 # Deployment-specific rules. Empty by default: this tool ships knowing
 # nothing about your infrastructure. Name your own servers, shares and
@@ -407,6 +415,7 @@ TOOL_REACH = {
     "psql": Reach.SHARED, "mysql": Reach.SHARED, "mongosh": Reach.SHARED,
     "redis-cli": Reach.SHARED, "stripe": Reach.SHARED, "twilio": Reach.SHARED,
     "launchctl": Reach.SYSTEM, "systemctl": Reach.SYSTEM, "security": Reach.SYSTEM,
+    "diskutil": Reach.SYSTEM,
 }
 
 # One word, one effect. This is the vocabulary the fourteen tables never
@@ -444,9 +453,21 @@ TOOL_EFFECT_WORDS = {
     # Every prune deletes what nothing uses — images, volumes, networks —
     # not only `system prune`'s (#872).
     "docker": dict(_REGISTRY_WORDS, prune=Effect.DESTROY),
+    # `aws s3 rb` removes a bucket; the one verb AWS does not spell out.
+    "aws": {"rb": Effect.DESTROY},
 }
 for _registry in ("npm", "pnpm", "yarn", "cargo", "poetry", "gem", "twine", "helm"):
     TOOL_EFFECT_WORDS[_registry] = dict(_REGISTRY_WORDS)
+# `helm uninstall` is `helm delete` under its newer name; diskutil's verbs
+# are disks wiped, as mkfs is. Each read MEDIUM beside its synonym's
+# CRITICAL (2026-10-25 review).
+TOOL_EFFECT_WORDS["helm"]["uninstall"] = Effect.DESTROY
+TOOL_EFFECT_WORDS["diskutil"] = {
+    "erasedisk": Effect.DESTROY, "erasevolume": Effect.DESTROY,
+    "zerodisk": Effect.DESTROY, "randomdisk": Effect.DESTROY,
+    "secureerase": Effect.DESTROY, "reformat": Effect.DESTROY,
+    "partitiondisk": Effect.DESTROY, "apfs": Effect.MUTATE,
+}
 
 # Flags that carry an effect. Deliberately few and unambiguous: a flag like
 # `-d` means "delete" to git and "data" to curl and "dictionary order" to
@@ -500,6 +521,20 @@ def _names_a_secret(word):
 
 
 _HOME_ITSELF = re.compile(r"^(~|\$\{?HOME\}?)/?\*?$")
+
+
+def _is_home(word):
+    """`~`, `$HOME`, or the home folder by its absolute path, with or
+    without a trailing `/` or `/*`. The hook runs as that user, so the path
+    is known: `rm -rf /Users/<you>` read HIGH beside `rm -rf ~`'s CRITICAL
+    (2026-10-25 review)."""
+    path = word.strip("'\"")
+    if _HOME_ITSELF.match(path):
+        return True
+    home = os.path.expanduser("~")
+    if len(home) < 2:
+        return False
+    return path.rstrip("*").rstrip("/") == home
 # The machine's own folders: one list for every tool. find and rm kept two
 # that disagreed — `find /Users -delete` read HIGH beside `rm -rf /Users`'s
 # CRITICAL, and `rm -rf /System` HIGH beside find's — and a bare prefix took
@@ -524,6 +559,18 @@ def _root_reach(word):
     return None
 
 
+def _joined_verb(word, own):
+    """The effect of a verb joined to its object: AWS spells every action
+    `terminate-instances`, `delete-stack`, so none of them matched the
+    one-word vocabulary and a production stack deletion read MEDIUM
+    (2026-10-25 review). Only a bare word is split — not a flag, a path or
+    a file name — so `cat delete-me.txt` names nothing."""
+    if word.startswith("-") or "-" not in word or any(c in word for c in "./\\=:"):
+        return None
+    verb = word.split("-", 1)[0].lower()
+    return own.get(verb) or EFFECT_WORDS.get(verb)
+
+
 def _ontology_risk(segment):
     """The effect this segment names, or None when it names none.
 
@@ -546,13 +593,15 @@ def _ontology_risk(segment):
             reach = max(reach, further)
     # The home directory itself is everything the user has on this machine:
     # `find ~ -delete` is not `find . -delete` (2026-10-05 review).
-    if any(_HOME_ITSELF.match(w.strip("'\"")) for w in words[1:]):
+    if any(_is_home(w) for w in words[1:]):
         reach = max(reach, Reach.MACHINE)
 
     effect = None
     own = TOOL_EFFECT_WORDS.get(tool, {})
     for word in words[1:]:
         named = own.get(word.lower()) or EFFECT_WORDS.get(word.lower()) or EFFECT_FLAGS.get(word)
+        if named is None:
+            named = _joined_verb(word, own)
         if isinstance(named, tuple):
             named, further = named
             reach = max(reach, further)
@@ -817,8 +866,14 @@ SEGMENT_RULES = [
     ("sudo", re.compile(r"\bsudo\b"), Risk.HIGH),
     ("sql-mutation", SQL_MUTATION, Risk.HIGH),
     ("secret-access", SECRET_PATH, Risk.HIGH),
+    ("secret-glob", SECRET_GLOB, Risk.HIGH),
     ("network-upload",
      re.compile(r"\b(curl|wget)\b[^|;&]*(-X\s*(POST|PUT|PATCH)|--data|--upload-file|"
+                # The long spellings: `--request POST`, curl's `--json`,
+                # wget's `--post-data`, `--post-file`, `--body-*` and
+                # `--method PUT` (2026-10-25 review).
+                r"--request[\s=]*(POST|PUT|PATCH)|--json\b|--post-(data|file)\b|"
+                r"--body-(data|file)\b|--method[\s=]*(POST|PUT|PATCH)|"
                 r"(^|\s)-d\s|(^|\s)-F\s|(^|\s)-T\s)", re.I), Risk.HIGH),
     ("remote-copy", re.compile(r"\b(scp|rsync|sftp|ftp)\b"), Risk.HIGH),
     ("install-from-url",
@@ -862,9 +917,11 @@ GIT_RE = re.compile(
     r"|-\w+\s+)*"           # bare short flag(s)
     r"([a-z][a-z-]*)\b(.*)" % _GIT_VALUE_GLOBALS, re.I)
 
-# Targets that mean "wipe the machine" or "wipe my home directory".
+# Targets that mean "wipe the machine" or "wipe my home directory". The
+# current folder and its parent by any spelling: `./` and `../` read HIGH
+# beside `.`'s CRITICAL (2026-10-25 review).
 CATASTROPHIC_TARGETS = re.compile(
-    r"^(/|//|/\*|~|~/|~/\*|\$\{?HOME\}?/?|\$\{?HOME\}?/\*|\.|\.\.|\*|"
+    r"^(/|//|/\*|~|~/|~/\*|\$\{?HOME\}?/?|\$\{?HOME\}?/\*|\.\.?/?\*?|\*|"
     r"(%s)/?\*?)$" % "|".join(re.escape(root) for root in
                               SYSTEM_ROOTS + MACHINE_ROOTS + ("/Windows",))
 )
@@ -917,7 +974,7 @@ def _rm_risk(segment):
     for target in targets.split():
         if target.startswith("-"):
             continue
-        if CATASTROPHIC_TARGETS.match(target.strip("'\"")):
+        if CATASTROPHIC_TARGETS.match(target.strip("'\"")) or _is_home(target):
             return ("rm-catastrophic", Risk.CRITICAL)
     if recursive:
         return ("rm-recursive", Risk.HIGH)
@@ -1077,7 +1134,7 @@ def _unwrapped(segment):
     # name they spell is the command that runs (2026-10-05 review).
     first = text.split(None, 1)
     if first and first[0][:1] not in "({" and any(q in first[0] for q in "'\"\\"):
-        bare = re.sub(r"['\"\\]", "", first[0])
+        bare = _QUOTING.sub("", first[0])
         if bare:
             return " ".join([bare] + first[1:])
     if (text.startswith("(") and text.endswith(")")) or (
@@ -1171,7 +1228,10 @@ CREDENTIAL_READS = re.compile(
     r"|\bsecurity\s+(find-(generic|internet)-password\b[^|;&]*\s-[a-z]*[wg][a-z]*\b"
     r"|dump-keychain\b|export\b)"
     r"|\bps\b(\s+-\S+)*(\s+-[a-zA-Z]*E[a-zA-Z]*|\s+[acehjlmrSTuvwxX]*e[acehjlmrSTuvwxX]*)(?=\s|$)"
-    r"|\bjq\b[^|;&]*\$ENV\b")
+    # jq's `env` and awk's `ENVIRON` are the whole environment too; a field
+    # called `.env` is not (2026-10-25 review).
+    r"|\bjq\b[^|;&]*(\$ENV\b|(?<![.\w$])env\b)"
+    r"|\b[gnm]?awk\b[^|;&]*\bENVIRON\b")
 
 
 _QUOTING = re.compile(r"['\"\\]")
@@ -1216,15 +1276,27 @@ def classify_bash(command):
     # A command substitution runs its OWN command — `echo $(rm -rf /)` is a
     # catastrophic delete wearing an echo. The segment splitter doesn't
     # descend into `$(…)`/backticks, so classify the inner command in its
-    # own right and take the max; recursion handles nesting. Without this a
-    # destructive payload hid behind the blunt MEDIUM "cmd-substitution"
-    # cap and could be auto-allowed under a raised threshold.
-    for dollar_form, backtick_form in _SUBSTITUTION_RE.findall(command):
-        inner = (dollar_form or backtick_form).strip()
-        if inner:
-            sub_risk, sub_rules = classify_bash(inner)
-            bump("cmd-substitution-inner:" + (sub_rules[0] if sub_rules
-                 else "?"), sub_risk)
+    # own right and take the max. Without this a destructive payload hid
+    # behind the blunt MEDIUM "cmd-substitution" cap and could be
+    # auto-allowed under a raised threshold.
+    #
+    # The pattern finds the innermost layer only. Each pass classifies that
+    # layer, then stands a plain word in for it so the layer outside comes
+    # into view: `echo $(rm -rf $(echo /))` surfaced `echo /` and never
+    # looked at the `rm -rf` around it (2026-10-25 review). Bounded, so a
+    # pathological nesting cannot spin.
+    remaining = command
+    for _ in range(8):
+        found = _SUBSTITUTION_RE.findall(remaining)
+        if not found:
+            break
+        for dollar_form, backtick_form in found:
+            inner = (dollar_form or backtick_form).strip()
+            if inner:
+                sub_risk, sub_rules = classify_bash(inner)
+                bump("cmd-substitution-inner:" + (sub_rules[0] if sub_rules
+                     else "?"), sub_risk)
+        remaining = _SUBSTITUTION_RE.sub(" x ", remaining)
 
     for segment in _segments(command):
         if segment.strip() in ("}", ")"):
@@ -1282,6 +1354,13 @@ def classify_bash(command):
         if special is None:
             special = _subcommand_risk(segment, token)
         if special is not None:
+            # A recognised read is still a read of what it names: `git show
+            # HEAD:.env` skipped the rule below and read SAFE while `cat
+            # .env` read HIGH (2026-10-25 review). The secret rule alone
+            # runs here; the blunt tool-name rules stay out, which is the
+            # point of recognising the invocation.
+            if SECRET_PATH.search(segment):
+                bump("secret-access", Risk.HIGH)
             bump(*special)
             continue
 
@@ -1360,7 +1439,9 @@ def classify_path(path, cwd=None):
         normalised = os.path.normpath(normalised).replace("\\", "/")
         path = normalised
 
-    if re.search(r"(^|/)\.git/", normalised, re.I):
+    # `.git` itself too: in a worktree it is a file (`gitdir: …`), and
+    # rewriting it re-points the checkout (2026-10-25 review).
+    if re.search(r"(^|/)\.git(/|$)", normalised, re.I):
         return Risk.CRITICAL, ["git-internals"]
     if SECRET_PATH.search(normalised):
         return Risk.CRITICAL, ["secret-file"]
@@ -2524,9 +2605,13 @@ def write_audit(entry, policy):
         # its owner only; on a shared machine the default umask is not.
         if not os.path.exists(path):
             os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
-        with open(path, "a", encoding="utf-8") as handle:
+        # A lone surrogate in a command string is written escaped rather
+        # than raising UnicodeEncodeError out of here; and whatever else
+        # goes wrong is said, not raised — a failure here used to replace
+        # a verdict the watch had already given (2026-10-25 review).
+        with open(path, "a", encoding="utf-8", errors="backslashreplace") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except OSError as error:
+    except Exception as error:
         print("ClaudeRiskClassifier: cannot write audit log (%s)" % error, file=sys.stderr)
 
 
@@ -2852,7 +2937,12 @@ def ask_watch(card, policy, project=None):
                 print("ClaudeRiskClassifier: no relay came back, so the "
                       "terminal asks", file=sys.stderr)
                 return "none", None
-    if not hmac.compare_digest(proof, _relay_proof2(key, nonce, status, raw)):
+    # Bytes, not str: compare_digest raises TypeError on a str with a
+    # non-ASCII character, and http.client decodes headers as latin-1, so
+    # an impostor's header broke the "never raises" promise here while the
+    # relay's twin was already fixed (2026-10-25 review).
+    if not hmac.compare_digest(proof.encode("utf-8", "replace"),
+                               _relay_proof2(key, nonce, status, raw).encode("ascii")):
         # Something answered on the relay's port without the relay's key.
         print("ClaudeRiskClassifier: the answer did not prove the relay's "
               "key, so the terminal asks", file=sys.stderr)

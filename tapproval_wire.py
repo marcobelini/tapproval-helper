@@ -41,10 +41,19 @@ def signature_message(method, path, stamp, nonce, body=b"", query=None):
     (percent-decoded, no query), the time, the nonce and the body; v2
     (``query`` given, even empty) adds the raw query string, which v1 left
     open: a signed request for `?id=A` could be sent on as `?id=B`
-    (2026-09-30 review)."""
+    (2026-09-30 review).
+
+    The fields are joined by newlines, so a path or query holding one would
+    read as another request's fields: ("/a", query="b\\nc") and
+    ("/a\\nb", query="c") were one message. Neither may be signed:
+    ValueError, which the relay reads as a signature that does not verify
+    (2026-10-25 review)."""
     parts = [str(method).upper(), str(path)]
     if query is not None:
         parts.append(str(query))
+    for part in parts[1:]:
+        if "\n" in part or "\r" in part:
+            raise ValueError("a signed path or query cannot hold a line break")
     parts += [str(stamp), str(nonce), hashlib.sha256(body or b"").hexdigest()]
     return "\n".join(parts).encode("utf-8")
 

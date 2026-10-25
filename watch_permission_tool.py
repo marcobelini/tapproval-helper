@@ -225,9 +225,16 @@ def handle(message, crc=None):
             return _result(request_id, {"content": [{"type": "text", "text": json.dumps(
                 deny("Tapproval could not read this permission request. Answer it "
                      "at the keyboard."))}]})
+        # The input is taken as sent, whatever its shape: `or {}` turned an
+        # empty string, list, zero or null into {} before decide() could
+        # refuse it, and `{"input": ""}` was allowed at a LOW threshold
+        # (2026-10-25 review). Unreadable is no, and so is absent.
+        if "input" in arguments:
+            tool_input = arguments["input"]
+        else:
+            tool_input = arguments.get("toolInput")
         decision = decide(arguments.get("tool_name") or arguments.get("toolName") or "",
-                          arguments.get("input") or arguments.get("toolInput") or {},
-                          crc=crc, cwd=arguments.get("cwd"))
+                          tool_input, crc=crc, cwd=arguments.get("cwd"))
         # The decision rides as JSON inside a text block: that is how a
         # permission tool answers, and Claude Code parses the text.
         return _result(request_id, {

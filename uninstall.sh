@@ -26,7 +26,18 @@ if [ -f "$HOME/.tapproval/ClaudeRiskClassifier.py" ]; then
 else
   echo "(~/.tapproval not found — nothing registered to remove)"
 fi
-pkill -f "watch_relay.py" 2>/dev/null || true
+# Stop this install's relay by the pid it wrote, never every relay this
+# user runs: `pkill -f watch_relay.py` took CI's isolated relay and an e2e
+# run's with it (2026-10-25 review). The old loose pid file too, for a relay
+# that never restarted since 1.1.60.
+for PIDFILE in "$HOME/.tapproval/data/relay.pid" "$HOME/.tapproval-relay.pid"; do
+  [ -f "$PIDFILE" ] || continue
+  RELAY_PID=$(tr -cd '0-9' < "$PIDFILE")
+  [ -n "$RELAY_PID" ] || continue
+  if ps -p "$RELAY_PID" -o command= 2>/dev/null | grep -q "watch_relay.py"; then
+    kill "$RELAY_PID" 2>/dev/null || true
+  fi
+done
 # The travel tunnel outlives a relay on purpose, so a restart keeps its
 # address; an uninstall must stop it, or a public URL would outlive Tapproval.
 pkill -f "cloudflared tunnel.*127.0.0.1:8978" 2>/dev/null || true

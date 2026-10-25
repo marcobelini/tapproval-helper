@@ -598,10 +598,13 @@ def _loopback_json(path, data=None, timeout=5, port=None, headers=None):
 def _probe_relay(timeout=2):
     """What the running relay says about itself, or None if none is up.
 
-    Asks over loopback, which the relay trusts, so the answer carries the
-    version and the pending count rather than the anonymous liveness reply.
+    Signed with the key file when it can be read: loopback alone opens
+    liveness and the version, nothing more (S2; 2026-10-25 review), and
+    --ensure needs the pending count and the pairing state to decide. With
+    no key file yet, the unsigned answer still carries the version.
     """
-    return _loopback_json("/health", timeout=timeout)
+    return _loopback_json("/health", timeout=timeout,
+                          headers=_admin_signature("/health", b"", method="GET"))
 
 
 PID_FILE = _home_path("PID_FILE")
@@ -691,14 +694,14 @@ def _relay_is_down():
     return _probe_relay(timeout=1) is None and not _port_in_use(TUNNEL_PORT)
 
 
-def _admin_signature(path, body, auth_file=None):
+def _admin_signature(path, body, auth_file=None, method="POST"):
     """The headers proving this user holds the key file, signed with the
     bootstrap so the key itself never travels; {} if it cannot be read,
     and the relay decides what an unproven caller may do."""
     bootstrap = wire.read_bootstrap(auth_file or AUTH_FILE)
     if not bootstrap:
         return {}
-    return {"X-Tapproval-Signature": wire.signed_header(bootstrap, "POST", path, body)[0]}
+    return {"X-Tapproval-Signature": wire.signed_header(bootstrap, method, path, body)[0]}
 
 
 def _admin_call(path, timeout=5):
@@ -1911,36 +1914,6 @@ def ensure_claude_on_path(environ=None, homes=None):
     return False
 
 
-# How each terminal app reaches the thing with a tty, and types into it.
-# Anything else — the desktop app, VS Code — has no window to type into,
-# and keeps the old route.
-TERMINAL_APPS = {
-    "Terminal": ('if tty of t is %(tty)s then\n'
-                 '  do script %(text)s in t\n'
-                 '  return "typed"\n'
-                 'end if\n'),
-    "iTerm2": ('repeat with s in sessions of t\n'
-               '  if tty of s is %(tty)s then\n'
-               '    tell s to write text %(text)s\n'
-               '    return "typed"\n'
-               '  end if\n'
-               'end repeat\n'),
-}
-TERMINAL_SCRIPT = ('tell application "%(app)s"\n'
-                   '  repeat with w in windows\n'
-                   '    repeat with t in tabs of w\n'
-                   '%(find)s'
-                   '    end repeat\n'
-                   '  end repeat\n'
-                   'end tell\n'
-                   'return "no tab"')
-# A terminal that would not be scripted stays refused for a while: the
-# consent prompt a background process cannot answer hangs until the
-# timeout, and every send should not pay that.
-_TERMINAL_REFUSED = {}
-TERMINAL_RETRY_SECONDS = 600
-
-
 def _applescript_literal(text):
     """An AppleScript string literal. json.dumps escapes the quotes and
     backslashes AppleScript understands — with ensure_ascii=False, because
@@ -2004,54 +1977,6 @@ def _settle_pair_request(auth, client_ip, ticket):
         allowed = ask_owner_to_pair(client_ip)
     finally:
         auth.finish_asking(client_ip, allowed, ticket)
-
-
-def _terminal_of(pid):
-    """(app, tty) of the terminal a process runs in, or None. One `ps`
-    snapshot, walked in memory. Never raises."""
-    try:
-        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,tty=,comm="],
-                             capture_output=True, text=True, timeout=2).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    table = {}
-    for line in out.splitlines():
-        parts = line.split(None, 3)
-        if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
-            table[int(parts[0])] = (int(parts[1]), parts[2], os.path.basename(parts[3]))
-    row = table.get(int(pid or 0))
-    if not row or row[1] in ("", "??"):
-        return None
-    tty, current = "/dev/" + row[1], int(pid)
-    for _ in range(16):
-        ppid, _, name = table.get(current, (1, "", ""))
-        if name in TERMINAL_APPS:
-            return name, tty
-        if ppid <= 1:
-            return None
-        current = ppid
-    return None
-
-
-def session_is_waiting(session_id):
-    """True only when the session sits at its prompt: the last turn is
-    Claude's finished reply, no tool is pending, and the transcript has
-    been still for a moment. A tool that is pending may be a permission
-    prompt, and typed text ending in Return would answer it — so any
-    doubt is a no."""
-    path = _find_transcript(session_id)
-    if not path:
-        return False
-    try:
-        if time.time() - os.path.getmtime(path) < 2.0:
-            return False
-        turns, running, tool_now = _parse_thread(path, THREAD_TURN_LIMIT)
-    except Exception:
-        return False
-    if running or tool_now or not turns:
-        return False
-    last = turns[-1]
-    return last.get("role") == "assistant" and last.get("kind") in (None, "text")
 
 
 # How long a watch's question about its open thread may be held while
@@ -2194,46 +2119,6 @@ def end_session(prefix, waiting=()):
     return "still running"
 
 
-def type_into_session(session_id, text, registry):
-    """Type a wrist message into the terminal a live session runs in.
-    True when it was typed; False sends it the old way. Never raises.
-
-    Off unless TAPPROVAL_TYPE_INTO_TERMINAL=1. Tested 2026-10-22 (#246): the
-    words reached the right tab, but from the helper Return did not reliably
-    submit them, and the session's inbox (post_to_inbox) does the same job
-    without keystrokes, so this stays off. The history: macOS must first let the helper script Terminal (a consent a
-    background process cannot ask for — the first test on 2026-09-24 hung
-    on it), and whether the line `do script` types ends in the Return
-    Claude Code's prompt submits on has not yet been watched happen. A
-    route that reports "sent" for words left sitting in a prompt would be
-    worse than the fork it replaces."""
-    if os.environ.get("TAPPROVAL_TYPE_INTO_TERMINAL") != "1":
-        return False
-    entry = registry.get(session_id)
-    # Cheapest refusals first: only a session at its prompt is worth a
-    # process walk.
-    if not entry or not session_is_waiting(session_id):
-        return False
-    found = _terminal_of(entry.get("pid"))
-    if not found:
-        return False
-    app, tty = found
-    if time.time() - _TERMINAL_REFUSED.get(app, float("-inf")) < TERMINAL_RETRY_SECONDS:
-        return False
-    # One line, no control characters: what a person could have typed.
-    line = "".join(ch for ch in text if ch.isprintable())
-    # Typed first into Claude Code's prompt, `!` runs the rest as a shell
-    # command with no permission card, and `#` writes to memory. Such a
-    # message takes the ordinary route instead (2026-09-25 review).
-    if line.lstrip()[:1] in ("!", "#"):
-        return False
-    find = TERMINAL_APPS[app] % {"tty": _applescript_literal(tty), "text": _applescript_literal(line)}
-    ok, said = _run_osascript(TERMINAL_SCRIPT % {"app": app, "find": find})
-    if not ok:
-        _TERMINAL_REFUSED[app] = time.time()
-    return ok and said == "typed"
-
-
 # Where Claude Code puts a session's inbox socket: its own directory under
 # the temp folder, or the per-user runtime folder on Linux. Anything else in
 # a registry file is not posted to.
@@ -2359,12 +2244,6 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
         print("relay: say %s inbox (%d ms)" % (session_id[:8],
               (time.monotonic() - started) * 1000), file=sys.stderr)
         return "sent"
-    # Open in a terminal and waiting for input: type it there. The words
-    # land in the live session itself — the one route that does not fork.
-    if type_into_session(session_id, text, registry):
-        print("relay: say %s typed (%d ms)" % (session_id[:8],
-              (time.monotonic() - started) * 1000), file=sys.stderr)
-        return "sent"
     stop = say_guard(session_id, force=force, live=registry)
     if stop:
         return stop
@@ -2397,6 +2276,11 @@ SKILL_BUILTINS = {
     "security-review": "Checks the changes for vulnerabilities.",
 }
 _SKILLS_CACHE = {}          # cwd -> (expires, rows)
+# ThreadingHTTPServer answers two /skills at once; an eviction iterating
+# the dict while another thread inserts raised "dictionary changed size
+# during iteration" (2026-10-25 review, L11). The scan of the disk runs
+# outside the lock; only the read, the insert and the eviction are inside.
+_SKILLS_CACHE_LOCK = threading.Lock()
 SKILLS_CACHE_MAX = 32
 SKILLS_CACHE_SECONDS = 60.0
 
@@ -2525,7 +2409,8 @@ def known_skills(cwd=None, home=None, now=None):
     home = home or os.path.expanduser("~")
     now = now or time.time()
     key = (cwd or "", home)
-    hit = _SKILLS_CACHE.get(key)
+    with _SKILLS_CACHE_LOCK:
+        hit = _SKILLS_CACHE.get(key)
     if hit and hit[0] > now:
         return hit[1]
     found = {}
@@ -2552,9 +2437,10 @@ def known_skills(cwd=None, home=None, now=None):
                            "plugin": plugin,
                            "argument_hint": required_argument(meta.get("argument-hint"))}
     rows = [dict(name="/" + name, **meta) for name, meta in sorted(found.items())]
-    _SKILLS_CACHE[key] = (now + SKILLS_CACHE_SECONDS, rows)
-    while len(_SKILLS_CACHE) > SKILLS_CACHE_MAX:     # one per folder, for weeks
-        _SKILLS_CACHE.pop(next(iter(_SKILLS_CACHE)), None)
+    with _SKILLS_CACHE_LOCK:
+        _SKILLS_CACHE[key] = (now + SKILLS_CACHE_SECONDS, rows)
+        while len(_SKILLS_CACHE) > SKILLS_CACHE_MAX:     # one per folder, for weeks
+            _SKILLS_CACHE.pop(next(iter(_SKILLS_CACHE)), None)
     return rows
 
 
@@ -2719,8 +2605,8 @@ def start_session(path, text, projects_dir=None, platform=None):
     if len(text) > SEND_CHARS:
         return too_long(text)
     if text[:1] in ("!", "#"):
-        # As in type_into_session: first in Claude Code's prompt, `!` runs
-        # the rest as a shell command with no card, and `#` writes memory.
+        # First in Claude Code's prompt, `!` runs the rest as a shell
+        # command with no card, and `#` writes memory (2026-09-25 review).
         return "a first message cannot start with ! or #"
     if (platform or sys.platform) != "darwin":
         return "new sessions need a Mac"
@@ -3098,22 +2984,30 @@ def _is_private_address(ip):
     only job is the DNS-rebinding check in :func:`host_allowed`, where the
     question is "does this Host header name this machine".
     """
-    ip = str(ip or "")
-    if _is_loopback(ip):
+    import ipaddress
+    address = _normal_ip(ip)         # ::ffff:192.168.1.1 is 192.168.1.1
+    if address is None:
+        return False
+    if address.is_loopback:
         return True
-    if ip.startswith(("10.", "192.168.", "169.254.", "fe80")):
-        return True
-    if ip.startswith("172."):
-        try:
-            return 16 <= int(ip.split(".")[1]) <= 31
-        except (ValueError, IndexError):
-            return False
-    if ip.startswith("100."):        # CGNAT block: Tailscale's range
-        try:
-            return 64 <= int(ip.split(".")[1]) <= 127
-        except (ValueError, IndexError):
-            return False
-    return False
+    return any(address in ipaddress.ip_network(block)
+               for block in _OWN_ADDRESS_BLOCKS[address.version])
+
+
+# The ranges a Host header may name this machine by, by address family.
+# Spelled out rather than taken from ipaddress's is_private, which also
+# counts the documentation range 2001:db8::/32 and the test nets as
+# "private". Until 2026-10-25 this was a string-prefix check that knew no
+# IPv6 beyond loopback and link-local, so a watch naming the tailnet's
+# own IPv6 address, or any ULA, was answered 403 "bad host" (review, L10).
+_OWN_ADDRESS_BLOCKS = {
+    4: ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",     # RFC 1918
+        "169.254.0.0/16",                                    # link-local
+        "100.64.0.0/10"),                                    # CGNAT: Tailscale's IPv4
+    6: ("fc00::/7",                                          # ULA
+        "fd7a:115c:a1e0::/48",                               # Tailscale's IPv6, inside ULA
+        "fe80::/10"),                                        # link-local
+}
 
 
 def authorize_request(client_ip, path, header_token,
@@ -3218,11 +3112,17 @@ def verify_signature(header, method, path, body, candidates, now=None, query="")
     # it, and a header is whatever latin-1 a stranger sent.
     mac = mac.encode("utf-8", "replace")
     match = None
-    for token in candidates:
-        if token and hmac.compare_digest(sign_request(
-                token, method, path, stamp, nonce, body, signed_query).encode("ascii"), mac):
-            match = token
-            break
+    try:
+        for token in candidates:
+            if token and hmac.compare_digest(sign_request(
+                    token, method, path, stamp, nonce, body, signed_query).encode("ascii"), mac):
+                match = token
+                break
+    except ValueError:
+        # A line break in the query: the wire refuses to sign such a request
+        # (2026-10-25), and a request nobody could have signed is one that
+        # does not verify, never an error (a 403 at the door, not a 500).
+        return None, None
     if match is None:
         return None, None
     with _NONCE_LOCK:
@@ -3411,10 +3311,11 @@ class RelayHandler(BaseHTTPRequestHandler):
     def _credentialed(self):
         """Did this caller prove anything at all? Decides how much /health
         is willing to say — a pending count and "is a watch on the wrist
-        right now" is a presence oracle, not liveness."""
-        if self._is_local_process():
-            return True
-        return _credential_ok(self.auth, self._presented())
+        right now" is a presence oracle, not liveness. Loopback is not a
+        proof: another account on this Mac and a raw port-forward arrive
+        as loopback too (S2), and until 2026-10-25 both read the whole
+        body. The hook, the bridge and --ensure sign with the key file."""
+        return _credential_ok(self.auth, self._presented()) or self._proves_bootstrap()
 
     def _proves_key(self):
         """A device token from anywhere; or, from a local process on the
@@ -3743,7 +3644,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         raw = str(body.get("device_id") or uuid.uuid4().hex)[:56]
         token = auth.issue_device("watch-" + raw,
                                   body.get("label") or "Apple Watch",
-                                  source=str(body.get("source") or "icloud"),
+                                  source=str(body.get("source") or "icloud")[:40],
                                   replaces=raw)
         if not auth.is_bootstrap(presented):
             # A key from the pairing window is traded in, not multiplied.
@@ -4015,6 +3916,13 @@ class RelayHandler(BaseHTTPRequestHandler):
                              # The watch says this, not "Mac" (2026-10-15).
                              "name": _computer_name(),
                              "paired_ever": getattr(self.auth, "paired_ever", True)})
+        elif self._is_local_process():
+            # A local process that proved nothing: alive, and which code
+            # answers, so a hook or an --ensure without the key file yet
+            # can still tell an old relay from the installed one. Not the
+            # pending count, the wrist, the conditions or the name.
+            self._send_json({"ok": True, "version": RELAY_VERSION,
+                             "helper": HELPER_VERSION})
         else:
             self._send_json({"ok": True})
 
@@ -4101,8 +4009,13 @@ class RelayHandler(BaseHTTPRequestHandler):
         # LAN only: hand the watch its away-addresses while it's home.
         # Deliberately NOT in the Bonjour TXT record — this fetch is the
         # one place the travel secret changes hands.
+        # The tailnet address is a plain URL, so it carries the main
+        # listener's port: over TLS this listener's own port is the
+        # encrypted one, and `http://100.x:<tls port>` was what the
+        # watch kept, masked only by its pin (2026-10-25 review).
+        plain_port = getattr(self.server, "plain_port", None) or self.server.server_address[1]
         answer = {"url": TUNNEL_URL,
-                  "tailscale": tailscale_url(self.server.server_address[1])}
+                  "tailscale": tailscale_url(plain_port)}
         if TLS_INFO:
             # Inside a proven answer: the one way a watch learns which
             # certificate is this computer's (#645 S4).
@@ -4263,7 +4176,10 @@ class RelayHandler(BaseHTTPRequestHandler):
         body = self._read_json()
         card_id = (body or {}).get("id")
         decision = (body or {}).get("decision")
-        if not isinstance(card_id, str) or decision not in VALID_DECISIONS:
+        # Card ids are short; one longer than any the relay issues is a bad
+        # request, refused before it reaches a log line (2026-10-25 review).
+        if (not isinstance(card_id, str) or len(card_id) > 64
+                or decision not in VALID_DECISIONS):
             self._send_json({"error": "expected {\"id\", \"decision\"}"}, 400)
             return
         if self.queue.not_here_yet(card_id):
@@ -4320,7 +4236,13 @@ class RelayHandler(BaseHTTPRequestHandler):
         # and whenever it changes. Anything but "available" means iCloud
         # carries nothing for this Mac, so a closed watch cannot buzz.
         body = self._read_json() or {}
-        self._send_json({"ok": note_bridge_icloud(body.get("icloud"))})
+        took = False
+        if "icloud" in body:
+            took = note_bridge_icloud(body.get("icloud")) or took
+        # And whether its CloudKit saves go through (2026-10-25 review).
+        if "saves" in body:
+            took = note_bridge_saves(body.get("saves")) or took
+        self._send_json({"ok": took})
 
     def _post_heartbeat(self, path, query):
         # The bridge relays the watch's CloudKit heartbeat: how many
@@ -4595,9 +4517,11 @@ class _TLSRelayServer(_RelayServer):
         super().process_request_thread(wrapped, client_address)
 
 
-def serve_tls(host, port, cert, key, queue=None, auth=None, allow_simulator=False):
+def serve_tls(host, port, cert, key, queue=None, auth=None, allow_simulator=False,
+              plain_port=None):
     """The encrypted listener: the main listener's routes and rules, over
-    TLS 1.2 or newer, with this computer's own certificate."""
+    TLS 1.2 or newer, with this computer's own certificate. ``plain_port``
+    is the main listener's, for the one plain address /tunnel names."""
     import ssl
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -4607,7 +4531,9 @@ def serve_tls(host, port, cert, key, queue=None, auth=None, allow_simulator=Fals
     context.load_cert_chain(cert, key)
     queue = queue if queue is not None else CardQueue()
     handler = _bound_handler(queue, None, auth, allow_simulator)
-    return _TLSRelayServer((host, port), handler, context), queue
+    server = _TLSRelayServer((host, port), handler, context)
+    server.plain_port = plain_port
+    return server, queue
 
 
 # ---- the encrypted listener -------------------------------------------------
@@ -4784,7 +4710,8 @@ class Auth:
                 data = json.load(handle)
         except (OSError, ValueError):
             data = None
-        if isinstance(data, dict) and data.get("version") == 1:
+        readable = isinstance(data, dict) and data.get("version") == 1
+        if readable:
             self.tunnel_secret = str(data.get("tunnel_secret") or "")
             self.bootstrap = str(data.get("bootstrap") or "")
             self.paired_ever = bool(data.get("paired_ever"))
@@ -4792,9 +4719,42 @@ class Auth:
             if isinstance(devices, list):
                 self.devices = [d for d in devices
                                 if isinstance(d, dict) and d.get("token")]
+        kept = None
+        if not readable and os.path.exists(self.path):
+            # A file is there but is not one this relay can read: not JSON,
+            # or a version it does not know. Seeding over it threw every
+            # pairing away in silence (2026-10-25 review, L9). It is kept
+            # beside the fresh file instead, and said: here and on the wrist.
+            kept = self._keep_unreadable()
         if not self.tunnel_secret or not self.bootstrap:
             self._seed()
         self._ensure_icloud_device()
+        if kept is not None:
+            # After the saves above: a successful save withdraws "pairing",
+            # and this must outlive the one that wrote the fresh identity.
+            # The next save that follows a watch pairing again lifts it.
+            note_condition(
+                "pairing",
+                "Your computer's pairing file could not be read, so every "
+                "watch must pair again; the old file was kept beside it%s."
+                % (" as %s" % os.path.basename(kept) if kept else
+                   ", but could not be renamed and was replaced"))
+
+    def _keep_unreadable(self):
+        """Rename the unreadable file to ``auth.json.bad-<unix stamp>``
+        beside itself. Returns the new path, or "" when even that failed
+        (the caller still says so; nothing is swallowed)."""
+        kept = "%s.bad-%d" % (self.path, int(time.time()))
+        try:
+            os.replace(self.path, kept)
+        except OSError as error:
+            print("relay: could not read %s and could not keep it either: %s"
+                  % (self.path, error), file=sys.stderr)
+            return ""
+        print("relay: could not read %s; kept as %s and starting a fresh "
+              "identity, so every watch must pair again"
+              % (self.path, os.path.basename(kept)), file=sys.stderr)
+        return kept
 
     def _seed(self):
         """First run — or a file we cannot read, which fails closed to a
@@ -5131,6 +5091,31 @@ def note_bridge_icloud(status):
     return True
 
 
+def note_bridge_saves(saves):
+    """What the bridge says about its CloudKit saves: `{"failing": bool,
+    "error": str}`. Failing, the wrist hears why no card arrives away from
+    home; working again, the sentence goes. A bridge whose saves were all
+    refused retried every card every 2 s for ever and told nobody
+    (2026-10-25 review). False for anything not of that shape, which
+    changes nothing."""
+    if not isinstance(saves, dict):
+        return False
+    failing = saves.get("failing")
+    if not isinstance(failing, (bool, int)):
+        return False
+    if failing:
+        why = str(saves.get("error") or "no reason given")[:120]
+        note_condition(
+            "bridge_saves",
+            "iCloud is refusing Tapproval's cards from this computer (%s), so "
+            "away from home your watch gets no cards until it clears. The "
+            "bridge keeps trying; if this stays, check this Mac's iCloud "
+            "storage and sign-in." % why)
+    else:
+        clear_condition("bridge_saves")
+    return True
+
+
 # The bridge's login item (1.1.0), asked at most this often: the answer is a
 # subprocess, and /health is polled.
 LOGIN_ITEM_EVERY = 300.0
@@ -5145,13 +5130,18 @@ def check_login_item(now=None):
     now = time.time() if now is None else now
     if now - _LOGIN_ITEM["at"] >= LOGIN_ITEM_EVERY:
         _LOGIN_ITEM["at"] = now
-        _LOGIN_ITEM["word"] = None
         try:
             import bridge_install
             app = bridge_install.app_path()
+            word = None
             if os.path.isdir(app) and bridge_install.registers_itself(app):
-                _LOGIN_ITEM["word"] = bridge_install.login_item("login-status", app)
+                word = bridge_install.login_item("login-status", app)
+            _LOGIN_ITEM["word"] = word
         except Exception as error:
+            # A check that broke changes nothing: the word stays what the
+            # last check saw, so a condition it noted stands. Resetting it
+            # here read a bridge that could not be asked as "Login Items
+            # is fine" (2026-10-25 review).
             print("relay: could not ask the bridge's login item: %s" % error,
                   file=sys.stderr)
     if _LOGIN_ITEM.get("word") == "requires-approval":
@@ -5811,7 +5801,8 @@ def _start_tls(args, queue, auth):
     cert, key = identity
     try:
         server, _ = serve_tls(args.host, args.tls_port, cert, key, queue=queue,
-                              auth=auth, allow_simulator=args.allow_simulator)
+                              auth=auth, allow_simulator=args.allow_simulator,
+                              plain_port=args.port)
     except (OSError, ValueError) as error:
         note_condition("no_tls", "Messages on your Wi-Fi are not encrypted: the "
                        "encrypted port %d is in use on this computer." % args.tls_port)

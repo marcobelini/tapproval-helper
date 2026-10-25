@@ -121,6 +121,18 @@ struct Card: Codable { let id: String; let tier: String
 struct Pending: Codable { let cards: [Card] }
 
 var mirrored: Set<String> = []
+/// CloudKit save refusals in a row, and what the last one said. Three in a
+/// row are a condition on the wrist, through /bridge-status; until then a
+/// refusal is a blip. While refused, new saves wait for the server's
+/// retry-after (or 30 s) instead of every card every 2 s, which told nobody
+/// and grew the log (2026-10-25 review).
+var saveFailures = 0
+var lastSaveError = ""
+var savesHeldUntil = Date.distantPast
+/// What the relay last took about the saves, so the post is made once per
+/// change: nil until it has taken anything.
+var relayTookSavesFailing: Bool?
+let saveFailuresSaid = 3
 /// Cards whose answer the relay has taken, until the relay stops listing
 /// them: the tick may still hold a list fetched before the answer, and
 /// mirroring one of those again would buzz the wrist a second time.
@@ -209,15 +221,40 @@ func log(_ message: String) {
     do {
         _ = try await cloud { try await $0.save(record) }
         mirrored.insert(card.id)
+        savesWorked()
         // T1 of the buzz-when-closed latency measurement, next to the
         // relay's "queued <id> ... at <ms>" (T0).
         log("mirrored \(card.id) \(card.alertBucket) at "
             + "\(Int(Date().timeIntervalSince1970 * 1000)) \(card.tier) \(card.headline)")
     } catch let error as CKError where error.code == .serverRecordChanged {
         mirrored.insert(card.id)
+        savesWorked()
     } catch {
-        log("mirror failed: \(error.localizedDescription)")
+        saveFailures += 1
+        lastSaveError = error.localizedDescription
+        let wait = (error as? CKError)?.retryAfterSeconds ?? 30
+        savesHeldUntil = Date().addingTimeInterval(wait)
+        log("mirror failed (\(saveFailures) in a row, next try in \(Int(wait)) s): \(lastSaveError)")
     }
+}
+
+/// A save went through: the run of refusals is over.
+@MainActor func savesWorked() {
+    saveFailures = 0
+    lastSaveError = ""
+    savesHeldUntil = .distantPast
+}
+
+/// Tell the relay when the saves have been refused `saveFailuresSaid` times
+/// in a row, and again when they work, once per change. No answer is a
+/// relay restarting; the next tick asks again.
+@MainActor func reportSaves() async {
+    let failing = saveFailures >= saveFailuresSaid
+    if relayTookSavesFailing == failing { return }
+    var saves: [String: Any] = ["failing": failing]
+    if failing { saves["error"] = lastSaveError }
+    guard let status = await postJSON("bridge-status", ["saves": saves]) else { return }
+    if (200..<300).contains(status) { relayTookSavesFailing = failing }
 }
 
 @MainActor func unmirror(_ id: String) async {
@@ -608,11 +645,13 @@ var ticks = 0
         if ticks % 30 == 0 { await reconcileCards(pendingIDs: pendingIDs) }
         // Read afresh for each card: an answer can land at any await here.
         for card in pending where !mirrored.contains(card.id) && !answered.contains(card.id) {
+            if Date() < savesHeldUntil { break }   // refused just now: wait it out
             await mirror(card)
         }
         for stale in mirrored.subtracting(pendingIDs) {
             await unmirror(stale)   // hook gave up; retract the card
         }
+        await reportSaves()
     }
     // The watch rewrites its presence record at most every 30s; fetching
     // it every 2s tick would be ~43k CloudKit reads a day for nothing.
@@ -824,6 +863,7 @@ while true {
     if ticks % 150 == 0 {   // every ~5 min, and at startup
         await mirrorRelayInfo()
         relayTookICloud = nil   // a relay that restarted has forgotten it
+        relayTookSavesFailing = nil
     }
     // Every 30 s: a change of account reaches the wrist within that.
     if ticks % 15 == 0 { await reportICloud() }

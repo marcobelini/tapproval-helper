@@ -506,8 +506,14 @@ def _install(pin, wait_for_bridge, home):
         except (InstallError, OSError) as error:
             # Every failure after the swap undoes it. Left half-done, the
             # new bridge would read as "current" and never be retried.
-            _roll_back(app, previous, had_previous, was)
+            not_back = _roll_back(app, previous, had_previous, was)
             reason = getattr(error, "strerror", None) or str(error)
+            if not_back:
+                # Both reasons, or the first is lost under the second
+                # (2026-10-25 review): the old bridge waits under .previous.
+                raise InstallError(
+                    "%s, and the previous bridge could not be put back: %s"
+                    % (reason, not_back)) from error
             raise InstallError(
                 "%s, so the previous one is back" % reason if had_previous
                 else "%s; nothing is installed" % reason) from error
@@ -519,7 +525,10 @@ def _install(pin, wait_for_bridge, home):
 
 def _roll_back(app, previous, had_previous, was):
     """Put back what was there before the swap: the previous bridge, under
-    its own name and started its own way, or nothing at all."""
+    its own name and started its own way, or nothing at all. Returns why the
+    previous bridge could not be put back, or "" when it was (or there was
+    none): the caller is already raising, and a second error thrown from
+    here would hide the first."""
     if os.path.isdir(app) and registers_itself(app) and (
             not had_previous or not registers_itself(previous)):
         # Its login item would point at nothing, or outrank the job file
@@ -529,7 +538,10 @@ def _roll_back(app, previous, had_previous, was):
     shutil.rmtree(app, ignore_errors=True)
     legacy = os.path.join(legacy_dir(), OLD_APP_NAME)
     if had_previous and os.path.isdir(previous):
-        os.rename(previous, was)
+        try:
+            os.rename(previous, was)
+        except OSError as error:
+            return "%s (%s)" % (error.strerror or error, previous)
         start(was)
     elif os.path.isdir(legacy):
         # The first install into the new place failed on a Mac whose bridge
@@ -542,6 +554,7 @@ def _roll_back(app, previous, had_previous, was):
             os.remove(agent_path())
         except OSError:
             pass
+    return ""
 
 
 def _retire_legacy():

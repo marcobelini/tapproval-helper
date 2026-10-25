@@ -178,8 +178,17 @@ def record(entry, path=None):
     try:
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         _rotate(path)
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, sort_keys=True) + "\n")
+        # One write() of one whole line: an entry can exceed the text
+        # layer's 8 KiB buffer, so two request threads crashing together
+        # could interleave halves, and the reader skipped the torn line
+        # (2026-10-25 review). Made 0600 rather than chmod'ed after, so the
+        # file is never readable to the machine for an instant.
+        line = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
+        handle = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(handle, line)
+        finally:
+            os.close(handle)
         os.chmod(path, 0o600)
         return True
     except OSError as error:
@@ -355,8 +364,11 @@ def report(message, stack, source="process", helper=None, now=None,
                 _sent_in_window += 1
         return reason, entry
     except Exception as error:                       # the last line of defence
-        print("crash_report: reporter itself failed (%s)" % error,
-              file=sys.stderr)
+        try:
+            print("crash_report: reporter itself failed (%s)" % error,
+                  file=sys.stderr)
+        except Exception:                 # stderr closed or full: say nothing, raise nothing
+            pass
         return "reporter_failed", {}
 
 

@@ -124,21 +124,37 @@ def _stat_cached(cache, path, compute, extra=None, limit=64):
     return result
 
 
+def _tail_text(path, n):
+    """The last ``n`` bytes of a file as text (undecodable bytes replaced),
+    the whole file when it is shorter. Raises what ``open`` raises, so each
+    reader keeps its own answer to a missing or unreadable file."""
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        handle.seek(max(0, handle.tell() - n))
+        return handle.read().decode("utf-8", "replace")
+
+
 # Parsed usage entries per transcript — a transcript that has not changed
 # is never read twice.
 _USAGE_FILES = {}   # path -> {"offset": bytes read, "entries": [(stamp, inp, out, cache_read, model)]}
 
 
-def _parse_stamp(text):
-    """ISO-8601 from a transcript to epoch seconds. None when unparseable."""
+def _parse_moment(text):
+    """An ISO-8601 stamp (a trailing "Z" allowed) as a datetime, naive when
+    the stamp carried no zone. None when unparseable."""
     if not text:
         return None
     try:
         from datetime import datetime
-        cleaned = str(text).replace("Z", "+00:00")
-        return datetime.fromisoformat(cleaned).timestamp()
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
+
+
+def _parse_stamp(text):
+    """ISO-8601 from a transcript to epoch seconds. None when unparseable."""
+    moment = _parse_moment(text)
+    return None if moment is None else moment.timestamp()
 
 
 _USAGE_LOCK = threading.Lock()
@@ -348,20 +364,24 @@ def live_sessions(sessions_dir=None):
 
 
 _MODE_TAIL_BYTES = 262144
+_MODE_CACHE = {}   # path -> ((mtime, size, tail), mode)
 
 
 def permission_mode(path, tail=_MODE_TAIL_BYTES):
     """The permission mode of a session's latest turn, from the end of its
-    transcript; "" when it cannot be told. Never raises."""
+    transcript; "" when it cannot be told. Never raises.
+
+    Asked for every live session on every /sessions poll, so the answer is
+    kept per path until the transcript's size or time changes: an unchanged
+    file is not opened again."""
+    def read():
+        text = _tail_text(path, tail)
+        found = re.findall(r'"%s"\s*:\s*"([A-Za-z]+)"' % shape("key.permission_mode"), text)
+        return found[-1] if found else ""
     try:
-        with open(path, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            handle.seek(max(0, handle.tell() - tail))
-            text = handle.read().decode("utf-8", "replace")
+        return _stat_cached(_MODE_CACHE, path, read, extra=tail)
     except (OSError, TypeError):
         return ""
-    found = re.findall(r'"%s"\s*:\s*"([A-Za-z]+)"' % shape("key.permission_mode"), text)
-    return found[-1] if found else ""
 
 
 def inbox_ready(entry, transcript):
@@ -1162,13 +1182,9 @@ _ACTIVITY_LOCK = threading.Lock()
 
 def _local_time(stamp):
     """("YYYY-MM-DD", "HH:MM") of an ISO timestamp in this machine's zone,
-    or None when it does not parse."""
-    from datetime import datetime
-    try:
-        moment = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if moment.tzinfo is None:
+    or None when it does not parse or names no zone."""
+    moment = _parse_moment(stamp)
+    if moment is None or moment.tzinfo is None:
         return None
     local = moment.astimezone()
     return local.strftime("%Y-%m-%d"), local.strftime("%H:%M")
@@ -1319,6 +1335,10 @@ def _find_transcript(prefix, projects_dir=None):
     None when there is no match. Memoised — the watch resolves the same
     session every couple of seconds while a thread view is open. Never
     raises."""
+    # "".startswith("") is True: an empty prefix matched the first transcript
+    # seen, in the cache and on disk alike (2026-10-25 review).
+    if not prefix or not str(prefix).strip():
+        return None
     with _CACHE_LOCK:
         cached = _TRANSCRIPT_PATHS.get(prefix) or next(
             (path for session_id, path in _TRANSCRIPT_PATHS.items()
@@ -1520,12 +1540,16 @@ def _tool_phrase(name, count=1):
 
 # Background tasks announce themselves when launched and are receipted by
 # a task-notification when they end; the difference is what is running.
+# Built from the table, like the prefilters that precede them: spelled bare,
+# a rename upstream that the table was updated for would pass the prefilter
+# and extract nothing (2026-10-25 review).
 _TASK_LAUNCH = re.compile(
-    r"running in background with ID: ([\w-]+)|agentId: ([a-f0-9]+)"
-    r"|Monitor started \(task ([\w-]+)"
-    r"|Workflow launched in background\. Task ID: ([\w-]+)")
-_TASK_DONE = re.compile(r"<task-id>([\w-]+)</task-id>")
-_WAKEUP_IN = re.compile(r"Next wakeup scheduled for [^(]*\(in (\d+)s\)")
+    r"%s: ([\w-]+)|%s: ([a-f0-9]+)|%s ([\w-]+)|%s ([\w-]+)" % (
+        re.escape(shape("task.launched")), re.escape(shape("task.agent_id")),
+        re.escape(shape("task.monitor_started")),
+        re.escape(shape("task.workflow_launched"))))
+_TASK_DONE = _tag_pattern(shape("tag.task_id"), r"([\w-]+)")
+_WAKEUP_IN = re.compile(re.escape(shape("wakeup.scheduled")) + r" [^(]*\(in (\d+)s\)")
 # How many tool descriptions to remember, to name a task by what it is for.
 _DESCRIPTIONS_KEPT = 64
 
@@ -1615,10 +1639,7 @@ def _judge_task_files(found, owner_started=None):
     # none.
     for path in found:
         try:
-            with open(path, "rb") as handle:
-                size = os.path.getsize(path)
-                handle.seek(max(0, size - 300))
-                tail = handle.read().decode("utf-8", "replace")
+            tail = _tail_text(path, 300)
             if shape("task.exited") in tail or shape("task.killed") in tail:
                 return "done"
             if time.time() - os.path.getmtime(path) <= 1800:
@@ -2234,15 +2255,12 @@ def prompts_at_the_mac(audit_log=None, tail=128 * 1024):
     def read():
         found = set()
         try:
-            with open(path, "rb") as handle:
-                handle.seek(0, os.SEEK_END)
-                handle.seek(max(0, handle.tell() - tail))
-                for raw in handle.read().decode("utf-8", "replace").splitlines():
-                    entry = _json_object(raw)
-                    if (entry and entry.get("effective") == "escalate"
-                            and entry.get("watch") != "skipped-parity"
-                            and entry.get("tool_use_id")):
-                        found.add(str(entry["tool_use_id"]))
+            for raw in _tail_text(path, tail).splitlines():
+                entry = _json_object(raw)
+                if (entry and entry.get("effective") == "escalate"
+                        and entry.get("watch") != "skipped-parity"
+                        and entry.get("tool_use_id")):
+                    found.add(str(entry["tool_use_id"]))
         except OSError:
             return set()
         return found

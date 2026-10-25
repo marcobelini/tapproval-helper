@@ -537,9 +537,62 @@ class TestTheHolesTheReviewFound:
     def test_the_reads_beside_them_stay_safe(self, command):
         assert crc.classify_bash(command)[0] == Risk.SAFE, command
 
+    @pytest.mark.parametrize("command", [
+        # 2026-10-25 whole-repository review: the shell expands a glob or a
+        # brace before cat sees it, so a wildcard inside a hidden folder of
+        # the home directory named a secret store the literal rule could
+        # not see, and --quiet let the private key into the transcript.
+        "cat ~/.ss?/id_rs?",
+        "cat ~/.config/*/hosts.yml",
+        "cat ~/.s{sh}/id_{rsa}",
+        "head ~/.netr?",
+        "grep -r . ~/.aw?/",
+        "cat $HOME/.ss[h]/id_rs[a]",
+        "cat ${HOME}/.*/config",
+        "less /Users/someone/.kub?/config",
+    ])
+    def test_a_wildcard_in_a_hidden_home_folder_is_a_secret_read(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= Risk.HIGH, (command, risk, rules)
+        assert "secret-glob" in rules, (command, rules)
+
+    @pytest.mark.parametrize("command", [
+        # Wildcards over visible files stay what they were.
+        "cat *.md", "ls ~/Documents/*.pdf", "grep -r TODO src/*.py",
+        "cat ~/notes/*.txt", "ls .github/workflows/*.yml",
+    ])
+    def test_a_wildcard_over_visible_files_is_not(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert "secret-glob" not in rules, (command, rules)
+
     def test_a_pipe_of_stderr_too_is_a_pipe(self):
         """`|&` was no separator: `echo hi |& sh` read MEDIUM, `| sh` CRITICAL."""
         assert crc.classify_bash("echo hi |& sh")[0] == crc.classify_bash("echo hi | sh")[0]
+
+    @pytest.mark.parametrize("command", [
+        # 2026-10-25 whole-repository review: awk's ENVIRON and jq's env
+        # print every token in the shell's environment, the dump
+        # `credential-read` exists to catch, and both read SAFE while `env`
+        # read HIGH.
+        "awk 'BEGIN{for(k in ENVIRON)print k\"=\"ENVIRON[k]}'",
+        "gawk 'BEGIN{print ENVIRON[\"AWS_SECRET_ACCESS_KEY\"]}'",
+        "jq -n 'env'",
+        "jq -n 'env | keys'",
+        "jq -rn 'env.GITHUB_TOKEN'",
+    ])
+    def test_an_environment_dump_through_a_read_tool_is_a_credential_read(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= Risk.HIGH, (command, risk, rules)
+        assert "credential-read" in rules, (command, rules)
+
+    @pytest.mark.parametrize("command", [
+        # A field called env, and awk over a file, are what they were.
+        "jq '.env.production' config.json", "jq -r '.environment' deploy.json",
+        "awk '{print $1}' access.log", "awk -F: '{print $1}' /etc/hosts",
+    ])
+    def test_the_reads_that_merely_say_env_stay_safe(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert "credential-read" not in rules, (command, rules)
 
     def test_a_multiedit_is_scanned_like_an_edit(self):
         edit = crc.classify({"tool_name": "Edit",
@@ -550,6 +603,28 @@ class TestTheHolesTheReviewFound:
                                              "edits": [{"old_string": "a",
                                                         "new_string": "DROP TABLE users;"}]}})
         assert multi["risk"] == edit["risk"] == Risk.CRITICAL, (edit, multi)
+
+    @pytest.mark.parametrize("command", [
+        # 2026-10-25 whole-repository review: a positively recognised git
+        # read skipped the secret rule, so a secret that was ever committed
+        # read SAFE through git while `cat .env` read HIGH.
+        "git show HEAD:.env",
+        "git log -p -- .env",
+        "git diff HEAD~1 -- .env",
+        "git show main:config/credentials.yml",
+        "git grep -n password -- .env.production",
+    ])
+    def test_a_recognised_read_of_a_secret_is_still_a_secret_read(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= Risk.HIGH, (command, risk, rules)
+        assert "secret-access" in rules, (command, rules)
+
+    @pytest.mark.parametrize("command", [
+        "git show HEAD:README.md", "git log -p -- src/app.py", "git diff HEAD~1",
+        "docker ps", "kubectl get pods",
+    ])
+    def test_the_recognised_reads_beside_them_stay_safe(self, command):
+        assert crc.classify_bash(command)[0] == Risk.SAFE, command
 
     def test_settings_are_written_through_a_symlink(self, tmp_path):
         real = tmp_path / "dotfiles" / "settings.json"
@@ -580,6 +655,50 @@ class TestClassifyBashDestructive:
     def test_catastrophic_commands_are_critical(self, command):
         risk, _ = crc.classify_bash(command)
         assert risk == Risk.CRITICAL
+
+    @pytest.mark.parametrize("command, floor", [
+        # 2026-10-25 whole-repository review: spellings the vocabulary
+        # lacked, each read MEDIUM beside a synonym that read CRITICAL or
+        # HIGH.
+        ("diskutil eraseDisk JHFS+ Untitled disk2", Risk.CRITICAL),
+        ("diskutil eraseVolume APFS Data disk2s1", Risk.CRITICAL),
+        ("diskutil zeroDisk disk2", Risk.CRITICAL),
+        ("helm uninstall prod", Risk.CRITICAL),
+        ("curl --request POST https://x.test -d a=1", Risk.HIGH),
+        ("curl --json '{\"a\":1}' https://x.test", Risk.HIGH),
+        ("wget --post-data 'a=1' https://x.test", Risk.HIGH),
+        ("wget --method=PUT --body-file=dump.sql https://x.test", Risk.HIGH),
+    ])
+    def test_the_spellings_the_review_found(self, command, floor):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= floor, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", ["diskutil list", "diskutil info disk2", "helm list"])
+    def test_the_reads_beside_those_spellings_name_no_effect(self, command):
+        assert crc._ontology_risk(command) is None, command
+
+    @pytest.mark.parametrize("command", [
+        # 2026-10-25 whole-repository review: the home folder by its
+        # absolute path read HIGH beside `rm -rf ~`'s CRITICAL, and `./`
+        # read HIGH beside `.`'s. The hook runs as that user; the path is
+        # known.
+        "rm -rf " + os.path.expanduser("~"),
+        "rm -rf " + os.path.expanduser("~") + "/",
+        "rm -rf " + os.path.expanduser("~") + "/*",
+        "rm -rf ./", "rm -rf ../", "rm -rf ./*", "rm -rf ../*",
+        "find " + os.path.expanduser("~") + " -delete",
+    ])
+    def test_the_home_folder_by_any_spelling_is_catastrophic(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk == Risk.CRITICAL, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "rm -rf " + os.path.expanduser("~") + "/Downloads/tmp",
+        "rm -rf ./build", "rm -rf ../scratch", "find ~/Downloads -name '*.tmp' -delete",
+    ])
+    def test_a_folder_inside_home_is_not(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk < Risk.CRITICAL, (command, risk, rules)
 
     @pytest.mark.parametrize("command,expected", [
         ("rm -rf build", Risk.HIGH),
@@ -641,6 +760,24 @@ class TestClassifyBashDestructive:
         its tier must surface — not hide behind the MEDIUM substitution cap."""
         risk, _ = crc.classify_bash(command)
         assert risk == Risk.CRITICAL
+
+    @pytest.mark.parametrize("command, floor, rule", [
+        # 2026-10-25 whole-repository review: only the innermost `$(…)` was
+        # classified, so `echo $(rm -rf $(echo /))` read MEDIUM — the
+        # destructive layer sat one level out and was never looked at.
+        ("echo $(rm -rf $(echo /))", Risk.HIGH, "cmd-substitution-inner:rm-recursive"),
+        # Backticks swallow the whole inner text; recursion labels it by
+        # its own first rule, and the tier is what matters.
+        ("echo `rm -rf $(echo /)`", Risk.HIGH, "cmd-substitution-inner:cmd-substitution"),
+        ("echo $(git push --force $(echo origin) main)", Risk.CRITICAL,
+         "cmd-substitution-inner:git-force-push-protected"),
+        ("echo $(cat $(echo ~)/.ssh/id_rsa)", Risk.HIGH, "cmd-substitution-inner:secret-access"),
+        ("echo $(a $(b $(c $(rm -rf ~))))", Risk.CRITICAL, "cmd-substitution-inner:rm-catastrophic"),
+    ])
+    def test_every_layer_of_a_nested_substitution_is_classified(self, command, floor, rule):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= floor, (command, risk, rules)
+        assert rule in rules, (command, rules)
 
     def test_benign_command_substitution_stays_capped_at_medium(self):
         risk, rules = crc.classify_bash("echo $(date)")
@@ -756,6 +893,14 @@ class TestClassifyPath:
     def test_path_tiers(self, path, expected):
         risk, _ = crc.classify_path(path, cwd=os.getcwd())
         assert risk == expected
+
+    @pytest.mark.parametrize("path", [".git", "/proj/.git", "sub/.git"])
+    def test_the_worktree_git_pointer_file_is_git_internals(self, path):
+        """In a worktree `.git` is a file (`gitdir: …`): rewriting it
+        re-points the checkout. The rule needed a trailing slash and read
+        it as a project file (2026-10-25 review)."""
+        risk, rules = crc.classify_path(path, cwd="/proj")
+        assert risk == Risk.CRITICAL and rules == ["git-internals"], (path, risk, rules)
 
     def test_write_outside_the_project_is_high(self):
         risk, rules = crc.classify_path("/etc/passwd", cwd="/home/user/project")
@@ -1299,6 +1444,26 @@ class TestAuditLog:
         crc.write_audit({"tier": "HIGH", "decision": "escalate"}, policy)
         entries = crc.read_audit(policy)
         assert [e["tier"] for e in entries] == ["SAFE", "HIGH"]
+
+    def test_a_lone_surrogate_in_the_command_cannot_raise(self, tmp_path):
+        """"Never raises" caught OSError only: a lone surrogate in a command
+        string made json.dumps(ensure_ascii=False) + a UTF-8 write raise
+        UnicodeEncodeError out of write_audit, into run_hook's outer except,
+        which replaced a verdict the watch had already given with the
+        fallback (2026-10-25 review)."""
+        policy = dict(crc.DEFAULT_POLICY, audit_log=str(tmp_path / "audit.jsonl"))
+        crc.write_audit({"tier": "HIGH", "command": "echo \ud800"}, policy)
+        entries = crc.read_audit(policy)
+        assert len(entries) == 1 and entries[0]["tier"] == "HIGH"
+
+    def test_a_failure_of_any_kind_is_said_not_raised(self, tmp_path, monkeypatch, capsys):
+        policy = dict(crc.DEFAULT_POLICY, audit_log=str(tmp_path / "audit.jsonl"))
+
+        def broken(*args, **kwargs):
+            raise ValueError("no")
+        monkeypatch.setattr(crc.json, "dumps", broken)
+        crc.write_audit({"tier": "HIGH"}, policy)
+        assert "cannot write audit log" in capsys.readouterr().err
 
     def test_missing_log_reads_as_empty(self, tmp_path):
         policy = dict(crc.DEFAULT_POLICY, audit_log=str(tmp_path / "nope.jsonl"))
@@ -1939,6 +2104,42 @@ class TestWatchRelayBridge:
         policy = dict(crc.DEFAULT_POLICY, relay=url, relay_wait=5.0)
         assert crc.ask_watch(self.CARD, policy) == ("deny", None)
 
+    def test_a_proof_header_that_is_not_ascii_is_refused_not_a_crash(self, capsys):
+        """hmac.compare_digest raises TypeError on a str with a non-ASCII
+        character, and http.client decodes headers as latin-1: anything on
+        the relay's port answering with such a header made ask_watch raise
+        against its "never raises" contract. run_hook still escalated, but
+        the audit line was skipped (2026-10-25 review). The relay's twin
+        was fixed on 2026-10-21."""
+        import http.server
+        watch_relay.Auth()
+
+        class Impostor(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                body = b'{"decision": "allow"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("X-Tapproval-Proof2", "\xe9" * 64)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Impostor)
+        _serve(server)
+        try:
+            policy = dict(crc.DEFAULT_POLICY,
+                          relay="http://127.0.0.1:%d" % server.server_address[1],
+                          relay_wait=2.0)
+            assert crc.ask_watch(self.CARD, policy) == ("none", None)
+        finally:
+            server.shutdown()
+            server.server_close()
+        assert "did not prove the relay's key" in capsys.readouterr().err
+
     def test_nobody_answers_means_none(self, relay):
         url, _ = relay
         policy = dict(crc.DEFAULT_POLICY, relay=url, relay_wait=0.2)
@@ -2458,6 +2659,32 @@ class TestTheDashboardRemembersWhatItRead:
         assert len(loads) == 2
         crc.configure_site_rules({})
 
+    def test_the_permission_mode_is_read_once_per_change(self, tmp_path, monkeypatch):
+        """Every /sessions poll asks each live session's mode; an unchanged
+        transcript is not opened again, and an appended one is."""
+        import builtins
+        import watch_dashboard as wd
+        path = str(_write_transcript(tmp_path, "-m", "mode.jsonl", [
+            {"type": "user", "permissionMode": "default",
+             "message": {"role": "user", "content": "a"}}]))
+        opened = []
+        real_open = builtins.open
+
+        def counting_open(file, *args, **kwargs):
+            opened.append(file)
+            return real_open(file, *args, **kwargs)
+        monkeypatch.setattr(builtins, "open", counting_open)
+        assert wd.permission_mode(path) == "default"
+        assert opened == [path]
+        assert wd.permission_mode(path) == "default"
+        assert opened == [path], "an unchanged transcript was read again"
+        with real_open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "user", "permissionMode": "plan",
+                                     "message": {"role": "user", "content": "b"}}) + "\n")
+        assert wd.permission_mode(path) == "plan"
+        assert opened == [path, path]
+        assert wd.permission_mode(None) == "" and wd.permission_mode(path + ".gone") == ""
+
 
 class TestRelaySessions:
     def test_lists_sessions_newest_first(self, tmp_path, monkeypatch):
@@ -2584,6 +2811,38 @@ class TestRelayTunnelDiscovery:
         finally:
             watch_relay.TUNNEL_URL = None
 
+    def test_the_encrypted_listener_names_the_plain_port_for_the_tailnet(self, fresh_auth, monkeypatch):
+        """Over TLS /tunnel named the tailnet address with the encrypted
+        listener's own port under an http:// scheme — a plain address at
+        the TLS port, masked only by the watch's pin (2026-10-25 review).
+        The main listener's port is the one a plain URL may carry."""
+        import ssl
+        import http.client
+        identity = watch_relay.ensure_tls_identity()
+        assert identity is not None
+        cert, key = identity
+        asked = []
+        monkeypatch.setattr(watch_relay, "tailscale_url",
+                            lambda port: asked.append(port) or "http://100.1.2.3:%d" % port)
+        server, _ = watch_relay.serve_tls("127.0.0.1", 0, cert, key, auth=fresh_auth,
+                                          plain_port=8977)
+        _serve(server)
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            conn = http.client.HTTPSConnection("127.0.0.1", server.server_address[1],
+                                               context=context, timeout=5)
+            conn.request("GET", "/tunnel", headers={"X-Tapproval-Token": fresh_auth.bootstrap})
+            reply = conn.getresponse()
+            body = json.loads(reply.read())
+            conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+        assert reply.status == 200, body
+        assert body["tailscale"] == "http://100.1.2.3:8977" and asked == [8977], (body, asked)
+
     def test_tunnel_url_not_exposed_through_tunnel_listener(self):
         server, _ = watch_relay.serve(port=0, token="tok")
         _serve(server)
@@ -2643,6 +2902,28 @@ class TestSelfStartingRelay:
         hooks = data.get("hooks", {})
         assert "PermissionRequest" not in hooks
         assert "SessionStart" not in hooks
+
+    def test_the_self_probe_signs_with_the_key_file(self, monkeypatch):
+        """--ensure decides on the pending count and the pairing state,
+        which a raw loopback /health no longer carries (2026-10-25 review):
+        the probe signs with the key file, as the hook and the bridge do.
+        Without a key file it still learns the version."""
+        server, queue = watch_relay.serve(port=0, auth=watch_relay.Auth())
+        _serve(server)
+        monkeypatch.setattr(watch_relay, "DEFAULT_PORT", server.server_address[1])
+        try:
+            signed = watch_relay._probe_relay()
+            assert signed and "pending" in signed and "paired_ever" in signed, signed
+            bare = watch_relay._loopback_json("/health")
+            assert bare and bare["version"] == watch_relay.RELAY_VERSION, bare
+            assert "pending" not in bare and "paired_ever" not in bare, bare
+            monkeypatch.setattr(watch_relay.wire, "read_bootstrap", lambda path: None)
+            unsigned = watch_relay._probe_relay()
+            assert unsigned and unsigned["version"] == watch_relay.RELAY_VERSION
+            assert "pending" not in unsigned
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_ensure_detects_running_relay(self, monkeypatch, capsys):
         server, _ = watch_relay.serve(port=0)
@@ -3175,13 +3456,14 @@ class TestSignedRequests:
         assert reply_headers.get("X-Tapproval-Proof") == watch_relay.relay_proof(device, nonce)
 
     def test_a_v1_path_cannot_stand_in_for_a_v2_path_and_query(self):
-        """The fields are joined by newlines: v1 of `P\\nQ` is byte for byte
+        """The fields are joined by newlines: v1 of `P\\nQ` was byte for byte
         v2 of P with query Q, so a captured v2 MAC replayed as v1 on the
-        path `P%0AQ` verified (2026-10-24 review)."""
+        path `P%0AQ` verified (2026-10-24 review). The relay refuses the
+        path; since 2026-10-25 the wire refuses to make the message at all."""
         stamp, nonce = int(time.time()), uuid.uuid4().hex
         mac = watch_relay.sign_request("k", "GET", "/thread", stamp, nonce, b"", "id=a")
-        assert tapproval_wire.signature_message("GET", "/thread\nid=a", stamp, nonce) \
-            == tapproval_wire.signature_message("GET", "/thread", stamp, nonce, b"", "id=a")
+        with pytest.raises(ValueError):
+            tapproval_wire.signature_message("GET", "/thread\nid=a", stamp, nonce)
         header = "v1 %d %s %s" % (stamp, nonce, mac)
         assert watch_relay.verify_signature(
             header, "GET", "/thread\nid=a", b"", ["k"], now=stamp) == (None, None)
@@ -3230,6 +3512,36 @@ class TestSignedRequests:
         pad = bytes(zeros[i] ^ bytes.fromhex(opened)[i] for i in range(32))
         issued = bytes(sealed[i] ^ pad[i] for i in range(32)).decode()
         assert fresh_auth.matches(issued)
+
+    def test_what_a_watch_says_about_itself_is_bounded(self, fresh_auth):
+        """`source` went into auth.json uncut: a key holder could put a
+        quarter megabyte there per enrolment, rewritten atomically on
+        every later change (2026-10-25 review). `label` was cut already."""
+        watch_relay.LIMITS.reset()
+        server, _ = watch_relay.serve(port=0, auth=fresh_auth)
+        _serve(server)
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        try:
+            body = {"device_id": "watch-3", "label": "L" * 500, "source": "s" * 100000}
+            headers, _ = self._signed(fresh_auth.bootstrap, "/enroll", body)
+            status, _, _ = self._post(base, "/enroll", body, headers)
+        finally:
+            server.shutdown()
+            server.server_close()
+        assert status == 200
+        row = [d for d in fresh_auth.devices if d["id"] == "watch-watch-3"][0]
+        assert len(row["source"]) <= 40 and len(row["label"]) <= 40, row
+
+    def test_an_overlong_card_id_is_refused_before_it_is_logged(self, relay, capsys):
+        """A caller's card id went into three refusal lines verbatim, up to
+        the body size (2026-10-25 review). Card ids are short; a long one
+        is a bad request, said in under a line."""
+        base, _, device = relay
+        status, _, _ = self._post(base, "/decision",
+                                  {"id": "x" * 10000, "decision": "allow"},
+                                  {"X-Tapproval-Token": device})
+        assert status == 400
+        assert all(len(line) < 300 for line in capsys.readouterr().err.splitlines())
 
     def _raw(self, base, path, headers, method="GET", body=None):
         request = urllib.request.Request(base + path, data=body, method=method, headers=headers)
@@ -3311,6 +3623,51 @@ class TestEveryCommittingScriptSaysWhoItIs:
                 assert re.search(r'^export GIT_AUTHOR_NAME="Tapproval"', text, re.M), path
                 assert "GIT_COMMITTER_EMAIL" in text, path
         assert len(committing) >= 2, committing
+
+
+@pytest.mark.private_layout
+class TestAnE2ERunRefusesATakenPort:
+    """Each e2e script starts a relay of its own on a port of its own.
+    pill-e2e.sh and place-e2e.sh first ask whether something already answers
+    there and stop if it does; tls-, encryption- and auto-update-e2e.sh
+    started theirs regardless, so a relay already on the port made the
+    "is it up yet" wait succeed at once and the run tested the wrong relay
+    (2026-10-25 review)."""
+
+    def _scripts(self):
+        scripts = sorted(glob.glob(os.path.join(_ROOT, "WatchApp", "*-e2e.sh")))
+        if not scripts:
+            pytest.skip("no e2e scripts in this layout")
+        return scripts
+
+    def test_every_e2e_script_asks_its_ports_before_starting_its_relay(self):
+        for path in self._scripts():
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+            ports = re.findall(r"(?:^|;)\s*([A-Z_]+)=(\d{4,5})\s*(?:;|$)", text, re.M)
+            assert ports, "%s names no port" % path
+            start = text.find("watch_relay.py --")
+            assert start > 0, "%s starts no relay" % path
+            before = text[:start]
+            guard = re.search(r"^[^\n]*curl[^\n]*/health[^\n]*$", before, re.M)
+            assert guard, "%s starts its relay without asking the port" % path
+            guard = before[guard.start():before.find("exit 1", guard.start()) + 6]
+            assert guard.endswith("exit 1"), path
+            for name, _ in ports:
+                named = "$%s" % name in guard or (
+                    "$BASE" in guard and re.search(r"^BASE=.*\$%s\b" % name, before, re.M))
+                assert named, "%s: the guard does not ask port %s" % (path, name)
+
+    def test_the_wait_for_a_sibling_run_names_this_folder_not_a_checkout(self):
+        """pill-e2e.sh waited for another simulator run by the name of the
+        release checkout's folder, which anywhere else matched nothing."""
+        for path in glob.glob(os.path.join(_ROOT, "WatchApp", "*.sh")):
+            with open(path, encoding="utf-8") as handle:
+                assert "ClaudeWatch-ship" not in handle.read(), path
+        with open(os.path.join(_ROOT, "WatchApp", "pill-e2e.sh"), encoding="utf-8") as handle:
+            pill = handle.read()
+        assert 'pgrep -f "$WATCHAPP/"' in pill, "the sibling pattern is the script's own folder"
+        assert 'WATCHAPP=$(pwd)' in pill and 'cd "$(dirname "$0")"' in pill
 
 
 @pytest.mark.private_layout
@@ -4243,6 +4600,57 @@ class TestTheBridgeIsWatched:
         import inspect
         assert "watch_bridge" in inspect.getsource(watch_relay.main)
 
+    def _saves_said(self):
+        return [c["detail"] for c in watch_relay.conditions() if c["key"] == "bridge_saves"]
+
+    def test_a_bridge_whose_saves_are_refused_is_named(self, fresh_auth):
+        """A bridge whose CloudKit saves all failed retried every card every
+        2 s for ever and told nobody: the away watch simply got no cards
+        (2026-10-25 review). The bridge now says so through /bridge-status,
+        and the sentence reaches the Connection screen."""
+        watch_relay.clear_condition("bridge_saves")
+        server, _ = watch_relay.serve(port=0, auth=fresh_auth)
+        _serve(server)
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        try:
+            status, body = relay_call(base + "/bridge-status", token=fresh_auth.bootstrap,
+                                      method="POST",
+                                      body={"saves": {"failing": True, "error": "quota exceeded"}})
+            assert status == 200 and body == {"ok": True}
+            said = self._saves_said()
+            assert said and "iCloud" in said[0] and "quota exceeded" in said[0], said
+            status, body = relay_call(base + "/bridge-status", token=fresh_auth.bootstrap,
+                                      method="POST", body={"saves": {"failing": False}})
+            assert status == 200 and body == {"ok": True}
+            assert self._saves_said() == []
+            # A body that says nothing about saves changes nothing.
+            watch_relay.note_condition("bridge_saves", "still")
+            relay_call(base + "/bridge-status", token=fresh_auth.bootstrap, method="POST",
+                       body={"icloud": "available"})
+            assert self._saves_said() == ["still"]
+            # Nonsense is refused, not recorded.
+            assert watch_relay.note_bridge_saves("yes") is False
+            assert watch_relay.note_bridge_saves({"failing": "maybe"}) is False
+        finally:
+            watch_relay.clear_condition("bridge_saves")
+            server.shutdown()
+            server.server_close()
+
+    def test_the_bridge_reports_refused_saves_and_backs_off(self):
+        """The bridge's half, read from its source: it counts refusals in a
+        row, holds its saves for the server's retry-after (or 30 s) instead
+        of every card every 2 s, and posts `saves` to /bridge-status both
+        when they fail and when they work again."""
+        path = os.path.join(_ROOT, "WatchApp", "Bridge", "main.swift")
+        if not os.path.isfile(path):
+            pytest.skip("no bridge in this layout")
+        with open(path, encoding="utf-8") as handle:
+            source = handle.read()
+        assert "retryAfterSeconds" in source
+        assert "saveFailures" in source and "savesHeldUntil" in source
+        assert '"saves"' in source and "bridge-status" in source
+        assert '"failing"' in source
+
 
 class TestStatusTroubleshoots:
     """--status used to stop at "relay running". It now reads the relay's
@@ -4308,7 +4716,6 @@ class TestTheRelayLogCarriesTheTime:
         monkeypatch.setattr(watch_relay, "session_registry", lambda: {})
         monkeypatch.setattr(watch_relay, "resolve_session",
                             lambda prefix, projects, registry=None: ("abcdef1234", "/tmp"))
-        monkeypatch.setattr(watch_relay, "type_into_session", lambda *a: False)
         monkeypatch.setattr(watch_relay, "say_guard", lambda *a, **k: None)
         monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
         monkeypatch.setattr(watch_relay, "signed_in", lambda *a, **k: True)
@@ -5823,6 +6230,47 @@ class TestTheAuthFileIsWrittenWhole:
         auth.save()
         assert path.read_text() == before
 
+    @pytest.mark.parametrize("garbage", [
+        b"{not json at all",
+        json.dumps({"version": 99, "devices": [{"token": "x"}]}).encode(),
+    ])
+    def test_a_file_that_cannot_be_read_is_kept_beside_and_said(
+            self, tmp_path, capsys, garbage):
+        """An unreadable auth.json, or one from a version this relay does
+        not know, used to be overwritten with a fresh identity in silence:
+        every pairing gone, nothing on stderr, nothing on the wrist
+        (2026-10-25 review, L9). The old bytes are kept beside the new
+        file, the log says so, and the Connection screen gets a row."""
+        path = tmp_path / "auth.json"
+        path.write_bytes(garbage)
+        auth = watch_relay.Auth(path=str(path))
+        kept = sorted(tmp_path.glob("auth.json.bad-*"))
+        assert len(kept) == 1, list(tmp_path.iterdir())
+        assert kept[0].read_bytes() == garbage
+        assert re.match(r"auth\.json\.bad-\d+$", kept[0].name)
+        fresh = json.loads(path.read_text())
+        assert fresh["version"] == 1 and auth.bootstrap
+        err = capsys.readouterr().err
+        assert kept[0].name in err
+        assert "pair again" in err
+        assert [c["key"] for c in watch_relay.conditions()] == ["pairing"]
+        assert "pair again" in watch_relay.conditions()[0]["detail"]
+
+    def test_the_kept_file_complaint_lifts_when_a_watch_pairs_again(self, tmp_path):
+        path = tmp_path / "auth.json"
+        path.write_text("{garbage")
+        auth = watch_relay.Auth(path=str(path))
+        assert [c["key"] for c in watch_relay.conditions()] == ["pairing"]
+        auth.issue_device("watch-1", label="Apple Watch")
+        assert watch_relay.conditions() == []
+
+    def test_a_missing_file_is_a_first_run_not_a_fault(self, tmp_path, capsys):
+        path = tmp_path / "auth.json"
+        watch_relay.Auth(path=str(path))
+        assert list(tmp_path.glob("auth.json.bad-*")) == []
+        assert watch_relay.conditions() == []
+        assert "pair again" not in capsys.readouterr().err
+
 
 class TestLanSourceIsNotTrusted:
     """The café-Wi-Fi hole, proved closed against a real server.
@@ -6515,7 +6963,6 @@ class TestAWristMessageGoesIntoTheInbox:
         # The inbox delivers text, never a command: /recap posted there
         # arrived as words Claude read, and Claude Code did not run it.
         spawned = self._stage(monkeypatch, posted=True)
-        monkeypatch.setattr(watch_relay, "type_into_session", lambda *a, **k: False)
         assert watch_relay.say_to_session("abcdef12", "/recap", force=True) == "sent"
         assert self.sent == []
         assert len(spawned) == 1 and spawned[0][0][-1] == "/recap"
@@ -6533,7 +6980,6 @@ class TestAWristMessageGoesIntoTheInbox:
 
     def test_a_post_that_fails_takes_the_old_route(self, monkeypatch):
         spawned = self._stage(monkeypatch, posted=False)
-        monkeypatch.setattr(watch_relay, "type_into_session", lambda *a, **k: False)
         # Still live, so the old route asks first, as before.
         assert watch_relay.say_to_session("abcdef12", "What's left?") == "live"
         assert watch_relay.say_to_session("abcdef12", "What's left?", force=True) == "sent"
@@ -7983,6 +8429,36 @@ class TestTheSharedWireModule:
         assert done.returncode != 0
         assert done.stdout.strip() == "", "no decision may be printed"
         assert "tapproval_wire" in done.stderr
+
+    @pytest.mark.parametrize("path, query", [
+        ("/a", "b\nc"), ("/a\nb", "c"), ("/a\rb", None), ("/a", "b\r"), ("/a\nb", None)])
+    def test_a_path_or_query_with_a_line_break_cannot_be_signed(self, path, query):
+        """The fields are joined by newlines, so ("/a", query="b\\nc") and
+        ("/a\\nb", query="c") were one message. The relay already refuses a
+        control character in a signed path; the wire now refuses to make
+        such a message at all, so no caller can (2026-10-25 review)."""
+        with pytest.raises(ValueError):
+            tapproval_wire.signature_message("GET", path, 1, "n" * 16, b"", query)
+        with pytest.raises(ValueError):
+            tapproval_wire.sign_request("k", "GET", path, 1, "n" * 16, b"", query)
+
+    def test_an_ordinary_path_and_query_still_sign_and_verify(self):
+        header, nonce = tapproval_wire.signed_header("k", "GET", "/thread", b"", "id=a&x=1")
+        stamp = int(header.split()[1])
+        assert watch_relay.verify_signature(header, "GET", "/thread", b"", ["k"],
+                                            now=stamp, query="id=a&x=1") == ("k", nonce)
+        assert tapproval_wire.signature_message("GET", "/a", 1, "n" * 16, b"", "b c") \
+            != tapproval_wire.signature_message("GET", "/a b", 1, "n" * 16, b"", "c")
+
+    def test_the_relay_reads_an_unsignable_request_as_no_match_not_an_error(self):
+        """A hostile query with a line break in it must read as a signature
+        that does not verify (403 at the door), never as a 500."""
+        stamp, nonce = int(time.time()), uuid.uuid4().hex
+        header = "v2 %d %s %s" % (stamp, nonce, "ab" * 32)
+        assert watch_relay.verify_signature(header, "GET", "/a", b"", ["k"],
+                                            now=stamp, query="b\nc") == (None, None)
+        assert watch_relay.verify_signature(header, "GET", "/a", b"", ["k"],
+                                            now=stamp, query="b\rc") == (None, None)
 
     def test_the_hook_and_the_relay_share_it_rather_than_copy_it(self):
         assert crc.wire is tapproval_wire and watch_relay.wire is tapproval_wire
@@ -9440,13 +9916,22 @@ class TestHostRebindingDefense:
     def test_loopback_and_local_ip_hosts_pass(self):
         for host in ("127.0.0.1:8977", "localhost:8977", "localhost",
                      "192.168.1.25:8977", "10.0.0.3:8977", "100.100.5.5:8977",
-                     "[::1]:8977", "::1"):
+                     "172.16.0.9:8977", "172.31.255.1:8977", "169.254.3.4:8977",
+                     "[::1]:8977", "::1", "[fe80::1]:8977",
+                     # IPv6 on the tailnet and a plain ULA were refused with
+                     # "bad host" until the check read the address instead
+                     # of its first characters (2026-10-25 review, L10).
+                     "[fd7a:115c:a1e0::1]:8977", "[fd00::1]:8977",
+                     "[fc00::abcd]:8977", "[::ffff:192.168.1.1]:8977"):
             assert watch_relay.host_allowed(host), host
 
     def test_rebinding_and_foreign_hosts_are_rejected(self):
         for host in ("evil.com:8977", "evil.com", "",
                      "10.evil.com:8977", "127.0.0.1.evil.com",
-                     "8.8.8.8:8977", "attacker.local:8977"):
+                     "8.8.8.8:8977", "attacker.local:8977",
+                     "172.32.0.1:8977", "100.63.255.255:8977", "100.128.0.1:8977",
+                     "[2001:db8::1]:8977", "[2606:4700::1111]:8977",
+                     "[::ffff:8.8.8.8]:8977", "[fe00::1]:8977"):
             assert not watch_relay.host_allowed(host), host
 
     def test_main_listener_refuses_a_foreign_host_end_to_end(self):
@@ -11080,6 +11565,38 @@ class TestWhatWeKnowAboutTheTranscript:
                      "agentId", "<task-id>"):
             assert text in named, "read bare, not named in the table: %r" % text
 
+    def test_the_task_and_wake_up_readers_are_built_from_the_table(self):
+        """The prefilters go through shape(), but the regexes that then
+        extract the id spelled the same strings bare, so a table updated
+        for an upstream rename would pass the prefilter and extract nothing
+        — the silent loss the table exists to prevent (2026-10-25 review).
+        The check above looks for the quoted token only, which a longer
+        raw-string literal slips past; here the text may not appear in
+        code at all."""
+        with open(watch_dashboard.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        start = source.index("UPSTREAM_SHAPES = {")
+        outside = source[:start] + source[source.index("\ndef shape(", start):]
+        outside = "\n".join(line for line in outside.splitlines()
+                             if not line.lstrip().startswith("#"))
+        # The tag is told as a story in a docstring; its reader is held by
+        # the extraction check below instead.
+        for name in ("task.launched", "task.agent_id", "task.monitor_started",
+                     "task.workflow_launched", "wakeup.scheduled"):
+            text = watch_dashboard.UPSTREAM_SHAPES[name][0]
+            assert text not in outside, (name, text)
+        # And the readers still read: the id comes out of each shape.
+        launched = watch_dashboard._TASK_LAUNCH
+        for line, tid in [("Command running in background with ID: bjlf-1", "bjlf-1"),
+                          ("agentId: a898d4c6", "a898d4c6"),
+                          ("Monitor started (task mon-7)", "mon-7"),
+                          ("Workflow launched in background. Task ID: wf_abc", "wf_abc")]:
+            groups = launched.findall(line)
+            assert groups and next(g for g in groups[0] if g) == tid, line
+        assert watch_dashboard._TASK_DONE.findall("<task-id>bjlf-1</task-id>") == ["bjlf-1"]
+        assert watch_dashboard._WAKEUP_IN.search(
+            "Next wakeup scheduled for 07:42:00 (in 257s)").group(1) == "257"
+
     def test_the_relay_and_the_hook_read_through_the_table_too(self):
         """The 2026-10-17 tech-debt review found the hook reading
         planFilePath and permissionMode, and the relay matching tool calls
@@ -11245,6 +11762,44 @@ class TestTheHelperReportsItsOwnCrashes:
                                             settings=self.SETTINGS, opener=explode)
         assert reason == "send_failed"
         assert entry["message"] == "boom", "and the crash is still recorded"
+
+    def test_the_last_line_of_defence_cannot_itself_raise(self, tmp_path, monkeypatch):
+        """With stderr closed (the relay under launchd writes it to a file
+        that can be full or gone) the final print raised out of report()
+        into the crash path it exists to protect (2026-10-25 review)."""
+        def broken(*args, **kwargs):
+            raise RuntimeError("the record step is broken")
+        monkeypatch.setattr(crash_report, "record", broken)
+        closed = io.StringIO()
+        closed.close()
+        monkeypatch.setattr(sys, "stderr", closed)
+        reason, entry = crash_report.report("boom", "stack", path=str(tmp_path / "c"),
+                                            settings=self.SETTINGS)
+        assert (reason, entry) == ("reporter_failed", {})
+
+    def test_two_threads_crashing_at_once_write_whole_lines(self, tmp_path, monkeypatch):
+        """One entry can exceed the text layer's 8 KiB buffer, so one write()
+        became two and two request threads could interleave halves; the
+        reader then skipped the torn line and the record was lost
+        (2026-10-25 review). One os.write per line, and the file is made
+        0600 rather than chmod'ed after."""
+        path = tmp_path / "data" / "crashes.jsonl"
+        entry = {"message": "m" * 500, "stack": "s" * 9000}
+        monkeypatch.setattr(crash_report, "_rotate", lambda path: None)  # 300 × 9 KB
+
+        def many():
+            for _ in range(150):
+                crash_report.record(entry, path=str(path))
+        threads = [threading.Thread(target=many) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 300, len(lines)
+        for line in lines:
+            assert json.loads(line)["stack"] == "s" * 9000
+        assert os.stat(path).st_mode & 0o777 == 0o600
 
     def test_it_does_not_swallow_the_owner_pressing_ctrl_c(self, tmp_path):
         """The one thing it must NOT catch. `except Exception` is deliberate:
@@ -11780,6 +12335,41 @@ class TestTheWristAnswersAHeadlessSend:
         out = wpt.decide("Bash", tool_input, crc=fake)
         assert out["behavior"] == "deny" and not fake.asked_the_watch
 
+    @pytest.mark.parametrize("tool_input", ["", [], 0, False, None])
+    def test_an_empty_tool_input_that_is_not_an_object_is_denied_too(self, tool_input):
+        """The 2026-10-24 fix stopped at `handle`: `input or toolInput or {}`
+        turned an empty string, list, zero or null into {} before the
+        object check, so only a *truthy* wrong shape was refused and
+        `{"input": ""}` was allowed at a LOW threshold (2026-10-25 review)."""
+        fake = self._Fake("allow", risk=crc.Risk.SAFE)
+        fake.policy_extra = {"auto_allow_at_or_below": "LOW", "mode": "enforce"}
+        reply = wpt.handle({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                            "params": {"name": "approve", "arguments": {
+                                "tool_name": "Read", "input": tool_input}}}, crc=fake)
+        decision = json.loads(reply["result"]["content"][0]["text"])
+        assert decision["behavior"] == "deny", (tool_input, decision)
+        assert not fake.asked and not fake.asked_the_watch
+
+    def test_a_missing_tool_input_is_denied(self):
+        fake = self._Fake("allow", risk=crc.Risk.SAFE)
+        fake.policy_extra = {"auto_allow_at_or_below": "LOW", "mode": "enforce"}
+        reply = wpt.handle({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                            "params": {"name": "approve", "arguments": {"tool_name": "Read"}}},
+                           crc=fake)
+        decision = json.loads(reply["result"]["content"][0]["text"])
+        assert decision["behavior"] == "deny", decision
+
+    def test_the_other_spelling_of_the_input_still_works(self):
+        fake = self._Fake("allow", risk=crc.Risk.SAFE)
+        fake.policy_extra = {"auto_allow_at_or_below": "LOW", "mode": "enforce"}
+        reply = wpt.handle({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                            "params": {"name": "approve", "arguments": {
+                                "toolName": "Read", "toolInput": {"file_path": "a.txt"}}}},
+                           crc=fake)
+        decision = json.loads(reply["result"]["content"][0]["text"])
+        assert decision["behavior"] == "allow", decision
+        assert fake.asked[0]["tool_input"] == {"file_path": "a.txt"}
+
     def test_reading_the_wrists_answer_cannot_raise(self):
         fake = self._Fake("answer", answer=crc.PLAN_ACCEPT_EDITS)
 
@@ -12279,7 +12869,7 @@ class TestAWatchThatSpeaksDanish:
                         if isinstance(node, ast.FunctionDef) and node.name == name)
         # Every AppleScript literal goes through one helper, and the
         # helpers that build scripts must use it.
-        for caller in ("start_session", "type_into_session"):
+        for caller in ("start_session", "ask_owner_to_pair"):
             calls = {node.func.id for node in ast.walk(function(caller))
                      if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
             assert "_applescript_literal" in calls, caller + " builds its own AppleScript literal"
@@ -12744,12 +13334,24 @@ class TestRelayRoutes:
         base, _, _ = relay
         assert self._call(base + path, method=method)[0] == 404
 
+    PRESENCE = ("pending", "watch_seen_seconds_ago", "alert_route", "conditions",
+                "name", "paired_ever", "tls", "agents", "helper_commit")
+
     def test_health_says_more_to_a_credentialed_caller(self, relay):
-        base, _, _ = relay
+        """Three callers, three answers. A raw loopback caller — another
+        account on this Mac, a port-forward (S2) — learns the relay is
+        alive and which code answers, so --ensure can replace an old
+        relay, and nothing about the wrist: a pending count and "is a
+        watch on the wrist right now" told whoever could reach loopback
+        when nobody was looking (2026-10-25 review)."""
+        base, _, auth = relay
         status, body = self._call(base + "/health")
         assert status == 200 and body["ok"] is True
-        # loopback is credentialed: the details come with it
-        assert "version" in body and "pending" in body
+        assert body["version"] == watch_relay.RELAY_VERSION and "helper" in body
+        for field in self.PRESENCE:
+            assert field not in body, field
+        status, body = self._call(base + "/health", token=auth.bootstrap)
+        assert status == 200 and "pending" in body and "paired_ever" in body
 
     def test_health_names_the_computer_to_a_credentialed_caller(self, relay, monkeypatch):
         """The watch says the computer's own name, not "Mac" (2026-10-15):
@@ -12758,16 +13360,17 @@ class TestRelayRoutes:
         callers only, like every other detail here."""
         import socket
         monkeypatch.setattr(socket, "gethostname", lambda: "Office-Mac-mini.local")
-        base, _, _ = relay
-        assert self._call(base + "/health")[1]["name"] == "Office Mac mini"
+        base, _, auth = relay
+        assert self._call(base + "/health", token=auth.bootstrap)[1]["name"] == "Office Mac mini"
+        assert "name" not in self._call(base + "/health")[1]
 
     def test_health_names_the_alert_route_once_the_bridge_polls(self, relay):
         """The watch can only promise a buzz when something will deliver
         one: /health says so, and a bridge poll is what makes it true."""
         base, _, auth = relay
-        assert self._call(base + "/health")[1]["alert_route"] is None
+        assert self._call(base + "/health", token=auth.bootstrap)[1]["alert_route"] is None
         assert self._call(base + "/pending?source=bridge", token=auth.bootstrap)[0] == 200
-        assert self._call(base + "/health")[1]["alert_route"] == "bridge"
+        assert self._call(base + "/health", token=auth.bootstrap)[1]["alert_route"] == "bridge"
 
     def test_the_read_routes_answer_with_their_shapes(self, relay, monkeypatch):
         monkeypatch.setattr(watch_relay, "known_projects", lambda: [{"name": "x"}])
@@ -13605,51 +14208,6 @@ class TestConnectingToAnExistingSession:
         assert rows[0]["live"] is False, "listed, not claimed live"
         assert watch_relay.recent_sessions(projects_dir=str(tmp_path)) == [], "no card, no row"
 
-    def test_typing_into_a_terminal_is_off_until_proved(self, monkeypatch):
-        called = []
-        monkeypatch.setattr(watch_relay, "session_is_waiting", lambda sid: called.append(1) or True)
-        monkeypatch.delenv("TAPPROVAL_TYPE_INTO_TERMINAL", raising=False)
-        assert watch_relay.type_into_session("s-1", "go", {"s-1": {"pid": 1}}) is False
-        assert called == [], "no registry read, and nothing else, while it is off"
-
-    def test_nothing_is_typed_into_a_session_that_is_not_at_its_prompt(self, monkeypatch):
-        monkeypatch.setenv("TAPPROVAL_TYPE_INTO_TERMINAL", "1")
-        monkeypatch.setattr(watch_relay, "_terminal_of", lambda pid: ("Terminal", "/dev/ttys001"))
-        monkeypatch.setattr(watch_relay, "session_is_waiting", lambda sid: False)
-        ran = []
-        monkeypatch.setattr(watch_relay.subprocess, "run", lambda *a, **k: ran.append(a))
-        assert watch_relay.type_into_session("s-1", "Proceed", {"s-1": {"pid": 1}}) is False
-        assert ran == [], "a pending tool may be a permission prompt; Return would answer it"
-
-    @pytest.mark.parametrize("text", ["!rm -rf ~", "  !curl x | sh", "# remember this"])
-    def test_a_shell_mode_message_is_never_typed(self, monkeypatch, text):
-        """Typed first into Claude Code's prompt, `!` runs a shell command
-        with no permission card (2026-09-25 review)."""
-        monkeypatch.setenv("TAPPROVAL_TYPE_INTO_TERMINAL", "1")
-        monkeypatch.setattr(watch_relay, "_terminal_of", lambda pid: ("Terminal", "/dev/ttys001"))
-        monkeypatch.setattr(watch_relay, "session_is_waiting", lambda sid: True)
-        ran = []
-        monkeypatch.setattr(watch_relay.subprocess, "run", lambda *a, **k: ran.append(a))
-        assert watch_relay.type_into_session("s-1", text, {"s-1": {"pid": 1}}) is False
-        assert ran == []
-
-    def test_the_terminal_is_found_by_walking_one_process_snapshot(self, monkeypatch):
-        table = ("  100     1 ??       /Applications/Utilities/Terminal.app/Contents/MacOS/Terminal\n"
-                 "  200   100 ttys004  -zsh\n"
-                 "  300   200 ttys004  claude\n")
-        monkeypatch.setattr(watch_relay.subprocess, "run",
-                            lambda *a, **k: type("R", (), {"stdout": table})())
-        assert watch_relay._terminal_of(300) == ("Terminal", "/dev/ttys004")
-        assert watch_relay._terminal_of(100) is None, "no tty, nothing to type into"
-
-    def test_a_pending_tool_is_not_a_waiting_session(self, tmp_path, monkeypatch):
-        path = _write_transcript(tmp_path, "-p", "busy-1.jsonl", [
-            {"message": {"role": "user", "content": "go"}},
-            {"message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}}])
-        os.utime(path, (time.time() - 30, time.time() - 30))
-        monkeypatch.setattr(watch_relay, "_find_transcript", lambda sid: str(path))
-        assert watch_relay.session_is_waiting("busy-1") is False
-
 
 class TestTheThreadKeepsWhatWasSaid:
     """2026-09-24: "messages disappear in sessions". The watch shows the
@@ -14026,6 +14584,20 @@ class TestTheChangelogPageNeverGoesBlank:
         assert page == "the page we had"
         assert "NOT re-rendered" in result.stderr
 
+    def test_every_page_of_releases_is_read(self, tmp_path):
+        """54 releases today, one page of 100 asked for: release 101 fell
+        off the page the intro promises holds every one (2026-10-25
+        review). gh pages for us and wraps the pages in one list."""
+        two_pages = ('[[{"tag_name":"v2","published_at":"2026-02-01","html_url":"u","body":"b"}],'
+                     '[{"tag_name":"v1","published_at":"2026-01-01","html_url":"u","body":"a"}]]')
+        result, page = self._run(
+            tmp_path, 'case "$*" in *--paginate*--slurp*) echo \'%s\';; *) echo "[]";; esac\n'
+            % two_pages)
+        if "uvx" in result.stderr and "NOT re-rendered" in result.stderr:
+            pytest.skip("uvx is not on this machine")
+        assert "wrote" in result.stdout and "(2 releases)" in result.stdout, result
+        assert "v2" in page and "v1" in page
+
     def test_no_releases_leaves_the_page_and_says_so(self, tmp_path):
         result, page = self._run(tmp_path, "echo '[]'\n")
         assert page == "the page we had"
@@ -14055,14 +14627,40 @@ class TestTheChangelogCarriesNoHtml:
         "<img src=x onerror=alert(1)>",
         "<script>alert(1)</script>",
         "[x](javascript:alert(1))",
+        # 2026-10-25 whole-repository review: Python-Markdown keeps an
+        # entity inside href and the browser decodes it there, so each of
+        # these rendered as a live script link on the project's domain.
+        "[x](javascript&colon;alert(1))",
+        "[x](&#106;avascript:alert(1))",
+        "[x](JAVASCRIPT&#58;alert(1))",
+        "[x](java\tscript:alert(1))",
+        "[x](data:text/html;base64,PHNjcmlwdD4=)",
+        "[x](vbscript:msgbox(1))",
+        "[x](&#x6A;avascript:alert(1))",
     ])
     def test_any_html_refuses_the_render(self, changelog, body):
         assert changelog.unsafe_release([{"tag_name": "v1", "body": body}]) == "v1"
+
+    def test_the_rendered_links_carry_only_web_schemes(self, changelog):
+        """What the filter lets through must render to http(s), mailto or a
+        relative href — checked on the real renderer, not the regex."""
+        notes = ("See [the guide](https://example.test/guide) and "
+                 "[write](mailto:tapproval@thoughtfulsteward.org) or "
+                 "[the security page](security.html); AT&T and `a < b`.")
+        assert changelog.unsafe_release([{"tag_name": "v1", "body": notes}]) is None
+        try:
+            out = changelog.render_page.markdown(notes)
+        except OSError:
+            pytest.skip("uvx is not on this machine")
+        for dest in re.findall(r'href="([^"]*)"', out):
+            assert re.match(r"^(https?:|mailto:|[\w./#-]+$)", dest), dest
 
     @pytest.mark.parametrize("body", [
         "- Fixed the `/t/<secret>` route\n- **Faster** cards",
         "```\n<html> in a code block\n```",
         "Use `a < b` and 3 > 2.",
+        "Metadata: the data: folder moved. AT&amp;T. See [#5](https://x.test/5).",
+        "[the guide](apple-watch-claude-code.html) and [top](#top)",
     ])
     def test_ordinary_notes_render(self, changelog, body):
         assert changelog.unsafe_release([{"tag_name": "v1", "body": body}]) is None
@@ -14150,6 +14748,18 @@ class TestTheSiteHasOnePageFrame:
         assert "uvx" not in re.sub(r'"""[\s\S]*?"""|#[^\n]*', "", text), \
             "markdown is borrowed in render_page.markdown(), once"
         assert "render_page.page(" in text and "render_page.markdown(" in text
+
+    def test_the_title_is_escaped_like_the_rest_of_the_frame(self):
+        """Every caller passes a constant today; the frame should not be the
+        one place a `<` would pass through unescaped (2026-10-25 review)."""
+        self._read("render_page.py")
+        spec = importlib.util.spec_from_file_location(
+            "render_page", os.path.join(_ROOT, "render_page.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        out = mod.page("A & B <script>", "", "<p>b</p>", "<p>f</p>")
+        assert "<title>A &amp; B &lt;script&gt;</title>" in out
+        assert "<title>A & B <script>" not in out
 
     def test_the_frame_wraps_what_it_is_given(self):
         self._read("render_page.py")
@@ -14382,6 +14992,39 @@ class TestTheReleaseToolsSayWhenAStepFailed:
         assert "||" in call[:120], "set -e stopped here and kept the pairing key"
         assert ".tapproval-crashes.jsonl" in script
         assert ".tapproval.superseded-" in script
+
+    def test_uninstall_stops_its_own_relay_by_pid_not_every_relay_by_name(self, tmp_path):
+        """`pkill -f watch_relay.py` killed every relay this user runs — on
+        the owner's Mac that is CI's isolated relay and an e2e run's
+        (2026-10-25 review; CI #435 died to the same pattern). The pid
+        file the relay writes is what the uninstaller already knows; the
+        stop lines are run here against a fake relay to prove they take
+        that process and only it."""
+        script = self._read("uninstall.sh")
+        assert 'pkill -f "watch_relay.py"' not in script
+        start = script.index("# Stop this install's relay")
+        end = script.index("# The travel tunnel outlives")
+        snippet = script[start:end]
+        home = tmp_path / "home"
+        (home / ".tapproval" / "data").mkdir(parents=True)
+        mine = subprocess.Popen([sys.executable, "-c",
+                                 "import time; time.sleep(60)  # watch_relay.py"])
+        other = subprocess.Popen([sys.executable, "-c",
+                                  "import time; time.sleep(60)  # watch_relay.py"])
+        try:
+            (home / ".tapproval" / "data" / "relay.pid").write_text("%d\n" % mine.pid)
+            subprocess.run(["bash", "-c", snippet], check=True, timeout=20,
+                           env=dict(os.environ, HOME=str(home)))
+            deadline = time.time() + 10
+            while mine.poll() is None and time.time() < deadline:
+                time.sleep(0.05)
+            assert mine.poll() is not None, "the install's own relay was not stopped"
+            assert other.poll() is None, "a relay that was not this install's was killed"
+        finally:
+            for proc in (mine, other):
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
 
     @pytest.mark.skipif(sys.platform != "darwin", reason="launchd is macOS")
     def test_uninstall_removes_the_login_job_when_the_hooks_are_already_gone(self, settings):
@@ -16337,9 +16980,9 @@ class TestTheReportingItselfIsChecked:
     # a key that is not here fails the first test below, which is the
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
-    VOCABULARY = {"bonjour", "bridge", "bridge_install", "claude", "codex", "crash", "dashboard", "helper",
-                  "icloud_off", "login_item_off", "no_tls", "outdated", "pairing", "port", "signin",
-                  "stuck", "tunnel", "update"}
+    VOCABULARY = {"bonjour", "bridge", "bridge_install", "bridge_saves", "claude", "codex", "crash",
+                  "dashboard", "helper", "icloud_off", "login_item_off", "no_tls", "outdated", "pairing",
+                  "port", "signin", "stuck", "tunnel", "update"}
 
     @staticmethod
     def _module_source(name):
@@ -16959,7 +17602,9 @@ class TestConditionsAreSaidOutLoud:
         _serve(server)
         try:
             base = "http://127.0.0.1:%d" % server.server_address[1]
-            _status, body = relay_call(base + "/health")
+            # A paired caller: a raw loopback /health carries no conditions
+            # since the 2026-10-25 review.
+            _status, body = relay_call(base + "/health", token="devicetoken")
             assert body["conditions"] == [{"key": "bonjour",
                                            "detail": "not announcing",
                                            "tone": "needs_you"}]
@@ -17117,6 +17762,30 @@ class TestTheEffectOntology:
             named = crc._ontology_risk(command)
             shipped, _ = crc.classify_bash(command)
             assert shipped >= (named[1] if named else crc.Risk.SAFE), command
+
+    @pytest.mark.parametrize("command", [
+        # 2026-10-25 whole-repository review: AWS spells every verb
+        # `verb-object`, so none matched the one-word vocabulary and a
+        # production stack deletion carried a MEDIUM card while
+        # `gcloud compute instances delete` was CRITICAL.
+        "aws ec2 terminate-instances --instance-ids i-0abc",
+        "aws cloudformation delete-stack --stack-name prod",
+        "aws s3 rb s3://bucket --force",
+        "aws rds delete-db-instance --db-instance-identifier prod",
+        "aws iam delete-user --user-name deploy",
+        "az group delete --name prod",
+    ])
+    def test_a_hyphen_joined_verb_names_its_effect(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk == crc.Risk.CRITICAL, "%s -> %s %s" % (command, risk.name, rules)
+
+    @pytest.mark.parametrize("command", [
+        # A file or path that happens to start with a verb is not a verb.
+        "cat delete-me.txt", "ls remove-later/", "cat ./purge-notes.md",
+        "aws s3 ls", "aws ec2 describe-instances",
+    ])
+    def test_a_hyphenated_name_is_not_a_verb(self, command):
+        assert crc._ontology_risk(command) is None, command
 
     @pytest.mark.parametrize("command", [
         'sh -c "rm -rf /"', "bash -c 'rm -rf ~'", 'eval "rm -rf ~"',
@@ -17643,6 +18312,24 @@ class TestATranscriptIsFoundByAnyPrefix:
         monkeypatch.setattr(wd.os, "listdir", lambda *a: pytest.fail("walked the folders"))
         assert wd._find_transcript(sid[:12]) == found
         assert wd._find_transcript(sid[:8]) == found
+
+
+class TestAnEmptyPrefixFindsNothing:
+    def test_an_empty_or_blank_prefix_is_no_match(self, tmp_path, monkeypatch):
+        """"".startswith("") is True, so _find_transcript("") returned the
+        first transcript it saw, against its own docstring; every caller
+        guarded, and the guard belongs in the function (2026-10-25
+        review)."""
+        import watch_dashboard as wd
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "abcdef123456-7890.jsonl").write_text("{}\n")
+        monkeypatch.setattr(wd, "CLAUDE_PROJECTS", str(tmp_path))
+        monkeypatch.setattr(wd, "_TRANSCRIPT_PATHS", {})
+        assert wd._find_transcript("abcdef") is not None
+        for prefix in ("", "  ", None):
+            assert wd._find_transcript(prefix) is None, repr(prefix)
+            assert wd._find_transcript(prefix, projects_dir=str(tmp_path)) is None, repr(prefix)
 
 
 class TestALineThatIsNotAnObject:
@@ -19502,6 +20189,31 @@ class TestTheHelperInstallsTheMacBridge:
             job = pl.load(handle)
         assert job["ProgramArguments"] == [os.path.join(old, "Contents", "MacOS", "TapprovalBridge")]
 
+    def test_a_rollback_that_cannot_put_the_old_bridge_back_says_both_things(self):
+        """The rename back was unguarded inside the rollback: when it failed,
+        a bare OSError about the rename escaped in place of the InstallError
+        naming why the install failed, and the first reason was lost
+        (2026-10-25 review). Here something has taken the old bridge's name
+        by the time the new one has failed to start."""
+        old = bridge_install.old_app_path()
+        _make_app(old, "1.0.3")
+        taken = os.path.join(old, "Contents", "somebody-elses")
+
+        def never_started():
+            os.makedirs(taken)          # a non-empty folder under the old name
+            return False
+
+        with pytest.raises(bridge_install.InstallError) as refused:
+            self._install_v("1.1.0", wait_for_bridge=never_started)
+        said = str(refused.value)
+        assert "the new bridge did not start" in said, said
+        assert "the previous bridge could not be put back" in said, said
+        assert "previous one is back" not in said, said
+        # Nothing is lost: the old bridge still waits under .previous, and
+        # the new one, which never worked, is gone.
+        assert bridge_install.installed_version(bridge_install.app_path() + ".previous") == "1.0.3"
+        assert not os.path.exists(bridge_install.app_path())
+
     def test_removing_unregisters_the_login_item(self):
         self._install_v("1.1.0")
         Path(bridge_install.relay_start_path()).write_text("{}")
@@ -19536,6 +20248,27 @@ class TestTheHelperInstallsTheMacBridge:
         self.mac.switched_off = False
         watch_relay.check_login_item(now=1e12 + watch_relay.LOGIN_ITEM_EVERY)
         assert not [c for c in watch_relay.conditions() if c["key"] == "login_item_off"]
+
+    def test_a_login_item_check_that_breaks_keeps_what_it_last_saw(self, monkeypatch):
+        """On any exception the word was reset to None and the condition
+        cleared: a bridge that could not be asked read as "Login Items is
+        fine" while the switch was still off (2026-10-25 review; the shape
+        check_codex_hook was fixed for on 2026-10-17)."""
+        monkeypatch.setattr(watch_relay, "_LOGIN_ITEM", {"at": 0.0})
+        self._install_v("1.1.0")
+        self.mac.switched_off = True
+        watch_relay.check_login_item(now=1e12)
+        assert [c for c in watch_relay.conditions() if c["key"] == "login_item_off"]
+
+        def broken():
+            raise OSError("the bridge cannot be asked today")
+        monkeypatch.setattr(bridge_install, "app_path", broken)
+        watch_relay.check_login_item(now=1e12 + watch_relay.LOGIN_ITEM_EVERY)
+        try:
+            assert [c for c in watch_relay.conditions() if c["key"] == "login_item_off"], \
+                "a check that broke withdrew the condition"
+        finally:
+            watch_relay.clear_condition("login_item_off")
 
     # -- the bridge wakes the relay, and the relay's own job goes ---------------
 
