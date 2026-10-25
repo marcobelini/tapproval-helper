@@ -2271,12 +2271,19 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
     return "could not start: %s" % error if error else "sent"
 
 
-# The read-only built-ins the watch offers by name. Built-ins live inside
-# the CLI, not on disk, so they cannot be discovered; these are the two
-# that a headless run can honestly deliver (they read, they do not write).
+# The built-ins the watch offers by name, as (description, hint). Built-ins
+# live inside the CLI, not on disk, so they cannot be discovered. The two
+# reviews read and do not write. /design and /slides (Claude Code 2.1.310,
+# signed in to claude.ai) make a new artifact from a brief; its publish asks
+# on the wrist like any other permission. Their CLI hint is in square
+# brackets, which required_argument() reads as optional, and a bare /design
+# only makes Claude ask back what to design: so the hint here has no
+# brackets, and the watch holds the tap for the brief.
 SKILL_BUILTINS = {
-    "code-review": "Reviews the diff for bugs and risks before it ships.",
-    "security-review": "Checks the changes for vulnerabilities.",
+    "code-review": ("Reviews the diff for bugs and risks before it ships.", None),
+    "security-review": ("Checks the changes for vulnerabilities.", None),
+    "design": ("Makes a new design from your brief.", "what to design"),
+    "slides": ("Makes a slide deck from your brief.", "what the deck is about"),
 }
 _SKILLS_CACHE = {}          # cwd -> (expires, rows)
 # ThreadingHTTPServer answers two /skills at once; an eviction iterating
@@ -2394,7 +2401,7 @@ def _plugin_name(folder):
 
 def known_skills(cwd=None, home=None, now=None):
     """Every slash command this machine can answer for a session in
-    ``cwd``: the read-only built-ins, the project's skills and commands
+    ``cwd``: the built-ins, the project's skills and commands
     (and its repository's, from a worktree), the user's own, and each
     installed plugin's under the name the CLI gives them,
     ``/<plugin>:<skill>``. One row per name, with the description its
@@ -2417,9 +2424,9 @@ def known_skills(cwd=None, home=None, now=None):
     if hit and hit[0] > now:
         return hit[1]
     found = {}
-    for name, description in SKILL_BUILTINS.items():
+    for name, (description, hint) in SKILL_BUILTINS.items():
         found[name] = {"description": description, "source": "builtin", "plugin": None,
-                       "argument_hint": None}
+                       "argument_hint": hint}
     for root, source, plugin in _skill_roots(cwd, home):
         files = [(os.path.basename(os.path.dirname(f)), f)
                  for f in glob.glob(os.path.join(root, "skills", "*", "SKILL.md"))]

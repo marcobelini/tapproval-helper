@@ -4206,30 +4206,34 @@ class TestTheBridgeSigns:
 
 
 @pytest.mark.private_layout
-class TestOurDoubleTapStaysInsideASession:
-    """Our own double tap (DoubleTapScrollsDown) is for inside a session:
-    the thread, a card, the reply and End-session sheets, where a pinch at
-    the end must stay put. Everywhere else is watchOS's own, which goes
-    round to the top and never darkened the screen the way ours does (the
-    owner's wrist, build 186, 2026-10-25). A new screen outside a session
-    that copies the modifier brings the dim back."""
+class TestTheDoubleTapIsTheWatchsOwn:
+    """The double tap is watchOS's own on every screen. Builds 184-187 ran
+    a hidden button of ours (`.handGestureShortcut(.primaryAction)`) to
+    choose where a pinch landed, and the watch lit it up on every tap:
+    first as a pill, then as the whole screen darkening (the owner's
+    wrist, 2026-10-25). Inside a session the one thing of ours left is
+    StaysAtTheEnd, which puts the reader back at the end when the
+    watch's own pinch goes round to the top."""
 
     INSIDE = {"SessionDetail.swift", "Cards.swift"}
 
-    def test_only_screens_inside_a_session_take_the_double_tap(self):
+    def _sources(self):
         folder = os.path.join(_ROOT, "WatchApp", "Tapproval")
         if not os.path.isdir(folder):
             pytest.skip("no watch app in this layout")
-        using = set()
-        for name in os.listdir(folder):
-            if not name.endswith(".swift"):
-                continue
-            with open(os.path.join(folder, name), encoding="utf-8") as handle:
-                source = handle.read()
-            if (".modifier(DoubleTapScrollsDown(" in source
-                    or ".doubleTapStop()" in source
-                    or ".doubleTapContent()" in source):
-                using.add(name)
+        for name in sorted(os.listdir(folder)):
+            if name.endswith(".swift"):
+                with open(os.path.join(folder, name), encoding="utf-8") as handle:
+                    yield name, handle.read()
+
+    def test_no_screen_carries_a_hidden_double_tap_button(self):
+        assert [name for name, source in self._sources()
+                if ".handGestureShortcut(" in source] == []
+
+    def test_only_screens_inside_a_session_keep_the_end(self):
+        using = {name for name, source in self._sources()
+                 if ".modifier(StaysAtTheEnd())" in source
+                 or ".modifier(EndKeeper(" in source}
         assert using == self.INSIDE
 
 
@@ -7368,6 +7372,28 @@ class TestTheMoreListIsWhatThisMachineCanAnswer:
         assert rows["/deploy"]["source"] == "project"
         assert rows["/code-review"]["source"] == "builtin" and rows["/security-review"]["source"] == "builtin"
         assert "/verify" not in rows                        # never existed; never listed
+
+    def test_the_brief_commands_ask_for_words_before_they_send(self, tmp_path):
+        # /design and /slides are Claude Code's own (2.1.310), not files on
+        # disk. The CLI's hint is "[what to design]", which reads as
+        # optional, so a tap would send a bare /design and Claude would only
+        # ask back what to design. The built-in carries a needed brief.
+        rows = {r["name"]: r for r in watch_relay.known_skills(
+            None, home=str(tmp_path), now=11.0)}
+        for name in ("/design", "/slides"):
+            assert rows[name]["source"] == "builtin"
+            assert rows[name]["argument_hint"]
+            assert watch_relay.required_argument(rows[name]["argument_hint"])
+        assert rows["/code-review"]["argument_hint"] is None
+
+    def test_a_design_plugin_does_not_hide_the_built_in_design(self, tmp_path):
+        home = tmp_path / "home"
+        skill = home / ".claude" / "plugins" / "synced" / "org_user" / "design" / "skills" / "critique"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\ndescription: Critiques a screen.\n---\n")
+        rows = {r["name"]: r for r in watch_relay.known_skills(None, home=str(home), now=12.0)}
+        assert rows["/design"]["source"] == "builtin"
+        assert rows["/design:critique"]["plugin"] == "design"
 
     def test_only_a_needed_argument_holds_the_tap_back(self):
         # A hint makes the watch fill its Message field rather than send.
