@@ -3660,10 +3660,12 @@ class RelayHandler(BaseHTTPRequestHandler):
         # The bridge asks every two seconds: answered, it is 40,000 lines a
         # day that say nothing and push the ones that do out of the log.
         from urllib.parse import urlsplit
-        split = urlsplit(self.path)
-        if (code == 200 and self.command == "GET" and split.path == "/pending"
-                and "source=bridge" in split.query):
-            return
+        # parse_request can reject the request line before path exists.
+        # Only successful GET polls can qualify for quiet bridge logging.
+        if code == 200 and getattr(self, "command", None) == "GET":
+            split = urlsplit(getattr(self, "path", ""))
+            if split.path == "/pending" and "source=bridge" in split.query:
+                return
         super().log_request(code, size)
 
     def log_message(self, fmt, *args):  # quiet: diagnostics only on stderr

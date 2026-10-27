@@ -23,6 +23,12 @@
 <main class="policy">
 <h1>Changelog</h1>
 <p><em>Every release of Tapproval Base, the helper on your computer, newest first. Starting Claude Code once updates it. Generated from <a href="https://github.com/marcobelini/tapproval-helper/releases">the releases on GitHub</a>, which may already hold a newer one. Security fixes are also explained on <a href="security.html">the security page</a>.</em></p>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.90">1.1.90 — Codex approval parity</a></h2>
+<p><em>2026-10-27</em></p>
+<p>Codex approval cards now follow native human approval requests across active sessions. This removes extra hook-only prompts, deduplicates replayed requests, and clears resolved cards synchronously.</p>
+<p>Complex permission and connected-tool consent requests use read-only handoff cards; answer those on the computer or iPhone. The matching internal 3.0 watch beta displays the handoff without approval buttons. Claude Code keeps its existing approval behavior.</p>
+<p>Codex tool activity in live threads is grouped instead of repeating generic tool-use lines.</p>
+<p>Validated with the Python 3.9–3.13 matrix, public package checks, 18 isolated native approval scenarios, watch unit tests and watch UI checks. The physical watch/iPhone parity check remains pending after installing the internal beta.</p>
 <h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.88">1.1.88</a></h2>
 <p><em>2026-10-25</em></p>
 <p><strong>Tapproval Base</strong> is the computer half of Tapproval: the Claude Code hook that marks each prompt with its risk and the relay that carries it to your Apple Watch and your answer back.</p>

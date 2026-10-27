@@ -18990,6 +18990,43 @@ class TestTheRelayServerItself:
     """2026-09-25 review: the stock ThreadingHTTPServer swallowed every
     handler crash into stderr, and nothing bounded a silent socket."""
 
+    @pytest.mark.parametrize("request_line,status", [
+        (b"GET /health NOT-HTTP\r\n\r\n", 400),
+        (b"GET /health HTTP/2.0\r\n\r\n", 505),
+        (b"POST /health\r\n\r\n", 400),
+        (b"\x16\x03\x01\x00\x08 bad tls\r\n", 400),
+        (b"GET /health /t/parse-secret\r\n\r\n", 400),
+    ])
+    def test_invalid_request_lines_do_not_crash_the_error_logger(
+            self, request_line, status, fresh_auth, monkeypatch, capsys):
+        """The HTTP parser can reject a line before it sets handler.path."""
+        crashes = []
+        monkeypatch.setattr(watch_relay, "_ON_HANDLER_ERROR",
+                            lambda *args: crashes.append(args))
+        server, cards = watch_relay.serve("127.0.0.1", 0, auth=fresh_auth)
+        _serve(server)
+        try:
+            with socket.create_connection(server.server_address, timeout=5) as peer:
+                peer.sendall(request_line)
+                peer.shutdown(socket.SHUT_WR)
+                response = b""
+                while True:
+                    part = peer.recv(4096)
+                    if not part:
+                        break
+                    response += part
+            assert b"Error code: %d" % status in response
+            assert crashes == []
+            assert cards.pending() == []
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            assert relay_call(base + "/health")[0] == 200
+        finally:
+            server.shutdown()
+            server.server_close()
+        logged = capsys.readouterr().err
+        assert "Traceback" not in logged
+        assert "parse-secret" not in logged
+
     def test_a_handler_crash_is_reported(self, monkeypatch):
         seen = []
         monkeypatch.setattr(watch_relay, "_ON_HANDLER_ERROR",
