@@ -425,6 +425,8 @@ def _no_real_codex(tmp_path, monkeypatch):
     into it and left five backups (2026-10-04). The default world is a
     machine without Codex; tests that are about Codex create the folder."""
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    # Activity now reads conversation history too, including closed sessions.
+    monkeypatch.setattr(watch_dashboard, "CLAUDE_PROJECTS", str(tmp_path / "no-projects"))
 
 
 @pytest.fixture(autouse=True)
@@ -2887,7 +2889,7 @@ class TestCodexThreads:
         old = time.time() - 300
         os.utime(path, (old, old))
         info = cx.thread_info(str(path))
-        assert info["state"] == "running" and info["running_tool"] == "apply_patch"
+        assert info["state"] == "running" and info["running_tool"] == "Editing files"
         assert "secret" not in json.dumps(info)
         with path.open("a") as handle:
             handle.write(self._line("event_msg", {"type": "task_complete"}))
@@ -2912,6 +2914,153 @@ class TestCodexThreads:
         fresh = cx.thread_info(str(path), new["mark"])
         assert fresh["reset"] is True
         assert [t["text"] for t in fresh["turns"]] == ["Fresh"]
+
+    @classmethod
+    def _call(cls, name, call_id, **extra):
+        return cls._line("response_item", dict(type="function_call", name=name,
+                                              call_id=call_id, **extra))
+
+    def test_equivalent_tools_use_claudes_summary_and_keep_one_identity(self, tmp_path):
+        import codex_sessions as cx
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(self._message("user", "Check it")
+                        + self._call("exec_command", "a"))
+        first = cx.thread_info(str(path), 0)
+        original = dict(first["turns"][-1])
+        assert original["text"] == "Ran a command"
+        with path.open("a") as handle:
+            handle.write(self._call("functions.exec_command", "b")
+                         + self._call("shell_command", "c")
+                         + self._call("shell", "d")
+                         + self._call("apply_patch", "e"))
+        news = cx.thread_info(str(path), first["mark"])
+        claude = watch_dashboard._merge_tool_runs([
+            {"role": "assistant", "kind": "tool", "text": name}
+            for name in ["Bash"] * 4 + ["Edit"]])
+        assert [t["text"] for t in news["turns"]] == [claude[0]["text"]]
+        assert news["turns"][0]["text"] == "Ran 4 commands, edited a file"
+        assert news["turns"][0]["n"] == original["n"]
+        assert first["turns"][-1] == original, "old poll snapshots must not mutate"
+        assert news["reset"] is False
+        assert cx.thread_info(str(path), news["mark"])["turns"] == []
+        cx._THREADS.pop(str(path))
+        assert cx.thread_info(str(path), first["mark"])["turns"] == news["turns"]
+
+    def test_unknown_and_wrapper_calls_share_one_private_counted_summary(self, tmp_path):
+        import codex_sessions as cx
+        path = tmp_path / "rollout.jsonl"
+        names = ["exec", "functions.exec", "wait", "sleep", "new_tool", "js", None]
+        path.write_text("".join(self._call(name, str(i),
+                             arguments='{"secret":"do not show"}', input="apply_patch(secret)")
+                                for i, name in enumerate(names)))
+        info = cx.thread_info(str(path))
+        assert [t["text"] for t in info["turns"]] == ["Used tools 7 times"]
+        assert info["state"] == "running" and info["state_reason"] == "tool"
+        assert info["running_tool"] is None, "opaque wrapper must not be called a command"
+        assert "secret" not in json.dumps(info)
+        assert set(info["turns"][0]) == {"role", "kind", "text", "at", "n"}
+
+    @pytest.mark.parametrize("name,namespace,text,activity", [
+        ("read_file", None, "Read a file", "Reading a file"),
+        ("grep", None, "Searched the code", "Searching the code"),
+        ("glob", None, "Searched the code", "Searching the code"),
+        ("web_search", None, "Searched the web", "Searching the web"),
+        ("write_stdin", None, "Sent input to a terminal", "Sending input to terminal"),
+        ("js", "mcp__cua_repl", "Used the computer", "Using the computer"),
+        ("mcp__cua_repl__js", None, "Used the computer", "Using the computer"),
+        ("exec_command", "custom_server", "Used a tool", None),
+        ([], None, "Used a tool", None),
+    ])
+    def test_friendly_tool_labels_do_not_expose_raw_names(self, tmp_path, name, namespace,
+                                                         text, activity):
+        import codex_sessions as cx
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(self._call(name, "a", namespace=namespace))
+        info = cx.thread_info(str(path))
+        assert info["turns"][0]["text"] == text
+        assert info["running_tool"] == activity
+
+    @pytest.mark.parametrize("boundary", ["assistant", "user", "task_complete", "turn_aborted",
+                                          "task_started"])
+    def test_messages_and_turn_boundaries_end_a_group_even_between_polls(self, tmp_path,
+                                                                       boundary):
+        import codex_sessions as cx
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(self._call("exec_command", "a"))
+        first = cx.thread_info(str(path), 0)
+        between = (self._message(boundary, "Next") if boundary in ("user", "assistant")
+                   else self._line("event_msg", {"type": boundary}))
+        with path.open("a") as handle:
+            handle.write(self._call("exec_command", "b") + between
+                         + self._call("exec_command", "c"))
+        info = cx.thread_info(str(path), first["mark"])
+        tools = [t for t in info["turns"] if t["kind"] == "tool"]
+        assert [t["text"] for t in tools] == ["Ran 2 commands", "Ran a command"]
+        assert tools[0]["n"] == first["turns"][0]["n"]
+        assert tools[1]["n"] > tools[0]["n"]
+
+    def test_a_long_tool_burst_stays_bounded_without_losing_counts_or_question(self, tmp_path):
+        import codex_sessions as cx
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(self._message("user", "The question") + self._call("exec", "0"))
+        first = cx.thread_info(str(path), 0)
+        with path.open("a") as handle:
+            handle.write("".join(self._call("unknown-%d" % i, str(i)) for i in range(1, 700)))
+        info = cx.thread_info(str(path), first["mark"])
+        assert info["reset"] is False
+        assert [t["text"] for t in info["turns"]] == ["Used tools 700 times"]
+        assert info["turns"][0]["n"] == first["turns"][-1]["n"]
+        assert [t["text"] for t in cx.thread_info(str(path))["turns"]] == [
+            "The question", "Used tools 700 times"]
+        state = cx._THREADS[str(path)]
+        assert len(state["turns"]) == 2
+        assert len(state["tool_run"].counts) == 1
+        assert len(state["seen_calls"]) <= 512 and len(state["calls"]) <= 64
+
+    def test_parallel_receipts_and_repeated_records_do_not_duplicate_or_complete_work(self,
+                                                                                       tmp_path):
+        import codex_sessions as cx
+        path = tmp_path / "rollout.jsonl"
+        first_call = self._call("exec_command", "a")
+        path.write_text(self._line("event_msg", {"type": "task_started"}) + first_call
+                        + self._call("apply_patch", "b")
+                        + self._line("response_item", {"type": "function_call_output",
+                                                       "call_id": "a", "output": "private"})
+                        + first_call)
+        info = cx.thread_info(str(path), 0)
+        assert info["turns"][0]["text"] == "Ran a command, edited a file"
+        assert info["running_tool"] == "Editing files"
+        assert info["state"] == "running"
+        assert cx.thread_info(str(path), card_waiting=True)["state"] == "asking"
+        with path.open("a") as handle:
+            handle.write(self._line("response_item", {"type": "custom_tool_call_output",
+                                                       "call_id": "b", "output": "private"}))
+        receipt = cx.thread_info(str(path), info["mark"])
+        assert receipt["turns"] == [] and receipt["running_tool"] is None
+        assert receipt["state"] == "running", "tool receipt is not turn completion"
+        with path.open("a") as handle:
+            handle.write(self._line("event_msg", {"type": "turn_aborted"}))
+        assert cx.thread_info(str(path))["state"] == "idle"
+
+    def test_private_and_malformed_records_do_not_break_a_run_and_replacement_resets_it(self,
+                                                                                      tmp_path):
+        import codex_sessions as cx
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(self._call("exec_command", "a"))
+        first = cx.thread_info(str(path), 0)
+        with path.open("a") as handle:
+            handle.write("bad json\n" + self._line("response_item", {"type": "reasoning"})
+                         + self._line("response_item", {"type": "message", "role": "assistant",
+                             "channel": "analysis", "content": [{"type": "output_text",
+                                                                     "text": "secret"}]})
+                         + self._call("exec_command", "b"))
+        assert cx.thread_info(str(path), first["mark"])["turns"][0]["text"] == "Ran 2 commands"
+        replacement = tmp_path / "replacement"
+        replacement.write_text(self._call("apply_patch", "a"))
+        replacement.replace(path)
+        fresh = cx.thread_info(str(path), first["mark"])
+        assert fresh["reset"] is True
+        assert [t["text"] for t in fresh["turns"]] == ["Edited a file"]
 
     def test_resolution_is_unambiguous_and_respects_the_profile(self, tmp_path, monkeypatch):
         import codex_sessions as cx
@@ -2987,7 +3136,7 @@ class TestRelayTunnelToken:
                 "/tunnel"} <= {p for _, p in hidden}
         assert all(p.startswith("/admin/") or p in ("/pair", "/enroll", "/card",
                                                      "/heartbeat", "/bridge-status",
-                                                     "/tunnel")
+                                                     "/tunnel", "/codex/attach")
                    for _, p in hidden)
         for method, path in hidden:
             status, _ = relay_call(base + "/t/s3cret" + path, method=method)
@@ -8102,19 +8251,14 @@ class TestQuestionCards:
                                 wait="1.5")
         assert _behavior(result) == "escalate"
 
-    def test_codex_keeps_the_answer_in_words(self, live_relay, tmp_path,
+    def test_codex_keeps_questions_in_its_native_client(self, live_relay, tmp_path,
                                              monkeypatch):
-        """Codex was never shown to take updatedInput; it keeps the deny
-        whose reason is the answer — now every answer."""
+        """The watch hook must not answer an ordinary Codex question."""
         port, queue = live_relay
-        self._answer_in_turn(queue, ["Luxon", "Time zones"])
         result = self._run_hook(self.TWO_QUESTIONS, port, tmp_path, monkeypatch,
                                 agent="codex")
-        assert _behavior(result) == "deny"
-        message = _decision_message(result)
-        assert "answered from their watch" in message
-        assert '"Which library?"="Luxon"' in message
-        assert '"Which features?"="Time zones"' in message
+        assert _behavior(result) == "escalate"
+        assert not queue.pending()
 
     def test_one_card_per_question(self):
         cards = crc.question_cards({"headline": "x", "fingerprint": "f"},
@@ -8280,13 +8424,13 @@ class TestQuestionCards:
         entry = json.loads(log_lines(tmp_path / "a.jsonl")[-1])
         assert '"Which features?"="Parsing, Time zones, Formatting"' in entry["answer"]
 
-    def test_codex_reads_several_labels_in_words(self, live_relay, tmp_path,
+    def test_codex_does_not_invent_answers_for_multiple_questions(self, live_relay, tmp_path,
                                                 monkeypatch):
         port, queue = live_relay
-        self._answer_in_turn(queue, ["Luxon", "Parsing\nTime zones"])
         result = self._run_hook(self.TWO_QUESTIONS, port, tmp_path, monkeypatch,
                                 agent="codex")
-        assert '"Which features?"="Parsing, Time zones"' in _decision_message(result)
+        assert not _decision_message(result)
+        assert not queue.pending()
 
     def test_an_allow_is_not_an_answer(self):
         """A bare Allow on a question card goes back without answers and
@@ -10920,7 +11064,7 @@ class TestTheHelperKeepsItsFilesInOneFolder:
             def server_close(self):
                 pass
 
-        monkeypatch.setattr(watch_relay, "serve", lambda *a, **k: (Server(), None))
+        monkeypatch.setattr(watch_relay, "serve", lambda *a, **k: (Server(), watch_relay.CardQueue()))
         monkeypatch.setattr(watch_relay.signal, "signal", lambda *a: None)
         assert watch_relay.main(["--host", "127.0.0.1", "--port", "1", "--no-bonjour"]) == 0
         new_key = os.path.join(watch_relay.TAPPROVAL_DIR, "data", "auth.json")
@@ -14055,8 +14199,8 @@ class TestRelayRoutes:
     def test_the_read_routes_answer_with_their_shapes(self, relay, monkeypatch):
         monkeypatch.setattr(watch_relay, "known_projects", lambda: [{"name": "x"}])
         monkeypatch.setattr(watch_relay, "recent_sessions", lambda **k: [])
-        monkeypatch.setattr(watch_relay, "activity_summary", lambda: {"total": 0})
-        monkeypatch.setattr(watch_relay, "usage_summary", lambda: {"input": 0})
+        monkeypatch.setattr(watch_relay, "activity_summary", lambda **_kwargs: {"total": 0})
+        monkeypatch.setattr(watch_relay, "usage_summary", lambda **_kwargs: {"input": 0})
         base, _, auth = relay
         key = auth.bootstrap
         assert self._call(base + "/projects", token=key)[1] == {"projects": [{"name": "x"}]}
@@ -17708,7 +17852,7 @@ class TestTheReportingItselfIsChecked:
     # a key that is not here fails the first test below, which is the
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
-    VOCABULARY = {"bonjour", "bridge", "bridge_install", "bridge_saves", "claude", "codex", "crash",
+    VOCABULARY = {"bonjour", "bridge", "bridge_install", "bridge_saves", "claude", "codex", "codex_sync", "crash",
                   "dashboard", "helper", "icloud_off", "login_item_off", "no_tls", "outdated", "pairing",
                   "port", "signin", "stuck", "tunnel", "update"}
 
@@ -18700,7 +18844,8 @@ class TestStandardLibraryOnly:
 
     #: pytest is the one third-party import allowed, and only here: the
     #: test suite is not what a user's interpreter is asked to run.
-    ALLOWED_THIRD_PARTY = {"test_claude_risk_classifier.py": {"pytest"}}
+    ALLOWED_THIRD_PARTY = {"test_claude_risk_classifier.py": {"pytest"},
+                           "test_codex_approvals.py": {"pytest"}, "test_activity.py": {"pytest"}}
 
     @staticmethod
     def _root_modules():
@@ -19725,8 +19870,8 @@ class TestCodexAgent:
         _, _, codex = crc.build_response(event, dict(crc.DEFAULT_POLICY), agent="codex")
         assert codex["kind"] == "question" and "allow_label" not in codex
 
-    def test_the_decision_object_is_the_same_for_codex(self, monkeypatch, tmp_path):
-        """Codex reads the same {"hookSpecificOutput":{"decision":...}} shape."""
+    def test_codex_leaves_the_decision_with_its_native_approval_flow(self, monkeypatch, tmp_path):
+        """Shared classifier labels must not override Codex's own reviewer."""
         monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
         (tmp_path / "settings.json").write_text(json.dumps(
             {"env": {"CLAUDE_RISK_MODE": "enforce", "CLAUDE_RISK_AUTO_ALLOW": "SAFE"}}))
@@ -19737,8 +19882,7 @@ class TestCodexAgent:
             stdout=out, agent="codex")
         decision = json.loads(out.getvalue())["hookSpecificOutput"]
         assert decision["hookEventName"] == "PermissionRequest"
-        assert decision["decision"] == {"behavior": "allow"}, \
-            "one switch for both agents: Claude Code's settings set Codex's mode too"
+        assert "decision" not in decision
 
     def test_the_installer_wires_codex_only_where_codex_is_used(self, tmp_path, monkeypatch):
         settings = tmp_path / "settings.json"
@@ -23080,3 +23224,149 @@ class TestTheLoginItemCheckLeavesNothing:
         move = src[src.index("def move_from_job_file("):src.index("def update_in_place(")]
         assert '"ProgramArguments": ["/usr/bin/true"]' in move
         assert "executable(app)" not in move, "the planted job runs no team-signed program"
+
+
+# Shared Claude Code / Codex auto-update and process contention.
+def test_codex_installs_the_same_starter_as_claude(tmp_path, monkeypatch):
+    home = tmp_path / 'codex'
+    home.mkdir()
+    monkeypatch.setenv('CODEX_HOME', str(home))
+    path = home / 'hooks.json'
+    original = {'hooks': {'SessionStart': [{'hooks': [
+        {'type': 'command', 'command': 'another-start-hook', 'timeout': 3}]}]}}
+    path.write_text(json.dumps(original))
+    assert crc.install_codex() == 'installed'
+    hooks = json.loads(path.read_text())
+    commands = [h['command'] for e in hooks['hooks']['SessionStart'] for h in e['hooks']]
+    assert commands == ['another-start-hook', crc._relay_command()]
+    assert crc.install_codex() == 'current'
+    assert crc.uninstall_codex()
+    assert json.loads(path.read_text()) == original
+
+
+def test_a_failed_spawn_can_retry_without_waiting_an_hour(tmp_path, monkeypatch):
+    (tmp_path / '.git').mkdir()
+    monkeypatch.setattr(watch_relay, '__file__', str(tmp_path / 'watch_relay.py'))
+    monkeypatch.setattr(watch_relay, '_UPDATE_STAMP', str(tmp_path / 'stamp'))
+    calls = []
+    monkeypatch.setattr(watch_relay, '_spawn_detached', lambda *args: calls.append(args) or 'failed')
+    watch_relay._self_update()
+    watch_relay._self_update()
+    assert len(calls) == 2
+    assert not (tmp_path / 'stamp').exists()
+
+
+def _shared_update_child(tmp_path, mode, name):
+    code = r'''
+import os, pathlib, sys, time
+sys.path.insert(0, sys.argv[1])
+import watch_relay as w
+root = pathlib.Path(sys.argv[2]); mode = sys.argv[3]; name = sys.argv[4]
+w._UPDATE_STAMP = str(root / 'stamp')
+w.__file__ = str(root / 'watch_relay.py')
+def log(event):
+    with open(root / 'events', 'a') as out:
+        out.write(event + '\n')
+def hold():
+    log(name)
+    (root / 'entered').touch()
+    end = time.monotonic() + 15
+    while not (root / 'release').exists():
+        if time.monotonic() > end: raise RuntimeError('parent did not release test')
+        time.sleep(.01)
+if mode == 'schedule':
+    original = w.os.path.getmtime
+    def delayed(path):
+        try: value = original(path)
+        except OSError:
+            time.sleep(.2)
+            raise
+        time.sleep(.2)
+        return value
+    w.os.path.getmtime = delayed
+    w._spawn_detached = lambda *args: log('spawn')
+    print('ready', flush=True)
+    while not (root / 'gate').exists(): time.sleep(.005)
+    w._self_update()
+elif mode == 'worker':
+    def pull():
+        hold()
+        return True
+    w._pull_update = pull
+    w.ensure_running = lambda **kwargs: log('replace') or 0
+    w.main(['--update'])
+elif mode == 'start':
+    w._ensure_running = lambda **kwargs: hold() or 0
+    w.ensure_running()
+'''
+    return subprocess.Popen([sys.executable, '-u', '-c', code,
+                             str(Path(watch_relay.__file__).resolve().parent),
+                             str(tmp_path), mode, name],
+                            env=dict(os.environ, HOME=str(tmp_path / "home")),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+
+
+def _finish_shared_update(child):
+    out, error = child.communicate(timeout=10)
+    assert child.returncode == 0, out + error
+
+
+def test_simultaneous_session_starts_schedule_one_update(tmp_path):
+    (tmp_path / '.git').mkdir()
+    children = [_shared_update_child(tmp_path, 'schedule', str(i)) for i in range(6)]
+    try:
+        for child in children:
+            assert child.stdout.readline().strip() == 'ready'
+        (tmp_path / 'gate').touch()
+        for child in children:
+            _finish_shared_update(child)
+        assert (tmp_path / 'events').read_text().splitlines() == ['spawn']
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
+
+
+@pytest.mark.parametrize('mode', ['worker', 'start'])
+def test_other_starters_return_while_one_process_owns_the_work(tmp_path, mode):
+    first = _shared_update_child(tmp_path, mode, 'first')
+    second = None
+    try:
+        end = time.monotonic() + 10
+        while not (tmp_path / 'entered').exists():
+            assert time.monotonic() < end, 'first process did not enter'
+            time.sleep(.01)
+        second = _shared_update_child(tmp_path, mode, 'second')
+        _finish_shared_update(second)
+        assert (tmp_path / 'events').read_text().splitlines() == ['first']
+        (tmp_path / 'release').touch()
+        _finish_shared_update(first)
+        expected = ['first', 'replace'] if mode == 'worker' else ['first']
+        assert (tmp_path / 'events').read_text().splitlines() == expected
+    finally:
+        for child in (first, second):
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.communicate()
+
+
+def test_a_crashed_owner_does_not_leave_a_stale_startup_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(watch_relay, '_UPDATE_STAMP', str(tmp_path / 'stamp'))
+    first = _shared_update_child(tmp_path, 'start', 'first')
+    try:
+        end = time.monotonic() + 10
+        while not (tmp_path / 'entered').exists():
+            assert time.monotonic() < end
+            time.sleep(.01)
+        first.kill()
+        first.communicate()
+        calls = []
+        monkeypatch.setattr(watch_relay, '_ensure_running', lambda **kwargs: calls.append(1) or 0)
+        assert watch_relay.ensure_running() == 0
+        assert calls == [1]
+    finally:
+        if first.poll() is None:
+            first.kill()
+            first.communicate()

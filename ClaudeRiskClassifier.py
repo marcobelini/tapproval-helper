@@ -110,7 +110,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.89"
+__version__ = "1.1.90"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -2803,6 +2803,7 @@ def build_response(event, policy, agent=None):
 
     audit = {
         "ts": datetime.now(timezone.utc).isoformat(),
+        "agent": agent or "claude",
         "session_id": (event or {}).get("session_id"),
         # A name, not the full path: enough to break a report down per
         # project, without writing directory structure into a log that
@@ -3297,6 +3298,43 @@ def _plan_input(event, card):
     return tool_input if isinstance(tool_input, dict) else {}
 
 
+def prepare_codex_sync(event, policy):
+    """Let Codex show its native prompt only after the relay has joined it.
+
+    A failed attachment leaves the question with Codex. It must never create
+    a separate watch approval. Merely reaching a local port is not proof.
+    """
+    import hmac
+    import urllib.parse
+    import urllib.request
+
+    session_id = event.get("session_id")
+    relay = str(policy.get("relay") or "").rstrip("/")
+    key = _relay_key(policy)
+    if not session_id or not key or not relay.startswith(("http://", "https://")):
+        return False
+    url = relay + "/codex/attach"
+    payload = {"session_id": session_id}
+    if event.get("tool_name") == "apply_patch":
+        payload["approval"] = {name: event.get(name) for name in (
+            "session_id", "turn_id", "transcript_path", "cwd", "tool_name", "tool_input")}
+    body = json.dumps(payload).encode("utf-8")
+    signature, nonce = wire.signed_header(
+        key, "POST", urllib.parse.unquote(urllib.parse.urlsplit(url).path), body)
+    request = urllib.request.Request(url, data=body, headers={
+        "Content-Type": "application/json", "X-Tapproval-Signature": signature})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as reply:
+            raw, status = reply.read(), reply.status
+            proof = reply.headers.get("X-Tapproval-Proof2") or ""
+        if not hmac.compare_digest(proof.encode("utf-8", "replace"),
+                                   _relay_proof2(key, nonce, status, raw).encode("ascii")):
+            return False
+        return status == 200 and json.loads(raw).get("attached") is True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def run_hook(stdin=None, stdout=None, agent=None):
     """Hook mode: read the event from stdin, write the decision to stdout.
 
@@ -3319,6 +3357,17 @@ def run_hook(stdin=None, stdout=None, agent=None):
         else:
             policy = load_policy()
         response, audit, card = build_response(event, policy, agent=agent)
+        if agent == "codex":
+            # Codex owns both automatic review and human approval. Our risk
+            # policy supplies labels, never an additional approval decision.
+            attached = (audit["mode"] == "enforce" and policy.get("relay")
+                        and prepare_codex_sync(event, policy))
+            audit.update(decision="escalate", effective="escalate",
+                         watch="native" if attached else "native-unavailable")
+            write_audit(audit, policy)
+            json.dump(ESCALATE_FALLBACK, stdout)
+            stdout.write("\n")
+            return 0
         # Only an enforce-mode escalation with a relay configured can ever
         # reach the wrist; check those cheap facts before touching any
         # settings file for the parity test below.
@@ -3598,7 +3647,7 @@ def _relay_path():
 
 
 def _relay_command():
-    """SessionStart hook: make sure the relay is alive whenever Claude is."""
+    """Shared SessionStart hook: keep the helper current for either agent."""
     return "%s %s --ensure" % (_quote_path(sys.executable),
                                _quote_path(_relay_path()))
 
@@ -4108,6 +4157,10 @@ def install_codex():
         return None
     entries = data.setdefault("hooks", {}).setdefault("PermissionRequest", [])
     changed = _sync_hook(entries, _codex_command(), "*", os.path.basename(__file__))
+    if os.path.exists(_relay_path()):
+        starters = data["hooks"].setdefault("SessionStart", [])
+        changed = _sync_hook(starters, _relay_command(), None,
+                             "watch_relay.py") or changed
     for handler in _settings_handlers(data):
         if handler.get("timeout") != WATCH_HOOK_TIMEOUT:
             handler["timeout"] = WATCH_HOOK_TIMEOUT

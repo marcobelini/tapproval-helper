@@ -73,6 +73,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import OrderedDict, deque
+from contextlib import contextmanager, nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import tapproval_wire as wire
@@ -408,7 +409,7 @@ ADMIN_CONDITIONS = {
     "/admin/update-deferred": lambda: note_condition(
         "update",
         "A newer helper is waiting to take over. It will replace this one "
-        "the next time Claude Code starts with no card waiting.",
+        "the next time Claude Code or Codex starts with no card waiting.",
         tone="in_hand"),
     # The hourly pull failed in a way the next one will repeat (a diverged
     # clone, local edits in the way). Fixed wording, no body: what git said
@@ -947,6 +948,40 @@ def watch_for_newer_helper(here=None):
         time.sleep(_RELEASE_LOOK_EVERY)
 
 
+@contextmanager
+def _process_lock(path, wait=0):
+    """One local process at a time; a crash releases the lock automatically.
+
+    Session hooks never wait for another starter. Only the detached updater
+    may wait briefly for a relay startup that is already in progress.
+    Never unlink the file: contenders must keep locking the same inode.
+    """
+    descriptor = None
+    acquired = False
+    try:
+        import fcntl
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError as error:
+                if (error.errno not in (errno.EACCES, errno.EAGAIN)
+                        or time.monotonic() >= deadline):
+                    break
+                time.sleep(0.05)
+    except (ImportError, OSError):
+        pass
+    try:
+        yield acquired
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _self_update():
     """Kick off a fast-forward of a git-installed helper, once an hour.
 
@@ -966,20 +1001,29 @@ def _self_update():
     here = os.path.dirname(os.path.abspath(__file__))
     if not os.path.isdir(os.path.join(here, ".git")):
         return
-    try:
-        age = time.time() - os.path.getmtime(_UPDATE_STAMP)
-        if age < _UPDATE_EVERY:
+    # Claude Code and Codex share the stamp and this atomic claim. Checking
+    # its age before taking the lock lets simultaneous starts both pull.
+    with _process_lock(_UPDATE_STAMP + ".claim.lock") as claimed:
+        if not claimed:
             return
-    except OSError:
-        pass
-    try:
-        os.makedirs(os.path.dirname(_UPDATE_STAMP), mode=0o700, exist_ok=True)
-        with open(_UPDATE_STAMP, "w") as handle:
-            handle.write(str(int(time.time())))
-    except OSError:
-        pass
-    _spawn_detached([sys.executable, os.path.abspath(__file__), "--update"],
-                    RELAY_LOG)
+        try:
+            if time.time() - os.path.getmtime(_UPDATE_STAMP) < _UPDATE_EVERY:
+                return
+        except OSError:
+            pass
+        try:
+            with open(_UPDATE_STAMP, "w") as handle:
+                handle.write(str(int(time.time())))
+        except OSError:
+            return
+        failed = _spawn_detached(
+            [sys.executable, os.path.abspath(__file__), "--update"], RELAY_LOG)
+        if failed:
+            # A child that never started must not suppress the next retry.
+            try:
+                os.remove(_UPDATE_STAMP)
+            except OSError:
+                pass
 
 
 # The Mac bridge is pinned by bridge.json, which a pull may move. Checking
@@ -1147,6 +1191,17 @@ def _serving_older_code(running):
 
 
 def ensure_running(updated=False):
+    """Serialize starts from either agent without blocking a session hook."""
+    wait = PORT_TAKEN_WAIT + RELAY_START_WAIT + 5 if updated else 0
+    with _process_lock(_UPDATE_STAMP + ".start.lock", wait=wait) as claimed:
+        if not claimed:
+            print("relay: another session is starting the helper; leaving it to it",
+                  file=sys.stderr)
+            return 0
+        return _ensure_running(updated=updated)
+
+
+def _ensure_running(updated=False):
     """Start the relay in the background unless one is already up.
 
     Registered as a Claude Code SessionStart hook, so the relay's whole
@@ -1282,7 +1337,7 @@ def alert_bucket(card):
     - "ask"     a question or a plan: open only, the answer is a choice.
     Anything unrecognised is "stop": fail closed.
     """
-    if card.get("kind") == "question":
+    if card.get("kind") in ("question", "handoff"):
         return "ask"
     return {"SAFE": "go", "LOW": "go", "MEDIUM": "careful"}.get(
         card.get("tier") if isinstance(card.get("tier"), str) else None, "stop")
@@ -1324,7 +1379,7 @@ class CardQueue:
     # second is still cheap.
     PROBE_SECONDS = 1.0
 
-    def submit(self, card, wait, caller_alive=None, resolved_elsewhere=None):
+    def submit(self, card, wait, caller_alive=None, resolved_elsewhere=None, admission_lock=None):
         """Queue a card and block until it is decided or ``wait`` expires.
 
         The card is queued whether or not a watch polled recently: Claude
@@ -1366,7 +1421,11 @@ class CardQueue:
         # wait could hold a card for days of calendar time (six, for one
         # answered question on 2026-10-05). The wall clock bounds it too.
         wall_deadline = self.wall_clock() + wait
-        with self._lock:
+        # A native adapter serializes publication with native resolution.
+        # Only admission holds that lock; the blocking wait never does.
+        with admission_lock or nullcontext(), self._lock:
+            if admission_lock is not None and resolved_elsewhere is not None and resolved_elsewhere():
+                return "", "none", None
             # The hook's own id, so a repost after a restart keeps it (#795);
             # anything else, or an id already in use, gets a fresh one.
             card_id = (wanted if isinstance(wanted, str) and CARD_ID.match(wanted)
@@ -1412,6 +1471,8 @@ class CardQueue:
                     remaining = deadline - time.monotonic()
                     if card_id in self._decisions:
                         reason = "answered-here"
+                    elif card_id not in self._pending:
+                        reason = "answered-elsewhere"
                     elif remaining <= 0 or self.wall_clock() >= wall_deadline:
                         reason = "expired"
                     else:
@@ -1447,6 +1508,13 @@ class CardQueue:
             card_id, reason, int((time.monotonic() - started) * 1000)),
             file=sys.stderr)
         return card_id, decision, answer
+
+    def withdraw(self, card_id):
+        """Retract a native request synchronously, before another tap/poll."""
+        with self._lock:
+            self._pending.pop(card_id, None)
+            self._decisions.pop(card_id, None)
+            self._lock.notify_all()
 
     def pending(self, from_watch=False, from_bridge=False):
         with self._lock:
@@ -1546,6 +1614,10 @@ class CardQueue:
                       file=sys.stderr)
                 return False
             card = self._pending[card_id]
+            if card.get("kind") == "handoff":
+                print("relay: refused answer for %s — answer on Mac or iPhone" % card_id,
+                      file=sys.stderr)
+                return False
             if decision in ("always", "dont_ask") and (
                     card.get("tier") == "CRITICAL" or not card.get("can_always")):
                 # A lasting grant only where the wrist offered one: never
@@ -1640,6 +1712,25 @@ def check_dashboard_is_loaded():
         return False
     clear_condition("dashboard")
     return True
+
+
+def _codex_sync_status(error):
+    if error:
+        note_condition("codex_sync", "Codex approvals are unavailable on the watch. "
+                       "Answer on your computer or iPhone while Base reconnects.")
+    else:
+        clear_condition("codex_sync")
+
+
+def codex_approval_sync(queue):
+    """The hook and background observer share one native request ledger."""
+    from codex_approvals import ApprovalSync
+    with queue._lock:
+        sync = getattr(queue, "codex_sync", None)
+        if sync is None:
+            sync = ApprovalSync(queue, card_title=with_session_title, status=_codex_sync_status)
+            queue.codex_sync = sync
+    return sync
 
 
 def with_session_title(card):
@@ -3873,6 +3964,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             # key_file: loopback is any process of any user here, and the
             # hook believes only an answer that proves the key back (S1).
             "/card": ("_post_card", dict(local=True, lan_only=True, key_file=True)),
+            "/codex/attach": ("_post_codex_attach", dict(local=True, lan_only=True, key_file=True)),
             "/heartbeat": ("_post_heartbeat", dict(local=True, lan_only=True)),
             # The bridge saying whether this Mac's iCloud account can carry
             # cards at all. admin: the key file, which the bridge signs
@@ -4112,15 +4204,15 @@ class RelayHandler(BaseHTTPRequestHandler):
         self._send_json({"sessions": active_sessions(waiting=waiting)})
 
     def _get_activity(self, path, query):
-        self._send_json(activity_summary())
+        self._send_json(activity_summary(background=True))
 
     def _get_recap(self, path, query):
         # A lifetime summary, not today's. Costs a full pass over the audit
         # log, which is why nothing polls it.
-        self._send_json(recap_summary())
+        self._send_json(recap_summary(background=True))
 
     def _get_usage(self, path, query):
-        self._send_json(usage_summary())
+        self._send_json(usage_summary(background=True))
 
     def _get_thread(self, path, query):
         session_id = (query.get("id", [""])[0] or "")[:64]
@@ -4228,10 +4320,27 @@ class RelayHandler(BaseHTTPRequestHandler):
     def _post_enroll(self, path, query):
         self._handle_enroll(self._read_json() or {})
 
+    def _post_codex_attach(self, path, query):
+        body = self._read_json() or {}
+        if not isinstance(body, dict):
+            self._send_json({"error": "expected an object"}, 400)
+            return
+        try:
+            sync = codex_approval_sync(self.queue)
+            attached = sync.attach(body.get("session_id"), approval=body.get("approval"))
+        except (ImportError, OSError, ValueError):
+            attached = False
+        self._send_json({"attached": attached})
+
     def _post_card(self, path, query):
         body = self._read_json()
         if body is None or not isinstance(body.get("card"), dict):
             self._send_json({"error": "expected {\"card\": {...}}"}, 400)
+            return
+        if body["card"].get("agent") == "codex":
+            # Older installed hooks may still post during an update. They
+            # must yield to Codex instead of creating a second approval.
+            self._send_json({"id": "", "decision": "none"})
             return
         try:
             wait = float(body.get("wait", DEFAULT_WAIT))
@@ -4326,7 +4435,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         if not isinstance(on, bool):
             self._send_json({"error": "expected {\"on\": true or false}"}, 400)
         elif not _plugin_install():
-            self._send_json({"error": "This helper updates itself whenever Claude Code starts."}, 409)
+            self._send_json({"error": "This helper updates itself when Claude Code or Codex starts."}, 409)
         else:
             state, why = set_auto_update(on)
             if why:
@@ -6281,9 +6390,11 @@ def main(argv=None):
         return ensure_running()
     if args.update:
         # The detached half of --ensure: pull, then replace the relay if
-        # the code moved and nothing is waiting.
-        if _pull_update():
-            ensure_running(updated=True)
+        # the code moved and nothing is waiting. Hold the worker lock
+        # through replacement, even if another hourly check becomes due.
+        with _process_lock(_UPDATE_STAMP + ".worker.lock") as claimed:
+            if claimed and _pull_update():
+                ensure_running(updated=True)
         return 0
     if args.bridge_update:
         return run_bridge_update()
@@ -6331,6 +6442,8 @@ def main(argv=None):
     threading.Thread(target=watch_for_newer_helper, name="release-look",
                      daemon=True).start()
     _inject_startup_cards(args, queue)
+    if not args.allow_simulator:
+        codex_approval_sync(queue).start()
 
     # SIGTERM (pkill, launchd, a relay restart from --ensure) must run the
     # same cleanup as Ctrl-C — otherwise the Bonjour advertiser and the
@@ -6351,6 +6464,9 @@ def main(argv=None):
         print("relay: stopped", file=sys.stderr)
     finally:
         stop_slow_parts()
+        sync = getattr(queue, "codex_sync", None)
+        if sync is not None:
+            sync.stop()
         # The tunnel is left running on purpose: the next relay adopts it,
         # so the travel address — the one route a watch without its iPhone
         # has — survives restarts and updates. start_tunnel() reaps it if

@@ -239,7 +239,7 @@ def _usage_entry_of(line):
             message.get("model") or "unknown")
 
 
-def usage_summary(projects_dir=None, now=None):
+def usage_summary(projects_dir=None, now=None, background=False):
     """Token consumption measured from the transcripts themselves.
 
     Every assistant message records its own ``usage`` block, so this is a
@@ -282,7 +282,210 @@ def usage_summary(projects_dir=None, now=None):
 
     totals["models"] = dict(sorted(totals["models"].items(),
                                    key=lambda kv: kv[1], reverse=True)[:4])
+    history = _overview_history(projects_dir=projects_dir, now=now, background=background)
+    totals["agents"] = history["usage"] if history else []
+    totals["today_output"] = sum(row["today_output"] or 0 for row in history["usage"]) if history else None
+    totals["output_complete"] = all(row["measured"] for row in history["usage"]) if history else False
     return totals
+
+
+_CONVERSATION_CACHE = OrderedDict()
+_CONVERSATION_LOCK = threading.RLock()
+_OVERVIEW_CACHE = {}
+_OVERVIEW_LOCK = threading.Lock()
+
+
+def _overview_history(projects_dir=None, now=None, background=False):
+    """Never hold a watch request for the initial lifetime-history scan.
+
+    Freeze the roots, clock and cache entry before starting the reader.
+    A reader finishing after the day (or a test's cache) changed cannot
+    publish its answer into another day's entry.
+    """
+    if not background:
+        return conversation_activity(projects_dir=projects_dir, now=now)
+    import codex_sessions as codex
+    now = time.time() if now is None else now
+    root = projects_dir or CLAUDE_PROJECTS
+    codex_root = os.path.join(codex._home(), "sessions")
+    key = (root, codex_root, time.strftime("%Y-%m-%d", time.localtime(now)))
+    with _OVERVIEW_LOCK:
+        state = _OVERVIEW_CACHE.get(key)
+        if state is None:
+            state = {"result": None, "reading": False, "updated": None}
+            _OVERVIEW_CACHE.clear()
+            _OVERVIEW_CACHE[key] = state
+        if not state["reading"] and (state["updated"] is None
+                                     or time.monotonic() - state["updated"] >= 10):
+            state["reading"] = True
+
+            def read():
+                try:
+                    result = conversation_activity(projects_dir=root, codex_dir=codex_root, now=now)
+                    with _OVERVIEW_LOCK:
+                        state["result"] = result
+                finally:
+                    with _OVERVIEW_LOCK:
+                        state["reading"] = False
+                        state["updated"] = time.monotonic()
+
+            threading.Thread(target=read, name="activity-history", daemon=True).start()
+        return state["result"]
+
+
+def _conversation_file(path, agent, fallback_id, now):
+    """Follow complete lines, keeping session days and at most a day of usage.
+
+    Sessions come from messages, never permission settings, live-process
+    discovery or the transcript's mtime. Codex token_count records carry
+    cumulative output, so repeated snapshots must not be added together.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    state = _CONVERSATION_CACHE.get(path)
+    identity = (stat.st_dev, stat.st_ino)
+    if (state is None or state["identity"] != identity
+            or stat.st_size < state["offset"]
+            or (stat.st_size == state["offset"] and stat.st_mtime_ns != state["mtime"])):
+        state = {"identity": identity, "mtime": stat.st_mtime_ns, "offset": 0,
+                 "id": fallback_id, "days": set(), "usage": {}, "previous": 0,
+                 "measured": False}
+    starts = []
+    lines, offset, _shrunk = _read_appended(path, state["offset"], starts=starts)
+    for index, line in enumerate(lines):
+        start = starts[index]
+        row = _json_object(line)
+        if not row:
+            continue
+        stamp = _parse_stamp(row.get("timestamp"))
+        if stamp is not None and stamp > now:
+            # Leave a future/just-appended record for the next clock tick,
+            # rather than consuming it without ever counting its message.
+            offset = start
+            break
+        if agent == "codex":
+            import codex_sessions as codex
+            payload = row.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if row.get("type") == codex.shape("record.meta"):
+                sid = payload.get("id") or payload.get("session_id")
+                if isinstance(sid, str) and sid:
+                    state["id"] = sid
+            is_message = (row.get("type") == codex.shape("record.item")
+                          and payload.get("type") == codex.shape("item.message")
+                          and payload.get("role") in ("user", "assistant")
+                          and payload.get("channel") != "analysis")
+            content = payload.get("content")
+            text = "\n".join(part.get("text", "") for part in content
+                             if isinstance(part, dict) and isinstance(part.get("text"), str)
+                             ) if isinstance(content, list) else ""
+            if payload.get("role") == "user" and text.startswith((
+                    codex.shape("user.environment"), "# AGENTS.md instructions for ")):
+                is_message = False
+            is_message = is_message and bool(text.strip())
+            if (row.get("type") == codex.shape("record.event")
+                    and payload.get("type") == codex.shape("event.usage")):
+                info = payload.get("info")
+                usage = info.get("total_token_usage") if isinstance(info, dict) else None
+                output = usage.get("output_tokens") if isinstance(usage, dict) else None
+                if isinstance(output, int) and not isinstance(output, bool) and output >= 0:
+                    previous = state["previous"]
+                    delta = output - previous if output >= previous else output
+                    state["previous"] = output
+                    state["measured"] = True
+                    if stamp is not None and stamp <= now and delta:
+                        state["usage"][start] = (stamp, delta)
+        else:
+            session_id = row.get("sessionId")
+            if isinstance(session_id, str) and session_id:
+                state["id"] = session_id
+            message = _message_of(row)
+            is_message = (message.get("role") in ("user", "assistant")
+                          and bool(message.get("content")) and not row.get(shape("key.is_meta")))
+            usage = message.get("usage")
+            output = usage.get("output_tokens") if isinstance(usage, dict) else None
+            if isinstance(output, int) and not isinstance(output, bool) and output >= 0:
+                state["measured"] = True
+                if stamp is not None and stamp <= now:
+                    # Streaming snapshots of the same assistant message are
+                    # one billable message, not independent usage events.
+                    message_id = message.get("id") or row.get("uuid")
+                    key = message_id if isinstance(message_id, str) and message_id else start
+                    old = state["usage"].get(key, (stamp, 0))
+                    state["usage"][key] = (stamp, max(output, old[1]))
+        if is_message and stamp is not None and stamp <= now:
+            state["days"].add(time.strftime("%Y-%m-%d", time.localtime(stamp)))
+    state["offset"], state["mtime"] = offset, stat.st_mtime_ns
+    state["usage"] = {key: value for key, value in state["usage"].items()
+                      if value[0] >= now - 86400}
+    _bounded_put(_CONVERSATION_CACHE, path, state, 4096)
+    return state
+
+
+def conversation_activity(projects_dir=None, codex_dir=None, now=None):
+    """Per-agent sessions and output usage, including closed conversations.
+
+    Today is the computer's calendar day. The legacy /usage rolling-day
+    fields remain unchanged; the new per-agent today_output means Today.
+    A missing token counter is unknown, not a measured zero.
+    """
+    import codex_sessions as codex
+    now = time.time() if now is None else now
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
+    midnight = time.mktime(time.strptime(today, "%Y-%m-%d"))
+    paths = [(mtime, path, "claude", sid) for mtime, path, _folder, sid
+             in transcripts_newest_first(projects_dir)]
+    root = codex_dir or os.path.join(codex._home(), "sessions")
+    for base, dirs, names in os.walk(root):
+        dirs.sort()
+        for name in names:
+            if name.startswith("rollout-") and name.endswith(".jsonl"):
+                path = os.path.join(base, name)
+                try:
+                    paths.append((os.path.getmtime(path), path, "codex", name[:-6]))
+                except OSError:
+                    continue
+    today_counts, all_counts, usage_rows, first_day = [], [], [], ""
+    with _CONVERSATION_LOCK:
+        seen = set()
+        for _mtime, path, agent, fallback in sorted(paths, reverse=True):
+            state = _conversation_file(path, agent, fallback, now)
+            if not state or not state["days"] or (agent, state["id"]) in seen:
+                continue
+            seen.add((agent, state["id"]))
+            first = min(state["days"])
+            first_day = min(first_day, first) if first_day else first
+            all_counts.append(agent)
+            if today in state["days"]:
+                today_counts.append(agent)
+            usage_rows.append((agent, state))
+        agents = sorted(set(all_counts), key=lambda agent: (agent != "codex", agent))
+        usage = []
+        for agent in agents:
+            states = [state for name, state in usage_rows if name == agent]
+            recent = [state for state in states if any(
+                stamp >= now - 86400 for stamp, _out in state["usage"].values())
+                or today in state["days"]]
+            if not recent:
+                continue
+            measured = bool(recent) and all(state["measured"] for state in recent)
+            usage.append({"agent": agent, "measured": measured,
+                          "window_output": sum(out for state in recent for stamp, out
+                                               in state["usage"].values()
+                                               if stamp >= now - USAGE_WINDOW_HOURS * 3600)
+                          if measured else None,
+                          "today_output": sum(out for state in recent for stamp, out
+                                              in state["usage"].values() if stamp >= midnight)
+                          if measured else None})
+    def counts(rows):
+        return [{"agent": agent, "sessions": rows.count(agent)}
+                for agent in sorted(set(rows), key=lambda agent: (agent != "codex", agent))]
+    return {"sessions": len(today_counts), "agents": counts(today_counts),
+            "all_sessions": len(all_counts), "all_agents": counts(all_counts),
+            "first_day": first_day, "usage": usage}
 
 # Where a session is being driven from, in the words the app uses.
 ENTRYPOINTS = {
@@ -1192,12 +1395,16 @@ def _count_decision(stats, entry):
     nothing is acted on, but "would not have bothered you" is still the
     honest measure of the triage.
     """
+    if entry.get("audit_type") == "watch_receipt":
+        answered = entry.get("watch") in ("allow", "deny", "answer")
+        stats["answered_on_watch"] += int(answered)
+        return answered
     stats["total"] += 1
     if entry.get("decision") == "allow":
         stats["silenced"] += 1
     else:
         stats["asked"] += 1
-    answered = entry.get("watch") in ("allow", "deny", "answer")
+    answered = entry.get("watch") in ("allow", "deny", "answer", "always", "dont_ask")
     if answered:
         stats["answered_on_watch"] += 1
     return answered
@@ -1228,7 +1435,7 @@ def _local_time(stamp):
     return local.strftime("%Y-%m-%d"), local.strftime("%H:%M")
 
 
-def activity_summary(audit_log=None, now=None):
+def activity_summary(audit_log=None, now=None, background=False):
     """What the triage actually did today, and the last few decisions.
 
     This is the product's own thesis made visible: how many prompts were
@@ -1245,7 +1452,27 @@ def activity_summary(audit_log=None, now=None):
     # lines into the same totals, and the day's numbers would be wrong for
     # the rest of the day with nothing to show why.
     with _ACTIVITY_LOCK:
-        return _activity_summary_locked(path, today)
+        stats = _activity_summary_locked(path, today)
+    history = _overview_history(now=now, background=background)
+    stats.update(session_count=history["sessions"] if history else None,
+                 agents=history["agents"] if history else [], sessions_loading=history is None)
+    return stats
+
+
+def _count_recorded_decision(stats, entry):
+    """Actual human requests, excluding hypothetical triage and auto-allow.
+
+    Older logs without enforce-mode evidence cannot prove a person was
+    asked. A recorded wrist answer does prove it. Native answer receipts
+    complement their hook request; they never create another request.
+    """
+    answered = entry.get("watch") in ("allow", "deny", "answer", "always", "dont_ask")
+    receipt = entry.get("audit_type") == "watch_receipt"
+    skipped = entry.get("watch") == "skipped-parity"
+    needed = not receipt and not skipped and (answered or (
+        entry.get("mode") == "enforce" and entry.get("decision") == "escalate"))
+    stats["decisions_needed"] += int(needed)
+    stats["recorded_watch_answers"] += int(answered)
 
 
 def _activity_summary_locked(path, today):
@@ -1253,7 +1480,8 @@ def _activity_summary_locked(path, today):
 
     def fresh_state():
         return {"day": today, "offset": 0, "total": 0, "silenced": 0,
-                "asked": 0, "answered_on_watch": 0, "tiers": {}, "recent": []}
+                "asked": 0, "answered_on_watch": 0, "tiers": {}, "recent": [],
+                "decisions_needed": 0, "recorded_watch_answers": 0}
 
     state = _ACTIVITY_STATE.get(path)
     if state is None or state["day"] != today:
@@ -1283,6 +1511,7 @@ def _activity_summary_locked(path, today):
             continue
         tier = entry.get("tier", "?")
         state["tiers"][tier] = state["tiers"].get(tier, 0) + 1
+        _count_recorded_decision(state, entry)
         if _count_decision(state, entry):
             state["recent"].append({
                 "verdict": entry.get("watch"),
@@ -1290,11 +1519,13 @@ def _activity_summary_locked(path, today):
                 "headline": entry.get("headline", ""),
                 "project": entry.get("project") or "",
                 "at": local[1],
+                "agent": entry.get("agent") if entry.get("agent") in ("codex", "claude") else None,
             })
             state["recent"] = state["recent"][-12:]
 
     stats = {key: state[key] for key in
-             ("total", "silenced", "asked", "answered_on_watch")}
+             ("total", "silenced", "asked", "answered_on_watch",
+              "decisions_needed", "recorded_watch_answers")}
     stats["tiers"] = dict(state["tiers"])
     stats["recent"] = list(reversed(state["recent"]))
     return _finish_counts(stats)
@@ -1310,10 +1541,11 @@ _RECAP_CACHE = OrderedDict()   # path -> {"offset", the running counts}
 
 def _recap_start():
     return {"offset": 0, "total": 0, "silenced": 0, "asked": 0,
-            "answered_on_watch": 0, "critical": 0, "first_day": ""}
+            "answered_on_watch": 0, "critical": 0, "first_day": "",
+            "decisions_needed": 0, "recorded_watch_answers": 0}
 
 
-def recap_summary(audit_log=None, now=None):
+def recap_summary(audit_log=None, now=None, background=False):
     """Everything the triage has done since the log began. Never raises."""
     path = audit_log or _audit_log_path()
     with _CACHE_LOCK:
@@ -1328,6 +1560,7 @@ def recap_summary(audit_log=None, now=None):
         if entry is None:
             continue              # a torn line is not a reason to fail
         _count_decision(running, entry)
+        _count_recorded_decision(running, entry)
         day = str(entry.get("ts", ""))[:10]
         if day and (not running["first_day"] or day < running["first_day"]):
             running["first_day"] = day
@@ -1335,7 +1568,17 @@ def recap_summary(audit_log=None, now=None):
             running["critical"] += 1
     running["offset"] = offset
     _bounded_put(_RECAP_CACHE, path, running, 8)
-    return _recap_facts(running, now)
+    stats = _recap_facts(running, now)
+    history = _overview_history(now=now, background=background)
+    stats.update(session_count=history["all_sessions"] if history else None,
+                 agents=history["all_agents"] if history else [], sessions_loading=history is None)
+    if history and history["first_day"]:
+        from datetime import date
+        today = date.fromtimestamp(time.time() if now is None else now)
+        stats["session_days"] = max(1, (today - date.fromisoformat(history["first_day"])).days + 1)
+    else:
+        stats["session_days"] = 0
+    return stats
 
 
 def _recap_facts(running, now=None):
@@ -1569,6 +1812,8 @@ _TOOL_PHRASES = (
     (("Grep", "Glob"), "searched the code", "ran %d searches"),
     (("WebFetch", "WebSearch"), "searched the web", "ran %d web searches"),
     (("Task", "Agent"), "launched a task", "launched %d tasks"),
+    (("TerminalInput",), "sent input to a terminal", "sent input %d times"),
+    (("ComputerUse",), "used the computer", "used the computer %d times"),
 )
 
 
@@ -1760,40 +2005,52 @@ def _thread_state_for(path):
     return state
 
 
+class _ToolRun:
+    """A bounded, growing tool summary shared by both transcript readers.
+
+    ``turn`` is replaced on every addition: an earlier poll's snapshot must
+    not change underneath the reader. The first line remains its identity.
+    """
+
+    def __init__(self):
+        self.counts = OrderedDict()
+        self.description = ""
+        self.turn = None
+
+    def add(self, name, at="", number=None, description=""):
+        self.counts[name] = self.counts.get(name, 0) + 1
+        if self.turn is None:
+            self.description = description
+        else:
+            self.description = ""
+        phrase = ("ran %s" % self.description if self.description else
+                  ", ".join(_tool_phrase(tool, count)
+                            for tool, count in self.counts.items()))
+        first = self.turn.get("n") if self.turn is not None else number
+        self.turn = {"role": "assistant", "kind": "tool", "at": at,
+                     "text": phrase[:1].upper() + phrase[1:]}
+        if first is not None:
+            self.turn["n"] = first
+        return self.turn
+
+
 def _merge_tool_runs(turns):
     """Phone-style aggregation: consecutive tool turns collapse into one
     phrase — "Ran a command, edited a file" — deduped, order kept. One
     call is named by what it was for, several are counted. Pure."""
     merged = []
-    runs = []                 # (name, desc, at, n) of the current consecutive run
-
-    def flush():
-        if not runs:
-            return
-        if len(runs) == 1 and runs[0][1]:
-            phrase = "ran %s" % runs[0][1]
-        else:
-            counts = OrderedDict()
-            for name, _desc, _at, _n in runs:
-                counts[name] = counts.get(name, 0) + 1
-            phrase = ", ".join(_tool_phrase(name, n)
-                               for name, n in counts.items())
-        turn = {"role": "assistant", "kind": "tool", "at": runs[-1][2],
-                "text": phrase[:1].upper() + phrase[1:]}
-        # A run is named by its first line, so one that grows keeps its name.
-        if runs[0][3] is not None:
-            turn["n"] = runs[0][3]
-        merged.append(turn)
-        del runs[:]
+    run = None
 
     for turn in turns:
         if turn["kind"] == "tool":
-            runs.append((turn["text"], turn.get("desc") or "",
-                         turn.get("at", ""), turn.get("n")))
+            if run is None:
+                run = _ToolRun()
+                merged.append(None)
+            merged[-1] = run.add(turn["text"], turn.get("at", ""), turn.get("n"),
+                                 turn.get("desc") or "")
             continue
-        flush()
+        run = None
         merged.append(dict(turn))
-    flush()
     return merged
 
 

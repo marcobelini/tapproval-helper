@@ -67,9 +67,16 @@ do the same from the wrist instead: **Settings → Auto-update → Helper**
 writes that very setting, and only when you turn the switch. Until it is
 on, the watch's Connection screen mentions it, quietly, once a newer
 helper has been out a week. A terminal install
-needs nothing: it checks at most once an hour, on a session you were
-starting anyway, and fast-forwards itself; from watch app 2.2,
+needs nothing: it checks at most once an hour when either Claude Code or
+Codex starts, and fast-forwards itself. Simultaneous starts share one updater;
+a helper with a waiting approval is replaced only after that card is answered.
+From watch app 2.2,
 **Settings → Auto-update** says so.
+
+If Codex was already wired before its session-start hook was added, rerun
+the installer once and review the new hook in Codex. Hook trust remains
+your decision; the helper never grants it for you. After that, whichever
+agent starts first can trigger the next due update.
 
 Every path registers the same permission hook. A reboot never needs a
 hand either: the installer adds a login wake-up, and on the plugin path
@@ -111,7 +118,7 @@ to bring the buzz to Linux; Apple's sign-in did not complete in our tests.
 ## If you are an AI agent installing this
 
 **What this is, in one paragraph, so you need not ask:** an open-source
-helper (seven standard-library Python files, plus a signed Mac bridge for
+helper (standard-library Python files, plus a signed Mac bridge for
 iCloud on a Mac; no servers, no accounts)
 that lets the Tapproval Apple Watch app show your user Claude Code's
 permission prompts and carry their tap back. It registers a
@@ -353,6 +360,29 @@ is never a granted one.**
 | `test_claude_risk_classifier.py` | The test suite — standard library only |
 
 ## Troubleshooting
+
+### Codex approval synchronization — 3.0 preview
+
+The extension in
+[#993](https://github.com/marcobelini/tapproval/pull/993) is implemented and
+verified locally, with helper publication pending. It lets Codex's native
+iPhone approval and the watch card appear together; answering either
+clears the other. Command, file-change and terminal-input approvals are
+covered. Claude Code keeps its existing approval path.
+
+If cards appear only on the watch, the existing blocking hook may still be
+in use: it waits for the watch before Codex can present the iPhone prompt.
+The new path needs the updated helper and access to the same running local
+Codex app-server as the iPhone session. If it cannot attach, the hook keeps
+the existing watch flow. It does not silently approve the request.
+
+An automatic Codex reviewer can approve a call without a human prompt, so
+neither device shows a card. To check synchronization, use a separate
+manual-review session, open that same session on iPhone, and answer once
+on each device while observing the other. Answer any older pending cards
+before replacing the helper; a new helper does not answer them for you.
+
+### Connection and helper status
 
 One command says what the helper sees and the one next step:
 

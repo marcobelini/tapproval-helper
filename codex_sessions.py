@@ -40,6 +40,7 @@ UPSTREAM_SHAPES = {
     "event.started": ("task_started", "Turn is in progress", "2026-10-14"),
     "event.complete": ("task_complete", "Turn has ended", "2026-10-14"),
     "event.aborted": ("turn_aborted", "Turn was interrupted", "2026-10-14"),
+    "event.usage": ("token_count", "Cumulative total_token_usage counter", "2026-10-27"),
     "origin.cli": ("codex-tui", "Terminal session", "2026-10-14"),
     "origin.desktop": ("Codex Desktop", "ChatGPT desktop session", "2026-10-14"),
     "user.environment": ("<environment_context>", "Harness context, not a user message", "2026-10-14"),
@@ -258,6 +259,38 @@ _THREADS = OrderedDict()
 _THREAD_LOCK = threading.Lock()
 
 
+# Normalize only tools whose action is known. In particular, ``exec`` is a
+# code-mode wrapper, not a shell command; its input must never be inspected
+# or executed to guess what work it performed. Unknown names share ONE bin.
+_TOOL_NAMES = {
+    "exec_command": "Bash", "shell_command": "Bash", "shell": "Bash",
+    "apply_patch": "Edit", "read_file": "Read",
+    "grep": "Grep", "glob": "Grep", "web_search": "WebSearch",
+    "write_stdin": "TerminalInput",
+}
+_TOOL_ACTIVITY = {
+    "Bash": "Running a command", "Edit": "Editing files", "Read": "Reading a file",
+    "Grep": "Searching the code", "WebSearch": "Searching the web",
+    "TerminalInput": "Sending input to terminal", "ComputerUse": "Using the computer",
+}
+
+
+def _tool_category(payload):
+    name = payload.get("name")
+    if not isinstance(name, str):
+        return "tool"
+    namespace = payload.get("namespace")
+    if namespace == "mcp__cua_repl" and name == "js":
+        return "ComputerUse"
+    if name == "mcp__cua_repl__js":
+        return "ComputerUse"
+    if namespace not in (None, "functions"):
+        return "tool"
+    if name.startswith("functions."):
+        name = name[len("functions."):]
+    return _TOOL_NAMES.get(name, "tool")
+
+
 def _fold(state, row, number):
     """Read Codex shapes only; formatting below is shared with Claude."""
     payload = row.get("payload")
@@ -267,9 +300,11 @@ def _fold(state, row, number):
     if row.get("type") == shape("record.event"):
         if kind == shape("event.started"):
             state["busy"] = True
+            state["tool_run"] = None
         elif kind in (shape("event.complete"), shape("event.aborted")):
             state["busy"] = False
             state["calls"].clear()
+            state["tool_run"] = None
         return
     if row.get("type") != shape("record.item"):
         return
@@ -283,14 +318,27 @@ def _fold(state, row, number):
     if kind in (shape("item.call"), shape("item.custom_call")):
         # Tool arguments/results may contain large blobs and private data;
         # the thread shows activity, using only the tool's name.
-        name = payload.get("name")
-        name = name[:120] if isinstance(name, str) else "tool"
-        if isinstance(call_id, str):
-            state["calls"][call_id] = name
+        category = _tool_category(payload)
+        if isinstance(call_id, str) and call_id:
+            if call_id in state["seen_calls"]:
+                return
+            state["seen_calls"][call_id] = None
+            while len(state["seen_calls"]) > 512:
+                state["seen_calls"].popitem(last=False)
+            state["calls"][call_id] = _TOOL_ACTIVITY.get(category)
             while len(state["calls"]) > 64:
                 state["calls"].pop(next(iter(state["calls"])))
-        state["turns"].append({"role": "assistant", "kind": "tool",
-                               "text": "Used a tool", "at": at, "n": number})
+        from watch_dashboard import _ToolRun
+        run = state["tool_run"]
+        if run is None:
+            run = state["tool_run"] = _ToolRun()
+            state["turns"].append(None)
+        # Store summaries rather than raw calls: a long burst must retain
+        # its first identity and full count even past the history limit.
+        state["turns"][-1] = run.add(category, at, number)
+        # The first byte is the row's identity; the newest call determines
+        # whether a delta poll must resend that row with its updated count.
+        state["changed"][run.turn["n"]] = number
         return
     if kind != shape("item.message"):
         return                         # includes private reasoning records
@@ -314,6 +362,7 @@ def _fold(state, row, number):
     text = plain_text(raw)
     if not text:
         return
+    state["tool_run"] = None
     turn = {"role": role, "kind": "text", "text": text, "at": at, "n": number}
     if role == "assistant":
         marked = blocks(raw, always=True)
@@ -349,7 +398,8 @@ def thread_info(path, mark=None, limit=14, card_waiting=False):
         if state is None or replaced:
             floor = _tail_start(path)
             state = {"identity": identity, "offset": floor, "floor": floor,
-                     "turns": [], "calls": {}, "busy": None, "last_said": None}
+                     "turns": [], "calls": {}, "busy": None, "last_said": None,
+                     "tool_run": None, "changed": {}, "seen_calls": OrderedDict()}
             _THREADS[path] = state
         _THREADS.move_to_end(path)
         while len(_THREADS) > 32:
@@ -357,7 +407,8 @@ def thread_info(path, mark=None, limit=14, card_waiting=False):
         starts = []
         lines, offset, _shrunk = _read_appended(path, state["offset"], starts=starts)
         if _shrunk:                  # truncated between stat and the read
-            state.update(turns=[], calls={}, busy=None, floor=0, last_said=None)
+            state.update(turns=[], calls={}, busy=None, floor=0, last_said=None,
+                         tool_run=None, changed={}, seen_calls=OrderedDict())
             replaced = True
         for index, line in enumerate(lines):
             row = _json_object(line)
@@ -366,6 +417,8 @@ def thread_info(path, mark=None, limit=14, card_waiting=False):
             if len(state["turns"]) > 160:
                 state["turns"] = state["turns"][-120:]
                 state["floor"] = state["turns"][0]["n"]
+                state["changed"] = {n: changed for n, changed in state["changed"].items()
+                                    if n >= state["floor"]}
         state["offset"] = offset
         turns = state["turns"]
         said = state["last_said"]
@@ -374,7 +427,8 @@ def thread_info(path, mark=None, limit=14, card_waiting=False):
         else:
             reset = replaced or mark <= 0 or mark > offset or mark < state["floor"]
             visible = (_keep_what_was_said(turns, said, 40) if reset
-                       else [t for t in turns if t["n"] >= mark])
+                       else [t for t in turns
+                             if state["changed"].get(t["n"], t["n"]) >= mark])
             if len(visible) > 60:
                 visible, reset = visible[-60:], True
             reply.update(mark=offset, reset=reset)
@@ -388,6 +442,6 @@ def thread_info(path, mark=None, limit=14, card_waiting=False):
         if card_waiting:
             reply.update(state="asking", state_reason="card", running_tool=tool)
         elif state["busy"] is True or (state["busy"] is None and active < 20):
-            reply.update(state="running", state_reason="tool" if tool else "turn",
+            reply.update(state="running", state_reason="tool" if state["calls"] else "turn",
                          running_tool=tool)
         return reply
