@@ -315,7 +315,7 @@ def session_registry(sessions_dir=None):
         if not isinstance(data, dict):
             continue
         session_id, pid = data.get("sessionId"), data.get("pid")
-        if not session_id or not pid:
+        if not session_id or not pid or not isinstance(session_id, str):
             continue
         # Unattended SDK runs (claude agents, headless drivers) never
         # appear in the phone app's session list — and the wrist mirrors
@@ -2452,3 +2452,43 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
             "wake_at": int(wake_at) if state == "scheduled" else None,
         })
     return sessions
+
+
+def active_sessions(limit=12, projects_dir=None, waiting=(), codex_rows=None):
+    """The one watch list: active Claude Code and verified-active Codex rows.
+
+    Claude's reader remains authoritative for its own sessions.  Codex rows
+    come from its independent rollout reader and arrive only when a local
+    process still owns the corresponding rollout file.  With no Codex rows
+    this returns Claude's existing answer unchanged, which keeps a
+    Claude-only installation byte-for-byte as it was.
+    """
+    claude = recent_sessions(limit=limit, projects_dir=projects_dir, waiting=waiting)
+    if codex_rows is None:
+        try:
+            from codex_sessions import active_sessions as codex_active_sessions
+            codex_rows = codex_active_sessions(limit=limit)
+        except Exception:  # a read-only optional source must not hide Claude
+            codex_rows = []
+    if not codex_rows:
+        return claude
+    # A card waiting on the wrist must retain its row even beyond the visual
+    # cap.  The Claude reader already applies this rule; repeat it after the
+    # cross-agent merge so a newer Codex row cannot evict a decision.
+    def is_waiting(row):
+        return any(str(session_id).startswith(str(row.get("session_id") or ""))
+                   for session_id in waiting)
+    codex_rows = [dict(row, state="asking", state_reason="card")
+                  if is_waiting(row) else row for row in codex_rows]
+    combined, seen = [], set()
+    for row in sorted(claude + list(codex_rows),
+                      key=lambda row: int(row.get("modified") or 0), reverse=True):
+        session_id = str(row.get("session_id") or "")
+        key = (row.get("agent") or "claude", session_id)
+        if not session_id or key in seen:
+            continue
+        seen.add(key)
+        combined.append(row)
+    visible = combined[:limit]
+    return visible + [row for row in combined[limit:]
+                      if is_waiting(row) and row not in visible]

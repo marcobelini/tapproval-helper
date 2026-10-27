@@ -1590,7 +1590,7 @@ try:
         activity_summary, card_session_title, recap_summary, _find_transcript, image_bytes,
         inbox_ready,
         _message_of, _parse_thread, _read_appended,
-        project_root, prompts_at_the_mac, recent_sessions, registry_turn, resolve_session,
+        project_root, prompts_at_the_mac, recent_sessions, active_sessions, registry_turn, resolve_session,
         session_registry, session_state, shape, thread_after, thread_tool_id,
         thread_wake_at, transcript_origin, transcripts_newest_first,
         THREAD_TURN_LIMIT, usage_summary)
@@ -1604,7 +1604,7 @@ except Exception as _error:  # noqa: BLE001 — any import-time failure, not onl
     # the import has one more place to go, not two.
     activity_summary = recap_summary = _find_transcript = image_bytes = \
         _message_of = _parse_thread = _read_appended = project_root = \
-        prompts_at_the_mac = recent_sessions = resolve_session = session_state = \
+        prompts_at_the_mac = recent_sessions = active_sessions = resolve_session = session_state = \
         shape = thread_after = thread_tool_id = thread_wake_at = transcript_origin = \
         transcripts_newest_first = usage_summary = _dashboard_unavailable
 
@@ -2004,12 +2004,13 @@ def _query_number(query, name, kind):
     return value if value == value and value >= 0 else None   # no NaN, no negatives
 
 
-def thread_news(path, mark, wait, still=lambda: True):
+def thread_news(path, mark, wait, still=lambda: True, reader=None):
     """``thread_after(path, mark)``, held up to ``wait`` seconds (at most
     THREAD_WAIT_MAX) while it has nothing to say and ``still()`` holds.
     The thread's lock is taken per look, never across the wait."""
-    news = thread_after(path, mark)
-    if news[0] or news[4] or wait <= 0:
+    reader = reader or thread_after
+    news = reader(path, mark)
+    if news[0] or news[4] or news[3] != mark or wait <= 0:
         return news
     if not _THREAD_WAITERS.acquire(blocking=False):
         return news
@@ -2022,8 +2023,8 @@ def thread_news(path, mark, wait, still=lambda: True):
                     continue
             except OSError:
                 break
-            news = thread_after(path, mark)
-            if news[0] or news[4]:
+            news = reader(path, mark)
+            if news[0] or news[4] or news[3] != mark:
                 break
         return news
     finally:
@@ -2667,6 +2668,11 @@ def _trusts(projects, path):
     return False
 
 
+# What a folder can bring that runs once Claude Code trusts it: its own
+# settings (hooks, an API-key helper, environment) and its tool servers.
+TRUST_RUNS = (".claude/settings.json", ".claude/settings.local.json", ".mcp.json")
+
+
 def trust_folder(path, config=None):
     """Make sure Claude Code will not stop a new session in ``path`` at its
     "Do you trust the files in this folder?" question. True when it will
@@ -2675,37 +2681,55 @@ def trust_folder(path, config=None):
     A folder Claude Code has never opened asks first, before it writes a
     transcript, so a session started there never reaches the watch's list:
     on 2026-10-25 a repository made that afternoon, offered by the picker
-    since #942, spun on the wrist as "Check Marco's Mac" while two Terminal
+    since #942, spun on the wrist as "Check <name>'s Mac" while two Terminal
     windows sat on the question. The wearer chose the folder, from their
     own code folders, on purpose — so the relay records the trust Claude
     Code would have asked for (the owner, 2026-10-25), touching that one
-    key and nothing else in the file. Never raises.
+    key and nothing else in the file.
+
+    Unless the folder brings settings of its own: trusting it runs its
+    hooks and tool servers, which a stranger's repository can carry, so
+    that question stays with the person at the Mac (the owner, 2026-10-26
+    review). And Claude Code rewrites the file while sessions run, so a
+    write that lands meanwhile is read again, never replaced. Never raises.
     """
     config = config or CLAUDE_CONFIG
     try:
-        with open(config, encoding="utf-8") as handle:
-            settings = json.load(handle)
-        projects = settings.setdefault("projects", {}) if isinstance(settings, dict) else None
-        if not isinstance(projects, dict):
-            raise ValueError("not Claude Code's config")
-        if _trusts(projects, path):
-            return True
-        entry = projects.setdefault(path, {})
-        if not isinstance(entry, dict):
-            raise ValueError("an entry that is not a table")
-        entry["hasTrustDialogAccepted"] = True
-        handle, temp = tempfile.mkstemp(prefix=".claude.json.", dir=os.path.dirname(config))
-        try:
-            with os.fdopen(handle, "w", encoding="utf-8") as out:
-                json.dump(settings, out, indent=2, ensure_ascii=False)
-            os.chmod(temp, os.stat(config).st_mode & 0o777)
-            os.replace(temp, config)
-        except BaseException:
+        for _attempt in range(2):
+            before = os.stat(config)
+            with open(config, encoding="utf-8") as handle:
+                settings = json.load(handle)
+            projects = settings.setdefault("projects", {}) if isinstance(settings, dict) else None
+            if not isinstance(projects, dict):
+                raise ValueError("not Claude Code's config")
+            if _trusts(projects, path):
+                return True
+            brings = [name for name in TRUST_RUNS if os.path.lexists(os.path.join(path, name))]
+            if brings:
+                raise ValueError("it brings %s" % ", ".join(brings))
+            entry = projects.setdefault(path, {})
+            if not isinstance(entry, dict):
+                raise ValueError("an entry that is not a table")
+            entry["hasTrustDialogAccepted"] = True
+            handle, temp = tempfile.mkstemp(prefix=".claude.json.", dir=os.path.dirname(config))
             try:
-                os.unlink(temp)
-            except OSError:
-                pass
-            raise
+                with os.fdopen(handle, "w", encoding="utf-8") as out:
+                    json.dump(settings, out, indent=2, ensure_ascii=False)
+                os.chmod(temp, before.st_mode & 0o777)
+                now = os.stat(config)
+                if (now.st_mtime_ns, now.st_size) != (before.st_mtime_ns, before.st_size):
+                    os.unlink(temp)
+                    continue            # rewritten meanwhile: read it again
+                os.replace(temp, config)
+                break
+            except BaseException:
+                try:
+                    os.unlink(temp)
+                except OSError:
+                    pass
+                raise
+        else:
+            raise ValueError("Claude Code kept rewriting its config")
     except (OSError, ValueError) as error:
         print("relay: new session: %s awaits trust (%s)"
               % (os.path.basename(path.rstrip("/")), error), file=sys.stderr)
@@ -4085,7 +4109,7 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def _get_sessions(self, path, query):
         waiting = {card["session_id"] for card in self.queue.pending() if card.get("session_id")}
-        self._send_json({"sessions": recent_sessions(waiting=waiting)})
+        self._send_json({"sessions": active_sessions(waiting=waiting)})
 
     def _get_activity(self, path, query):
         self._send_json(activity_summary())
@@ -4113,6 +4137,32 @@ class RelayHandler(BaseHTTPRequestHandler):
                 str(card.get("session_id") or "").startswith(session_id)
                 for card in self.queue.pending())
         card_waiting = card_is_waiting()
+        if not path_on_disk and session_id:
+            import codex_sessions
+            rollout = codex_sessions.find_rollout(session_id)
+            if rollout:
+                if mark is None:
+                    info = codex_sessions.thread_info(rollout, card_waiting=card_waiting)
+                else:
+                    info = {}
+                    def codex_after(path, after):
+                        nonlocal info
+                        info = codex_sessions.thread_info(
+                            path, after, card_waiting=card_is_waiting())
+                        return (info["turns"], 0, info["running_tool"],
+                                info["mark"], info["reset"])
+                    thread_news(rollout, mark,
+                                _query_number(query, "wait", float) or 0.0,
+                                lambda: card_is_waiting() == card_waiting,
+                                reader=codex_after)
+                    # A waiting card can arrive without a rollout append.
+                    if card_is_waiting() != card_waiting:
+                        fresh = codex_sessions.thread_info(
+                            rollout, mark, card_waiting=card_is_waiting())
+                        fresh["reset"] = fresh["reset"] or info["reset"]
+                        info = fresh
+                self._send_json(info)
+                return
         if path_on_disk:
             if mark is None:
                 turns, running, tool_now = _parse_thread(
@@ -5280,6 +5330,10 @@ def check_login_item(now=None):
             word = None
             if os.path.isdir(app) and bridge_install.registers_itself(app):
                 word = bridge_install.login_item("login-status", app)
+                if word is None:
+                    # Timed out: the same as a check that broke, so the
+                    # word stays what the last one saw (2026-10-26 review).
+                    raise OSError("the bridge did not answer")
             _LOGIN_ITEM["word"] = word
         except Exception as error:
             # A check that broke changes nothing: the word stays what the

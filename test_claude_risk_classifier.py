@@ -561,6 +561,9 @@ class TestTheHolesTheReviewFound:
         "cat $HOME/.ss[h]/id_rs[a]",
         "cat ${HOME}/.*/config",
         "less /Users/someone/.kub?/config",
+        # 2026-10-26 review: a hidden file of the project's own, through a
+        # wildcard, read SAFE while `cat .env*` read HIGH.
+        "cat .en?", "cat ./.e[n]v", "cat config/.e{nv}", "head '.npmr?'",
     ])
     def test_a_wildcard_in_a_hidden_home_folder_is_a_secret_read(self, command):
         risk, rules = crc.classify_bash(command)
@@ -570,7 +573,8 @@ class TestTheHolesTheReviewFound:
     @pytest.mark.parametrize("command", [
         # Wildcards over visible files stay what they were.
         "cat *.md", "ls ~/Documents/*.pdf", "grep -r TODO src/*.py",
-        "cat ~/notes/*.txt", "ls .github/workflows/*.yml",
+        "cat ~/notes/*.txt", "ls .github/workflows/*.yml", "ls ./*.sh",
+        "cat ../*.md", "cat file.t?t",
     ])
     def test_a_wildcard_over_visible_files_is_not(self, command):
         risk, rules = crc.classify_bash(command)
@@ -624,6 +628,10 @@ class TestTheHolesTheReviewFound:
         "git diff HEAD~1 -- .env",
         "git show main:config/credentials.yml",
         "git grep -n password -- .env.production",
+        # 2026-10-26 review: the same reads through a wildcard read SAFE,
+        # where `cat ~/.config/gh/host*` read HIGH.
+        "git diff --no-index ~/.config/gh/host* /dev/null",
+        "git diff --no-index $HOME/.config/*/hosts.yml /dev/null",
     ])
     def test_a_recognised_read_of_a_secret_is_still_a_secret_read(self, command):
         risk, rules = crc.classify_bash(command)
@@ -674,6 +682,9 @@ class TestClassifyBashDestructive:
         ("diskutil eraseDisk JHFS+ Untitled disk2", Risk.CRITICAL),
         ("diskutil eraseVolume APFS Data disk2s1", Risk.CRITICAL),
         ("diskutil zeroDisk disk2", Risk.CRITICAL),
+        # 2026-10-26 review: apfs's own deletes read MEDIUM.
+        ("diskutil apfs deleteContainer disk3", Risk.CRITICAL),
+        ("diskutil apfs deleteVolume disk3s5", Risk.CRITICAL),
         ("helm uninstall prod", Risk.CRITICAL),
         ("curl --request POST https://x.test -d a=1", Risk.HIGH),
         ("curl --json '{\"a\":1}' https://x.test", Risk.HIGH),
@@ -697,6 +708,8 @@ class TestClassifyBashDestructive:
         "rm -rf " + os.path.expanduser("~") + "/",
         "rm -rf " + os.path.expanduser("~") + "/*",
         "rm -rf ./", "rm -rf ../", "rm -rf ./*", "rm -rf ../*",
+        # 2026-10-26 review: the home folder spelled with a trailing `/.`.
+        "rm -rf ~/.", "rm -rf $HOME/.", "rm -rf ~/./",
         "find " + os.path.expanduser("~") + " -delete",
     ])
     def test_the_home_folder_by_any_spelling_is_catastrophic(self, command):
@@ -789,6 +802,33 @@ class TestClassifyBashDestructive:
         risk, rules = crc.classify_bash(command)
         assert risk >= floor, (command, risk, rules)
         assert rule in rules, (command, rules)
+
+    @staticmethod
+    def _nested(depth, core="x"):
+        for _ in range(depth):
+            core = "echo $(%s)" % core
+        return core
+
+    @pytest.mark.parametrize("command", [
+        # 2026-10-26 review: past the passes, the outer layers were never
+        # classified — a delete of the home folder nine deep read MEDIUM.
+        "echo $(rm -rf ~ $(%s))" % _nested.__func__(8),
+        # A parenthesis inside quotes hides the substitution from the
+        # pattern altogether: it read HIGH, auto-allowed under HIGH.
+        'echo $(echo "(" && rm -rf ~)',
+        "cat <(echo ')' ; rm -rf ~)",
+    ])
+    def test_a_substitution_the_pattern_cannot_take_apart_is_critical(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk == Risk.CRITICAL, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "echo $((1 + 2))", "echo $(( $(wc -l < a.txt) * 2 ))",
+        "echo $(date)", 'echo "$(git rev-parse HEAD)"', "diff <(ls a) <(ls b)",
+    ])
+    def test_ordinary_substitutions_and_arithmetic_stay_below_critical(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk < Risk.CRITICAL, (command, risk, rules)
 
     def test_benign_command_substitution_stays_capped_at_medium(self):
         risk, rules = crc.classify_bash("echo $(date)")
@@ -1272,7 +1312,7 @@ class TestCardFacts:
         foot = foot[:foot.index("case .sends")]
         assert "case .answers: EmptyView()" in foot
         row = cards[cards.index("struct CardRow"):cards.index("struct CardAnswerControls")]
-        assert "Text(card.shownHeadline)" in row, "the thread's card lost its headline"
+        assert "Text(card.drawnHeadline)" in row, "the thread's card lost its headline"
         assert ".lineLimit(" not in row and ".truncationMode(" not in row, \
             "the thread's card cuts its words"
         facts = cards[cards.index("struct FactLines"):cards.index("struct CardDetail")]
@@ -2720,6 +2760,194 @@ class TestRelaySessions:
 
     def test_missing_projects_dir_is_empty(self, tmp_path):
         assert watch_relay.recent_sessions(projects_dir=str(tmp_path / "no")) == []
+
+
+class TestCodexActiveSessions:
+    """Codex rollouts are durable history; only an open one belongs on wrist."""
+
+    def _rollout(self, tmp_path, session_id="cx-1", originator="codex-tui",
+                 cwd="/work/Example"):
+        path = tmp_path / "sessions" / "2026" / "10" / "26" / ("rollout-" + session_id + ".jsonl")
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {"id": session_id, "cwd": cwd, "originator": originator},
+        }) + "\n", encoding="utf-8")
+        return path
+
+    def test_an_open_rollout_becomes_a_codex_row(self, tmp_path):
+        import codex_sessions
+        rollout = self._rollout(tmp_path, originator="Codex Desktop")
+        index = tmp_path / "session_index.jsonl"
+        index.write_text(json.dumps({"id": "cx-1", "thread_name": "Repair session list"}) + "\n")
+        [row] = codex_sessions.active_sessions(
+            sessions_dir=str(tmp_path / "sessions"), index_path=str(index),
+            open_paths={str(rollout)})
+        assert row["agent"] == "codex"
+        assert row["title"] == "Repair session list"
+        assert row["project"] == "Example"
+        assert row["status"] == "Desktop"
+        assert row["state"] == "running" and row["live"] is True
+
+    def test_a_saved_rollout_is_not_an_active_session(self, tmp_path):
+        import codex_sessions
+        self._rollout(tmp_path)
+        assert codex_sessions.active_sessions(
+            sessions_dir=str(tmp_path / "sessions"), open_paths=set()) == []
+
+    def test_a_bad_rollout_is_ignored_without_hiding_a_good_one(self, tmp_path):
+        import codex_sessions
+        good = self._rollout(tmp_path, session_id="cx-good")
+        bad = tmp_path / "sessions" / "2026" / "10" / "26" / "rollout-bad.jsonl"
+        bad.write_text("not json\n", encoding="utf-8")
+        rows = codex_sessions.active_sessions(
+            sessions_dir=str(tmp_path / "sessions"), open_paths={str(good), str(bad)})
+        assert [row["session_id"] for row in rows] == ["cx-good"]
+
+    def test_the_combined_list_is_unchanged_without_codex(self, tmp_path, monkeypatch):
+        import watch_dashboard as wd
+        claude = [{"session_id": "cc-1", "modified": 100, "agent": None}]
+        monkeypatch.setattr(wd, "recent_sessions", lambda **_kwargs: claude)
+        assert wd.active_sessions(codex_rows=[]) is claude
+
+    def test_the_combined_list_merges_by_recency_and_keeps_a_waiting_claude_row(self,
+                                                                                  tmp_path, monkeypatch):
+        import watch_dashboard as wd
+        claude = [
+            {"session_id": "cc-new", "modified": 100, "agent": None},
+            {"session_id": "cc-wait", "modified": 1, "agent": None},
+        ]
+        codex = [{"session_id": "cx-new", "modified": 200, "agent": "codex"}]
+        monkeypatch.setattr(wd, "recent_sessions", lambda **_kwargs: claude)
+        rows = wd.active_sessions(limit=2, waiting={"cc-wait-full"}, codex_rows=codex)
+        assert [row["session_id"] for row in rows] == ["cx-new", "cc-new", "cc-wait"]
+
+
+class TestCodexThreads:
+    """Codex's stored conversation feeds the existing watch thread wire."""
+
+    @staticmethod
+    def _line(kind, payload):
+        return json.dumps({"type": kind, "payload": payload,
+                           "timestamp": "2026-10-14T08:00:00Z"}) + "\n"
+
+    @classmethod
+    def _message(cls, role, text):
+        return cls._line("response_item", {"type": "message", "role": role,
+                         "content": [{"type": "input_text" if role == "user"
+                                      else "output_text", "text": text}]})
+
+    def test_only_conversation_is_shown_and_markdown_is_kept(self, tmp_path):
+        import codex_sessions as cx
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(
+            self._message("developer", "Private instructions")
+            + self._message("user", "<environment_context>private paths</environment_context>")
+            + self._message("user", "# AGENTS.md instructions for /private/project")
+            + self._message("user", "Fix **the bug**")
+            + self._line("response_item", {"type": "reasoning", "summary": "private"})
+            + self._message("assistant", "Done.\n\n```python\nprint('ok')\n```")
+            + self._line("event_msg", {"type": "item_completed",
+                "item": {"type": "message", "role": "assistant", "text": "Done."}}))
+        info = cx.thread_info(str(path), 0)
+        assert [t["text"] for t in info["turns"]] == ["Fix the bug", "Done.\n\n[code]"]
+        assert info["turns"][1]["blocks"][-1] == {
+            "kind": "code", "text": "print('ok')", "lang": "python"}
+        assert info["reset"] is True and info["mark"] == path.stat().st_size
+
+    def test_complete_lines_catch_up_once_with_stable_numbers(self, tmp_path):
+        import codex_sessions as cx
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(self._message("user", "Hello"))
+        first = cx.thread_info(str(path), 0)
+        pending = self._message("assistant", "Héllo").encode("utf-8")
+        with path.open("ab") as handle:
+            handle.write(pending[:-2])
+        assert cx.thread_info(str(path), first["mark"])["turns"] == []
+        with path.open("ab") as handle:
+            handle.write(pending[-2:])
+        second = cx.thread_info(str(path), first["mark"])
+        assert [t["text"] for t in second["turns"]] == ["Héllo"]
+        assert second["turns"][0]["n"] == first["mark"]
+        assert second["reset"] is False
+        assert cx.thread_info(str(path), second["mark"])["turns"] == []
+        cx._THREADS.pop(str(path))
+        assert cx.thread_info(str(path), first["mark"])["turns"] == second["turns"]
+
+    def test_tool_receipts_and_turn_end_control_activity(self, tmp_path):
+        import codex_sessions as cx
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(self._line("event_msg", {"type": "task_started"})
+                        + self._line("response_item", {"type": "function_call",
+                            "call_id": "a", "name": "exec_command", "arguments": "secret"})
+                        + self._line("response_item", {"type": "custom_tool_call",
+                            "call_id": "b", "name": "apply_patch", "input": "secret"})
+                        + self._line("response_item", {"type": "function_call_output",
+                            "call_id": "a", "output": "secret"}))
+        old = time.time() - 300
+        os.utime(path, (old, old))
+        info = cx.thread_info(str(path))
+        assert info["state"] == "running" and info["running_tool"] == "apply_patch"
+        assert "secret" not in json.dumps(info)
+        with path.open("a") as handle:
+            handle.write(self._line("event_msg", {"type": "task_complete"}))
+        done = cx.thread_info(str(path))
+        assert done["state"] == "idle" and done["running_tool"] is None
+        assert cx.thread_info(str(path), card_waiting=True)["state"] == "asking"
+
+    def test_a_replaced_file_resets_and_bad_lines_do_not_hide_good_ones(self, tmp_path):
+        import codex_sessions as cx
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(self._message("user", "A long old conversation " * 50))
+        old = cx.thread_info(str(path), 0)
+        path.write_text("bad json\n" + self._line("response_item", ["not an object"])
+                        + self._message("assistant", "New"))
+        new = cx.thread_info(str(path), old["mark"])
+        assert new["reset"] is True
+        assert [t["text"] for t in new["turns"]] == ["New"]
+        # Replace rather than append: no old turns survive a changed inode.
+        replacement = tmp_path / "replacement"
+        replacement.write_text(self._message("assistant", "Fresh"))
+        replacement.replace(path)
+        fresh = cx.thread_info(str(path), new["mark"])
+        assert fresh["reset"] is True
+        assert [t["text"] for t in fresh["turns"]] == ["Fresh"]
+
+    def test_resolution_is_unambiguous_and_respects_the_profile(self, tmp_path, monkeypatch):
+        import codex_sessions as cx
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        root = tmp_path / "sessions"
+        root.mkdir()
+        for sid in ("shared00-one", "shared00-two"):
+            (root / ("rollout-" + sid + ".jsonl")).write_text(
+                self._line("session_meta", {"id": sid}))
+        assert cx.find_rollout("shared00") is None
+        assert cx.find_rollout("shared00-one").endswith("rollout-shared00-one.jsonl")
+        for bad in ("", "../rollout", "*", "shared"):
+            assert cx.find_rollout(bad) is None
+
+    def test_file_selection_requires_both_the_user_and_the_path(self, monkeypatch):
+        import codex_sessions as cx
+        def run(command, **kwargs):
+            assert "-a" in command and "-u" in command
+            return subprocess.CompletedProcess(command, 0, stdout="n/test/rollout.jsonl\n")
+        monkeypatch.setattr(cx.subprocess, "run", run)
+        assert cx._lsof_open_paths(["/test/rollout.jsonl"]) == {"/test/rollout.jsonl"}
+
+    def test_a_long_thread_keeps_the_question_and_bounds_catch_up(self, tmp_path):
+        import codex_sessions as cx
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(self._message("user", "The question"))
+        first = cx.thread_info(str(path), 0)
+        with path.open("a") as handle:
+            handle.write("".join(self._message("assistant", "Answer %d" % i)
+                                 for i in range(200)))
+        news = cx.thread_info(str(path), first["mark"])
+        assert news["reset"] is True and len(news["turns"]) <= 60
+        assert news["turns"][0]["text"] == "The question"
+        assert news["turns"][-1]["text"] == "Answer 199"
+        assert len(cx._THREADS[str(path)]["turns"]) <= 160
+        assert cx.thread_info(str(path), news["mark"])["turns"] == []
 
 
 class TestRelayTunnelToken:
@@ -4211,9 +4439,11 @@ class TestTheDoubleTapIsTheWatchsOwn:
     a hidden button of ours (`.handGestureShortcut(.primaryAction)`) to
     choose where a pinch landed, and the watch lit it up on every tap:
     first as a pill, then as the whole screen darkening (the owner's
-    wrist, 2026-10-25). Inside a session the one thing of ours left is
-    StaysAtTheEnd, which puts the reader back at the end when the
-    watch's own pinch goes round to the top."""
+    wrist, 2026-10-25). One primary action is left, and it is visible:
+    EndLine, the thread's last line, where the watch's own pinch stops
+    instead of going round to the top. It is never a control that sends
+    or answers, because a pinch on it would send or approve. The short
+    screens over the thread keep StaysAtTheEnd."""
 
     INSIDE = {"SessionDetail.swift", "Cards.swift"}
 
@@ -4226,9 +4456,24 @@ class TestTheDoubleTapIsTheWatchsOwn:
                 with open(os.path.join(folder, name), encoding="utf-8") as handle:
                     yield name, handle.read()
 
-    def test_no_screen_carries_a_hidden_double_tap_button(self):
-        assert [name for name, source in self._sources()
-                if ".handGestureShortcut(" in source] == []
+    def test_the_only_double_tap_button_is_the_threads_end_line(self):
+        found = [(name, source.count(".handGestureShortcut("))
+                 for name, source in self._sources() if ".handGestureShortcut(" in source]
+        assert found == [("SessionDetail.swift", 1)]
+        source = dict(self._sources())["SessionDetail.swift"]
+        end_line = source[source.index("struct EndLine: View {"):]
+        end_line = end_line[:end_line.index("\n}\n")]
+        assert "line.handGestureShortcut(.primaryAction, isEnabled: pinchable)" in end_line
+        assert 'accessibilityIdentifier("endLine")' in end_line
+
+    def test_the_end_line_ends_the_thread_and_sends_nothing(self):
+        source = dict(self._sources())["SessionDetail.swift"]
+        call = source.index("EndLine(pinchable: onTop && !replying && !ending) {")
+        body = source[call:source.index("}", call)]
+        assert "ExactScroll.Request(bottom: true" in body
+        assert "send(" not in body and "answer" not in body.lower()
+        thread_end = source.index(".coordinateSpace(.named(Self.threadSpace))")
+        assert source.index("if liveAsk != nil { liveAskPanel }") < call < thread_end
 
     def test_only_screens_inside_a_session_keep_the_end(self):
         using = {name for name, source in self._sources()
@@ -8922,6 +9167,16 @@ class TestClaudeCodeSaysWhetherATurnIsRunning:
         assert wd.registry_turn("") is None
         assert wd.registry_turn("dddd") is None
 
+    def test_a_registry_entry_whose_id_is_not_text_is_left_out(self, tmp_path, monkeypatch):
+        """registry_turn promises never to raise, and called startswith on
+        whatever sessionId a registry file held (2026-10-26 review)."""
+        import watch_dashboard as wd
+        root = self._registry(tmp_path, monkeypatch, "busy")
+        (tmp_path / "sessions" / "2.json").write_text(json.dumps(
+            {"pid": os.getpid(), "sessionId": 123, "entrypoint": "cli"}), encoding="utf-8")
+        assert 123 not in wd.session_registry(sessions_dir=root)
+        assert wd.registry_turn("cccc3333") == "busy"
+
     def _quiet_session(self, tmp_path, monkeypatch, status):
         import watch_dashboard as wd
         self._registry(tmp_path, monkeypatch, status)
@@ -13412,6 +13667,49 @@ class TestNewSessionFromTheWatch:
         assert written == others
         assert oct(config.stat().st_mode & 0o777) == oct(0o600)
 
+    @pytest.mark.parametrize("brings", [".claude/settings.json",
+                                        ".claude/settings.local.json", ".mcp.json"])
+    def test_a_folder_that_brings_its_own_settings_waits_for_the_mac(self, tmp_path, brings):
+        """Trusting a folder runs its own hooks and tool servers. A stranger's
+        repository can carry them, so one that does is left to the person at
+        the Mac; one that does not is still trusted from the wrist (the
+        owner's choice, 2026-10-26 review)."""
+        config = tmp_path / "claude.json"
+        before = json.dumps({"projects": {}})
+        config.write_text(before, encoding="utf-8")
+        repo = tmp_path / "Developer" / "strangers"
+        (repo / os.path.dirname(brings)).mkdir(parents=True, exist_ok=True)
+        (repo / brings).write_text("{}", encoding="utf-8")
+        assert not watch_relay.trust_folder(str(repo), str(config))
+        assert config.read_text(encoding="utf-8") == before
+        plain = tmp_path / "Developer" / "mine"
+        (plain / ".claude").mkdir(parents=True)
+        (plain / ".claude" / "commands").mkdir()
+        assert watch_relay.trust_folder(str(plain), str(config))
+
+    def test_a_config_rewritten_meanwhile_keeps_the_other_writers_change(
+            self, tmp_path, monkeypatch):
+        """Claude Code rewrites ~/.claude.json while sessions run. A write
+        that landed between the relay's read and its replace was lost
+        (2026-10-26 review); the relay reads again and keeps it."""
+        config = tmp_path / "claude.json"
+        config.write_text(json.dumps({"projects": {}}), encoding="utf-8")
+        real = watch_relay.tempfile.mkstemp
+        calls = []
+
+        def meanwhile(*args, **kwargs):
+            if not calls:
+                config.write_text(json.dumps({"projects": {}, "numStartups": 7}),
+                                  encoding="utf-8")
+            calls.append(1)
+            return real(*args, **kwargs)
+        monkeypatch.setattr(watch_relay.tempfile, "mkstemp", meanwhile)
+        repo = str(tmp_path / "Developer" / "acme")
+        assert watch_relay.trust_folder(repo, str(config))
+        written = json.loads(config.read_text(encoding="utf-8"))
+        assert written["numStartups"] == 7, "the other writer's change was lost"
+        assert written["projects"][repo] == {"hasTrustDialogAccepted": True}
+
     def test_a_folder_under_a_trusted_one_is_left_alone(self, tmp_path):
         config = tmp_path / "claude.json"
         before = json.dumps({"projects": {str(tmp_path): {"hasTrustDialogAccepted": True}}})
@@ -13834,6 +14132,48 @@ class TestRelayRoutes:
         assert body == {"turns": [], "running_tasks": 0, "running_tool": None,
                         "modified_seconds_ago": None, "state": "idle",
                         "state_reason": "", "wake_at": None}
+
+    def test_a_codex_session_opens_the_same_thread_route(self, relay, monkeypatch, tmp_path):
+        import codex_sessions as cx
+        base, _, auth = relay
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        root = tmp_path / "sessions"
+        root.mkdir()
+        rollout = root / "rollout-cx-thread1.jsonl"
+        rollout.write_text(TestCodexThreads._line("session_meta", {
+            "id": "cx-thread1", "cwd": "/work/Example", "originator": "Codex Desktop"})
+            + TestCodexThreads._message("user", "Fix it")
+            + TestCodexThreads._message("assistant", "Fixed")
+            + TestCodexThreads._line("event_msg", {"type": "task_complete"}))
+        monkeypatch.setattr(watch_relay, "_find_transcript", lambda _sid: None)
+        monkeypatch.setattr(watch_dashboard, "recent_sessions", lambda **_kw: [])
+        monkeypatch.setattr(cx, "open_rollout_paths", lambda _paths: {str(rollout)})
+        status, listing = self._call(base + "/sessions", token=auth.bootstrap)
+        assert status == 200
+        [row] = listing["sessions"]
+        assert row["agent"] == "codex" and row["state"] == "idle"
+        status, first = self._call(base + "/thread?id=cx-thread1&after=0", token=auth.bootstrap)
+        assert status == 200 and first["state"] == row["state"]
+        assert [t["text"] for t in first["turns"]] == ["Fix it", "Fixed"]
+        assert first["reset"] is True
+
+        def finish():
+            with rollout.open("a") as handle:
+                handle.write(TestCodexThreads._line("event_msg", {"type": "task_started"}))
+        timer = threading.Timer(0.3, finish)
+        timer.start()
+        try:
+            started = time.monotonic()
+            _, news = self._call(base + "/thread?id=cx-thread1&after=%d&wait=3"
+                                 % first["mark"], token=auth.bootstrap)
+            assert time.monotonic() - started < 2
+            assert news["turns"] == [] and news["state"] == "running"
+            assert news["reset"] is False and news["mark"] > first["mark"]
+        finally:
+            timer.join()
+        _, legacy = self._call(base + "/thread?id=cx-thread1", token=auth.bootstrap)
+        assert "mark" not in legacy and "reset" not in legacy
+        assert legacy["turns"] == first["turns"]
 
     def test_a_thread_says_its_state(self, relay, monkeypatch, tmp_path):
         """The thread's header shows the same state as the list's row."""
@@ -15019,6 +15359,11 @@ class TestTheChangelogCarriesNoHtml:
         "[x](data:text/html;base64,PHNjcmlwdD4=)",
         "[x](vbscript:msgbox(1))",
         "[x](&#x6A;avascript:alert(1))",
+        # 2026-10-26 review: a reference-style link carried its target on a
+        # line of its own, where the inline check never looked.
+        "[x][1]\n\n[1]: data:text/html,hi",
+        "[x][a]\n\n  [a]: <data:text/html,hi>",
+        "[x][a]\n\n[a]: file:///etc/passwd \"title\"",
     ])
     def test_any_html_refuses_the_render(self, changelog, body):
         assert changelog.unsafe_release([{"tag_name": "v1", "body": body}]) == "v1"
@@ -15043,6 +15388,7 @@ class TestTheChangelogCarriesNoHtml:
         "Use `a < b` and 3 > 2.",
         "Metadata: the data: folder moved. AT&amp;T. See [#5](https://x.test/5).",
         "[the guide](apple-watch-claude-code.html) and [top](#top)",
+        "[the guide][g]\n\n[g]: https://x.test/guide \"The guide\"",
     ])
     def test_ordinary_notes_render(self, changelog, body):
         assert changelog.unsafe_release([{"tag_name": "v1", "body": body}]) is None
@@ -20710,6 +21056,21 @@ class TestTheHelperInstallsTheMacBridge:
         finally:
             watch_relay.clear_condition("login_item_off")
 
+    def test_a_login_item_check_that_times_out_keeps_what_it_last_saw(self, monkeypatch):
+        """A bridge that hangs past the timeout answers None, which reset the
+        word just as an exception did (2026-10-26 review)."""
+        monkeypatch.setattr(watch_relay, "_LOGIN_ITEM", {"at": 0.0})
+        self._install_v("1.1.0")
+        self.mac.switched_off = True
+        watch_relay.check_login_item(now=1e12)
+        monkeypatch.setattr(bridge_install, "login_item", lambda *_a, **_k: None)
+        watch_relay.check_login_item(now=1e12 + watch_relay.LOGIN_ITEM_EVERY)
+        try:
+            assert [c for c in watch_relay.conditions() if c["key"] == "login_item_off"], \
+                "a check that timed out withdrew the condition"
+        finally:
+            watch_relay.clear_condition("login_item_off")
+
     # -- the bridge wakes the relay, and the relay's own job goes ---------------
 
     def _relay_here(self, tmp_path, monkeypatch, place=".tapproval"):
@@ -22648,6 +23009,55 @@ class TestTheLoginItemCheckLeavesNothing:
         assert sorted(booted) == ["gui/%d/app.tapproval.e2e-a82f083c" % os.getuid(),
                                   "gui/%d/app.tapproval.e2e.login" % os.getuid()]
         assert not [c for c in ran if "sfltool" in c], "the sweep never resets anything"
+
+    def test_clean_up_never_boots_out_a_label_that_is_not_the_stand_ins(
+            self, tmp_path, monkeypatch):
+        """A run stopped before aim_at left bridge_install.ITEM_LABEL the
+        real one, and the no-job stand-in's label fell back to it: clean_up
+        booted out the owner's live bridge (2026-10-26 review)."""
+        e2e = self._mod()
+        monkeypatch.setattr(bridge_install, "ITEM_LABEL", "com.tapproval.bridge.login")
+        monkeypatch.setattr(bridge_install, "LABEL", "com.tapproval.bridge")
+        app = tmp_path / "nojob" / "Tapproval.app"
+        (app / "Contents" / "MacOS").mkdir(parents=True)
+        ran = []
+        monkeypatch.setattr(e2e.subprocess, "run", lambda command, **kw: ran.append(command))
+        e2e.clean_up([(str(app), e2e.NOJOB_IDENT, str(tmp_path / "none.plist"))],
+                     str(tmp_path / "current"))
+        booted = [c[2].rsplit("/", 1)[1] for c in ran if c[:2] == ["launchctl", "bootout"]]
+        assert booted and all(label.startswith(e2e.IDENT) for label in booted), booted
+
+    def test_two_runs_cannot_both_hold_the_lock(self, tmp_path, monkeypatch):
+        """Two runs that both found a stale lock could each remove the
+        other's and go on together on one identity (2026-10-26 review)."""
+        e2e = self._mod()
+        monkeypatch.setattr(e2e, "HOME", str(tmp_path))
+        monkeypatch.setattr(e2e, "LOCK", str(tmp_path / "lock"))
+        (tmp_path / "lock").write_text("999999")       # a dead run's
+        first = e2e.take_lock()
+        try:
+            with pytest.raises(e2e.CannotRun):
+                e2e.take_lock()
+        finally:
+            e2e.release_lock(first)
+        e2e.release_lock(e2e.take_lock())
+
+    def test_a_run_that_cannot_start_says_so_with_exit_2(self, tmp_path, monkeypatch):
+        """2 is "could not run", 1 "a scenario failed": an older --app that
+        lacked a file exited 1 (2026-10-26 review)."""
+        e2e = self._mod()
+        monkeypatch.setattr(e2e, "HOME", str(tmp_path))
+        monkeypatch.setattr(e2e, "LOCK", str(tmp_path / "lock"))
+        monkeypatch.setattr(e2e.signal, "signal", lambda *a: None)
+        calls = []
+
+        def leftovers(*a, **k):
+            calls.append(1)
+            if len(calls) == 1:
+                raise FileNotFoundError("no such file in that build")
+            return {"labels": [], "plists": [], "folders": []}
+        monkeypatch.setattr(e2e, "stale_leftovers", leftovers)
+        assert e2e.main(["--app", str(tmp_path / "Tapproval.app")]) == 2
 
     def test_the_check_cleans_up_on_every_exit_path(self):
         src = open(self._mod().__file__).read()

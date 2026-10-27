@@ -110,7 +110,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.88"
+__version__ = "1.1.89"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -224,9 +224,12 @@ SECRET_PATH = re.compile(
 # folder of the home directory — `~/.ss?/id_rs?`, `~/.config/*/hosts.yml`,
 # `~/.s{sh}/id_{rsa}` — it names a secret store the literal list above
 # cannot see, so it reads as one. Wildcards over visible files are left
-# alone: `cat *.md` is not a credential read (2026-10-25 review).
+# alone: `cat *.md` is not a credential read (2026-10-25 review). So is a
+# wildcard in a hidden file's own name anywhere — `cat .en?` read SAFE
+# beside `cat .env*`'s HIGH (2026-10-26 review); `./*.sh` is not one.
 SECRET_GLOB = re.compile(
-    r"(?:^|[\s='\"])(?:~|\$\{?HOME\}?|/Users/[^/\s]+|/home/[^/\s]+)/\.[^\s]*[*?\[{]")
+    r"(?:^|[\s='\"])(?:~|\$\{?HOME\}?|/Users/[^/\s]+|/home/[^/\s]+)/\.[^\s]*[*?\[{]"
+    r"|(?:^|[\s='\"/])\.[^\s/.][^\s/]*[*?\[{]|(?:^|[\s='\"/])\.[*?\[{]")
 
 # Deployment-specific rules. Empty by default: this tool ships knowing
 # nothing about your infrastructure. Name your own servers, shares and
@@ -467,6 +470,7 @@ TOOL_EFFECT_WORDS["diskutil"] = {
     "zerodisk": Effect.DESTROY, "randomdisk": Effect.DESTROY,
     "secureerase": Effect.DESTROY, "reformat": Effect.DESTROY,
     "partitiondisk": Effect.DESTROY, "apfs": Effect.MUTATE,
+    "deletecontainer": Effect.DESTROY, "deletevolume": Effect.DESTROY,
 }
 
 # Flags that carry an effect. Deliberately few and unambiguous: a flag like
@@ -534,7 +538,9 @@ def _is_home(word):
     home = os.path.expanduser("~")
     if len(home) < 2:
         return False
-    return path.rstrip("*").rstrip("/") == home
+    # `~/.` is the home folder too (2026-10-26 review).
+    path = re.sub(r"^(?:~|\$\{?HOME\}?)(?=/|$)", lambda _: home, path)
+    return os.path.normpath(path.rstrip("*") or "/") == home
 # The machine's own folders: one list for every tool. find and rm kept two
 # that disagreed — `find /Users -delete` read HIGH beside `rm -rf /Users`'s
 # CRITICAL, and `rm -rf /System` HIGH beside find's — and a bare prefix took
@@ -1292,11 +1298,20 @@ def classify_bash(command):
             break
         for dollar_form, backtick_form in found:
             inner = (dollar_form or backtick_form).strip()
+            if inner.count("'") % 2 or inner.count('"') % 2:
+                # Cut short at a quoted `)`: what it ran is not this text.
+                bump("cmd-substitution-unread", Risk.CRITICAL)
             if inner:
                 sub_risk, sub_rules = classify_bash(inner)
                 bump("cmd-substitution-inner:" + (sub_rules[0] if sub_rules
                      else "?"), sub_risk)
         remaining = _SUBSTITUTION_RE.sub(" x ", remaining)
+    # What the pattern could not take apart was never classified: layers
+    # past the passes, or a parenthesis inside quotes that hides the whole
+    # substitution (`$(echo "(" && rm -rf ~)` read HIGH). Unread is the
+    # worst it could be (2026-10-26 review). `$((` is arithmetic.
+    if re.search(r"\$\((?!\()|[<>]\(|`", remaining):
+        bump("cmd-substitution-unread", Risk.CRITICAL)
 
     for segment in _segments(command):
         if segment.strip() in ("}", ")"):
@@ -1359,7 +1374,7 @@ def classify_bash(command):
             # .env` read HIGH (2026-10-25 review). The secret rule alone
             # runs here; the blunt tool-name rules stay out, which is the
             # point of recognising the invocation.
-            if SECRET_PATH.search(segment):
+            if SECRET_PATH.search(segment) or SECRET_GLOB.search(segment):
                 bump("secret-access", Risk.HIGH)
             bump(*special)
             continue
