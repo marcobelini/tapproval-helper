@@ -20,6 +20,8 @@ import threading
 import time
 from collections import OrderedDict
 
+import tapproval_host as _host
+
 
 _MAX_CANDIDATES = 128
 
@@ -133,7 +135,7 @@ def _lsof_open_paths(paths):
         # Absolute paths need no ``--`` (macOS lsof does not consistently
         # accept it); filtering by uid makes a file held by another account
         # insufficient evidence that *this* user's Codex session is active.
-        run = subprocess.run(["lsof", "-a", "-F", "n", "-u", str(os.getuid())] + list(paths),
+        run = subprocess.run(["lsof", "-a", "-F", "n", "-u", _host.current_user() or ""] + list(paths),
                              capture_output=True, text=True, timeout=3)
     except (OSError, subprocess.SubprocessError):
         return set()

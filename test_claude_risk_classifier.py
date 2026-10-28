@@ -27,6 +27,7 @@ from pathlib import Path
 import glob
 import re
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
@@ -79,6 +80,56 @@ def _serve(server):
                               daemon=True)
     thread.start()
     return thread
+
+
+def _set_home(monkeypatch, path):
+    """The home folder for this test, on every host: Windows' expanduser
+    reads USERPROFILE and never HOME."""
+    monkeypatch.setenv("HOME", str(path))
+    monkeypatch.setenv("USERPROFILE", str(path))
+
+
+def _owner_only(path, mode=0o600):
+    """Readable by this user alone. On macOS and Linux that is exactly
+    ``mode``; on Windows a mode says nothing about other users, so the
+    grants are read instead (tapproval_host.owner_only)."""
+    import tapproval_host
+    if tapproval_host.native_windows():
+        # Says what it read when it fails: the grants are not visible otherwise.
+        assert tapproval_host.owner_only(str(path)) is True, (
+            str(path), tapproval_host._windows_dacl(str(path)),
+            tapproval_host._windows_user_sid())
+        return True
+    return os.stat(path).st_mode & 0o777 == mode
+
+
+def _mode_chmod_gives(folder, mode):
+    """What a chmod to ``mode`` reads back as here: itself on POSIX, and
+    on Windows only the read-only bit, so 0o666."""
+    probe = os.path.join(str(folder), ".mode-probe")
+    with open(probe, "w"):
+        pass
+    os.chmod(probe, mode)
+    try:
+        return oct(os.stat(probe).st_mode & 0o777)
+    finally:
+        os.unlink(probe)
+
+
+# What a Windows test run cannot run: install.sh, uninstall.sh and their
+# kin are the macOS and Linux installers (Windows has install.ps1, whose
+# round trip e2e_host_roundtrip.py makes), and there "bash" can name WSL.
+posix_scripts = pytest.mark.skipif(
+    os.name == "nt", reason="a POSIX installer script; Windows runs install.ps1")
+_BASH = shutil.which("bash") or "bash"
+
+
+@pytest.fixture
+def _mac_uid(monkeypatch):
+    """launchd's gui/<uid> domain, for the Mac-only tests on a host
+    without uids: a fake stands in where os.getuid does not exist."""
+    if not hasattr(os, "getuid"):
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
 
 
 def _wait_until(predicate, timeout=5.0, interval=0.02, what=None):
@@ -1874,7 +1925,6 @@ class TestInstallerCLI:
 
     def test_installed_hook_command_actually_runs(self, tmp_path):
         """The command written into settings.json must work as written."""
-        import shlex
         self._run(["--install"], tmp_path)
         data = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
         command = data["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
@@ -1885,7 +1935,7 @@ class TestInstallerCLI:
         for key in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY",
                     "CLAUDE_RISK_RELAY_WAIT", "CLAUDE_RISK_CONFIG"):
             env.pop(key, None)
-        result = subprocess.run(shlex.split(command), input=event,
+        result = subprocess.run(crc._split_command(command), input=event,
                                 capture_output=True, text=True, env=env, timeout=30)
         assert result.returncode == 0
         decision = _behavior(json.loads(result.stdout))
@@ -1929,6 +1979,7 @@ class TestTestsNeverReachTheRealLaunchd:
         assert not crc._launch_agent_is_real()
 
 
+@pytest.mark.usefixtures("_mac_uid")
 class TestTheLoginJobIsOnlyClaimedWhenLaunchdTookIt:
     """The installer dropped launchctl's answer, so a bootstrap that
     failed still printed "the relay wakes again at login" (2026-10-14
@@ -1960,7 +2011,10 @@ class TestTheLoginJobIsOnlyClaimedWhenLaunchdTookIt:
         """Read back as launchd will: the label, this interpreter, the relay
         and --ensure, even from a folder whose name XML would choke on."""
         relay = tmp_path / "R&D <tools>" / "watch_relay.py"
-        relay.parent.mkdir()
+        try:
+            relay.parent.mkdir()
+        except OSError:
+            pytest.skip("this file system refuses < and > in a name")
         relay.write_text("")
         monkeypatch.setattr(crc.sys, "platform", "darwin")
         monkeypatch.setattr(crc, "_relay_path", lambda: str(relay))
@@ -3105,11 +3159,13 @@ class TestCodexThreads:
 
     def test_file_selection_requires_both_the_user_and_the_path(self, monkeypatch):
         import codex_sessions as cx
+        rollout = os.path.abspath("/test/rollout.jsonl")    # D:\\test\\… on Windows
+
         def run(command, **kwargs):
             assert "-a" in command and "-u" in command
-            return subprocess.CompletedProcess(command, 0, stdout="n/test/rollout.jsonl\n")
+            return subprocess.CompletedProcess(command, 0, stdout="n%s\n" % rollout)
         monkeypatch.setattr(cx.subprocess, "run", run)
-        assert cx._lsof_open_paths(["/test/rollout.jsonl"]) == {"/test/rollout.jsonl"}
+        assert cx._lsof_open_paths([rollout]) == {rollout}
 
     def test_a_long_thread_keeps_the_question_and_bounds_catch_up(self, tmp_path):
         import codex_sessions as cx
@@ -3527,7 +3583,9 @@ class TestSelfStartingRelay:
         monkeypatch.setattr(watch_relay.os, "kill", lambda pid, sig: sent.append((pid, sig)))
         monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: {"version": 2})
         assert watch_relay._stop_relay(deadline=0.0) is False
-        assert sent == [(4242, watch_relay.signal.SIGTERM), (4242, watch_relay.signal.SIGKILL)]
+        # Windows has no KILL: its TERM already ends the process.
+        hard = getattr(watch_relay.signal, "SIGKILL", watch_relay.signal.SIGTERM)
+        assert sent == [(4242, watch_relay.signal.SIGTERM), (4242, hard)]
 
     def test_stop_is_content_with_a_relay_that_leaves_when_asked(self, monkeypatch):
         sent = []
@@ -4549,10 +4607,13 @@ class TestAnUpdateKeepsTheAwayAddress:
         _fake_cloudflared(monkeypatch, "https://own-file.trycloudflare.com", calls)
         watch_relay.start_tunnel(8978, "tok")
         started = calls[0]
-        assert started.get("start_new_session") is True
+        if tapproval_host.native_windows():                 # no sessions there
+            assert started["creationflags"] & tapproval_host._DETACHED_PROCESS
+        else:
+            assert started.get("start_new_session") is True
         assert started.get("stderr") is not watch_relay.subprocess.PIPE
         assert started.get("stdout") is not watch_relay.subprocess.PIPE
-        assert oct(os.stat(watch_relay.TUNNEL_LOG).st_mode & 0o777) == "0o600"
+        assert _owner_only(watch_relay.TUNNEL_LOG)
 
     def test_a_healthy_check_clears_the_notice(self, monkeypatch):
         monkeypatch.setattr(watch_relay, "TUNNEL_URL", self.URL + "/t/tok")
@@ -5443,6 +5504,9 @@ class TestTheTravelAddressSurvivesARestart:
                               "--url http://127.0.0.1:8978")
         monkeypatch.setattr(watch_relay.subprocess, "run",
                             lambda cmd, **k: sp.CompletedProcess(cmd, 0, command + "\n", ""))
+        # Windows asks CIM rather than ps; the command line is the same.
+        if tapproval_host.native_windows():
+            monkeypatch.setattr(watch_relay._host, "command_of", lambda pid: command.strip())
 
     def test_a_live_tunnel_for_this_port_is_adoptable(self, monkeypatch):
         self._remember()
@@ -5500,7 +5564,7 @@ class TestTheTravelAddressSurvivesARestart:
         assert reaped == [None], "nothing is kept when nothing is adopted"
         saved = json.loads(self.state.read_text())
         assert saved == {"pid": 5151, "url": fresh, "port": 8978}
-        assert oct(os.stat(self.state).st_mode & 0o777) == "0o600"
+        assert _owner_only(self.state)
 
     def test_a_rotation_while_the_tunnel_opens_is_in_the_address_it_announces(self, monkeypatch):
         """The announce thread wrote the address with the secret it was
@@ -6647,12 +6711,11 @@ class TestSecretsDoNotRideAlong:
     def test_the_audit_log_is_not_world_readable(self, tmp_path):
         """It records what each card showed; on a shared machine the default
         umask leaves that readable by everyone."""
-        import os
         path = tmp_path / "audit.jsonl"
         policy = dict(crc.DEFAULT_POLICY, audit_log=str(path))
         crc.write_audit({"tier": "HIGH", "detail": "rm -rf /"}, policy)
         assert path.exists()
-        assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+        assert _owner_only(path)
 
 
 class TestTheKeyCarriedThroughICloudWorks:
@@ -6772,7 +6835,7 @@ class TestTheAuthFileIsWrittenWhole:
         path.write_text("{}")
         os.chmod(path, 0o644)
         watch_relay.Auth(path=str(path)).save()
-        assert (os.stat(path).st_mode & 0o777) == 0o600
+        assert _owner_only(path)
 
     def test_a_failed_write_leaves_the_old_file_whole(self, tmp_path, monkeypatch):
         path = tmp_path / "auth.json"
@@ -7359,6 +7422,8 @@ class TestASendIntoALiveSessionAsksFirst:
         assert origins == {"from the desk": None, "from the wrist": "headless"}
 
 
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"),
+                    reason="Claude Code's inbox is a Unix socket; this Python has none")
 class TestAWristMessageGoesIntoTheInbox:
     """#246: a wrist message ran as a headless `claude --resume -p` beside
     the open session, which never read it, and neither did the phone that
@@ -8977,7 +9042,8 @@ class TestTheSharedWireModule:
         assert watch_relay.verify_signature(header, "POST", "/card", b"{}", ["k"],
                                             now=int(stamp)) == ("k", nonce)
 
-    @pytest.mark.parametrize("line", ["[]", "3", '"x"', "{", "", "[" * 100000])
+    @pytest.mark.parametrize("line", ["[]", "3", '"x"', "{", "", "[" * 100000],
+                             ids=["list", "number", "string", "open", "empty", "deep"])
     def test_a_line_that_is_not_an_object_reads_as_none(self, line):
         assert tapproval_wire.json_object(line) is None
 
@@ -9522,7 +9588,7 @@ class TestTheCardSaysWhereAndWhat:
 
     def test_a_home_folder_under_git_is_never_the_repository(self, tmp_path, monkeypatch):
         home = self._repo(tmp_path, "home")
-        monkeypatch.setenv("HOME", str(home))
+        _set_home(monkeypatch, home)
         (home / "projects" / "x").mkdir(parents=True)
         assert crc.repository_name(str(home / "projects" / "x")) == "x"
 
@@ -10912,7 +10978,7 @@ class TestTheSyncScriptSaysWhatItDidAndDidNot:
         condition = (
             '[ "$1" != "$2" ] && '
             '[ "$(printf \'%s\\n%s\\n\' "$1" "$2" | sort -V | head -1)" = "$1" ]')
-        done = subprocess.run(["bash", "-c", condition, "bash", local, published])
+        done = subprocess.run([_BASH, "-c", condition, "bash", local, published])
         assert (done.returncode == 0) is refuses, (
             "%s over %s: expected refuses=%s" % (local, published, refuses))
 
@@ -10980,7 +11046,7 @@ class TestTheHelperKeepsItsFilesInOneFolder:
             with open(os.path.join(watch_relay.TAPPROVAL_DIR, folder, name), encoding="utf-8") as handle:
                 assert handle.read() == "old " + legacy
         data = os.path.join(watch_relay.TAPPROVAL_DIR, "data")
-        assert os.stat(data).st_mode & 0o777 == 0o700, "the keys' folder is this user's alone"
+        assert _owner_only(data, 0o700), "the keys' folder is this user's alone"
         assert watch_relay.move_loose_files() == [], "once"
 
     def test_a_paired_watch_needs_no_new_pairing(self):
@@ -10992,7 +11058,7 @@ class TestTheHelperKeepsItsFilesInOneFolder:
         assert watch_relay.move_loose_files() == ["auth.json"]
         where = watch_relay.home_file("data", "auth.json", ".tapproval-auth.json")
         assert where == os.path.join(watch_relay.TAPPROVAL_DIR, "data", "auth.json")
-        assert os.stat(where).st_mode & 0o777 == 0o600
+        assert _owner_only(where)
         after = _RealAuth(path=where)
         assert [d["token"] for d in after.devices if d.get("id") == "watch-1"] == [token]
         assert after.bootstrap == before.bootstrap, "the bridge's key, too"
@@ -11118,7 +11184,7 @@ class TestTheHelperKeepsItsFilesInOneFolder:
     def test_the_hook_reads_the_key_where_it_is(self, tmp_path):
         """The hook stands alone, so it decides once more, at import."""
         def where(home):
-            env = dict(os.environ, HOME=str(home), PYTHONPATH=_ROOT)
+            env = dict(os.environ, HOME=str(home), USERPROFILE=str(home), PYTHONPATH=_ROOT)
             for name in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY", "CLAUDE_RISK_RELAY_WAIT",
                          "CLAUDE_RISK_AUTH_FILE"):
                 env.pop(name, None)
@@ -11127,7 +11193,7 @@ class TestTheHelperKeepsItsFilesInOneFolder:
                                   "print(c.AUTH_FILE); print(r.CRASH_LOG)"],
                                  capture_output=True, text=True, env=env, cwd=str(home), timeout=60)
             assert run.returncode == 0, run.stderr
-            return run.stdout.split()
+            return [os.path.normpath(line) for line in run.stdout.split()]
         home = tmp_path / "user"
         home.mkdir()
         assert where(home) == [str(home / ".tapproval/data/auth.json"),
@@ -11971,11 +12037,13 @@ class TestTunnelBinaryLookup:
     """
 
     def test_found_on_path(self, monkeypatch, tmp_path):
-        fake = tmp_path / "cloudflared"
+        # Windows finds a program by its extension (PATHEXT).
+        name = "cloudflared.exe" if tapproval_host.native_windows() else "cloudflared"
+        fake = tmp_path / name
         fake.write_text("#!/bin/sh\n", encoding="utf-8")
         fake.chmod(0o755)
         monkeypatch.setenv("PATH", str(tmp_path))
-        assert watch_relay._cloudflared() == str(fake)
+        assert os.path.normcase(watch_relay._cloudflared()) == os.path.normcase(str(fake))
 
     def test_found_where_homebrew_puts_it_when_path_is_bare(
             self, monkeypatch, tmp_path):
@@ -12410,7 +12478,7 @@ class TestTheHelperReportsItsOwnCrashes:
         written = json.loads(log.read_text().strip())
         assert written["message"] == "ValueError: boom"
         assert written["source"] == "process" and written["at"]
-        assert oct(os.stat(log).st_mode & 0o777) == "0o600"
+        assert _owner_only(log)
 
     def test_a_machine_with_no_key_says_so_rather_than_pretending(self, tmp_path):
         reason, _ = crash_report.report("boom", "stack", path=str(tmp_path / "c"),
@@ -12514,7 +12582,7 @@ class TestTheHelperReportsItsOwnCrashes:
         assert len(lines) == 300, len(lines)
         for line in lines:
             assert json.loads(line)["stack"] == "s" * 9000
-        assert os.stat(path).st_mode & 0o777 == 0o600
+        assert _owner_only(path)
 
     def test_it_does_not_swallow_the_owner_pressing_ctrl_c(self, tmp_path):
         """The one thing it must NOT catch. `except Exception` is deliberate:
@@ -12542,7 +12610,7 @@ class TestTheHelperReportsItsOwnCrashes:
         said = crash_report.install_key("re_abc123\n", path=str(target))
         assert "stored" in said and "re_abc123" not in said, "never echo the key"
         assert target.read_text().strip() == "re_abc123"
-        assert oct(os.stat(target).st_mode & 0o777) == "0o600"
+        assert _owner_only(target)
 
     def test_the_request_carries_a_user_agent(self):
         """Cloudflare fronts Resend and refuses urllib's default agent with
@@ -13678,7 +13746,7 @@ class TestNewSessionFromTheWatch:
         (scratch / "pad").mkdir(parents=True)
         work.mkdir(parents=True)
         monkeypatch.setattr(watch_relay, "SCRATCH_ROOTS", (str(scratch),))
-        monkeypatch.setenv("HOME", str(home))
+        _set_home(monkeypatch, home)
         root = tmp_path / "projects"
         self._transcript(root, "-pad", scratch / "pad", 1)
         self._transcript(root, "-home", home, 2)
@@ -13839,6 +13907,7 @@ class TestNewSessionFromTheWatch:
                   "oauthAccount": {"emailAddress": "someone@example.invalid"}}
         config.write_text(json.dumps(others), encoding="utf-8")
         config.chmod(0o600)
+        kept = oct(config.stat().st_mode & 0o777)
         monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
         import subprocess as sp
@@ -13854,7 +13923,7 @@ class TestNewSessionFromTheWatch:
         assert written["projects"][repo] == {"hasTrustDialogAccepted": True}
         del written["projects"][repo]
         assert written == others
-        assert oct(config.stat().st_mode & 0o777) == oct(0o600)
+        assert oct(config.stat().st_mode & 0o777) == kept
 
     @pytest.mark.parametrize("brings", [".claude/settings.json",
                                         ".claude/settings.local.json", ".mcp.json"])
@@ -14060,7 +14129,7 @@ class TestNewSessionFromTheWatch:
             tmp_path, monkeypatch, osascript=sp.TimeoutExpired("osascript", 4))
         assert status == "started"
         assert calls == ["open"], "osascript must not be waited on when the file opened"
-        assert lines["mode"] == "0o700"
+        assert lines["mode"] == _mode_chmod_gives(tmp_path, 0o700)
         assert lines["file"][0] == "#!/bin/bash"
         assert lines["file"][1] == 'rm -f -- "$0"', "the file must remove itself, not pile up in tmp"
         assert shell_line == self._expected_line(tmp_path)
@@ -14086,6 +14155,8 @@ class TestNewSessionFromTheWatch:
         Run for real in a shell that carries the markers, so the check
         fails on the old line rather than trusting its text."""
         import subprocess as sp
+        if not os.path.exists("/bin/sh"):
+            pytest.skip("the line Terminal runs is a POSIX shell's; this host has none")
         real_run = sp.run  # _start replaces sp.run too: same module
         status, _, shell_line, _ = self._start(tmp_path, monkeypatch, text="go")
         assert status == "started"
@@ -14884,10 +14955,11 @@ class TestLocalMeansLocal:
                         what="the server to take both slots")
             third = _socket.create_connection(server.server_address, timeout=5)
             held.append(third)
-            third.sendall(b"GET /health HTTP/1.0\r\n\r\n")
+            # Windows says a closed connection is aborted, not reset.
             try:
+                third.sendall(b"GET /health HTTP/1.0\r\n\r\n")
                 answer = third.recv(100)
-            except ConnectionResetError:
+            except (ConnectionResetError, ConnectionAbortedError):
                 answer = b""
             assert answer == b"", "the third connection was served"
             for sock in held[:2]:
@@ -14936,6 +15008,11 @@ class TestInstallerHelpers:
     """The installer's three moves, each on its own: point our hook at a
     command (idempotently), take our hooks out and nobody else's, and
     strip the env we injected."""
+
+    @pytest.fixture(autouse=True)
+    def _shell_form(self, monkeypatch):
+        # These read the shell form; Windows' PowerShell one is TestEveryHost's.
+        monkeypatch.setattr(crc, "_hook_shell", lambda: None)
 
     def test_sync_adds_our_hook_with_the_matcher_when_absent(self):
         import ClaudeRiskClassifier as crc
@@ -15910,6 +15987,7 @@ class TestTheReleaseToolsSayWhenAStepFailed:
         assert ".tapproval-crashes.jsonl" in script
         assert ".tapproval.superseded-" in script
 
+    @posix_scripts
     def test_uninstall_stops_its_own_relay_by_pid_not_every_relay_by_name(self, tmp_path):
         """`pkill -f watch_relay.py` killed every relay this user runs — on
         the owner's Mac that is CI's isolated relay and an e2e run's
@@ -17747,6 +17825,8 @@ class TestClaudeIsFoundWhoeverStartedTheRelay:
         binary = folder / "claude"
         binary.write_text("#!/bin/sh\nexit 0\n")
         binary.chmod(0o755)
+        # Windows finds a program by its extension (PATHEXT).
+        (folder / "claude.exe").write_text("")
         return folder
 
     def test_a_bare_launchd_path_still_finds_a_native_install(self, tmp_path):
@@ -18572,8 +18652,12 @@ def test_the_two_ci_workflows_share_their_test_steps():
         rest = lines[start + 1:]
         end = next((i for i, line in enumerate(rest)
                     if line.startswith("  ") and not line.startswith("   ")), len(rest))
+        # The public matrix also names its hosts (Linux, Windows, macOS);
+        # the private fallback runs on one, as the runner is private.
         return [line for line in rest[:end]
-                if "vars.CI_RUNNER" not in line and "runs-on:" not in line]
+                if "vars.CI_RUNNER" not in line and "runs-on:" not in line
+                and not line.strip().startswith("os: [")
+                and "Every host the helper promises" not in line]
     assert python_steps(private) == python_steps(public)
     # The lint job too, by its run lines (comments may differ): the public
     # copy named two scripts by hand and ran no ruff at all, the shape the
@@ -18933,6 +19017,12 @@ class TestStandardLibraryOnly:
         """
         if name in sys.builtin_module_names:
             return True
+        # Another host's standard library cannot be resolved here, and
+        # tapproval_host imports it only on that host (msvcrt on Windows,
+        # fcntl on macOS and Linux).
+        if name in getattr(sys, "stdlib_module_names", ()) or name in (
+                "msvcrt", "winreg", "_winapi", "fcntl", "termios", "pwd", "grp"):
+            return True
         try:
             spec = importlib.util.find_spec(name)
         except (ImportError, ValueError):
@@ -18942,9 +19032,17 @@ class TestStandardLibraryOnly:
         origin = spec.origin or ""
         if origin in ("built-in", "frozen"):
             return True
-        stdlib = sysconfig.get_paths()["stdlib"]
-        return (os.path.commonpath([os.path.abspath(origin), stdlib]) == stdlib
-                and "site-packages" not in origin)
+        # normcase: Windows calls the same folder "lib" and "Lib", and keeps
+        # the compiled half of its standard library (select, _socket) in DLLs.
+        origin = os.path.normcase(os.path.abspath(origin))
+        homes = [os.path.normcase(sysconfig.get_paths()["stdlib"]),
+                 os.path.normcase(os.path.join(sys.base_prefix, "DLLs"))]
+        def under(home):
+            try:
+                return os.path.commonpath([origin, home]) == home
+            except ValueError:                   # another drive, on Windows
+                return False
+        return any(under(home) for home in homes) and "site-packages" not in origin
 
     def test_every_module_at_the_root_imports_only_the_standard_library(self):
         ours = {name[:-3] for name in self._root_modules()}
@@ -19823,6 +19921,8 @@ class TestOneOddLineBreaksNothing:
         assert wd._json_object("[" * 100000) is None
 
 
+@pytest.mark.skipif(not hasattr(time, "tzset"),
+                    reason="the zone is set through TZ, which this host's time module cannot read")
 class TestTodayIsTheWearersDay:
     """The audit log is written in UTC, and Today counted and clocked in
     UTC: a decision at 09:30 in Copenhagen read "07:30", and the day turned
@@ -20739,7 +20839,7 @@ class _FakeMac:
         self.item_label = None
 
     def _login_item(self, command):
-        app = command[0].split("/Contents/MacOS/")[0]
+        app = command[0].split(os.sep + os.path.join("Contents", "MacOS", ""))[0]
         action = command[1]
         self.login_calls.append((os.path.basename(app), action))
         if action == "--register" and not self.refuses:
@@ -20760,7 +20860,7 @@ class _FakeMac:
 
     def __call__(self, command, timeout=60):
         self.ran.append(command[0])
-        if "/Contents/MacOS/" in command[0]:
+        if "/Contents/MacOS/" in command[0].replace(os.sep, "/"):
             return self._login_item(command)
         if command[0] == "ditto":
             _make_app(os.path.join(command[-1], bridge_install.APP_NAME), self.version,
@@ -20784,6 +20884,7 @@ class _FakeMac:
         raise AssertionError("unexpected command %r" % (command,))
 
 
+@pytest.mark.usefixtures("_mac_uid")
 class TestTheHelperInstallsTheMacBridge:
     """Route B (#378): every Mac running the helper gets the notarized
     Developer ID bridge, so a closed watch buzzes through iCloud. What
@@ -20806,7 +20907,7 @@ class TestTheHelperInstallsTheMacBridge:
         pin = _bridge_zip_pin()
         _write_pin(pin)
         assert bridge_install.read_pin() == pin
-        assert pin["path"] == os.path.join(
+        assert os.path.normpath(pin["path"]) == os.path.join(
             os.path.dirname(os.environ["TAPPROVAL_BRIDGE_PIN"]),
             "bridge", "TapprovalBridge-1.0.0.zip")
 
@@ -21300,7 +21401,7 @@ class TestTheHelperInstallsTheMacBridge:
     # -- the bridge wakes the relay, and the relay's own job goes ---------------
 
     def _relay_here(self, tmp_path, monkeypatch, place=".tapproval"):
-        monkeypatch.setenv("HOME", str(tmp_path))
+        _set_home(monkeypatch, tmp_path)
         relay = tmp_path / place / "watch_relay.py"
         relay.parent.mkdir(parents=True, exist_ok=True)
         relay.write_text("# relay\n")
@@ -21613,6 +21714,7 @@ class TestTheHelperInstallsTheMacBridge:
         assert 'rm -rf "$HOME/.tapproval-bridge"' in src
 
     @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+    @posix_scripts
     def test_install_makes_a_checkout_of_a_folder_that_holds_the_bridge(self, tmp_path):
         """A plugin user's Mac can have ~/.tapproval holding only the bridge,
         and git clone refuses a folder that is not empty. install.sh's own
@@ -21686,6 +21788,7 @@ class TestTheHelperInstallsTheMacBridge:
                      % (shlex.quote(str(home)), shlex.quote(repo), block), check=False)
         return result, home, sorted(p.name for p in tmp_path.iterdir())
 
+    @posix_scripts
     def test_an_update_that_cannot_fetch_keeps_the_install(self, tmp_path):
         """2026-10-19 review: a pull and a clone that both fail (a network
         blip) moved the install aside and left nothing where every hook
@@ -21698,6 +21801,7 @@ class TestTheHelperInstallsTheMacBridge:
         assert not [n for n in names if ".superseded-" in n or ".fresh-" in n], names
         assert "keeping the one installed" in result.stderr
 
+    @posix_scripts
     def test_an_update_whose_swap_fails_halfway_keeps_the_keys(self, tmp_path):
         """A move that failed after `data` had gone stopped the script under
         set -e, with the watches' keys in a .fresh- folder nothing reads
@@ -21717,6 +21821,7 @@ class TestTheHelperInstallsTheMacBridge:
         assert not [n for n in names if ".fresh-" in n or ".superseded-" in n], names
         assert "keeping the one installed" in result.stderr
 
+    @posix_scripts
     def test_an_update_by_fresh_clone_keeps_the_bridge(self, tmp_path):
         result, home, names = self._update(tmp_path, clone_from="source")
         assert result.returncode == 0, result.stderr
@@ -22164,7 +22269,8 @@ class TestASessionCanBeEndedFromTheWrist:
         proc = start()
         arrange({"status": "Terminal", "pid": proc.pid}, [(proc.pid, "/usr/local/bin/claude")])
         assert watch_relay.end_session(self.SID[:12]) == "ended"
-        assert proc.poll() is not None, "the process is gone"
+        # Windows' TerminateProcess returns before the handle is signalled.
+        _wait_until(lambda: proc.poll() is not None, what="the process to be gone")
 
     def test_the_copies_a_wrist_message_started_end_with_it(self, stage):
         start, arrange = stage
@@ -22172,14 +22278,15 @@ class TestASessionCanBeEndedFromTheWrist:
         arrange({"status": "Terminal", "pid": live.pid},
                 [(live.pid, "claude"), (copy.pid, "claude --resume %s -p -- hi" % self.SID)])
         assert watch_relay.end_session(self.SID[:12]) == "ended"
-        assert live.poll() is not None and copy.poll() is not None
+        _wait_until(lambda: live.poll() is not None and copy.poll() is not None,
+                    what="both processes to be gone")
 
     def test_a_closed_session_with_a_copy_still_running_ends_the_copy(self, stage):
         start, arrange = stage
         copy = start()
         arrange(None, [(copy.pid, "claude --resume %s -p -- hi" % self.SID)])
         assert watch_relay.end_session(self.SID[:12]) == "ended"
-        assert copy.poll() is not None
+        _wait_until(lambda: copy.poll() is not None, what="the copy to be gone")
 
     def test_nothing_running_is_said_so(self, stage):
         _, arrange = stage
@@ -22213,6 +22320,8 @@ class TestASessionCanBeEndedFromTheWrist:
         assert watch_relay.end_session(self.SID[:12]) == "not ours"
         assert proc.poll() is None
 
+    @pytest.mark.skipif(not hasattr(signal, "SIGKILL"),
+                        reason="Windows ends a process outright; none can ignore the ask")
     def test_one_that_will_not_stop_is_said_so(self, stage, monkeypatch):
         start, arrange = stage
         proc = subprocess.Popen([sys.executable, "-c",
@@ -22229,8 +22338,13 @@ class TestASessionCanBeEndedFromTheWrist:
             proc.wait()
 
     def test_only_this_users_claude_processes_are_listed(self, monkeypatch):
-        listing = ("  101 %d /usr/local/bin/claude\n  102 0 /usr/local/bin/claude\n"
-                   "  103 %d /bin/zsh\n" % (os.getuid(), os.getuid()))
+        if tapproval_host.native_windows():                 # CIM's pid, owner, command
+            me = tapproval_host.current_user()
+            listing = ("101\t%s\t/usr/local/bin/claude\n102\tOTHER\\x\t/usr/local/bin/claude\n"
+                       "103\t%s\t/bin/zsh\n" % (me, me))
+        else:
+            listing = ("  101 %d /usr/local/bin/claude\n  102 0 /usr/local/bin/claude\n"
+                       "  103 %d /bin/zsh\n" % (os.getuid(), os.getuid()))
         monkeypatch.setattr(watch_relay.subprocess, "run",
                             lambda *a, **k: subprocess.CompletedProcess(a, 0, listing, ""))
         assert watch_relay._our_claude_processes() == [(101, "/usr/local/bin/claude")]
@@ -23457,3 +23571,286 @@ def test_a_crashed_owner_does_not_leave_a_stale_startup_lock(tmp_path, monkeypat
         if first.poll() is None:
             first.kill()
             first.communicate()
+
+
+# --------------------------------------------------------------------------
+# Every host: macOS, Linux and Windows (owner, 2026-10-28)
+# --------------------------------------------------------------------------
+
+import tapproval_host  # noqa: E402
+
+
+class TestEveryHost:
+    """tapproval_host is the one place that knows which computer this is.
+    These run natively on whichever host CI gives them, and stand in for
+    the others by setting sys.platform, as tapproval_host reads it per call."""
+
+    # Where a host check may still live outside tapproval_host, and why.
+    # Each line is matched by its text, so moving one is free and adding
+    # one fails until it is listed here with its reason.
+    ALLOWED = {
+        "bridge_install.py": [
+            # The bridge is a signed Mac app; this is its own seam.
+            'if (platform_name or sys.platform) != "darwin":'],
+        "crash_report.py": [
+            # A crash report says which host it came from: data, no branch.
+            '"platform": _clip(sys.platform, MAX_SHORT),'],
+        "watch_relay.py": [
+            # Starting a session in a terminal: Phase 2 gives Linux and
+            # Windows their own terminal.
+            'if (platform or sys.platform) != "darwin":'],
+    }
+    CHECK = re.compile(r"sys\.platform|os\.name\b|^\s*import (fcntl|msvcrt|termios)\b"
+                       r"|^\s*from (fcntl|msvcrt|termios) import")
+
+    def test_host_checks_live_in_tapproval_host_alone(self):
+        """Six files each asked which host this was, and Windows was missed
+        by all of them: --ensure never started a relay there."""
+        sources = [name for name in os.listdir(_ROOT)
+                   if name.endswith(".py") and not name.startswith(("test_", "e2e_", "render"))
+                   and name not in ("tapproval_host.py", "conftest.py")]
+        found = []
+        for name in sorted(sources):
+            with open(os.path.join(_ROOT, name), encoding="utf-8") as handle:
+                for number, line in enumerate(handle, 1):
+                    text = line.split("#", 1)[0].strip() if not line.strip().startswith(('"', "'")) else ""
+                    if text and self.CHECK.search(text) and text not in self.ALLOWED.get(name, []):
+                        found.append("%s:%d: %s" % (name, number, text))
+        assert found == [], ("ask tapproval_host instead:\n  " + "\n  ".join(found))
+
+    def test_a_held_lock_is_refused_and_a_released_one_taken(self, tmp_path):
+        path = str(tmp_path / "start.lock")
+        first = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        second = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            assert tapproval_host.try_lock(first) is True
+            if not tapproval_host.is_windows():
+                # flock is per open file, so a second descriptor contends;
+                # msvcrt locks per process, which CI covers across processes.
+                assert tapproval_host.try_lock(second) is False
+            tapproval_host.unlock(first)
+            assert tapproval_host.try_lock(second) is True
+        finally:
+            tapproval_host.unlock(second)
+            os.close(first)
+            os.close(second)
+
+    def test_a_lock_held_by_another_process_is_refused(self, tmp_path):
+        """What --ensure relies on: a second starter backs off."""
+        path = str(tmp_path / "start.lock")
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import os,sys,time;sys.path.insert(0,sys.argv[2]);import tapproval_host as h;"
+             "fd=os.open(sys.argv[1],os.O_CREAT|os.O_RDWR);print(h.try_lock(fd),flush=True);"
+             "time.sleep(30)", path, _ROOT],
+            stdout=subprocess.PIPE, text=True)
+        try:
+            assert holder.stdout.readline().strip() == "True"
+            mine = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                assert tapproval_host.try_lock(mine) is False
+            finally:
+                os.close(mine)
+        finally:
+            holder.kill()
+            holder.wait()
+
+    def test_liveness_is_asked_without_a_signal(self):
+        assert tapproval_host.pid_alive(os.getpid()) is True
+        assert tapproval_host.pid_exists(os.getpid()) is True
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        assert tapproval_host.pid_alive(child.pid) is False
+        assert tapproval_host.pid_alive("not a pid") is False
+
+    def test_windows_never_sends_signal_zero(self, monkeypatch):
+        """os.kill(pid, 0) is CTRL_C_EVENT on Windows: it would interrupt
+        every process on the console instead of asking about one."""
+        monkeypatch.setattr(tapproval_host, "native_windows", lambda: True)
+        monkeypatch.setattr(tapproval_host.os, "kill",
+                            lambda *a: pytest.fail("os.kill on Windows"))
+        monkeypatch.setattr(tapproval_host, "_windows_process_state", lambda pid: True)
+        assert tapproval_host.pid_alive(1234) is True
+        monkeypatch.setattr(tapproval_host, "_windows_process_state", lambda pid: None)
+        assert tapproval_host.pid_alive(1234) is False      # exists, not ours
+        assert tapproval_host.pid_exists(1234) is True
+
+    def test_a_detached_child_outlives_its_parents_session(self, tmp_path):
+        child = tapproval_host.popen_detached([sys.executable, "-c", "import time;time.sleep(5)"],
+                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            assert tapproval_host.pid_alive(child.pid)
+            if not tapproval_host.is_windows():
+                assert os.getsid(child.pid) == child.pid      # its own session
+        finally:
+            assert tapproval_host.stop(child.pid, hard=True)
+            child.wait(timeout=10)
+
+    def test_windows_spawns_detached_and_retries_without_breakaway(self, monkeypatch):
+        monkeypatch.setattr(tapproval_host, "native_windows", lambda: True)
+        calls = []
+
+        def popen(command, **kwargs):
+            calls.append(kwargs)
+            if kwargs["creationflags"] & tapproval_host._CREATE_BREAKAWAY_FROM_JOB:
+                raise OSError(5, "Access is denied")
+            return "child"
+        monkeypatch.setattr(subprocess, "Popen", popen)
+        assert tapproval_host.popen_detached(["relay"]) == "child"
+        assert [bool(c["creationflags"] & tapproval_host._CREATE_BREAKAWAY_FROM_JOB)
+                for c in calls] == [True, False]
+        assert all("start_new_session" not in c for c in calls)
+        assert all(c["creationflags"] & tapproval_host._DETACHED_PROCESS for c in calls)
+
+    def test_a_hard_stop_works_where_there_is_no_sigkill(self, monkeypatch):
+        sent = []
+        monkeypatch.delattr(tapproval_host.signal, "SIGKILL", raising=False)
+        monkeypatch.setattr(tapproval_host.os, "kill", lambda pid, sig: sent.append(sig))
+        assert tapproval_host.stop(42, hard=True) is True
+        assert sent == [tapproval_host.signal.SIGTERM]
+
+    def test_windows_finds_who_listens_from_netstat(self, monkeypatch):
+        """netstat is the fallback for a listener table that cannot be read."""
+        monkeypatch.setattr(tapproval_host, "native_windows", lambda: True)
+        monkeypatch.setattr(tapproval_host, "_windows_listeners", lambda: None)
+        table = ("  Proto  Local Address          Foreign Address        State           PID\n"
+                 "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1000\n"
+                 "  TCP    0.0.0.0:8977           0.0.0.0:0              LISTENING       4242\n"
+                 "  TCP    127.0.0.1:8977         127.0.0.1:50000        ESTABLISHED     77\n")
+        monkeypatch.setattr(subprocess, "run",
+                            lambda *a, **k: subprocess.CompletedProcess(a, 0, table, ""))
+        assert tapproval_host.listener_pid(8977) == 4242
+        assert tapproval_host.listener_pid(9999) is None
+
+    def test_the_hook_reads_its_event_as_utf8_whatever_the_code_page(self, monkeypatch):
+        import io
+        raw = json.dumps({"tool_input": {"command": "echo café ✓"}}, ensure_ascii=False)
+
+        class Console:
+            buffer = io.BytesIO(raw.encode("utf-8"))
+        monkeypatch.setattr(tapproval_host.sys, "stdin", Console)
+        assert "café ✓" in tapproval_host.read_stdin_text()
+
+    def test_windows_hooks_name_powershell_and_quote_for_it(self, monkeypatch):
+        """Git Bash reads a bare C:\\ path's backslashes as escapes, and
+        PowerShell runs a quoted path only after its call operator."""
+        monkeypatch.setattr(tapproval_host.sys, "platform", "win32")
+        monkeypatch.setattr(crc.sys, "executable", r"C:\Program Files\Python312\python.exe")
+        command = crc._hook_command()
+        assert command.startswith(r"& 'C:\Program Files\Python312\python.exe' '")
+        assert crc._hook_shell() == "powershell"
+        assert crc._split_command(command)[0] == r"C:\Program Files\Python312\python.exe"
+        assert crc._split_command(r"& 'C:\it''s\python.exe' 'x.py' --ensure") == [
+            r"C:\it's\python.exe", "x.py", "--ensure"]
+        entries = []
+        assert crc._sync_hook(entries, command, None, "ClaudeRiskClassifier.py")
+        assert entries[0]["hooks"][0]["shell"] == "powershell"
+        assert not crc._sync_hook(entries, command, None, "ClaudeRiskClassifier.py")
+
+    def test_macos_and_linux_hooks_are_unchanged(self, monkeypatch):
+        monkeypatch.setattr(tapproval_host.sys, "platform", "linux")
+        monkeypatch.setattr(crc.sys, "executable", "/usr/bin/python3")
+        assert crc._hook_command() == "/usr/bin/python3 %s" % crc._quote_path(
+            os.path.abspath(crc.__file__))
+        entries = [{"hooks": [{"type": "command", "command": "old ClaudeRiskClassifier.py",
+                               "shell": "powershell"}]}]
+        assert crc._sync_hook(entries, crc._hook_command(), None, "ClaudeRiskClassifier.py")
+        assert "shell" not in entries[0]["hooks"][0]
+
+    def test_a_second_relay_on_a_held_port_is_refused(self):
+        """Natively, on whichever host this runs: Windows' SO_REUSEADDR let
+        a second relay bind beside the first, so a port race never failed
+        and the suite waited on it for an hour (2026-10-28)."""
+        first, _ = watch_relay.serve(port=0, auth=None)
+        try:
+            with pytest.raises(OSError):
+                second, _ = watch_relay.serve(port=first.server_address[1], auth=None)
+                second.server_close()
+        finally:
+            first.server_close()
+
+    def test_windows_claims_its_port_alone(self, monkeypatch):
+        options = []
+
+        class Socket:
+            def setsockopt(self, *option):
+                options.append(option)
+
+        class Server:
+            allow_reuse_address = True
+            socket = Socket()
+        server = Server()
+        monkeypatch.setattr(tapproval_host, "native_windows", lambda: False)
+        tapproval_host.claim_port_alone(server)
+        assert server.allow_reuse_address is True and options == []
+        monkeypatch.setattr(tapproval_host, "native_windows", lambda: True)
+        tapproval_host.claim_port_alone(server)
+        assert server.allow_reuse_address is False
+        assert options == [(socket.SOL_SOCKET,
+                            getattr(socket, "SO_EXCLUSIVEADDRUSE", -5), 1)]
+
+    def test_a_free_port_reads_free_and_a_held_one_held(self):
+        """Natively: Windows retries a refused loopback connection for two
+        seconds, so a one-second try read every free port as taken and
+        --ensure never started a relay there (2026-10-28)."""
+        holder = socket.socket()
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        held = holder.getsockname()[1]
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        free = probe.getsockname()[1]
+        probe.close()
+        try:
+            started = time.monotonic()
+            assert tapproval_host.something_listens(held) is True
+            assert tapproval_host.something_listens(free) is False
+            assert time.monotonic() - started < 1.0, "a free port was waited on"
+        finally:
+            holder.close()
+
+    def test_windows_reads_listeners_from_the_table_and_waits_when_it_cannot(self, monkeypatch):
+        monkeypatch.setattr(tapproval_host, "native_windows", lambda: True)
+        monkeypatch.setattr(tapproval_host, "_windows_listeners", lambda: {8977: 4242})
+        assert tapproval_host.something_listens(8977) is True
+        assert tapproval_host.something_listens(8978) is False
+        assert tapproval_host.listener_pid(8977) == 4242
+        waited = []
+
+        def connect(address, timeout):
+            waited.append(timeout)
+            raise ConnectionRefusedError()
+        monkeypatch.setattr(tapproval_host, "_windows_listeners", lambda: None)
+        monkeypatch.setattr(socket, "create_connection", connect)
+        assert tapproval_host.something_listens(8978, timeout=1.0) is False
+        assert waited == [3.0], "a refusal there takes two seconds to come"
+
+    def test_a_secret_made_here_is_its_owners_alone(self, tmp_path):
+        """Natively: 0600 on macOS and Linux, one grant on Windows."""
+        path = str(tmp_path / "secret")
+        descriptor = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+        os.close(descriptor)
+        assert tapproval_host.restrict_to_owner(path) is True
+        assert _owner_only(path)
+
+    def test_windows_grants_the_owner_alone_and_reads_it_back(self, monkeypatch):
+        sid = "S-1-5-21-1-2-3-1001"
+        monkeypatch.setattr(tapproval_host, "native_windows", lambda: True)
+        monkeypatch.setattr(tapproval_host, "_windows_user_sid", lambda: sid)
+        # GitHub's runners are the built-in Administrator, which reads back as LA.
+        monkeypatch.setattr(tapproval_host, "_windows_sid_spellings", lambda s: {s, "LA"})
+        set_to = []
+        monkeypatch.setattr(tapproval_host, "_windows_set_dacl",
+                            lambda path, sddl: set_to.append((path, sddl)) or True)
+        assert tapproval_host.restrict_to_owner("C:\\k") is True
+        assert tapproval_host.restrict_to_owner("C:\\d", folder=True) is True
+        assert set_to == [("C:\\k", "D:P(A;;FA;;;%s)" % sid),
+                          ("C:\\d", "D:P(A;OICI;FA;;;%s)" % sid)]
+        for sddl, alone in (("D:P(A;;FA;;;%s)" % sid, True),
+                            ("D:PAI(A;OICI;FA;;;%s)" % sid, True),
+                            ("D:PAI(A;;FA;;;LA)", True),                     # its alias
+                            ("D:AI(A;ID;FA;;;%s)" % sid, False),           # inherited
+                            ("D:P(A;;FA;;;%s)(A;;FR;;;BU)" % sid, False),  # Users may read
+                            ("D:P", False)):                                # nobody: not "alone"
+            monkeypatch.setattr(tapproval_host, "_windows_dacl", lambda path, s=sddl: s)
+            assert tapproval_host.owner_only("C:\\k") is alone, sddl

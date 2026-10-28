@@ -38,6 +38,9 @@ import urllib.error
 import urllib.request
 
 # The same limits every other crash route here uses.
+# One crash line at a time from this process (see record()).
+_RECORD_LOCK = threading.Lock()
+
 MAX_MESSAGE = 500
 MAX_STACK = 8000
 MAX_SHORT = 120
@@ -184,12 +187,19 @@ def record(entry, path=None):
         # (2026-10-25 review). Made 0600 rather than chmod'ed after, so the
         # file is never readable to the machine for an instant.
         line = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
-        handle = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        try:
-            os.write(handle, line)
-        finally:
-            os.close(handle)
+        # Windows has no atomic append: its O_APPEND is a seek to the end
+        # and then a write, so two threads could still land on one offset.
+        with _RECORD_LOCK:
+            fresh = not os.path.exists(path)
+            handle = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.write(handle, line)
+            finally:
+                os.close(handle)
         os.chmod(path, 0o600)
+        if fresh:
+            import tapproval_host
+            tapproval_host.restrict_to_owner(path)
         return True
     except OSError as error:
         print("crash_report: could not write %s (%s)" % (path, error),
@@ -406,6 +416,8 @@ def install_key(text, path=None):
         with os.fdopen(handle, "w") as out:
             out.write(key + "\n")
         os.chmod(path, 0o600)
+        import tapproval_host
+        tapproval_host.restrict_to_owner(path)
     except OSError as error:
         return "could not write %s (%s)" % (path, error)
     return "stored in %s, readable only by you" % path

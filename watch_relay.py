@@ -76,6 +76,7 @@ from collections import OrderedDict, deque
 from contextlib import contextmanager, nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import tapproval_host as _host
 import tapproval_wire as wire
 
 DEFAULT_HOST = "127.0.0.1"
@@ -451,11 +452,13 @@ def check_helper_is_visible():
 def lan_ips():
     """This machine's LAN addresses (never the tailnet). Never raises."""
     import socket
-    for iface in ("en0", "en1", "en2", "en3"):
+    # `ipconfig getifaddr` is the Mac's: Windows has an ipconfig too, which
+    # prints its usage, and that text was published as the address.
+    for iface in ("en0", "en1", "en2", "en3") if _host.is_mac() else ():
         try:
             out = subprocess.run(["ipconfig", "getifaddr", iface],
                                  capture_output=True, text=True, timeout=2)
-            ip = (out.stdout or "").strip()
+            ip = (out.stdout or "").strip() if getattr(out, "returncode", 0) == 0 else ""
             if ip and not ip.startswith("100."):
                 return [ip]
         except (OSError, subprocess.SubprocessError):
@@ -574,8 +577,7 @@ def _spawn_detached(command, log_path, cwd=None):
         # made ~/.tapproval/logs.
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         with open(log_path, "a") as log:
-            subprocess.Popen(command, cwd=cwd, stdout=log, stderr=log,
-                             start_new_session=True)
+            _host.popen_detached(command, cwd=cwd, stdout=log, stderr=log)
     except OSError as error:
         return str(error)
     return ""
@@ -624,14 +626,7 @@ def _relay_pid(port=None):
             return pid
     except (OSError, ValueError):
         pass
-    try:
-        done = subprocess.run(
-            ["lsof", "-nP", "-iTCP:%d" % (port or DEFAULT_PORT),
-             "-sTCP:LISTEN", "-t"], capture_output=True, text=True, timeout=5)
-        first = done.stdout.split()
-        return int(first[0]) if first else None
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
+    return _host.listener_pid(port or DEFAULT_PORT)
 
 
 def _stop_relay(deadline=8.0):
@@ -649,18 +644,12 @@ def _stop_relay(deadline=8.0):
     holds the port, and asked to stop by pid: TERM, then KILL.
     """
     pid = _relay_pid()
-    if pid is None:
-        try:                                            # last resort, as before
-            subprocess.run(["pkill", "-f", "watch_relay.py --host"],
-                           capture_output=True, timeout=5)
-        except Exception:
-            pass
-    for signum, wait in ((signal.SIGTERM, deadline), (signal.SIGKILL, 3.0)):
+    if pid is None:                                     # last resort, as before
+        for stray in _host.pids_running("watch_relay.py --host"):
+            _host.stop(stray)
+    for hard, wait in ((False, deadline), (True, 3.0)):
         if pid is not None:
-            try:
-                os.kill(pid, signum)
-            except OSError:
-                pass
+            _host.stop(pid, hard=hard)
         end = time.time() + wait
         while time.time() < end:
             if _relay_is_down():
@@ -672,14 +661,7 @@ def _stop_relay(deadline=8.0):
 def _port_in_use(port, host="127.0.0.1", timeout=1.0):
     """True while something is listening. Unknown counts as in use: this
     answers "may I bind?", and a maybe is a no."""
-    import socket
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except socket.timeout:
-        return True                     # the maybe: something is there, slowly
-    except OSError:
-        return False                    # refused: nothing is listening
+    return _host.something_listens(port, host, timeout)
 
 
 def _relay_is_down():
@@ -959,21 +941,20 @@ def _process_lock(path, wait=0):
     descriptor = None
     acquired = False
     try:
-        import fcntl
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         deadline = time.monotonic() + wait
         while True:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except OSError as error:
-                if (error.errno not in (errno.EACCES, errno.EAGAIN)
-                        or time.monotonic() >= deadline):
+                if _host.try_lock(descriptor):
+                    acquired = True
                     break
-                time.sleep(0.05)
-    except (ImportError, OSError):
+            except OSError:
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+    except OSError:
         pass
     try:
         yield acquired
@@ -1992,7 +1973,8 @@ def ensure_claude_on_path(environ=None, homes=None):
             return True
         for home in homes:
             folder = os.path.expanduser(home)
-            if os.access(os.path.join(folder, "claude"), os.X_OK):
+            # which(), not os.access: Windows' claude is claude.exe.
+            if shutil.which("claude", path=folder):
                 env["PATH"] = os.pathsep.join(
                     part for part in (env.get("PATH", ""), folder) if part)
                 print("relay: found Claude Code in %s (not on this process's "
@@ -2133,34 +2115,15 @@ END_WAIT_SECONDS = 3.5
 def _our_claude_processes():
     """(pid, command) of every process of this user's whose command runs
     Claude Code. Never raises; nothing found is an empty list."""
-    try:
-        out = subprocess.run(["ps", "-axo", "pid=,uid=,command="], capture_output=True,
-                             text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    found = []
-    for line in out.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3 or not parts[0].isdigit() or parts[1] != str(os.getuid()):
-            continue
-        if "claude" in parts[2]:
-            found.append((int(parts[0]), parts[2]))
-    return found
+    me = _host.current_user()
+    return [(pid, command) for pid, owner, command in _host.processes()
+            if me is not None and owner == me and "claude" in command]
 
 
 def _gone(pid):
     """True once ``pid`` no longer runs (reaped here if it was ours)."""
-    try:
-        os.waitpid(pid, os.WNOHANG)
-    except ChildProcessError:
-        pass
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except OSError:
-        return False
-    return False
+    _host.reap(pid)
+    return not _host.pid_exists(pid)
 
 
 def end_session(prefix, waiting=()):
@@ -2225,7 +2188,7 @@ INBOX_TIMEOUT = 3.0
 def _peer_pid(sock):
     """The pid at the other end of a connected Unix socket, or None."""
     try:
-        if sys.platform == "darwin":
+        if _host.is_mac():
             # SOL_LOCAL (0), LOCAL_PEERPID (2): <sys/un.h>
             return struct.unpack("i", sock.getsockopt(0, 2, 4))[0]
         creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
@@ -2247,7 +2210,7 @@ def post_to_inbox(entry, text, brief=False, timeout=INBOX_TIMEOUT):
     session's process: the same checks Claude Code makes before it sends."""
     entry = entry or {}
     path = str(entry.get("socket") or "")
-    if not INBOX_PATH.match(path):
+    if not INBOX_PATH.match(path) or not _host.unix_sockets():
         return False
     try:
         found = os.lstat(path)
@@ -4783,6 +4746,11 @@ class _RelayServer(ThreadingHTTPServer):
         self._slots = threading.BoundedSemaphore(self.MAX_CONNECTIONS)
         super().__init__(*args, **kwargs)
 
+    def server_bind(self):
+        # One relay per port on every host, Windows included.
+        _host.claim_port_alone(self)
+        super().server_bind()
+
     def process_request(self, request, client_address):
         if not self._slots.acquire(blocking=False):
             self.shutdown_request(request)
@@ -4952,6 +4920,7 @@ def ensure_tls_identity(folder=None, openssl=None, runner=None):
         finally:
             os.umask(old)
         os.chmod(key, 0o600)
+        _host.restrict_to_owner(key)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         note_condition("no_tls", "Messages on your Wi-Fi are not encrypted: the "
                        "certificate could not be made (%s)." % type(error).__name__)
@@ -5179,6 +5148,7 @@ class Auth:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(temp, 0o600)
+            _host.restrict_to_owner(temp)
             os.replace(temp, self.path)
         except OSError as error:
             try:
@@ -5564,6 +5534,7 @@ def make_home_dirs():
     try:
         os.makedirs(os.path.join(TAPPROVAL_DIR, "data"), mode=0o700, exist_ok=True)
         os.chmod(os.path.join(TAPPROVAL_DIR, "data"), 0o700)
+        _host.restrict_to_owner(os.path.join(TAPPROVAL_DIR, "data"), folder=True)
         os.makedirs(os.path.join(TAPPROVAL_DIR, "logs"), exist_ok=True)
         return True
     except OSError as error:
@@ -5617,6 +5588,9 @@ def move_loose_files():
             continue
         try:
             shutil.move(old, new)
+            if folder == "data":
+                # A move keeps the old folder's grants on Windows.
+                _host.restrict_to_owner(new)
             moved.append(name)
         except OSError as error:
             _tell("relay: could not move ~/%s (%s); it is used where it is" % (legacy, error))
@@ -5674,12 +5648,11 @@ TUNNEL_ANNOUNCE_WAIT = 60      # seconds for cloudflared to name its address
 
 def _tunnel_pids(port):
     """Every cloudflared process that forwards to our tunnel port."""
-    try:
-        found = subprocess.run(["pgrep", "-f", "cloudflared tunnel.*127.0.0.1:%d" % port],
-                               capture_output=True, text=True, timeout=5)
-        return [int(pid) for pid in found.stdout.split() if pid.isdigit()]
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return []
+    if _host.is_windows():
+        # pgrep's pattern is a regular expression; the process list is not.
+        return [pid for pid in _host.pids_running("127.0.0.1:%d" % port)
+                if "cloudflared" in _host.command_of(pid)]
+    return _host.pids_running("cloudflared tunnel.*127.0.0.1:%d" % port)
 
 
 def _reap_stale_tunnels(port, keep=None):
@@ -5694,18 +5667,11 @@ def _reap_stale_tunnels(port, keep=None):
     for pid in _tunnel_pids(port):
         if pid == keep:
             continue
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
+        _host.stop(pid)
 
 
 def _pid_alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError, TypeError):
-        return False
+    return _host.pid_alive(pid)
 
 
 def _remember_tunnel(pid, url, port, path=None):
@@ -5716,6 +5682,7 @@ def _remember_tunnel(pid, url, port, path=None):
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump({"pid": int(pid), "url": url, "port": int(port)}, handle)
         os.chmod(path, 0o600)
+        _host.restrict_to_owner(path)
     except (OSError, ValueError, TypeError):
         pass
 
@@ -5735,11 +5702,7 @@ def _adoptable_tunnel(port):
         return None
     if saved_port != port or not url.startswith("https://") or not _pid_alive(pid):
         return None
-    try:
-        command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
-                                 capture_output=True, text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
+    command = _host.command_of(pid)
     if "cloudflared" not in command or "127.0.0.1:%d" % port not in command:
         return None
     return {"pid": pid, "url": url, "port": port}
@@ -5847,13 +5810,13 @@ def start_tunnel(port, token):
     # second). No travel address had ever survived a relay restart.
     try:
         log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        _host.restrict_to_owner(log_path)       # it names the travel address
     except OSError:
         log_fd = subprocess.DEVNULL
-    proc = subprocess.Popen(
+    proc = _host.popen_detached(
         [binary, "tunnel", "--no-autoupdate",
          "--url", "http://127.0.0.1:%d" % port],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log_fd,
-        start_new_session=True)
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log_fd)
     if log_fd is not subprocess.DEVNULL:
         os.close(log_fd)                # the child has its own copy
 
@@ -6016,7 +5979,7 @@ def _stop_tunnel(handle):
         if hasattr(handle, "terminate"):
             handle.terminate()
         elif handle is not None and handle.pid:
-            os.kill(handle.pid, signal.SIGTERM)
+            _host.stop(handle.pid)
     except (OSError, AttributeError):
         pass
 

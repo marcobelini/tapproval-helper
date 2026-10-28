@@ -77,6 +77,7 @@ from datetime import datetime, timezone
 from enum import IntEnum
 
 import tapproval_wire as wire
+import tapproval_host as _host  # noqa: E402  after wire: a hook missing both names wire
 
 # argparse, shutil and tempfile are imported where they are used. They
 # serve the installer and the CLI only, and this module is a hook that
@@ -2798,6 +2799,7 @@ def write_audit(entry, policy):
         # its owner only; on a shared machine the default umask is not.
         if not os.path.exists(path):
             os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+            _host.restrict_to_owner(path)
         # A lone surrogate in a command string is written escaped rather
         # than raising UnicodeEncodeError out of here; and whatever else
         # goes wrong is said, not raised — a failure here used to replace
@@ -2847,16 +2849,18 @@ def repository_root(cwd):
                 break
             marker = os.path.join(here, ".git")
             if os.path.isdir(marker):
-                return here
+                return _native_path(here)
             if os.path.isfile(marker):
                 with open(marker, encoding="utf-8", errors="replace") as handle:
                     line = handle.readline().strip()
                 gitdir = line[len("gitdir:"):].strip() if line.startswith("gitdir:") else ""
                 if gitdir and not os.path.isabs(gitdir):
                     gitdir = os.path.normpath(os.path.join(here, gitdir))
+                # Worked on in "/" form: Windows' normpath gave back "\".
+                gitdir = gitdir.replace("\\", "/")
                 if "/.git/worktrees/" in gitdir:
-                    return gitdir.split("/.git/worktrees/", 1)[0] or here
-                return here
+                    return _native_path(gitdir.split("/.git/worktrees/", 1)[0] or here)
+                return _native_path(here)
             parent = os.path.dirname(here)
             if parent == here:
                 break
@@ -2864,6 +2868,13 @@ def repository_root(cwd):
     except (OSError, ValueError):
         pass
     return None
+
+
+def _native_path(path):
+    """A path worked on in "/" form, given back as this computer writes
+    it: unchanged on macOS and Linux, "\\" again on Windows, so it still
+    equals the session's own cwd."""
+    return path.replace("/", os.sep)
 
 
 def repository_name(cwd):
@@ -3518,10 +3529,16 @@ def run_hook(stdin=None, stdout=None, agent=None):
 
     ``agent`` is "codex" when Codex runs the hook (its hooks.json command
     says --agent codex); Claude Code's command names no agent."""
+    from_console = stdin is None
     stdin = sys.stdin if stdin is None else stdin
     stdout = sys.stdout if stdout is None else stdout
     try:
-        raw = stdin.read()
+        if from_console:
+            # As UTF-8, whatever the console's code page (Windows).
+            import tapproval_host
+            raw = tapproval_host.read_stdin_text()
+        else:
+            raw = stdin.read()
         event = json.loads(raw) if raw and raw.strip() else {}
         if not isinstance(event, dict):
             raise ValueError("event is not a JSON object")
@@ -3805,18 +3822,48 @@ def _settings_path():
 
 
 def _quote_path(path):
-    """Quote a path for a shell command string, if it needs it."""
+    """Quote a path for a shell command string, if it needs it. On Windows
+    always, for PowerShell: Git Bash would read a bare C:\\ path's
+    backslashes as escapes, so Windows hooks name PowerShell (_hook_shell)."""
+    if _host.is_windows():
+        return "'%s'" % path.replace("'", "''")
     if not re.search(r"[\s\"\']", path):
         return path
-    if os.name == "nt":
-        return '"%s"' % path
     return "'%s'" % path.replace("'", "'\\''")
+
+
+def _hook_shell():
+    """The shell our hook entries name: PowerShell on Windows, where its
+    call operator runs a quoted path; the default (sh) elsewhere."""
+    return "powershell" if _host.is_windows() else None
+
+
+def _run_prefix():
+    """PowerShell runs a quoted path only after its call operator."""
+    return "& " if _host.is_windows() else ""
+
+
+def _split_command(command):
+    """A hook command's words, as the shell that runs it reads them."""
+    if not _host.is_windows():
+        return shlex.split(command)
+    # PowerShell's quoting: '' is one quote inside '...'; no escapes in "...".
+    parts = []
+    for word in re.findall(r"'(?:[^']|'')*'|\"[^\"]*\"|\S+", command):
+        if word.startswith("'") and word.endswith("'") and len(word) > 1:
+            word = word[1:-1].replace("''", "'")
+        elif word.startswith('"') and word.endswith('"') and len(word) > 1:
+            word = word[1:-1]
+        elif word[:1] in ("'", '"'):
+            raise ValueError("No closing quotation")         # as shlex says it
+        parts.append(word)
+    return parts[1:] if parts[:1] == ["&"] else parts
 
 
 def _hook_command():
     """The exact command Claude Code should run, using this interpreter."""
-    return "%s %s" % (_quote_path(sys.executable),
-                      _quote_path(os.path.abspath(__file__)))
+    return "%s%s %s" % (_run_prefix(), _quote_path(sys.executable),
+                        _quote_path(os.path.abspath(__file__)))
 
 
 def _relay_path():
@@ -3826,8 +3873,8 @@ def _relay_path():
 
 def _relay_command():
     """Shared SessionStart hook: keep the helper current for either agent."""
-    return "%s %s --ensure" % (_quote_path(sys.executable),
-                               _quote_path(_relay_path()))
+    return "%s%s %s --ensure" % (_run_prefix(), _quote_path(sys.executable),
+                                 _quote_path(_relay_path()))
 
 
 # A reboot must not need a hand: a login item wakes the relay the moment
@@ -3876,7 +3923,7 @@ def install_launch_agent():
     over the port. Crash recovery between logins stays with that hook.
     Returns True when the agent is in place. macOS only; never raises.
     """
-    if sys.platform != "darwin":
+    if not _host.is_mac():
         return False
     relay = _relay_path()
     if not os.path.exists(relay):
@@ -3930,7 +3977,7 @@ def wake_relay_at_login():
 
 def remove_launch_agent():
     """Take the login wake-up out again — part of a clean exit."""
-    if sys.platform != "darwin":
+    if not _host.is_mac():
         return False
     if _launch_agent_is_real():
         _launchctl("bootout", "gui/%d/com.tapproval.relay" % os.getuid())
@@ -3987,8 +4034,7 @@ def _manifest_hook(wiring):
     """Our PermissionRequest handler in a hooks manifest: (env, timeout)."""
     for handler in _settings_handlers(wiring):
         try:
-            parts = shlex.split(str(handler.get("command", "")),
-                                posix=(os.name != "nt"))
+            parts = _split_command(str(handler.get("command", "")))
         except ValueError:
             parts = []
         env, _rest = _split_assignments(parts)
@@ -4166,17 +4212,24 @@ def _sync_hook(entry_list, wanted, matcher, marker):
     matcher — when absent, left alone when already right. True if the
     list changed, which is what decides whether settings are rewritten.
     """
+    shell = _hook_shell()
     ours = [h for entry in entry_list for h in entry.get("hooks", [])
             if marker in str(h.get("command", ""))]
     if ours:
-        if all(h.get("command") == wanted for h in ours):
+        if all(h.get("command") == wanted and h.get("shell") == shell for h in ours):
             return False
         for handler in ours:
             handler["command"] = wanted
             handler.setdefault("timeout", 10)
+            if shell:
+                handler["shell"] = shell
+            else:
+                handler.pop("shell", None)
         return True
-    entry = {"hooks": [{"type": "command", "command": wanted,
-                        "timeout": 10}]}
+    handler = {"type": "command", "command": wanted, "timeout": 10}
+    if shell:
+        handler["shell"] = shell
+    entry = {"hooks": [handler]}
     if matcher:
         entry["matcher"] = matcher
     entry_list.append(entry)
@@ -4770,7 +4823,7 @@ def check_command(command):
     import shutil
     problems = []
     try:
-        parts = shlex.split(command, posix=(os.name != "nt"))
+        parts = _split_command(command)
     except ValueError:
         return ["the command in settings.json cannot be parsed"]
     if not parts:

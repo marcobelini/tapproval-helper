@@ -33,6 +33,8 @@ class LocalWebSocket:
     """A bounded RFC 6455 client for Codex's user-private Unix socket."""
 
     def __init__(self, path, timeout=3):
+        if not hasattr(socket, "AF_UNIX"):
+            raise OSError("this computer's Python has no Unix sockets")
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(timeout)
         self._buffer = b""

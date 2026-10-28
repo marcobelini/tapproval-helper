@@ -557,6 +557,9 @@ class HandshakeSocket:
 def websocket(monkeypatch, frames=b"", bad_accept=False):
     fake = HandshakeSocket(frames, bad_accept)
     monkeypatch.setattr("codex_approvals.socket.socket", lambda *a: fake)
+    # The frames are this test's subject, not the socket family: a host
+    # without Unix sockets still reads them through the fake.
+    monkeypatch.setattr("codex_approvals.socket.AF_UNIX", 1, raising=False)
     return LocalWebSocket("/test/socket"), fake
 
 
@@ -934,11 +937,11 @@ class TestCodexTalkingBack:
         assert not spawned
 
     def test_an_existing_writer_lock_is_live_even_if_lsof_finds_nothing(self, setup):
-        import fcntl
+        import tapproval_host
         talk, sessions, sid, path, _, _, spawned, send = setup
         lock_path = sessions._home() + '/thread-writer-locks/' + sid + '.lock'
         with open(lock_path, 'rb') as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert tapproval_host.try_lock(handle.fileno())
             assert talk.activity(str(path), sid) is True
             assert 'permission limits' in send()
         assert not spawned

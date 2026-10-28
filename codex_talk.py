@@ -9,7 +9,8 @@ from __future__ import annotations
 import os
 import subprocess
 import time
-import fcntl
+
+import tapproval_host as _host
 
 from codex_approvals import LocalWebSocket
 import codex_sessions as sessions
@@ -110,17 +111,15 @@ def activity(path, sid):
     lock = os.path.join(sessions._home(), "thread-writer-locks", sid + ".lock")
     try:
         with open(lock, "rb") as handle:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+            if not _host.try_lock(handle.fileno()):
                 return True
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            _host.unlock(handle.fileno())
             return False
     except FileNotFoundError:
         # Legacy rollouts predate writer locks. lsof's empty successful
         # search is different from not being able to inspect processes.
         try:
-            result = subprocess.run(["lsof", "-a", "-F", "n", "-u", str(os.getuid()), path],
+            result = subprocess.run(["lsof", "-a", "-F", "n", "-u", _host.current_user() or "", path],
                                     capture_output=True, text=True, timeout=3)
             if result.returncode in (0, 1) and not result.stderr.strip():
                 return any(line == "n" + path for line in result.stdout.splitlines())
