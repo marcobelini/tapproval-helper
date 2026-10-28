@@ -19,7 +19,6 @@ What it trusts, in order:
 Any check that fails throws the copy away and leaves the bridge that was
 already here running. Standard library only, like every helper file.
 """
-import fcntl
 import hashlib
 import json
 import os
@@ -494,7 +493,8 @@ def install(pin, wait_for_bridge=None):
     # could interleave their renames, and the loser's rollback deleted the
     # winner's bridge (2026-10-24 review). The second waits its turn.
     with open(os.path.join(home, ".install.lock"), "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        import tapproval_host
+        tapproval_host.lock(lock.fileno())
         return _install(pin, wait_for_bridge, home)
 
 
@@ -659,7 +659,8 @@ def relay_may_be_woken(relay, home=None):
     home = home or os.path.expanduser("~")
     real = os.path.realpath(relay)
     return (os.path.basename(real) == "watch_relay.py" and os.path.isfile(real)
-            and any(real.startswith(os.path.join(home, place[2:]))
+            and any(real.startswith(os.path.join(home, *place[2:].strip("/").split("/"))
+                                    + os.sep)
                     for place in RELAY_HOMES))
 
 

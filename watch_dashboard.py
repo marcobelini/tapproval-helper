@@ -30,6 +30,7 @@ import threading
 import time
 from collections import OrderedDict
 
+import tapproval_host as _host
 import tapproval_wire as wire
 
 def _read_appended(path, offset, limit=None, starts=None):
@@ -525,9 +526,7 @@ def session_registry(sessions_dir=None):
         # the phone, so they don't belong on the watch either.
         if data.get("entrypoint") == shape("entrypoint.sdk_cli"):
             continue
-        try:
-            os.kill(int(pid), 0)          # signal 0: "are you there?"
-        except (OSError, ValueError, TypeError):
+        if not _host.pid_alive(pid):     # "are you there?"
             continue
         registry[session_id] = {
             "status": ENTRYPOINTS.get(data.get("entrypoint", ""), "Connected"),
@@ -705,8 +704,10 @@ def project_root(cwd):
     session ("app-store-version-update-b03a35")."""
     cwd = str(cwd or "")
     marker = shape("path.worktree")
-    if marker in cwd:
-        return cwd.split(marker, 1)[0]
+    # Either separator: a Windows cwd says .claude\\worktrees\\.
+    for mark in dict.fromkeys((marker, marker.replace("/", os.sep))):
+        if mark in cwd:
+            return cwd.split(mark, 1)[0]
     # Any other worktree or subfolder ("wt-push", "ios") belongs to the
     # repository git says it does — found, not rebuilt. "Parent of the
     # folder plus the repository's name" made /x/proj/ios into /x/proj/proj,

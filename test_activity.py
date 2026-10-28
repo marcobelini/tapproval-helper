@@ -19,7 +19,10 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     monkeypatch.setattr(dashboard, "_audit_log_path", lambda: str(tmp_path / "audit.jsonl"))
     monkeypatch.setenv("TZ", "UTC")
-    time.tzset()
+    if hasattr(time, "tzset"):
+        time.tzset()
+    elif time.timezone or time.altzone:
+        pytest.skip("this host's clock cannot be set to UTC, and is not on it")
     dashboard._CONVERSATION_CACHE.clear()
     dashboard._ACTIVITY_STATE.clear()
     dashboard._RECAP_CACHE.clear()

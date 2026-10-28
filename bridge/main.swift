@@ -129,6 +129,26 @@ var mirrored: Set<String> = []
 var saveFailures = 0
 var lastSaveError = ""
 var savesHeldUntil = Date.distantPast
+/// A refusal that is about one record — a field the Production schema does
+/// not know, say — waits for that card alone. Holding every save for it
+/// kept each card behind it off iCloud for as long as it stayed pending
+/// (2026-10-26 review).
+var cardHeldUntil: [String: Date] = [:]
+
+/// Is this refusal iCloud's as a whole (busy, throttled, offline, signed
+/// out, full), or one record's? Only the first holds every save.
+func holdsEverySave(_ error: Error) -> Bool {
+    guard let error = error as? CKError else { return true }
+    if error.retryAfterSeconds != nil { return true }
+    switch error.code {
+    case .requestRateLimited, .zoneBusy, .serviceUnavailable, .quotaExceeded,
+         .notAuthenticated, .networkUnavailable, .networkFailure,
+         .accountTemporarilyUnavailable:
+        return true
+    default:
+        return false
+    }
+}
 /// What the relay last took about the saves, so the post is made once per
 /// change: nil until it has taken anything.
 var relayTookSavesFailing: Bool?
@@ -233,8 +253,14 @@ func log(_ message: String) {
         saveFailures += 1
         lastSaveError = error.localizedDescription
         let wait = (error as? CKError)?.retryAfterSeconds ?? 30
-        savesHeldUntil = Date().addingTimeInterval(wait)
-        log("mirror failed (\(saveFailures) in a row, next try in \(Int(wait)) s): \(lastSaveError)")
+        if holdsEverySave(error) {
+            savesHeldUntil = Date().addingTimeInterval(wait)
+            log("mirror failed (\(saveFailures) in a row, next try in \(Int(wait)) s): \(lastSaveError)")
+        } else {
+            cardHeldUntil[card.id] = Date().addingTimeInterval(wait)
+            log("mirror of \(card.id) refused (\(saveFailures) in a row, that card again in "
+                + "\(Int(wait)) s, the others now): \(lastSaveError)")
+        }
     }
 }
 
@@ -644,8 +670,10 @@ var ticks = 0
         // At start, then once a minute: what an earlier bridge left behind.
         if ticks % 30 == 0 { await reconcileCards(pendingIDs: pendingIDs) }
         // Read afresh for each card: an answer can land at any await here.
+        cardHeldUntil = cardHeldUntil.filter { pendingIDs.contains($0.key) }
         for card in pending where !mirrored.contains(card.id) && !answered.contains(card.id) {
-            if Date() < savesHeldUntil { break }   // refused just now: wait it out
+            if Date() < savesHeldUntil { break }   // iCloud refused just now: wait it out
+            if let until = cardHeldUntil[card.id], Date() < until { continue }   // this one alone
             await mirror(card)
         }
         for stale in mirrored.subtracting(pendingIDs) {
