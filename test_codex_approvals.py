@@ -895,6 +895,8 @@ class TestCodexTalkingBack:
         monkeypatch.setattr(relay, '_claude_projects', lambda *_args: [row])
         monkeypatch.setattr(relay, 'transcript_origin', lambda _path: (str(workspace), 'cli'))
         monkeypatch.setattr(relay, 'transcripts_newest_first', lambda *_args: [(mtime - 1, 'cc', '', '')])
+        # On Linux the workspace sits under /tmp, which is never offered as a project.
+        monkeypatch.setattr(relay, 'SCRATCH_ROOTS', ())
         [project] = relay.known_projects()
         assert project['agent'] == 'codex'
         os.utime(path, (mtime - 2, mtime - 2))

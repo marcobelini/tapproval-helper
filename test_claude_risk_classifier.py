@@ -4645,12 +4645,25 @@ class TestTheDoubleTapIsTheWatchsOwn:
 
     def test_the_end_line_ends_the_thread_and_sends_nothing(self):
         source = dict(self._sources())["SessionDetail.swift"]
-        call = source.index("EndLine(pinchable: onTop && !replying && !ending) {")
+        call = source.index("EndLine(pinchable: onTop && !replying && !ending, atTheEnd: restingAtTheEnd) {")
         body = source[call:source.index("}", call)]
         assert "ExactScroll.Request(bottom: true" in body
         assert "send(" not in body and "answer" not in body.lower()
         thread_end = source.index(".coordinateSpace(.named(Self.threadSpace))")
         assert source.index("if liveAsk != nil { liveAskPanel }") < call < thread_end
+
+    def test_at_the_very_end_the_line_is_switched_off_and_looks_the_same(self):
+        """Pressed by a pinch, a control plays the watch's own press, which
+        dims the screen; at the end it did on every pinch (build 190,
+        2026-10-28). Switched off there, nothing is pressed (proposal A).
+        `.plain` fades a switched-off button, so the line has a style that
+        draws it as it is."""
+        source = dict(self._sources())["SessionDetail.swift"]
+        end_line = source[source.index("struct EndLine: View {"):]
+        end_line = end_line[:end_line.index("\n}\n")]
+        assert ".disabled(atTheEnd)" in end_line
+        assert ".buttonStyle(AsDrawn())" in end_line and ".buttonStyle(.plain)" not in end_line
+        assert ".modifier(AtTheVeryEnd(atIt: $restingAtTheEnd))" in source
 
     def test_only_screens_inside_a_session_keep_the_end(self):
         using = {name for name, source in self._sources()
@@ -13272,7 +13285,11 @@ class TestALostTunnelIsNotALostRelay:
         monkeypatch.setattr(watch_relay, "TUNNEL_PORT", busy)
         watch_relay.clear_condition("tunnel")
         try:
-            got = watch_relay._start_tunnel(watch_relay.CardQueue(), fresh_auth)
+            # By argument: the default is bound when the function is
+            # defined, so patching TUNNEL_PORT alone tested the real port,
+            # which passed only where the live relay held it.
+            got = watch_relay._start_tunnel(watch_relay.CardQueue(), fresh_auth,
+                                            port=busy)
         finally:
             holder.close()
         assert got is None, "a busy tunnel port must not raise"
@@ -21288,6 +21305,8 @@ class TestTheHelperInstallsTheMacBridge:
         relay.parent.mkdir(parents=True, exist_ok=True)
         relay.write_text("# relay\n")
         monkeypatch.setattr(crc, "_relay_path", lambda: str(relay))
+        # launchd is macOS; the public CI is Linux.
+        monkeypatch.setattr(crc.sys, "platform", "darwin")
         return relay
 
     def test_a_registered_bridge_takes_the_relays_wake_up(self, tmp_path, monkeypatch):
@@ -22969,8 +22988,11 @@ class TestHookEdges:
             auto_allow_at_or_below="LOW"))
         monkeypatch.setattr(crc, "ask_watch",
                             lambda card, policy, project=None: asked.append(card) or ("deny", None))
-        wpt.decide("Write", {"file_path": str(tmp_path / "elsewhere" / "notes.md"),
-                             "content": "x"}, crc=crc)
+        # Outside any temp folder: on Linux tmp_path sits under /tmp, where
+        # a write is scratch by design, and the test passed only on a Mac.
+        elsewhere = "/opt/tapproval-test-elsewhere/notes.md"
+        assert "outside-project" in crc.classify_path(elsewhere, cwd=str(project))[1]
+        wpt.decide("Write", {"file_path": elsewhere, "content": "x"}, crc=crc)
         assert asked, "allowed without asking"
 
     @pytest.mark.parametrize("value", [None, "abc", [1]])
