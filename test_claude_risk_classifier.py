@@ -4706,25 +4706,12 @@ class TestTheDoubleTapIsTheWatchsOwn:
 
     def test_the_end_line_ends_the_thread_and_sends_nothing(self):
         source = dict(self._sources())["SessionDetail.swift"]
-        call = source.index("EndLine(pinchable: onTop && !replying && !ending, atTheEnd: restingAtTheEnd) {")
+        call = source.index("EndLine(pinchable: onTop && !replying && !ending) {")
         body = source[call:source.index("}", call)]
         assert "ExactScroll.Request(bottom: true" in body
         assert "send(" not in body and "answer" not in body.lower()
         thread_end = source.index(".coordinateSpace(.named(Self.threadSpace))")
         assert source.index("if liveAsk != nil { liveAskPanel }") < call < thread_end
-
-    def test_at_the_very_end_the_line_is_switched_off_and_looks_the_same(self):
-        """Pressed by a pinch, a control plays the watch's own press, which
-        dims the screen; at the end it did on every pinch (build 190,
-        2026-10-28). Switched off there, nothing is pressed (proposal A).
-        `.plain` fades a switched-off button, so the line has a style that
-        draws it as it is."""
-        source = dict(self._sources())["SessionDetail.swift"]
-        end_line = source[source.index("struct EndLine: View {"):]
-        end_line = end_line[:end_line.index("\n}\n")]
-        assert ".disabled(atTheEnd)" in end_line
-        assert ".buttonStyle(AsDrawn())" in end_line and ".buttonStyle(.plain)" not in end_line
-        assert ".modifier(AtTheVeryEnd(atIt: $restingAtTheEnd))" in source
 
     def test_only_screens_inside_a_session_keep_the_end(self):
         using = {name for name, source in self._sources()
@@ -14007,8 +13994,26 @@ class TestNewSessionFromTheWatch:
         else:
             assert config.read_text(encoding="utf-8") == content
 
-    def test_refuses_anything_but_a_mac(self, tmp_path):
-        assert watch_relay.start_session("/x", "go", platform="linux") == "new sessions need a Mac"
+    def test_off_a_mac_the_same_session_opens_in_the_desktops_terminal(
+            self, tmp_path, monkeypatch):
+        """Linux and Windows open their own terminal (2026-10-28); the
+        refusal "new sessions need a Mac" is gone from the relay."""
+        monkeypatch.setattr(watch_relay._host, "is_windows", lambda: False)    # Linux
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
+        monkeypatch.setattr(watch_relay, "signed_in", lambda: True)
+        monkeypatch.setattr(watch_relay, "trust_folder", lambda _p: True)
+        opened = []
+        monkeypatch.setattr(watch_relay._host, "open_terminal",
+                            lambda posix, windows: opened.append((posix, windows)) or (True, ""))
+        monkeypatch.setattr(watch_relay.subprocess, "run",
+                            lambda *a, **k: pytest.fail("no Terminal, no osascript off a Mac"))
+        root = self._projects(tmp_path)
+        status = watch_relay.start_session(str(tmp_path / "acme"), "Fix CI; it's red",
+                                           projects_dir=root, platform="linux")
+        assert status == "started"
+        assert opened[0][0] == self._expected_line(tmp_path)
+        assert "new sessions need a Mac" not in open(watch_relay.__file__, encoding="utf-8").read()
 
     def test_refuses_an_empty_message(self):
         assert watch_relay.start_session("/x", "   ", platform="darwin") == "empty"
@@ -15411,7 +15416,9 @@ class TestFirstPairingIsAWindow:
         (True, "", False),
     ])
     def test_only_a_clicked_allow_is_a_yes(self, monkeypatch, ok, said, allowed):
-        """Don't Allow, no click, no screen, no osascript: all a no."""
+        """Don't Allow, no click, no screen, no osascript: all a no. The
+        Mac's dialog, on whichever host this runs."""
+        monkeypatch.setattr(watch_relay._host, "is_mac", lambda: True)
         seen = []
         monkeypatch.setattr(watch_relay, "_run_osascript",
                             lambda script, timeout=4: seen.append(script) or (ok, said))
@@ -23618,10 +23625,6 @@ class TestEveryHost:
         "crash_report.py": [
             # A crash report says which host it came from: data, no branch.
             '"platform": _clip(sys.platform, MAX_SHORT),'],
-        "watch_relay.py": [
-            # Starting a session in a terminal: Phase 2 gives Linux and
-            # Windows their own terminal.
-            'if (platform or sys.platform) != "darwin":'],
     }
     CHECK = re.compile(r"sys\.platform|os\.name\b|^\s*import (fcntl|msvcrt|termios)\b"
                        r"|^\s*from (fcntl|msvcrt|termios) import")
@@ -23877,3 +23880,177 @@ class TestEveryHost:
                             ("D:P", False)):                                # nobody: not "alone"
             monkeypatch.setattr(tapproval_host, "_windows_dacl", lambda path, s=sddl: s)
             assert tapproval_host.owner_only("C:\\k") is alone, sddl
+
+
+class TestEveryHostHasItsOwnWindows:
+    """Phase 2 of every host (2026-10-28): what a Mac did through Terminal,
+    osascript and launchd, Linux and Windows do through their own desktop.
+    The Mac's paths are untouched; these stand in for the others."""
+
+    @pytest.fixture
+    def linux(self, monkeypatch):
+        monkeypatch.setattr(tapproval_host.sys, "platform", "linux")
+        monkeypatch.setattr(tapproval_host, "native_windows", lambda: False)
+        monkeypatch.setenv("DISPLAY", ":0")
+
+    @pytest.fixture
+    def windows(self, monkeypatch):
+        monkeypatch.setattr(tapproval_host.sys, "platform", "win32")
+        monkeypatch.setattr(tapproval_host, "native_windows", lambda: True)
+
+    def test_with_no_screen_the_answer_is_no(self, linux, monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("nothing to show"))
+        assert tapproval_host.ask_person("T", "x", "Allow", "Deny", 30) == (
+            False, "no screen to ask on")
+
+    @pytest.mark.parametrize("code, allowed, why", [
+        (0, True, "allowed on this computer"),
+        (1, False, "not allowed"),
+        (5, False, "not answered")])
+    def test_linux_asks_with_zenity_and_no_is_the_default(
+            self, linux, monkeypatch, code, allowed, why):
+        seen = []
+        monkeypatch.setattr(tapproval_host, "_which",
+                            lambda name: "/usr/bin/zenity" if name == "zenity" else None)
+        monkeypatch.setattr(subprocess, "run", lambda argv, **k: seen.append(argv)
+                            or subprocess.CompletedProcess(argv, code, b"", b""))
+        assert tapproval_host.ask_person("Tapproval", "a watch; $(rm -rf ~)", "Allow",
+                                         "Don't Allow", 30) == (allowed, why)
+        assert seen[0][0] == "zenity" and "--default-cancel" in seen[0]
+        assert seen[0][seen[0].index("--text") + 1] == "a watch; $(rm -rf ~)"
+
+    def test_no_dialog_program_is_a_no(self, linux, monkeypatch):
+        monkeypatch.setattr(tapproval_host, "_which", lambda name: None)
+        allowed, why = tapproval_host.ask_person("T", "x", "Allow", "Deny", 30)
+        assert allowed is False and "zenity" in why
+
+    @pytest.mark.parametrize("code, allowed", [(6, True), (7, False), (-1, False)])
+    def test_windows_asks_with_a_popup_that_gives_up(self, windows, monkeypatch, code, allowed):
+        seen = []
+        monkeypatch.setattr(subprocess, "run", lambda argv, **k: seen.append((argv, k))
+                            or subprocess.CompletedProcess(argv, code, b"", b""))
+        assert tapproval_host.ask_person("Tapproval", "it's 'quoted'", "Allow",
+                                         "Don't Allow", 30)[0] is allowed
+        argv, kwargs = seen[0]
+        # The words travel in the environment, never in the script's text.
+        assert "it's" not in argv[-1] and "Popup($env:TAPPROVAL_ASK_TEXT, 30" in argv[-1]
+        assert "it's 'quoted'" in kwargs["env"]["TAPPROVAL_ASK_TEXT"]
+
+    def test_pairing_off_a_mac_asks_the_desktop_and_never_osascript(self, monkeypatch):
+        monkeypatch.setattr(watch_relay._host, "is_mac", lambda: False)
+        asked = []
+        monkeypatch.setattr(watch_relay._host, "ask_person",
+                            lambda *a: asked.append(a) or (False, "not answered"))
+        monkeypatch.setattr(watch_relay, "_run_osascript",
+                            lambda *a, **k: pytest.fail("osascript is the Mac's"))
+        assert _REAL_ASK_OWNER_TO_PAIR("192.0.2.7") is False
+        assert asked[0][2:] == ("Allow", "Don't Allow", watch_relay.PAIR_ASK_SECONDS)
+        assert "192.0.2.7" in asked[0][1]
+
+    def test_linux_wakes_at_login_by_autostart_and_uninstall_takes_it(
+            self, linux, monkeypatch, tmp_path):
+        target = tmp_path / "autostart" / "tapproval-relay.desktop"
+        monkeypatch.setenv("CLAUDE_LAUNCH_AGENT_PATH", str(target))
+        monkeypatch.setattr(crc.sys, "executable", "/usr/bin/python3")
+        assert crc.install_launch_agent() is True
+        text = target.read_text(encoding="utf-8")
+        assert text.startswith("[Desktop Entry]\n")
+        assert text == tapproval_host.login_file_text("/usr/bin/python3", crc._relay_path())
+        assert 'Exec="/usr/bin/python3" "' in text and '--ensure\n' in text
+        assert crc.remove_launch_agent() is True and not target.exists()
+
+    def test_the_autostart_line_quotes_as_the_spec_says(self, linux):
+        text = tapproval_host.login_file_text('/o"dd/$py`', "/r\\elay.py")
+        assert 'Exec="/o\\"dd/\\$py\\`" "/r\\\\elay.py" --ensure' in text
+
+    def test_windows_wakes_at_login_from_the_startup_folder(self, windows, monkeypatch, tmp_path):
+        monkeypatch.setenv("APPDATA", str(tmp_path))
+        assert tapproval_host.login_file_path() == os.path.join(
+            str(tmp_path), "Microsoft", "Windows", "Start Menu", "Programs", "Startup",
+            "Tapproval relay.cmd")
+        python = tmp_path / "python.exe"
+        (tmp_path / "pythonw.exe").write_text("")
+        text = tapproval_host.login_file_text(str(python), r"C:\h\watch_relay.py")
+        assert text == '@echo off\r\nstart "" "%s" "C:\\h\\watch_relay.py" --ensure\r\n' % (
+            tmp_path / "pythonw.exe")
+
+    def test_a_mac_keeps_launchd(self, monkeypatch):
+        monkeypatch.setattr(tapproval_host.sys, "platform", "darwin")
+        assert tapproval_host.login_file_path() is None
+
+    def _session(self, tmp_path, monkeypatch, claude):
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: claude)
+        monkeypatch.setattr(watch_relay, "signed_in", lambda: True)
+        monkeypatch.setattr(watch_relay, "trust_folder", lambda _p: True)
+        monkeypatch.setattr(watch_relay._host, "is_windows", lambda: True)
+        opened = []
+        monkeypatch.setattr(watch_relay._host, "open_terminal",
+                            lambda posix, ps: opened.append(ps) or (True, ""))
+        root = TestNewSessionFromTheWatch._projects(None, tmp_path)
+        status = watch_relay.start_session(str(tmp_path / "acme"), "it's a&calc $(x)",
+                                           projects_dir=root, platform="win32")
+        return status, opened
+
+    def test_windows_never_hands_the_wearers_words_to_a_batch_wrapper(
+            self, tmp_path, monkeypatch):
+        status, opened = self._session(tmp_path, monkeypatch, r"C:\npm\claude.cmd")
+        assert status == "new sessions need Claude Code's own installer on Windows"
+        assert opened == []
+
+    def test_windows_runs_claude_with_every_word_a_literal(self, tmp_path, monkeypatch):
+        status, opened = self._session(tmp_path, monkeypatch, r"C:\Users\x\claude.exe")
+        assert status == "started"
+        assert opened[0].endswith(
+            "Set-Location -LiteralPath %s -ErrorAction Stop; & 'C:\\Users\\x\\claude.exe' "
+            "'--settings' %s '--' 'it''s a&calc $(x)'" % (
+                tapproval_host.powershell_literal(str(tmp_path / "acme")),
+                tapproval_host.powershell_literal(watch_relay.BRIEF_REPLY_SETTINGS)))
+
+    def test_a_powershell_literal_comes_back_as_it_went_in(self, tmp_path):
+        """Run where PowerShell is (Windows; pwsh on other runners): the
+        wearer's words survive quoting, smart quotes and all."""
+        import base64
+        import shutil as _shutil
+        shell = _shutil.which("powershell.exe") or _shutil.which("pwsh")
+        if not shell:
+            pytest.skip("no PowerShell on this host")
+        words = "it's \u2018smart\u2019 $(Get-Date) \"q\" ; & | `n \u00e6\u00f8\u00e5"
+        script = ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+                  "Write-Output %s" % tapproval_host.powershell_literal(words))
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        done = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                               encoded], capture_output=True, timeout=60)
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.decode("utf-8").strip() == words
+
+    def test_linux_opens_the_first_terminal_it_finds(self, linux, monkeypatch):
+        started = []
+        monkeypatch.setattr(tapproval_host, "_which",
+                            lambda name: "/usr/bin/konsole" if name == "konsole" else None)
+        monkeypatch.setattr(tapproval_host, "popen_detached",
+                            lambda argv, **k: started.append(argv))
+        assert tapproval_host.open_terminal("cd /x && claude", "unused") == (True, "")
+        assert started == [["/usr/bin/konsole", "-e", "bash", "-c", "cd /x && claude"]]
+
+    def test_no_terminal_is_said_in_words(self, linux, monkeypatch):
+        monkeypatch.setattr(tapproval_host, "_which", lambda name: None)
+        assert tapproval_host.open_terminal("x", "y") == (False, "no terminal program found")
+
+    def test_windows_temp_is_scratch_too(self, windows):
+        import tempfile
+        assert tapproval_host.scratch_roots(("/tmp",)) == ("/tmp", tempfile.gettempdir())
+
+    def test_a_mac_keeps_its_scratch_roots(self, monkeypatch):
+        monkeypatch.setattr(tapproval_host, "native_windows", lambda: False)
+        assert tapproval_host.scratch_roots(("/tmp", "/private/tmp")) == ("/tmp", "/private/tmp")
+
+    @pytest.mark.parametrize("platform, words", [
+        ("darwin", "brew install cloudflared"),
+        ("win32", "winget install --id Cloudflare.cloudflared"),
+        ("linux", "your package manager (the package is cloudflared)")])
+    def test_cloudflared_is_installed_the_hosts_way(self, monkeypatch, platform, words):
+        monkeypatch.setattr(tapproval_host.sys, "platform", platform)
+        assert tapproval_host.cloudflared_install() == words

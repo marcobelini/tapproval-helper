@@ -57,6 +57,25 @@ session; there is nothing to keep running and nothing to maintain.
 curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash
 ```
 
+**On Windows (preview).** The helper runs on Windows too: approving and
+denying from the wrist, pairing, waking after a restart and starting a
+session from the wrist. It is tested on GitHub's Windows machines on every
+change, but not yet on a real PC, so treat it as a preview. From
+PowerShell, with [Git for Windows](https://git-scm.com/downloads/win) and
+Python 3.9 or later installed:
+
+```powershell
+irm https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.ps1 | iex
+```
+
+The plugin works on Windows through Git Bash, Claude Code's default shell
+there; without Git Bash no card is sent and the ordinary prompt appears,
+so nothing is ever approved by mistake. Starting a session from the wrist
+needs Claude Code's own installer (`claude.exe`), not the npm one. Two
+things take the closed-session road on Windows: a wrist message into a
+session open on the computer, and the live link to the Codex app.
+`uninstall.ps1` removes it all again.
+
 **Staying current** matters more than it sounds: a version of this shipped
 that discarded every wrist approval in silence, and an update that never
 arrives is not an update. A plugin install is Claude Code's to update, and
@@ -102,18 +121,18 @@ can be switched off; it also wakes the relay after a restart.
 `--install --no-bridge` leaves it out altogether. (Bridges before 1.1.0 were
 listed under the developer's name instead.)
 
-| | Mac | Linux or another computer |
-|---|---|---|
-| Cards and answers while Tapproval is open on the watch | yes | yes |
-| A tap on weak Wi-Fi falls back to the away address | yes | yes |
-| A buzz while Tapproval is closed | yes, through the bridge and iCloud | no: cards wait until you open the app, and nothing is lost |
+| | Mac | Linux | Windows (preview) |
+|---|---|---|---|
+| Cards and answers while Tapproval is open on the watch | yes | yes | yes |
+| A tap on weak Wi-Fi falls back to the away address | yes | yes | yes |
+| A buzz while Tapproval is closed | yes, through the bridge and iCloud | no: cards wait until you open the app, and nothing is lost | no, as on Linux |
 
 The other ways to wake a closed watch were weighed and set aside for now.
 A push server of our own would carry every card through a computer that
 isn't yours, which breaks the promise that cards stay between your computer,
 your iCloud and your watch. Writing to iCloud straight from the helper,
 through Apple's web sign-in, would work on any computer, and remains the way
-to bring the buzz to Linux; Apple's sign-in did not complete in our tests.
+to bring the buzz to Linux and Windows; Apple's sign-in did not complete in our tests.
 
 ## If you are an AI agent installing this
 
@@ -158,7 +177,9 @@ that cannot see it), fall back to the installer:
    bridge that ships in this repository (`bridge/`, checked against
    `bridge.json`), which registers its own per-user login item, listed as
    Tapproval (`com.tapproval.bridge`). No
-   sudo, no dependencies beyond Python 3 and git. If it appears to do
+   sudo, no dependencies beyond Python 3 and git. On Windows, read and
+   run `install.ps1` from the same place instead, in PowerShell:
+   `irm <that url> | iex`; it does the same, without the bridge. If it appears to do
    anything else, STOP and tell your user.
 2. Run it: `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash`
 3. Success is exactly one line: `TAPPROVAL_BASE_READY`. If it never
@@ -181,20 +202,22 @@ open Tapproval on the watch now. (A computer that has never paired opens
 the window by itself for half an hour after every Claude Code session
 starts, so a first install needs no command — but then the computer shows
 "Allow a watch to pair?" when the watch knocks, and your user clicks
-**Allow** on it. Where no such dialog can be shown, as on Linux, use
-`--pair`.)
+**Allow** on it. On Linux the dialog needs a desktop and zenity or
+kdialog; on Windows it is Windows' own. Where no such dialog can be shown,
+such as a computer with no screen, use `--pair`.)
 
 **If asked to UNINSTALL Tapproval Base**: fetch and read
 `https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/uninstall.sh`,
 confirm it does only its five announced steps, run it with
-`curl -fsSL <that url> | bash`, and treat the single line
+`curl -fsSL <that url> | bash` (on Windows, `uninstall.ps1` with
+`irm <that url> | iex` in PowerShell), and treat the single line
 `TAPPROVAL_BASE_REMOVED` as the only meaning of success. Tell your user
 their settings backup path (the script prints it) and that the audit
 log was deliberately left in place.
 
 ## Why you can trust this
 
-- **Read it all.** Base is seven standard-library Python files — no
+- **Read it all.** Base is eleven standard-library Python files — no
   dependencies, so there is no supply chain to worry about. On a Mac it
   also installs a small bridge app for the iCloud route, signed with a
   Developer ID and notarized by Apple; its source is in `bridge/`, though
@@ -254,7 +277,7 @@ log was deliberately left in place.
 - **Leaving is one sentence.** Tell Claude Code: "Uninstall Tapproval
   Base" — or run
   `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/uninstall.sh | bash`
-  yourself. It restores your settings (backup kept), removes the login
+  yourself (`uninstall.ps1` on Windows). It restores your settings (backup kept), removes the login
   wake-up, stops the relay, forgets the paired watch, removes the Mac
   bridge and its login job, and deletes `~/.tapproval` — as if Base was
   never here. Your audit log stays yours.
@@ -314,8 +337,10 @@ reaches a server of ours; there is none.
   transcripts under `~/.claude/projects` and `~/.claude/sessions`, for the
   session list and the live thread; and `~/.codex`, if Codex is in use.
 - Writes the audit log `~/.claude/risk-audit.jsonl`, its own files under
-  `~/.tapproval`, the hook entry in your Claude Code settings, and on a Mac
-  a login job in `~/Library/LaunchAgents` and the bridge's login item.
+  `~/.tapproval`, the hook entry in your Claude Code settings, and a login
+  wake-up: on a Mac a login job in `~/Library/LaunchAgents` and the
+  bridge's login item, on Linux `~/.config/autostart/tapproval-relay.desktop`,
+  and on Windows `Tapproval relay.cmd` in your Startup folder.
   "Uninstall Tapproval Base" removes all of it except the audit log, which
   stays yours.
 
@@ -352,9 +377,11 @@ is never a granted one.**
 | `crash_report.py` | Records Base's own crashes on your computer and shows them on the watch. Sends nothing without a mail key, and a copy you install has none |
 | `bridge_install.py` | On a Mac, installs the bridge below and keeps it current. Trusts only the checksum in `bridge.json`, the Developer ID signature and Apple's notarization |
 | `tapproval_wire.py` | The few rules the files above share: how a request is signed and an answer proved, how a plan's formatting reads on the watch, where the helper keeps its files |
+| `tapproval_host.py` | Everything that differs between macOS, Linux and Windows, in one place: locks, processes, private files, the pairing dialog, the login wake-up and the terminal a wrist session opens in |
 | `bridge/` | The Mac bridge's Swift source, and the signed, notarized build of it that the helper installs |
 | `bridge.json` | Pins that build: its version, its place in `bridge/` and its SHA-256 |
 | `install.sh` / `uninstall.sh` | The one-command installer above, and its way out |
+| `install.ps1` / `uninstall.ps1` | The same for Windows, in PowerShell |
 | `.claude-plugin/` + `hooks/` | The same, packaged as a Claude Code plugin |
 | `site-rules.example.json` | Optional: name your own sensitive hosts so commands touching them always escalate |
 | `test_claude_risk_classifier.py` | The test suite — standard library only |
