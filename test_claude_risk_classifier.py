@@ -776,6 +776,25 @@ class TestClassifyBashDestructive:
         assert risk == Risk.SAFE
 
     @pytest.mark.parametrize("command", [
+        # jq filters are not hidden files: quoted, the shell expands nothing
+        # in them, and `[]`, `[0]` and `[1500:5000]` are not wildcards. Each
+        # read HIGH under 1.1.90/1.1.91 (1,263 of the owner's commands).
+        "gh pr view 1222 --json files -q '.files[] | .path'",
+        "gh issue view 2262 --json body --jq '.body[1500:5000]'",
+        "jq -r '.[] | .name' repos.json",
+        "jq '.items[0].id' a.json",
+        "gh run list --json status --jq '.[0]'",
+        # A path in quoted code, a heredoc's body and a pattern the segment
+        # splitter cuts at its `\\|` are not wildcards either (2026-10-28).
+        """python3 -c "import json;print(json.load(open('$HOME/.tapproval/desk-state.json'))['last_sent'])\"""",
+        "python3 - <<'EOF'\nimport glob; print(glob.glob('*.env?'), '.npmr?')\nEOF",
+        'grep -n "extract\\|const .*=\\s*\\[" src/a.test.ts | head -20',
+    ])
+    def test_a_jq_filter_is_not_a_hidden_file_wildcard(self, command):
+        _, rules = crc.classify_bash(command)
+        assert "secret-glob" not in rules and "secret-access" not in rules, (command, rules)
+
+    @pytest.mark.parametrize("command", [
         "echo $(rm -rf /)",
         "x=`mkfs.ext4 /dev/sda`",
         "echo $(git push --force origin main)",
@@ -792,9 +811,8 @@ class TestClassifyBashDestructive:
         # classified, so `echo $(rm -rf $(echo /))` read MEDIUM — the
         # destructive layer sat one level out and was never looked at.
         ("echo $(rm -rf $(echo /))", Risk.HIGH, "cmd-substitution-inner:rm-recursive"),
-        # Backticks swallow the whole inner text; recursion labels it by
-        # its own first rule, and the tier is what matters.
-        ("echo `rm -rf $(echo /)`", Risk.HIGH, "cmd-substitution-inner:cmd-substitution"),
+        # Each layer is named by what it does, past its own substitutions.
+        ("echo `rm -rf $(echo /)`", Risk.HIGH, "cmd-substitution-inner:rm-recursive"),
         ("echo $(git push --force $(echo origin) main)", Risk.CRITICAL,
          "cmd-substitution-inner:git-force-push-protected"),
         ("echo $(cat $(echo ~)/.ssh/id_rsa)", Risk.HIGH, "cmd-substitution-inner:secret-access"),
@@ -827,6 +845,16 @@ class TestClassifyBashDestructive:
     @pytest.mark.parametrize("command", [
         "echo $((1 + 2))", "echo $(( $(wc -l < a.txt) * 2 ))",
         "echo $(date)", 'echo "$(git rev-parse HEAD)"', "diff <(ls a) <(ls b)",
+        # The owner's own commands, CRITICAL unread under 1.1.90/1.1.91: a
+        # `)` or a quote inside quotes, and a heredoc inside a substitution
+        # (944 of 18,808, 2026-10-28).
+        'echo "total: $(wc -l < $L | tr -d \' \')"',
+        "R=$(gh pr view 1217 --json mergeable -q '\"\\(.mergeable)|\\(.state)\"')",
+        "for i in $(seq 1 40); do sleep 10; done",
+        'n=$(git grep -n "\'$k\'" -- src | wc -l)',
+        "gh pr create --title t --body \"$(cat <<'BODY'\nSome (text) with 'quotes' and \"more\"\nBODY\n)\"",
+        "cat <<'EOF' > f.yaml\n# a (comment) with an 'apostrophe\nEOF",
+        'gh issue create --title "Buy the Program (\\$99/yr)" --body "x"',
     ])
     def test_ordinary_substitutions_and_arithmetic_stay_below_critical(self, command):
         risk, rules = crc.classify_bash(command)

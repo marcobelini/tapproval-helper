@@ -30,6 +30,7 @@ UPSTREAM_SHAPES = {
     "record.meta": ("session_meta", "Durable session identity", "2026-10-14"),
     "record.item": ("response_item", "Conversation items", "2026-10-14"),
     "record.event": ("event_msg", "Turn lifecycle, not message copies", "2026-10-14"),
+    "record.context": ("turn_context", "Per-turn directory and permission policy", "2026-10-27"),
     "item.message": ("message", "A role and typed content parts", "2026-10-14"),
     "item.call": ("function_call", "Named tool call with call_id", "2026-10-14"),
     "item.custom_call": ("custom_tool_call", "Freeform tool call", "2026-10-14"),
@@ -219,7 +220,7 @@ def active_sessions(limit=12, sessions_dir=None, index_path=None, open_paths=Non
             "repo": "",
             "status": _entrypoint(meta["originator"]),
             "live": True,
-            "side_thread": True,
+            "side_thread": False,
             "path": cwd,
             "session_id": session_id,
             "opening": "",
@@ -235,6 +236,7 @@ def active_sessions(limit=12, sessions_dir=None, index_path=None, open_paths=Non
             "state_reason": info["state_reason"],
             "wake_at": None,
             "agent": "codex",
+            "can_send": True,
         })
         if len(rows) >= limit:
             break

@@ -2303,7 +2303,7 @@ class _StampedStream:
         return getattr(self._stream, name)
 
 
-def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
+def say_to_session(prefix, text, projects_dir=None, brief=True, force=False, agent=None):
     """Send an instruction to a session, the way the terminal would.
 
     A session open on this computer gets it in its own inbox (post_to_inbox,
@@ -2321,6 +2321,19 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False):
         return "empty"
     if len(text) > SEND_CHARS:
         return too_long(text)
+    if agent not in (None, "claude", "codex"):
+        return "unknown agent"
+    import codex_sessions
+    codex_path = codex_sessions.find_rollout(prefix)
+    if agent == "codex" or codex_path:
+        if agent == "claude":
+            return "session belongs to Codex"
+        from ClaudeRiskClassifier import ensure_codex_on_path
+        from codex_talk import send
+        binary = ensure_codex_on_path()
+        if not binary:
+            return "Codex is not installed on your computer"
+        return send(prefix, text, binary, _spawn_detached, SAY_LOG, brief=brief)
     registry = session_registry()
     session_id, cwd = resolve_session(prefix, projects_dir, registry=registry)
     if not session_id:
@@ -2640,6 +2653,38 @@ def first_projects(limit=25, home=None, repositories_only=False):
 
 
 def known_projects(projects_dir=None, limit=25):
+    """Known folders, choosing the most recently used agent per project."""
+    import codex_sessions
+    rows = _claude_projects(projects_dir, limit)
+    by_path = {os.path.realpath(row["path"]): dict(row) for row in rows}
+    modified = {}
+    for mtime, path, _, _ in transcripts_newest_first(projects_dir):
+        cwd, entry = transcript_origin(path)
+        if cwd and entry != shape("entrypoint.sdk_cli"):
+            real = os.path.realpath(project_root(cwd))
+            modified[real] = max(mtime, modified.get(real, 0))
+    for mtime, path in codex_sessions._rollouts(os.path.join(codex_sessions._home(), "sessions")):
+        meta = codex_sessions._rollout_meta(path)
+        if not meta or not meta["cwd"]:
+            continue
+        root = project_root(meta["cwd"])
+        if not root or not os.path.isdir(root):
+            continue
+        real = os.path.realpath(root)
+        home = os.path.realpath(os.path.expanduser("~"))
+        if real == home or any((real + os.sep).startswith(os.path.realpath(p) + os.sep)
+                               for p in SCRATCH_ROOTS):
+            continue
+        age = max(0, int((time.time() - mtime) / 60))
+        old = by_path.get(real)
+        if old is None or mtime > modified.get(real, 0):
+            by_path[real] = {"name": os.path.basename(root.rstrip("/")) or root,
+                             "path": root, "minutes_ago": age, "agent": "codex"}
+            modified[real] = mtime
+    return sorted(by_path.values(), key=lambda r: r["minutes_ago"])[:limit]
+
+
+def _claude_projects(projects_dir=None, limit=25):
     """The projects a new session may be started in: one row per repository
     a person has recently worked in, most recent first. Derived from the
     same transcripts the session list reads, so the watch never has to
@@ -2858,13 +2903,23 @@ def start_session(path, text, projects_dir=None, platform=None):
     if (platform or sys.platform) != "darwin":
         return "new sessions need a Mac"
     path = os.path.expanduser(str(path or ""))
-    if path not in {row["path"] for row in known_projects(projects_dir)}:
+    project = next((row for row in known_projects(projects_dir) if row["path"] == path), None)
+    if project is None:
         return "unknown project"
-    if not ensure_claude_on_path():
-        return "claude not on PATH"
-    if signed_in() is False:
-        return "signed out"
-    started = "started" if trust_folder(path) else AWAITS_TRUST
+    codex = project.get("agent") == "codex"
+    if codex:
+        from ClaudeRiskClassifier import ensure_codex_on_path
+        from codex_talk import flags
+        binary = ensure_codex_on_path()
+        if not binary:
+            return "Codex is not installed on your computer"
+        started = "started"
+    else:
+        if not ensure_claude_on_path():
+            return "claude not on PATH"
+        if signed_in() is False:
+            return "signed out"
+        started = "started" if trust_folder(path) else AWAITS_TRUST
     # shlex.quote stops the shell reading the text; "--" stops claude
     # reading it as a flag, which quoting alone does not.
     # The unset is for a Terminal that is already carrying some session's
@@ -2877,6 +2932,10 @@ def start_session(path, text, projects_dir=None, platform=None):
     script = 'unset %s; cd %s && claude --settings %s -- %s' % (
         " ".join(HOST_SESSION_MARKERS), shlex.quote(path),
         shlex.quote(BRIEF_REPLY_SETTINGS), shlex.quote(text))
+    if codex:
+        script = 'unset %s; cd %s && %s' % (
+            " ".join(HOST_SESSION_MARKERS), shlex.quote(path),
+            shlex.join([binary] + flags() + ["--", text]))
     # json.dumps is the right escaper for the quotes and backslashes an
     # AppleScript string literal understands — but only with
     # ensure_ascii=False. Left at its default it writes \u00e5 for "å",
@@ -4196,6 +4255,10 @@ class RelayHandler(BaseHTTPRequestHandler):
         # what the watch's More list shows, and describes, in each
         # skill's own words. Without a session it is the user's set.
         prefix = (query.get("session_id") or [""])[0][:64]
+        from codex_sessions import find_rollout
+        if prefix and find_rollout(prefix):
+            self._send_json({"skills": [], "project": None})
+            return
         _, cwd = resolve_session(prefix) if prefix else (None, None)
         # The repository's name captions the "its own" group on the wrist.
         project = os.path.basename(project_root(cwd).rstrip("/")) if cwd else None
@@ -4418,7 +4481,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             say_to_session(str(body.get("session_id", ""))[:64],
                            body.get("text", ""),
                            brief=body.get("brief") is not False,
-                           force=body.get("force") is True),
+                           force=body.get("force") is True,
+                           agent=body.get("agent")),
             "sent"), path)
 
     def _post_end(self, path, query):

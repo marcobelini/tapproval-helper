@@ -23,6 +23,11 @@
 <main class="policy">
 <h1>Changelog</h1>
 <p><em>Every release of Tapproval Base, the helper on your computer, newest first. Starting Claude Code once updates it. Generated from <a href="https://github.com/marcobelini/tapproval-helper/releases">the releases on GitHub</a>, which may already hold a newer one. Security fixes are also explained on <a href="security.html">the security page</a>.</em></p>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.91">1.1.91 — Handle malformed HTTP without logger crashes</a></h2>
+<p><em>2026-10-27</em></p>
+<p>Malformed HTTP input can reach the request logger before Python has assigned a request path. The relay now completes the normal 400/505 error response instead of reporting an AttributeError from the handler.</p>
+<p>Includes five isolated socket regressions, continued health-response checks, preserved tunnel-secret redaction and quiet bridge polling. The Python 3.9–3.13 matrix and public helper package checks passed.</p>
+<p>Compatible with the existing internal watch build 190; no new watch installation or approval-setting change is required. This patch does not alter Codex approval behavior or address a stopped native Codex service.</p>
 <h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.90">1.1.90 — Codex approval parity</a></h2>
 <p><em>2026-10-27</em></p>
 <p>Codex approval cards now follow native human approval requests across active sessions. This removes extra hook-only prompts, deduplicates replayed requests, and clears resolved cards synchronously.</p>

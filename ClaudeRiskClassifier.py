@@ -110,7 +110,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.91"
+__version__ = "1.1.92"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -227,9 +227,53 @@ SECRET_PATH = re.compile(
 # alone: `cat *.md` is not a credential read (2026-10-25 review). So is a
 # wildcard in a hidden file's own name anywhere — `cat .en?` read SAFE
 # beside `cat .env*`'s HIGH (2026-10-26 review); `./*.sh` is not one.
-SECRET_GLOB = re.compile(
-    r"(?:^|[\s='\"])(?:~|\$\{?HOME\}?|/Users/[^/\s]+|/home/[^/\s]+)/\.[^\s]*[*?\[{]"
-    r"|(?:^|[\s='\"/])\.[^\s/.][^\s/]*[*?\[{]|(?:^|[\s='\"/])\.[*?\[{]")
+#
+# The hidden name is read outside quotes, or as a quoted word that is that
+# name and nothing else (`head '.npmr?'`): read anywhere, every jq filter
+# was a secret read — `-q '.files[] | …'`, `--jq '.[0]'` — 1,263 of the
+# owner's commands HIGH (2026-10-28). A bracket is a wildcard only around
+# a letter: `.items[]` and `.body[1500:5000]` are jq, `.ss[h]` is a glob.
+_HOME_HIDDEN_GLOB = re.compile(
+    r"(?:^|[\s='\"])(?:~|\$\{?HOME\}?|/Users/[^/\s]+|/home/[^/\s]+)/\.[^\s'\"();|&<>]*[*?\[{]")
+_HIDDEN_NAME_GLOB = (r"\.[\w-][\w.-]*(?:[*?]|\[!?[A-Za-z][^\]\s]*\]|\{[^}\s]*\})"
+                     r"[\w.*?\[\]{},-]*")
+_HIDDEN_GLOB_BARE = re.compile(r"(?:^|[\s=/])(?:%s|\.[*?])" % _HIDDEN_NAME_GLOB)
+_HIDDEN_GLOB_WORD = re.compile(r"(?:[\w./-]*/)?%s" % _HIDDEN_NAME_GLOB)
+_QUOTED = re.compile(r"'([^']*)'|\"((?:\\.|[^\"\\])*)\"")
+_HEREDOC_MARK = re.compile(r"<<(-?)[ \t]*(['\"]?)([\w.@:+-]+)\2")
+
+
+def _without_heredoc_bodies(text):
+    """``text`` with each heredoc's body left out: it is a program's input,
+    and the shell expands no wildcard in it (`python3 - <<'EOF'` with a
+    `.env*` in its code read HIGH, 2026-10-28)."""
+    kept, pending = [], []
+    for line in text.split("\n"):
+        if pending:
+            delimiter, tabs = pending[0]
+            if (line.lstrip("\t") if tabs else line) == delimiter:
+                pending.pop(0)
+            continue
+        kept.append(line)
+        pending = [(m.group(3), bool(m.group(1))) for m in _HEREDOC_MARK.finditer(line)]
+    return "\n".join(kept)
+
+
+class _SecretGlob:
+    """SECRET_GLOB's `search`, by the rules above."""
+
+    @staticmethod
+    def search(text):
+        text = _without_heredoc_bodies(text)
+        if _HOME_HIDDEN_GLOB.search(text):
+            return True
+        if _HIDDEN_GLOB_BARE.search(_QUOTED.sub(" ", text)):
+            return True
+        return any(_HIDDEN_GLOB_WORD.fullmatch(single or double)
+                   for single, double in _QUOTED.findall(text))
+
+
+SECRET_GLOB = _SecretGlob()
 
 # Deployment-specific rules. Empty by default: this tool ships knowing
 # nothing about your infrastructure. Name your own servers, shares and
@@ -872,7 +916,6 @@ SEGMENT_RULES = [
     ("sudo", re.compile(r"\bsudo\b"), Risk.HIGH),
     ("sql-mutation", SQL_MUTATION, Risk.HIGH),
     ("secret-access", SECRET_PATH, Risk.HIGH),
-    ("secret-glob", SECRET_GLOB, Risk.HIGH),
     ("network-upload",
      re.compile(r"\b(curl|wget)\b[^|;&]*(-X\s*(POST|PUT|PATCH)|--data|--upload-file|"
                 # The long spellings: `--request POST`, curl's `--json`,
@@ -933,11 +976,120 @@ CATASTROPHIC_TARGETS = re.compile(
 )
 
 
-# Contents of an innermost `$(…)` (no nested parens) or a backtick pair.
-# Innermost-first means nested substitutions surface one layer per pass and
-# recursion in classify_bash() reaches the rest.
-# zsh's `=(…)` too, which only starts a word: `a=(b c)` is an array.
-_SUBSTITUTION_RE = re.compile(r"(?:[$<>]|(?<!\S)=)\(([^()]*)\)|`([^`]*)`")
+class _Unread(Exception):
+    """A substitution the reader could not take apart."""
+
+
+_HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)([\w.@:+-]+)\2")
+
+
+def _substitutions(text):
+    """What each outermost `$(…)`, backtick pair, `<(…)`, `>(…)` and
+    zsh `=(…)` in ``text`` runs, read the way the shell reads it: nothing
+    inside single quotes or a quoted heredoc, a `)` inside quotes is not
+    the end, and a heredoc's body is its own text. `$((…))` is arithmetic;
+    what it holds is read for substitutions of its own. zsh's `=(…)` only
+    starts a word: `a=(b c)` is an array. Raises _Unread on
+    one left open. The text pattern this replaces could not see a `)` in
+    quotes or a heredoc, and called 944 of the owner's commands CRITICAL
+    unread (2026-10-28)."""
+    found = []
+    _scan(text, 0, None, found)
+    return found
+
+
+def _scan(text, i, closer, found):
+    """Read from ``i`` to ``closer`` (`)` or None for the end), adding the
+    inner text of each substitution met at this level to ``found`` (None:
+    only skip them). Returns the index after ``closer``."""
+    n, quote, depth, heredocs = len(text), None, 0, []
+    while i < n:
+        c = text[i]
+        if quote == "'":
+            quote = None if c == "'" else quote
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if c == "\n" and heredocs and quote is None:
+            i = _skip_heredocs(text, i + 1, heredocs, found)
+            heredocs = []
+            continue
+        if c == '"':
+            quote = None if quote == '"' else '"'
+            i += 1
+            continue
+        if c == "'" and quote is None:
+            quote = "'"
+            i += 1
+            continue
+        if c == "`":
+            end = i + 1
+            while end < n and text[end] != "`":
+                end += 2 if text[end] == "\\" else 1
+            if end >= n:
+                raise _Unread()
+            if found is not None:
+                found.append(text[i + 1:end])
+            i = end + 1
+            continue
+        opens = (text.startswith("$(", i)
+                 or (quote is None and c in "<>" and text.startswith("(", i + 1))
+                 or (quote is None and c == "=" and text.startswith("(", i + 1)
+                     and (i == 0 or text[i - 1].isspace())))
+        if opens:
+            if text.startswith("$((", i):
+                # Arithmetic: its own substitutions count, its text does not.
+                end = _scan(text, i + 3, ")", None)
+                if found is not None:
+                    found.extend(_substitutions(text[i + 3:end - 1]))
+                i = end + (1 if text.startswith(")", end) else 0)
+                continue
+            start = i + 2
+            end = _scan(text, start, ")", None)
+            if found is not None:
+                found.append(text[start:end - 1])
+            i = end
+            continue
+        if quote is None:
+            if c == "<" and _HEREDOC.match(text, i) and not text.startswith("<<<", i):
+                match = _HEREDOC.match(text, i)
+                heredocs.append((match.group(3), bool(match.group(2)), bool(match.group(1))))
+                i = match.end()
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                if depth == 0 and closer == ")":
+                    return i + 1
+                depth = max(0, depth - 1)
+        i += 1
+    if closer is not None:
+        raise _Unread()
+    return i
+
+
+def _skip_heredocs(text, i, heredocs, found):
+    """Past the bodies of the heredocs opened on the line just ended. An
+    unquoted delimiter's body still runs its substitutions."""
+    for delimiter, quoted, tabs in heredocs:
+        start = i
+        while i <= len(text):
+            end = text.find("\n", i)
+            line = text[i:] if end < 0 else text[i:end]
+            if (line.lstrip("\t") if tabs else line) == delimiter:
+                if not quoted and found is not None:
+                    found.extend(_substitutions(text[start:i].replace('"', " ").replace("'", " ")))
+                i = len(text) if end < 0 else end + 1
+                break
+            if end < 0:
+                # No closing line: the rest is the body.
+                if not quoted and found is not None:
+                    found.extend(_substitutions(text[start:].replace('"', " ").replace("'", " ")))
+                return len(text)
+            i = end + 1
+    return i
 
 
 def _segments(command):
@@ -1256,13 +1408,27 @@ def _bare_flags(segment):
     return " ".join(bare) if bare != words else segment
 
 
+_SUBSTITUTION_DEPTH = 16
+
+
 def classify_bash(command):
     """Classify a shell command. Returns ``(Risk, [rule_id, ...])``."""
+    risk, rules, _ = _classify_bash(command, 0)
+    return risk, rules
+
+
+def _classify_bash(command, _depth, fragment=False):
+    """classify_bash, with the tier each rule reached, so a substitution
+    can be named by the rule that made it what it is. ``fragment`` is a
+    piece the segment splitter cut out (it knows neither quotes nor
+    heredocs): its substitutions were read whole from the command it came
+    from, so one left open in the piece is the cut, not the shell."""
     if not command or not command.strip():
-        return Risk.MEDIUM, ["empty-command"]
+        return Risk.MEDIUM, ["empty-command"], {"empty-command": Risk.MEDIUM}
 
     risk = Risk.SAFE
     rules = []
+    levels = {}
 
     def bump(rule_id, level):
         nonlocal risk
@@ -1270,10 +1436,18 @@ def classify_bash(command):
             risk = level
         if rule_id not in rules:
             rules.append(rule_id)
+        levels[rule_id] = max(level, levels.get(rule_id, Risk.SAFE))
 
     for rule_id, pattern, level in WHOLE_LINE_RULES + SITE_RULES:
         if pattern.search(command):
             bump(rule_id, level)
+    # A wildcard naming a hidden file, read once over the whole command,
+    # where its quotes are whole: the segment splitter cuts `grep "a\|.*b"`
+    # at the `\|`, and the half it leaves showed a bare `.*` (2026-10-28).
+    # A fragment's command was read already.
+    hidden_glob = not fragment and bool(SECRET_GLOB.search(command))
+    if hidden_glob:
+        bump("secret-glob", Risk.HIGH)
     if SQL_EXEC.search(command) and any(
             os.path.basename(_first_token(segment)).lower() in SQL_CLIENTS
             for segment in _segments(command)):
@@ -1286,39 +1460,43 @@ def classify_bash(command):
     # behind the blunt MEDIUM "cmd-substitution" cap and could be
     # auto-allowed under a raised threshold.
     #
-    # The pattern finds the innermost layer only. Each pass classifies that
-    # layer, then stands a plain word in for it so the layer outside comes
-    # into view: `echo $(rm -rf $(echo /))` surfaced `echo /` and never
-    # looked at the `rm -rf` around it (2026-10-25 review). Bounded, so a
-    # pathological nesting cannot spin.
-    remaining = command
-    for _ in range(8):
-        found = _SUBSTITUTION_RE.findall(remaining)
-        if not found:
+    # Each substitution is read the way the shell reads it (_substitutions)
+    # and classified in its own right, the layers inside it by the same
+    # call. One the reader cannot take apart, or nested past any honest
+    # command, was never classified: unread is the worst it could be
+    # (2026-10-26 review), and narrowly so — the text pattern before it
+    # called every `)` in quotes unread (2026-10-28).
+    try:
+        inners = _substitutions(command)
+    except _Unread:
+        inners = []
+        if not fragment:
+            bump("cmd-substitution-unread", Risk.CRITICAL)
+    for inner in inners:
+        inner = inner.strip()
+        if not inner:
+            continue
+        if _depth >= _SUBSTITUTION_DEPTH:
+            bump("cmd-substitution-unread", Risk.CRITICAL)
             break
-        for dollar_form, backtick_form in found:
-            inner = (dollar_form or backtick_form).strip()
-            if inner.count("'") % 2 or inner.count('"') % 2:
-                # Cut short at a quoted `)`: what it ran is not this text.
-                bump("cmd-substitution-unread", Risk.CRITICAL)
-            if inner:
-                sub_risk, sub_rules = classify_bash(inner)
-                bump("cmd-substitution-inner:" + (sub_rules[0] if sub_rules
-                     else "?"), sub_risk)
-        remaining = _SUBSTITUTION_RE.sub(" x ", remaining)
-    # What the pattern could not take apart was never classified: layers
-    # past the passes, or a parenthesis inside quotes that hides the whole
-    # substitution (`$(echo "(" && rm -rf ~)` read HIGH). Unread is the
-    # worst it could be (2026-10-26 review). `$((` is arithmetic.
-    if re.search(r"\$\((?!\()|[<>]\(|`", remaining):
-        bump("cmd-substitution-unread", Risk.CRITICAL)
+        sub_risk, sub_rules, sub_levels = _classify_bash(inner, _depth + 1)
+        # Named by the rule that made the inner command what it is, however
+        # deep that rule sits; a tie goes to what the command does over the
+        # substitution bookkeeping.
+        top = max(sub_levels.values(), default=Risk.SAFE)
+        cause = next((r for r in sub_rules if sub_levels[r] == top
+                      and not r.startswith("cmd-substitution")), None) or next(
+            (r for r in sub_rules if sub_levels[r] == top), "?")
+        if cause.startswith("cmd-substitution-inner:"):
+            cause = cause[len("cmd-substitution-inner:"):]
+        bump("cmd-substitution-inner:" + cause, sub_risk)
 
     for segment in _segments(command):
         if segment.strip() in ("}", ")"):
             continue  # the closing half of a group split at its `;`
         inner = _unwrapped(segment)
         if inner is not None and inner.strip() != segment.strip():
-            sub_risk, sub_rules = classify_bash(inner)
+            sub_risk, sub_rules, _ = _classify_bash(inner, _depth + 1, fragment=True)
             bump("wrapped:" + (sub_rules[0] if sub_rules else "?"), sub_risk)
             # Grouping and a leading backslash change nothing but aliases.
             # A real wrapper can: `env LD_PRELOAD=x.so ls` runs x.so. It
@@ -1342,7 +1520,7 @@ def classify_bash(command):
             # MEDIUM (it still runs a command), anything more is HIGH or
             # whatever the command is on its own, if that is worse.
             for inner in _find_runs(segment):
-                sub_risk, sub_rules = classify_bash(inner)
+                sub_risk, sub_rules, _ = _classify_bash(inner, _depth + 1, fragment=True)
                 bump("find-exec:" + (sub_rules[0] if sub_rules else "?"),
                      Risk.MEDIUM if sub_risk <= Risk.LOW else max(sub_risk, Risk.HIGH))
 
@@ -1374,7 +1552,7 @@ def classify_bash(command):
             # .env` read HIGH (2026-10-25 review). The secret rule alone
             # runs here; the blunt tool-name rules stay out, which is the
             # point of recognising the invocation.
-            if SECRET_PATH.search(segment) or SECRET_GLOB.search(segment):
+            if SECRET_PATH.search(segment) or hidden_glob:
                 bump("secret-access", Risk.HIGH)
             bump(*special)
             continue
@@ -1403,7 +1581,7 @@ def classify_bash(command):
         # Unknown command: never assume it is safe.
         bump("unknown-command", Risk.MEDIUM)
 
-    return risk, rules
+    return risk, rules, levels
 
 
 # --------------------------------------------------------------------------

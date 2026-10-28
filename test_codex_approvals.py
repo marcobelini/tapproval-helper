@@ -718,3 +718,235 @@ def test_new_server_epoch_can_reuse_a_resolved_native_request_id(monkeypatch):
         assert cards.pending()[0]["id"] != old_id
     finally:
         adapter.close()
+
+
+class TestCodexTalkingBack:
+    @pytest.fixture
+    def setup(self, tmp_path, monkeypatch):
+        import codex_sessions as sessions
+        import codex_talk as talk
+        sid = 'a0000000-0000-4000-8000-000000000001'
+        home = tmp_path / 'codex'
+        root = home / 'sessions'
+        root.mkdir(parents=True)
+        locks = home / 'thread-writer-locks'
+        locks.mkdir()
+        (locks / (sid + '.lock')).touch()
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir()
+        rollout = root / ('rollout-' + sid + '.jsonl')
+        rollout.write_text(json.dumps({'type': 'session_meta', 'payload': {
+            'id': sid, 'cwd': str(workspace), 'originator': 'codex-tui'}}) + '\n')
+        monkeypatch.setenv('CODEX_HOME', str(home))
+        monkeypatch.setattr(sessions, 'open_rollout_paths', lambda _paths: set())
+        spawned = []
+        def spawn(command, log, cwd=None):
+            spawned.append((command, log, cwd))
+            return ''
+        class Socket:
+            def __init__(self):
+                self.sent = []
+                self.responses = []
+                self.closed = False
+                self.fail = None
+                self.loaded = [sid]
+            def send(self, value):
+                self.sent.append(value)
+                method = value.get('method')
+                if method == 'initialized':
+                    return
+                if self.fail == method:
+                    self.responses.append(EOFError('closed'))
+                    return
+                result = {'thread/loaded/list': {'data': self.loaded, 'nextCursor': None},
+                          'thread/resume': {'thread': {'id': sid}},
+                          'turn/start': {'turn': {'id': 'turn-2', 'status': 'inProgress'}}}.get(method, {})
+                self.responses.append({'id': value['id'], 'result': result})
+            def receive(self):
+                value = self.responses.pop(0)
+                if isinstance(value, Exception):
+                    raise value
+                return value
+            def close(self):
+                self.closed = True
+        socket = Socket()
+        def unavailable():
+            raise OSError('no control socket')
+        def send(text='check the fix', connect=None, **kwargs):
+            return talk.send(sid, text, '/bin/codex', spawn, '/tmp/isolated-say.log',
+                             connect=connect or unavailable, **kwargs)
+        return talk, sessions, sid, rollout, workspace, socket, spawned, send
+
+    def test_live_reply_is_one_same_thread_mutation_with_limits(self, setup):
+        talk, _, sid, _, workspace, socket, spawned, send = setup
+        assert send(connect=lambda: socket) == 'sent'
+        calls = [m for m in socket.sent if m.get('method') == 'turn/start']
+        assert len(calls) == 1
+        params = calls[0]['params']
+        assert params['threadId'] == sid
+        assert params['sandboxPolicy'] == talk.POLICY
+        assert params['approvalPolicy'] == 'on-request'
+        assert params['runtimeWorkspaceRoots'] == [str(workspace)]
+        assert 'check the fix' in params['input'][0]['text']
+        assert spawned == [] and socket.closed
+
+    def test_codex_row_advertises_same_thread_sends(self, setup):
+        _, sessions, _, path, _, _, _, _ = setup
+        [row] = sessions.active_sessions(open_paths=[str(path)])
+        assert row['can_send'] is True
+        assert row['side_thread'] is False
+
+    def test_a_moved_session_uses_its_latest_working_directory(self, setup):
+        _, _, _, path, workspace, _, spawned, send = setup
+        moved = workspace.parent / 'moved-workspace'
+        moved.mkdir()
+        workspace.rmdir()
+        with path.open('a') as handle:
+            handle.write(json.dumps({'type': 'turn_context', 'payload': {'cwd': str(moved)}}) + '\n')
+        assert send() == 'sent'
+        assert spawned[0][2] == str(moved)
+
+    def test_lost_mutation_receipt_never_falls_back_or_retries(self, setup):
+        _, _, _, _, _, socket, spawned, send = setup
+        socket.fail = 'turn/start'
+        assert 'check the session before retrying' in send(connect=lambda: socket)
+        assert len([m for m in socket.sent if m.get('method') == 'turn/start']) == 1
+        assert not spawned
+
+    def test_saved_session_resumes_its_exact_uuid_with_bounded_permissions(self, setup):
+        talk, _, sid, _, workspace, _, spawned, send = setup
+        assert send('--dangerously-bypass-approvals-and-sandbox') == 'sent'
+        [call] = spawned
+        command, _, cwd = call
+        assert cwd == str(workspace)
+        assert command[:2] == ['/bin/codex', 'exec']
+        assert command[2] == '--skip-git-repo-check'
+        assert command[3:3 + len(talk.flags())] == talk.flags()
+        assert command[-4:-1] == ['resume', sid, '--']
+        assert command[-1].startswith('--dangerously-bypass-approvals-and-sandbox')
+
+    def test_a_live_thread_on_another_server_is_never_resumed_headlessly(self, setup, monkeypatch):
+        _, sessions, _, path, _, socket, spawned, send = setup
+        monkeypatch.setattr(sessions, 'open_rollout_paths', lambda _: {str(path)})
+        socket.loaded = []
+        assert 'permission limits' in send(connect=lambda: socket)
+        assert not spawned
+        assert not any(m['method'] in ('thread/resume', 'turn/start') for m in socket.sent)
+
+    @pytest.mark.parametrize('policy', [None, {}, {'approval_policy': 'never'},
+        {'approval_policy': 'never', 'sandbox_policy': {'type': 'danger-full-access'}},
+        {'approval_policy': 'unknown', 'sandbox_policy': {
+            'type': 'workspace-write', 'network_access': False}},
+        {'approval_policy': 'never', 'sandbox_policy': {
+            'type': 'workspace-write', 'network_access': True}}])
+    def test_queue_does_not_pretend_to_apply_limits(self, setup, monkeypatch, policy):
+        talk, sessions, _, path, _, _, spawned, send = setup
+        monkeypatch.setattr(sessions, 'open_rollout_paths', lambda _: {str(path)})
+        with path.open('a') as handle:
+            handle.write(json.dumps({'type': 'turn_context', 'payload': policy}) + '\n')
+        assert not talk.queue_safe(str(path))
+        assert 'permission limits' in send()
+        assert not spawned
+
+    def test_a_verified_restricted_live_queue_uses_only_its_uuid(self, setup, monkeypatch):
+        import subprocess
+        _, sessions, sid, path, _, _, spawned, send = setup
+        monkeypatch.setattr(sessions, 'open_rollout_paths', lambda _: {str(path)})
+        with path.open('a') as handle:
+            handle.write(json.dumps({'type': 'turn_context', 'payload': {
+                'approval_policy': 'never', 'sandbox_policy': {
+                    'type': 'workspace-write', 'network_access': False}}}) + '\n')
+        commands = []
+        def run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, '', '')
+        assert send(runner=run) == 'sent'
+        assert commands[0][:4] == ['/bin/codex', 'queue', '--thread', sid]
+        assert not spawned
+
+    def test_claude_commands_are_not_sent_to_codex(self, setup):
+        talk, _, _, _, _, _, spawned, send = setup
+        assert 'not Claude Code commands' in send('/security-review')
+        assert talk.message('/recap', brief=False) == talk.RECAP
+        assert not spawned
+
+    def test_missing_codex_identity_never_falls_back_to_claude(self, setup, monkeypatch):
+        import watch_relay as relay
+        monkeypatch.setattr(classifier, 'ensure_codex_on_path', lambda: '/bin/codex')
+        monkeypatch.setattr(relay, 'session_registry', lambda: pytest.fail('Claude path reached'))
+        assert relay.say_to_session('missing-uuid', 'hi', agent='codex') == 'unknown Codex session'
+
+    def test_codex_is_recognised_for_older_callers_without_an_agent(self, setup, monkeypatch):
+        import watch_relay as relay
+        import codex_talk
+        _, _, sid, _, _, _, _, _ = setup
+        monkeypatch.setattr(classifier, 'ensure_codex_on_path', lambda: '/bin/codex')
+        monkeypatch.setattr(codex_talk, 'send', lambda *args, **kwargs: 'sent')
+        monkeypatch.setattr(relay, 'session_registry', lambda: pytest.fail('Claude path reached'))
+        assert relay.say_to_session(sid, 'hi') == 'sent'
+        assert relay.say_to_session(sid, 'hi', agent='claude') == 'session belongs to Codex'
+
+    def test_new_session_uses_last_agent_even_within_one_minute(self, setup, monkeypatch):
+        import os
+        import watch_relay as relay
+        _, _, _, path, workspace, _, _, _ = setup
+        mtime = path.stat().st_mtime
+        row = {'name': 'workspace', 'path': str(workspace), 'minutes_ago': 0}
+        monkeypatch.setattr(relay, '_claude_projects', lambda *_args: [row])
+        monkeypatch.setattr(relay, 'transcript_origin', lambda _path: (str(workspace), 'cli'))
+        monkeypatch.setattr(relay, 'transcripts_newest_first', lambda *_args: [(mtime - 1, 'cc', '', '')])
+        [project] = relay.known_projects()
+        assert project['agent'] == 'codex'
+        os.utime(path, (mtime - 2, mtime - 2))
+        [project] = relay.known_projects()
+        assert project.get('agent') is None  # Claude was later by one second.
+
+    def test_new_codex_terminal_is_quoted_and_never_uses_claude_trust(self, setup, monkeypatch):
+        import os
+        import subprocess
+        import watch_relay as relay
+        talk, _, _, _, workspace, _, _, _ = setup
+        monkeypatch.setattr(relay, 'known_projects', lambda *_args: [{
+            'path': str(workspace), 'name': 'workspace', 'minutes_ago': 0, 'agent': 'codex'}])
+        monkeypatch.setattr(classifier, 'ensure_codex_on_path', lambda: '/opt/a path/codex')
+        monkeypatch.setattr(relay, 'trust_folder', lambda _: pytest.fail('Claude trust reached'))
+        monkeypatch.setattr(relay, 'signed_in', lambda: pytest.fail('Claude auth reached'))
+        scripts = []
+        def opened(command, **kwargs):
+            assert command[0] == 'open'
+            with open(command[1]) as handle:
+                scripts.append(handle.read())
+            os.unlink(command[1])
+            return subprocess.CompletedProcess(command, 0, '', '')
+        monkeypatch.setattr(relay.subprocess, 'run', opened)
+        text = '--dangerously-bypass-approvals-and-sandbox $(touch no) å'
+        assert relay.start_session(str(workspace), text, platform='darwin') == 'started'
+        import shlex
+        script = scripts[0].split(' && ', 1)[1].strip()
+        assert shlex.split(script) == ['/opt/a path/codex'] + talk.flags() + ['--', text]
+
+    def test_unknown_activity_never_starts_a_second_writer(self, setup, monkeypatch):
+        talk, _, _, _, _, _, spawned, send = setup
+        monkeypatch.setattr(talk, 'activity', lambda *_args: None)
+        assert 'activity could not be verified' in send()
+        assert not spawned
+
+    def test_an_existing_writer_lock_is_live_even_if_lsof_finds_nothing(self, setup):
+        import fcntl
+        talk, sessions, sid, path, _, _, spawned, send = setup
+        lock_path = sessions._home() + '/thread-writer-locks/' + sid + '.lock'
+        with open(lock_path, 'rb') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert talk.activity(str(path), sid) is True
+            assert 'permission limits' in send()
+        assert not spawned
+        assert talk.activity(str(path), sid) is False
+
+    @pytest.mark.parametrize('roots', [['/outside'], 'not-a-list', [None]])
+    def test_queue_refuses_external_or_malformed_write_grants(self, setup, roots):
+        talk, _, _, path, workspace, _, _, _ = setup
+        with path.open('a') as handle:
+            handle.write(json.dumps({'type': 'turn_context', 'payload': {
+                'cwd': str(workspace), 'approval_policy': 'on-request', 'sandbox_policy': {
+                    'type': 'workspace-write', 'network_access': False, 'writable_roots': roots}}}) + '\n')
+        assert not talk.queue_safe(str(path))
