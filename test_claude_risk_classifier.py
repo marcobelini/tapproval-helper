@@ -18572,8 +18572,12 @@ def test_the_two_ci_workflows_share_their_test_steps():
         rest = lines[start + 1:]
         end = next((i for i, line in enumerate(rest)
                     if line.startswith("  ") and not line.startswith("   ")), len(rest))
+        # The public matrix also names its hosts (Linux, Windows, macOS);
+        # the private fallback runs on one, as the runner is private.
         return [line for line in rest[:end]
-                if "vars.CI_RUNNER" not in line and "runs-on:" not in line]
+                if "vars.CI_RUNNER" not in line and "runs-on:" not in line
+                and not line.strip().startswith("os: [")
+                and "Every host the helper promises" not in line]
     assert python_steps(private) == python_steps(public)
     # The lint job too, by its run lines (comments may differ): the public
     # copy named two scripts by hand and ran no ruff at all, the shape the
