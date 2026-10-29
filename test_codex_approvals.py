@@ -954,6 +954,75 @@ class TestCodexTalkingBack:
         assert not spawned
         assert talk.activity(str(path), sid) is False
 
+    def test_closed_legacy_reply_survives_an_unrelated_devicefs_mount(self, setup, monkeypatch):
+        import os
+        import subprocess
+        talk, sessions, sid, path, _, _, spawned, send = setup
+        os.unlink(sessions._home() + '/thread-writer-locks/' + sid + '.lock')
+        monkeypatch.setattr(talk._host, 'is_mac', lambda: True)
+        mount = str(path.parent.parent / 'unrelated-DeviceFS')
+        warning = ('lsof: WARNING: can\'t stat() devicefs file system %s\n'
+                   '      Output information may be incomplete.\n'
+                   '      assuming "dev=%x" from mount table\n' % (mount, path.stat().st_dev + 1))
+        monkeypatch.setattr(talk.subprocess, 'run', lambda *a, **k:
+                            subprocess.CompletedProcess(a[0], 1, '', warning))
+        assert send() == 'sent'
+        assert len(spawned) == 1
+        assert spawned[0][0][-4:] == ['resume', sid, '--', talk.message('check the fix', True)]
+
+    def test_legacy_open_rollout_never_resumes_despite_devicefs_warning(self, setup, monkeypatch):
+        import os
+        import subprocess
+        talk, sessions, sid, path, _, _, spawned, send = setup
+        os.unlink(sessions._home() + '/thread-writer-locks/' + sid + '.lock')
+        monkeypatch.setattr(talk._host, 'is_mac', lambda: True)
+        mount = str(path.parent.parent / 'unrelated-DeviceFS')
+        warning = ('lsof: WARNING: can\'t stat() devicefs file system %s\n'
+                   '      Output information may be incomplete.\n'
+                   '      assuming "dev=%x" from mount table\n' % (mount, path.stat().st_dev + 1))
+        monkeypatch.setattr(talk.subprocess, 'run', lambda *a, **k:
+                            subprocess.CompletedProcess(a[0], 0, 'n' + str(path) + '\n', warning))
+        assert talk.activity(str(path), sid) is True
+        assert 'permission limits' in send()
+        assert not spawned
+
+    @pytest.mark.parametrize('problem', [
+        'same-device', 'target-mount', 'missing-device', 'extra-warning',
+        'other-filesystem', 'relative-mount', 'linux', 'bad-exit', 'missing-file',
+    ])
+    def test_incomplete_legacy_activity_never_resumes(self, setup, monkeypatch, problem):
+        import os
+        import subprocess
+        talk, sessions, sid, path, _, _, spawned, send = setup
+        os.unlink(sessions._home() + '/thread-writer-locks/' + sid + '.lock')
+        monkeypatch.setattr(talk._host, 'is_mac', lambda: problem != 'linux')
+        mount = str(path.parent if problem == 'target-mount'
+                    else path.parent.parent / 'unrelated-DeviceFS')
+        if problem == 'relative-mount':
+            mount = 'relative/DeviceFS'
+        device = path.stat().st_dev + (problem != 'same-device')
+        warning = ('lsof: WARNING: can\'t stat() devicefs file system %s\n'
+                   '      Output information may be incomplete.\n'
+                   '      assuming "dev=%x" from mount table\n' % (mount, device))
+        if problem == 'missing-device':
+            warning = warning[:warning.index('      assuming')]
+        if problem == 'extra-warning':
+            warning += 'lsof: cannot inspect a process\n'
+        if problem == 'other-filesystem':
+            warning = warning.replace('devicefs', 'apfs')
+        if problem == 'missing-file':
+            # Exercise the stat failure without changing rollout discovery.
+            monkeypatch.setattr(talk.os, 'stat', lambda *_a, **_k: (_ for _ in ()).throw(OSError()))
+        monkeypatch.setattr(talk.subprocess, 'run', lambda *a, **k:
+                            subprocess.CompletedProcess(a[0], 2 if problem == 'bad-exit' else 1,
+                                                        '', warning))
+        # Calling activity directly also covers a missing target without
+        # letting the send preflight's project lookup mask that failure.
+        assert talk.activity(str(path), sid) is None
+        if problem != 'missing-file':
+            assert 'activity could not be verified' in send()
+        assert not spawned
+
     @pytest.mark.parametrize('roots', [['/outside'], 'not-a-list', [None]])
     def test_queue_refuses_external_or_malformed_write_grants(self, setup, roots):
         talk, _, _, path, workspace, _, _, _ = setup

@@ -7,6 +7,7 @@ cannot: its sandbox flags are ignored for an existing thread (verified on
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 
@@ -110,6 +111,41 @@ def queue_safe(path):
             and sandbox.get("network_access") is False)
 
 
+def _lsof_complete_for(path, stderr):
+    """Only tolerate missing DeviceFS mount metadata on a different device.
+
+    Darwin lsof can recover a mount's device number from its mount table
+    when stat fails. That warning cannot hide a reference to our file on
+    another device. All other diagnostics, including an unknown device or
+    a warning about the target's own filesystem, still make absence unknown.
+    Never use -w: it also hides diagnostics that do affect this search.
+    """
+    if not stderr.strip():
+        return True
+    if not _host.is_mac():
+        return False
+    warning = re.compile(
+        r"lsof: WARNING: can't stat\(\) devicefs file system ([^\r\n]+)\n"
+        r'[ \t]+Output information may be incomplete\.\n'
+        r'[ \t]+assuming "dev=([0-9a-fA-F]+)" from mount table(?:\n|$)')
+    try:
+        target = os.path.realpath(path)
+        device = os.stat(target).st_dev
+        offset = 0
+        while offset < len(stderr):
+            match = warning.match(stderr, offset)
+            if not match:
+                return False
+            mount = os.path.realpath(match[1])
+            if (not os.path.isabs(match[1]) or device == int(match[2], 16)
+                    or os.path.commonpath([target, mount]) == mount):
+                return False
+            offset = match.end()
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def activity(path, sid):
     """True/False/unknown; failure to inspect activity is never 'closed'."""
     if os.path.realpath(path) in sessions.open_rollout_paths([path]):
@@ -127,7 +163,7 @@ def activity(path, sid):
         try:
             result = subprocess.run(["lsof", "-a", "-F", "n", "-u", _host.current_user() or "", path],
                                     capture_output=True, text=True, timeout=3)
-            if result.returncode in (0, 1) and not result.stderr.strip():
+            if result.returncode in (0, 1) and _lsof_complete_for(path, result.stderr):
                 return any(line == "n" + path for line in result.stdout.splitlines())
         except (OSError, subprocess.SubprocessError):
             pass
