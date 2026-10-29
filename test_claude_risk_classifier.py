@@ -22887,7 +22887,9 @@ class TestTheTravelEnvelope:
                                                      body=json.dumps({"id": "no-such-card",
                                                                       "decision": "allow"}).encode())
             assert status == 200 and headers.get("Content-Type") == "application/octet-stream"
-            for word in (b"decision", b"no-such-card", b"ok"):
+            # '"ok"', quotes and all: a bare b"ok" is two bytes, which random
+            # ciphertext of this length holds about once in 800 runs.
+            for word in (b"decision", b"no-such-card", b'"ok"'):
                 assert word not in raw
             inner_status, body = self._open(key, raw)
             assert inner_status == 200 and json.loads(body) == {"ok": False}
