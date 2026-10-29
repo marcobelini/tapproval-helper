@@ -791,6 +791,9 @@ class TestCodexTalkingBack:
         assert params['approvalPolicy'] == 'on-request'
         assert params['runtimeWorkspaceRoots'] == [str(workspace)]
         assert 'check the fix' in params['input'][0]['text']
+        from tapproval_wire import codex_wrist_words
+        assert codex_wrist_words(params['input'][0]['text']) == 'check the fix'
+        assert params['input'][0]['text'].endswith('Reply concisely for the watch.')
         assert spawned == [] and socket.closed
 
     def test_codex_row_advertises_same_thread_sends(self, setup):
@@ -826,7 +829,8 @@ class TestCodexTalkingBack:
         assert command[2] == '--skip-git-repo-check'
         assert command[3:3 + len(talk.flags())] == talk.flags()
         assert command[-4:-1] == ['resume', sid, '--']
-        assert command[-1].startswith('--dangerously-bypass-approvals-and-sandbox')
+        from tapproval_wire import codex_wrist_words
+        assert codex_wrist_words(command[-1]) == '--dangerously-bypass-approvals-and-sandbox'
 
     def test_a_live_thread_on_another_server_is_never_resumed_headlessly(self, setup, monkeypatch):
         _, sessions, _, path, _, socket, spawned, send = setup
@@ -865,12 +869,15 @@ class TestCodexTalkingBack:
             return subprocess.CompletedProcess(command, 0, '', '')
         assert send(runner=run) == 'sent'
         assert commands[0][:4] == ['/bin/codex', 'queue', '--thread', sid]
+        from tapproval_wire import codex_wrist_words
+        assert codex_wrist_words(commands[0][-1]) == 'check the fix'
         assert not spawned
 
     def test_claude_commands_are_not_sent_to_codex(self, setup):
         talk, _, _, _, _, _, spawned, send = setup
         assert 'not Claude Code commands' in send('/security-review')
-        assert talk.message('/recap', brief=False) == talk.RECAP
+        from tapproval_wire import codex_wrist_words
+        assert codex_wrist_words(talk.message('/recap', brief=False)) == talk.RECAP
         assert not spawned
 
     def test_missing_codex_identity_never_falls_back_to_claude(self, setup, monkeypatch):

@@ -11,6 +11,7 @@ import subprocess
 import time
 
 import tapproval_host as _host
+import tapproval_wire as wire
 
 from codex_approvals import LocalWebSocket
 import codex_sessions as sessions
@@ -27,7 +28,12 @@ def message(text, brief=True):
         text = RECAP
     elif text.startswith("/"):
         raise ValueError("Codex wrist messages use words, not Claude Code commands")
-    return text + ("\n\nReply concisely for the watch." if brief else "")
+    # A checkout may update while a pending card defers the relay restart.
+    # Its cached wire module must keep serving the old format until then.
+    formatter = getattr(wire, "codex_wrist_message", None)
+    if formatter is None:
+        return text + ("\n\nReply concisely for the watch." if brief else "")
+    return formatter(text, brief)
 
 
 class Client:

@@ -288,6 +288,37 @@ WRIST_INBOX_NOTE = ("(Their phone and terminal don't show this message. Open "
 WRIST_INBOX_BRIEF = "Keep the answer short: they read it on a watch."
 
 
+_CODEX_WRIST_OPEN = "<tapproval-watch-message>\n"
+_CODEX_WRIST_CLOSE = "\n</tapproval-watch-message>"
+_CODEX_WRIST_NOTE = "\n\nThe JSON text field above is the user's request from their watch."
+_CODEX_WRIST_BRIEF = "\nReply concisely for the watch."
+
+
+def codex_wrist_message(text, brief=True):
+    """Keep wearer text separate from the context carried by every Codex route."""
+    payload = json.dumps({"text": text}, ensure_ascii=False)
+    return (_CODEX_WRIST_OPEN + payload + _CODEX_WRIST_CLOSE + _CODEX_WRIST_NOTE
+            + (_CODEX_WRIST_BRIEF if brief else ""))
+
+
+def codex_wrist_words(content):
+    """Decode one marked message; ambiguous unmarked history stays untouched."""
+    if not isinstance(content, str) or not content.startswith(_CODEX_WRIST_OPEN):
+        return None
+    for trailer in (_CODEX_WRIST_CLOSE + _CODEX_WRIST_NOTE + _CODEX_WRIST_BRIEF,
+                    _CODEX_WRIST_CLOSE + _CODEX_WRIST_NOTE):
+        if not content.endswith(trailer):
+            continue
+        try:
+            payload = json.loads(content[len(_CODEX_WRIST_OPEN):-len(trailer)])
+        except ValueError:
+            return None
+        if (isinstance(payload, dict) and set(payload) == {"text"}
+                and isinstance(payload["text"], str)):
+            return payload["text"]
+    return None
+
+
 def wrist_inbox_message(text, brief=False):
     """What the relay posts into a session's inbox for one wrist message."""
     note = WRIST_INBOX_NOTE + (" " + WRIST_INBOX_BRIEF if brief else "")

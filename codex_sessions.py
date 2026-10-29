@@ -21,6 +21,7 @@ import time
 from collections import OrderedDict
 
 import tapproval_host as _host
+import tapproval_wire as wire
 
 
 _MAX_CANDIDATES = 128
@@ -359,6 +360,11 @@ def _fold(state, row, number):
     if role == "user" and raw.startswith((shape("user.environment"),
                                            "# AGENTS.md instructions for ")):
         return
+    if role == "user":
+        decoder = getattr(wire, "codex_wrist_words", None)
+        words = decoder(raw) if decoder else None
+        if words is not None:
+            raw = words
     if not raw:
         return
     from watch_dashboard import blocks, plain_text

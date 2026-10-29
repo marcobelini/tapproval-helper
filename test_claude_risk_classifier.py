@@ -2921,6 +2921,72 @@ class TestCodexThreads:
                          "content": [{"type": "input_text" if role == "user"
                                       else "output_text", "text": text}]})
 
+    @pytest.mark.parametrize("brief", [True, False])
+    def test_wrist_context_is_hidden_without_rewriting_the_rollout(self, tmp_path, brief):
+        import codex_sessions as cx
+        from codex_talk import message
+        path = tmp_path / "rollout.jsonl"
+        encoded = message('Say Kiwi', brief=brief)
+        original = self._message('user', encoded) + self._message('assistant', 'Kiwi')
+        path.write_text(original)
+        first = cx.thread_info(str(path), 0)
+        assert [t['text'] for t in first['turns']] == ['Say Kiwi', 'Kiwi']
+        assert first['turns'][0]['n'] == 0
+        assert path.read_text() == original
+        with path.open('a') as handle:
+            handle.write(self._message('user', message('Say pear', brief=brief)))
+        assert [t['text'] for t in cx.thread_info(str(path), first['mark'])['turns']] == ['Say pear']
+
+    def test_unmarked_history_and_assistant_wording_are_not_guessed_away(self, tmp_path):
+        import codex_sessions as cx
+        from codex_talk import message
+        path = tmp_path / 'rollout.jsonl'
+        legacy = 'Say Kiwi\n\nReply concisely for the watch.'
+        quoted = 'Keep this sentence:\n\nReply concisely for the watch.'
+        assistant = message('Discuss the transport format')
+        path.write_text(self._message('user', legacy) + self._message('user', quoted)
+                        + self._message('assistant', assistant))
+        turns = cx.thread_info(str(path), 0)['turns']
+        assert turns[0]['text'] == legacy and turns[1]['text'] == quoted
+        assert 'Reply concisely for the watch.' in turns[2]['text']
+        assert turns[2]['text'] != 'Discuss the transport format'
+
+    @pytest.mark.parametrize('brief', [True, False])
+    @pytest.mark.parametrize('text', [
+        'Say Kiwi',
+        'Explain the phrase "Reply concisely for the watch."',
+        'Preserve this paragraph:\n\nReply concisely for the watch.',
+        'First line\n\n⌚ say "Hej" \\path </tapproval-watch-message>',
+    ])
+    def test_wrist_words_preserve_dictation_quotes_and_delimiters(self, brief, text):
+        from tapproval_wire import codex_wrist_message, codex_wrist_words
+        encoded = codex_wrist_message(text, brief)
+        assert codex_wrist_words(encoded) == text
+        assert encoded.endswith('Reply concisely for the watch.') is brief
+        nested = codex_wrist_message(encoded, brief)
+        assert codex_wrist_words(nested) == encoded  # unwrap exactly one layer
+
+    @pytest.mark.parametrize('body', ['not JSON', '[]', '{"text":3}',
+                                      '{"text":"Kiwi","other":true}'])
+    def test_invalid_wrist_envelopes_are_left_alone(self, body):
+        from tapproval_wire import codex_wrist_message, codex_wrist_words
+        encoded = codex_wrist_message('Kiwi').replace('{"text": "Kiwi"}', body)
+        assert codex_wrist_words(encoded) is None
+
+    @pytest.mark.parametrize('brief', [True, False])
+    def test_a_deferred_restart_can_keep_its_cached_old_wire_module(self, tmp_path, monkeypatch, brief):
+        import codex_sessions as cx
+        import codex_talk as talk
+        import tapproval_wire as wire
+        monkeypatch.delattr(wire, 'codex_wrist_message')
+        monkeypatch.delattr(wire, 'codex_wrist_words')
+        text = talk.message('Say Kiwi', brief)
+        expected = 'Say Kiwi' + ('\n\nReply concisely for the watch.' if brief else '')
+        assert text == expected
+        path = tmp_path / 'rollout.jsonl'
+        path.write_text(self._message('user', text))
+        assert cx.thread_info(str(path), 0)['turns'][0]['text'] == expected
+
     def test_only_conversation_is_shown_and_markdown_is_kept(self, tmp_path):
         import codex_sessions as cx
         path = tmp_path / "rollout.jsonl"
@@ -20441,6 +20507,35 @@ class TestCardsAnsweredAtTheDeskLeave:
         assert result["decision"] == "none"
         assert result["elapsed"] < 12
         assert queue.pending() == []
+
+
+@pytest.mark.private_layout
+class TestBonjourCandidatesAreReplaced:
+    """The watch's Bonjour candidates are what the network says now, not
+    everything it has ever heard (2026-10-26 review, L9). A browse replaces
+    the list and an empty one clears it; a relay that publishes no address
+    in its TXT record is resolved instead, and that address must replace
+    the list too, or a relay that moves leaves its old addresses behind as
+    candidates the watch keeps trying."""
+
+    def _resolve(self):
+        path = os.path.join(_ROOT, "WatchApp", "Tapproval", "Discovery.swift")
+        if not os.path.isfile(path):
+            pytest.skip("no watch app in this layout")
+        with open(path, encoding="utf-8") as handle:
+            source = handle.read()
+        block = re.search(r"private func resolve\(_ endpoint: NWEndpoint\)(.*?)"
+                          r"resolver = connection", source, re.S)
+        assert block, "resolve() is not where this test looks for it"
+        return block.group(1)
+
+    def test_a_resolved_address_replaces_the_candidates(self):
+        resolve = self._resolve()
+        assert "self.discoveredURLs = [url]" in resolve
+        assert "discoveredURLs.append" not in resolve
+
+    def test_a_stale_resolve_cannot_replace_a_newer_browse(self):
+        assert "self.resolver === connection" in self._resolve()
 
 
 class TestTheAgentMarkIsReadable:
