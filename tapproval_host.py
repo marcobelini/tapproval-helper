@@ -590,6 +590,181 @@ def owner_only(path):
             and all(len(ace) >= 6 and ace[5] in mine and "ID" not in ace[1] for ace in grants))
 
 
+# ---- the person at this computer ---------------------------------------------
+
+def has_screen():
+    """True where a window can be shown to someone sitting here: always on
+    Windows and macOS sessions, and on Linux only with a display."""
+    if native_windows() or is_mac():
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _which(name):
+    import shutil
+    return shutil.which(name)
+
+
+def ask_person(title, text, allow, deny, seconds):
+    """Ask whoever sits at this Linux or Windows computer a yes-or-no on its
+    screen. (True, how) only when they chose ``allow``; (False, why)
+    otherwise: they said no, did not answer within ``seconds``, or there is
+    no screen or no way to show one. Fails closed; never raises. macOS asks
+    through osascript in the relay, unchanged."""
+    import subprocess
+    if not has_screen():
+        return False, "no screen to ask on"
+    try:
+        if native_windows():
+            # WScript.Shell's Popup is the one built-in dialog that gives up
+            # by itself. 4 = Yes and No, 48 = a warning, 256 = No is the
+            # default; 6 is Yes. The words go in by the environment, never
+            # into the script's text.
+            script = ("$s = New-Object -ComObject WScript.Shell; "
+                      "exit $s.Popup($env:TAPPROVAL_ASK_TEXT, %d, $env:TAPPROVAL_ASK_TITLE, 308)"
+                      % int(seconds))
+            env = dict(os.environ, TAPPROVAL_ASK_TEXT="%s\n\nYes: %s.  No: %s."
+                       % (text, allow, deny), TAPPROVAL_ASK_TITLE=title)
+            done = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive",
+                                   "-Command", script], env=env, capture_output=True,
+                                  timeout=seconds + 15)
+            if done.returncode == 6:
+                return True, "allowed on this computer"
+            return False, "not answered" if done.returncode == -1 else "not allowed"
+        if _which("zenity"):
+            done = subprocess.run(["zenity", "--question", "--title", title, "--text", text,
+                                   "--ok-label", allow, "--cancel-label", deny,
+                                   "--default-cancel", "--timeout", str(int(seconds))],
+                                  capture_output=True, timeout=seconds + 15)
+            if done.returncode == 0:
+                return True, "allowed on this computer"
+            return False, "not answered" if done.returncode == 5 else "not allowed"
+        if _which("kdialog"):
+            done = subprocess.run(["kdialog", "--title", title, "--yes-label", allow,
+                                   "--no-label", deny, "--warningyesno", text],
+                                  capture_output=True, timeout=seconds)
+            if done.returncode == 0:
+                return True, "allowed on this computer"
+            return False, "not allowed"
+        return False, "no dialog program (zenity or kdialog) to ask with"
+    except subprocess.TimeoutExpired:
+        return False, "not answered"
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, str(error)
+
+
+# ---- signing in at login -----------------------------------------------------
+
+def login_file_path():
+    """Where a file that wakes the relay at every login lives, on hosts
+    that have no launchd: XDG autostart on Linux, the Startup folder on
+    Windows (neither needs an administrator). None on macOS, whose login
+    job is launchd's."""
+    if is_mac():
+        return None
+    if is_windows():
+        base = os.environ.get("APPDATA") or os.path.join(
+            os.path.expanduser("~"), "AppData", "Roaming")
+        return os.path.join(base, "Microsoft", "Windows", "Start Menu", "Programs",
+                            "Startup", "Tapproval relay.cmd")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config")
+    return os.path.join(base, "autostart", "tapproval-relay.desktop")
+
+
+def login_file_text(python, relay):
+    """The login file's contents, running ``relay --ensure`` once: it starts
+    the relay if none answers and exits, as the Mac's job does."""
+    if is_windows():
+        quiet = os.path.join(os.path.dirname(python), "pythonw.exe")
+        if os.path.exists(quiet):
+            python = quiet                       # no console window at login
+        return '@echo off\r\nstart "" "%s" "%s" --ensure\r\n' % (python, relay)
+    def quoted(word):
+        # The Desktop Entry spec's quoting: double quotes, with \\ \" \` \$.
+        for char in '\\"`$':
+            word = word.replace(char, "\\" + char)
+        return '"%s"' % word
+    return ("[Desktop Entry]\nType=Application\nName=Tapproval relay\n"
+            "Comment=Lets your watch reach this computer after a restart\n"
+            "Exec=%s %s --ensure\nTerminal=false\nNoDisplay=true\n"
+            "X-GNOME-Autostart-enabled=true\n" % (quoted(python), quoted(relay)))
+
+
+# ---- a terminal window -------------------------------------------------------
+
+def powershell_literal(text):
+    """``text`` as a PowerShell single-quoted string. PowerShell also closes
+    such a string on the typographic single quotes, so each is doubled."""
+    text = str(text)
+    for quote in "'‘’‚‛":
+        text = text.replace(quote, quote * 2)
+    return "'%s'" % text
+
+
+_TERMINALS = (                              # (program, what goes before the command)
+    ("gnome-terminal", ["--"]),
+    ("konsole", ["-e"]),
+    ("xfce4-terminal", ["-x"]),
+    ("kitty", []),
+    ("alacritty", ["-e"]),
+    # Debian's alternative last but one: its -e takes one word on some
+    # terminals, and the named ones above are asked for by their own rule.
+    ("x-terminal-emulator", ["-e"]),
+    ("xterm", ["-e"]),
+)
+
+
+def open_terminal(posix_script, powershell_script):
+    """Open a new terminal window running one script, as someone at this
+    Linux or Windows computer would: ``posix_script`` in bash on Linux,
+    ``powershell_script`` in PowerShell on Windows. (True, "") once the
+    window was asked for, (False, why) otherwise. Never raises."""
+    import base64
+    import subprocess
+    if not has_screen():
+        return False, "no screen to open a terminal on"
+    try:
+        if native_windows():
+            # Encoded, so no quoting layer between here and PowerShell can
+            # read the wearer's words as anything but the script's own.
+            encoded = base64.b64encode(powershell_script.encode("utf-16-le")).decode("ascii")
+            subprocess.Popen(["powershell.exe", "-NoExit", "-NoProfile",
+                              "-EncodedCommand", encoded],
+                             creationflags=0x00000010,          # CREATE_NEW_CONSOLE
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            return True, ""
+        for program, before in _TERMINALS:
+            found = _which(program)
+            if found:
+                popen_detached([found] + before + ["bash", "-c", posix_script],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                return True, ""
+        return False, "no terminal program found"
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, str(error)
+
+
+def cloudflared_install():
+    """How this host's people install cloudflared, as words to show them."""
+    if is_mac():
+        return "brew install cloudflared"
+    if is_windows():
+        return "winget install --id Cloudflare.cloudflared"
+    return "your package manager (the package is cloudflared)"
+
+
+def scratch_roots(roots):
+    """The folders whose contents are scratch, never projects: ``roots``,
+    and on Windows its temp folder, which is not under /tmp."""
+    if not native_windows():
+        return tuple(roots)
+    import tempfile
+    return tuple(roots) + (tempfile.gettempdir(),)
+
+
 # ---- hook streams ------------------------------------------------------------
 
 def read_stdin_text():

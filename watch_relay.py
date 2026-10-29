@@ -2019,17 +2019,25 @@ def _run_osascript(script, timeout=4):
 
 
 def ask_owner_to_pair(client_ip):
-    """True only when the person at this Mac clicked Allow.
+    """True only when the person at this computer clicked Allow.
 
-    Plain ``display dialog`` from osascript: it needs no automation consent,
-    so it cannot hang on one the way scripting Terminal does. Don't Allow,
-    no click within PAIR_ASK_SECONDS, no screen to show it on, or no
-    osascript at all (Linux) are all a no — fail closed; ``--pair`` is the
-    way in there."""
+    On a Mac, plain ``display dialog`` from osascript: it needs no
+    automation consent, so it cannot hang on one the way scripting Terminal
+    does. On Linux and Windows, the desktop's own dialog
+    (tapproval_host.ask_person). Don't Allow, no click within
+    PAIR_ASK_SECONDS, or no screen to show it on are all a no — fail
+    closed; ``--pair`` is the way in there."""
     text = ("A watch at %s on your network wants to pair with this "
             "computer and answer its Claude Code prompts.\n\n"
             "Allow it only if it is your watch and you just opened "
             "Tapproval on it." % client_ip)
+    if not _host.is_mac():
+        allowed, said = _host.ask_person("Tapproval", text, "Allow", "Don't Allow",
+                                         PAIR_ASK_SECONDS)
+        print("relay: pairing from %s %s" % (
+            client_ip, "allowed at this computer" if allowed else "not allowed: " + said),
+            file=sys.stderr)
+        return allowed
     script = ('display dialog %s with title "Tapproval" '
               'buttons {"Don\'t Allow", "Allow"} default button "Don\'t Allow" '
               'cancel button "Don\'t Allow" with icon caution '
@@ -2525,7 +2533,8 @@ def known_skills(cwd=None, home=None, now=None):
 # Folders that hold throwaway work — Claude Code's own scratchpads live
 # under /tmp. A module constant so the tests, whose temporary projects live
 # there too on Linux, can say so.
-SCRATCH_ROOTS = ("/tmp", "/private/tmp")
+# Windows adds its temp folder, which is not under /tmp.
+SCRATCH_ROOTS = _host.scratch_roots(("/tmp", "/private/tmp"))
 
 # Where a person keeps code, by the names people give that folder, for the
 # Mac that has never run Claude Code: the first session has to start
@@ -2839,7 +2848,7 @@ def trust_folder(path, config=None):
 
 
 def start_session(path, text, projects_dir=None, platform=None):
-    """Open a REAL Claude Code session on this Mac, in ``path``, with ``text``
+    """Open a REAL Claude Code session on this computer, in ``path``, with ``text``
     as its first message. Returns a short status; "started" on success.
 
     Not ``claude -p``: that is headless, and a headless session never fires
@@ -2863,8 +2872,9 @@ def start_session(path, text, projects_dir=None, platform=None):
         # First in Claude Code's prompt, `!` runs the rest as a shell
         # command with no card, and `#` writes memory (2026-09-25 review).
         return "a first message cannot start with ! or #"
-    if (platform or sys.platform) != "darwin":
-        return "new sessions need a Mac"
+    # Which window to open: Terminal on a Mac, the desktop's own terminal
+    # on Linux and Windows. ``platform`` lets a test stand in for a host.
+    on_mac = _host.is_mac() if platform is None else platform == "darwin"
     path = os.path.expanduser(str(path or ""))
     project = next((row for row in known_projects(projects_dir) if row["path"] == path), None)
     if project is None:
@@ -2899,6 +2909,28 @@ def start_session(path, text, projects_dir=None, platform=None):
         script = 'unset %s; cd %s && %s' % (
             " ".join(HOST_SESSION_MARKERS), shlex.quote(path),
             shlex.join([binary] + flags() + ["--", text]))
+    if not on_mac:
+        # The same session in PowerShell words for Windows; Linux runs the
+        # bash script above. Every word is a literal, the binary's included.
+        words = ([binary] + flags() if codex
+                 else ["claude", "--settings", BRIEF_REPLY_SETTINGS]) + ["--", text]
+        if _host.is_windows():
+            # A program, never a .cmd or .ps1 wrapper (npm's): a batch file
+            # reads its arguments again, so "a&calc" in the wearer's text
+            # would run calc. Claude Code's and Codex's own installers give
+            # an .exe; anything else is refused, in words.
+            program = binary if codex else shutil.which("claude")
+            if not program or not program.lower().endswith(".exe"):
+                return "new sessions need %s's own installer on Windows" % (
+                    "Codex" if codex else "Claude Code")
+            words[0] = program
+        windows = "%s; Set-Location -LiteralPath %s -ErrorAction Stop; & %s" % (
+            "; ".join("Remove-Item -ErrorAction SilentlyContinue Env:%s" % name
+                      for name in HOST_SESSION_MARKERS),
+            _host.powershell_literal(path),
+            " ".join(_host.powershell_literal(word) for word in words))
+        ok, why = _host.open_terminal(script, windows)
+        return started if ok else "could not open a terminal: %s" % why
     # json.dumps is the right escaper for the quotes and backslashes an
     # AppleScript string literal understands — but only with
     # ensure_ascii=False. Left at its default it writes \u00e5 for "å",
@@ -5782,7 +5814,7 @@ def start_tunnel(port, token):
         note_condition(
             "tunnel",
             "Answering from away is off: cloudflared is not installed on "
-            "this computer. Install it with: brew install cloudflared")
+            "this computer. Install it with: %s" % _host.cloudflared_install())
         return None
     adopted = _adoptable_tunnel(port)
     if adopted and _tunnel_answers_soon(adopted["url"], token,

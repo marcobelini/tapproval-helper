@@ -111,7 +111,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.93"
+__version__ = "1.1.94"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -3921,10 +3921,11 @@ def install_launch_agent():
     The agent runs ``watch_relay.py --ensure`` once at load — idempotent
     and exits immediately — so it can never fight the SessionStart hook
     over the port. Crash recovery between logins stays with that hook.
-    Returns True when the agent is in place. macOS only; never raises.
+    Returns True when the agent is in place. Never raises. Linux and
+    Windows have no launchd: a login file does the same there.
     """
     if not _host.is_mac():
-        return False
+        return _install_login_file()
     relay = _relay_path()
     if not os.path.exists(relay):
         return False
@@ -3958,6 +3959,27 @@ def install_launch_agent():
     return True
 
 
+def _login_file():
+    """Where the login file goes: the test override, or the host's own."""
+    return os.environ.get("CLAUDE_LAUNCH_AGENT_PATH") or _host.login_file_path()
+
+
+def _install_login_file():
+    """Linux's XDG autostart entry or Windows' Startup-folder file, running
+    ``watch_relay.py --ensure`` at each login, as the Mac's launchd job does.
+    True when it is in place."""
+    relay, target = _relay_path(), _login_file()
+    if not target or not os.path.exists(relay):
+        return False
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8", newline="") as handle:
+            handle.write(_host.login_file_text(sys.executable, relay))
+        return True
+    except OSError:
+        return False
+
+
 def wake_relay_at_login():
     """Make sure something wakes the relay at login. A bridge from 1.1.0
     does it, as part of the one "Tapproval" item in Login Items, and the
@@ -3978,7 +4000,12 @@ def wake_relay_at_login():
 def remove_launch_agent():
     """Take the login wake-up out again — part of a clean exit."""
     if not _host.is_mac():
-        return False
+        target = _login_file()
+        try:
+            os.remove(target)
+            return True
+        except (OSError, TypeError):
+            return False
     if _launch_agent_is_real():
         _launchctl("bootout", "gui/%d/com.tapproval.relay" % os.getuid())
     try:
