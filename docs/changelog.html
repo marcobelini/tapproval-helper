@@ -23,6 +23,19 @@
 <main class="policy">
 <h1>Changelog</h1>
 <p><em>Every release of Tapproval Base, the helper on your computer, newest first. Starting Claude Code once updates it. Generated from <a href="https://github.com/marcobelini/tapproval-helper/releases">the releases on GitHub</a>, which may already hold a newer one. Security fixes are also explained on <a href="security.html">the security page</a>.</em></p>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.94">1.1.94</a></h2>
+<p><em>2026-10-29</em></p>
+<p>On a Mac, one card that iCloud refuses no longer holds back the cards behind it: that card waits for its own retry, and the rest still reach a closed watch. Only a refusal that affects every card (iCloud busy or down, signed out, no network) still pauses them all. On Linux and Windows, pairing, waking at login and starting a session from the wrist now work as on a Mac.</p>
+<h3>Since 1.1.93</h3>
+<ul>
+<li>Mac bridge 1.1.2, notarized: a CloudKit save refused for one card gives that card its own next try instead of pausing every save (#1021, #1032).</li>
+<li>Linux and Windows: the first pairing asks the person at the computer (zenity or kdialog on Linux, a Yes/No popup on Windows); no screen or no answer counts as no (#1028).</li>
+<li>Linux and Windows: the relay wakes by itself at login, from an autostart entry or the Startup folder, with no administrator rights; uninstall removes it (#1028).</li>
+<li>Linux and Windows: New session from the wrist opens the desktop's terminal, or PowerShell on Windows, with every word quoted as plain text. On Windows only a real <code>claude.exe</code> or <code>codex.exe</code> is used (#1028).</li>
+<li>Windows' temp folder counts as scratch and is never offered as a project; the cloudflared hint names each system's own installer (#1028).</li>
+<li>The README says what the helper does on each kind of computer, with a Windows (preview) section (#1033).</li>
+</ul>
+<p>Windows is tested on GitHub's Windows machines, not yet on a real PC. The closed-app buzz stays Mac-only.</p>
 <h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.93">1.1.93</a></h2>
 <p><em>2026-10-28</em></p>
 <p>The helper now runs on Windows, as well as on macOS and Linux. On a Windows PC it installs, starts its relay, puts a card on the watch and carries Allow or Deny back to Claude Code. Every change is tested on Linux, Windows and macOS, on Python 3.9 to 3.13, including a real install, a wrist Allow, a Deny and an uninstall on each. Nothing changes on a Mac.</p>
