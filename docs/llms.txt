@@ -5,6 +5,8 @@
 > watch, marked with one of five risk tiers, and one tap answers it.
 > No account and no server of ours. Independent; not affiliated with Anthropic.
 > Made for Claude Code users and vibe coders who step away while Claude works.
+> Not to be confused with tapproval.vercel.app, a separate phone-notification
+> tool by another developer.
 
 ## What it does
 - Approve or deny Claude Code permission prompts with one tap on the watch.
@@ -26,7 +28,10 @@
 
 ## What it needs
 - An Apple Watch running watchOS 10 or later.
-- Claude Code on a Mac or a Linux machine.
+- Claude Code on a Mac or a Linux machine, or on Windows as a preview
+  (tested on GitHub's Windows machines, not yet on a real PC). The buzz
+  while the app is closed is Mac-only; elsewhere cards wait until the app
+  is opened.
 - Tapproval Base, the free, open-source helper (MIT licence; the
   tapproval-helper plugin and repository), which Claude Code installs
   when told: "Install the Tapproval plugin from marcobelini/tapproval-helper".

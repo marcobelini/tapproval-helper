@@ -15618,6 +15618,71 @@ class TestTheSiteMapMatchesTheSite:
 
 
 @pytest.mark.private_layout
+class TestTheSitemapDatesFollowThePages:
+    """Hand-kept lastmod dates fell behind: on 2026-10-29 five of eight
+    were older than their pages, so search engines were told nothing had
+    moved. render-sitemap.py derives them from git when the site syncs."""
+
+    SITE = "https://tapproval.thoughtfulsteward.org/"
+
+    @pytest.fixture
+    def sitemap(self):
+        path = os.path.join(_ROOT, "render-sitemap.py")
+        if not os.path.exists(path):
+            pytest.skip("render-sitemap.py lives in the product repo only")
+        spec = importlib.util.spec_from_file_location("render_sitemap", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _repo(self, tmp_path, day):
+        repo = tmp_path / "repo"
+        (repo / "helper" / "docs").mkdir(parents=True)
+        (repo / "helper" / "docs" / "index.html").write_text("home")
+        (repo / "helper" / "docs" / "guide.html").write_text("guide")
+        stamp = "%sT12:00:00" % day
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid",
+                   GIT_AUTHOR_DATE=stamp, GIT_COMMITTER_DATE=stamp)
+        for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "pages"]):
+            subprocess.run(["git", "-C", str(repo)] + args, env=env, check=True,
+                           capture_output=True)
+        return repo
+
+    def _xml(self, *entries):
+        return "".join("<url><loc>%s%s</loc><lastmod>%s</lastmod></url>\n"
+                       % (self.SITE, loc, day) for loc, day in entries)
+
+    def test_a_stale_date_takes_the_pages_last_commit(self, sitemap, tmp_path):
+        repo = self._repo(tmp_path, "2026-10-20")
+        xml = self._xml(("", "2026-10-01"), ("guide.html", "2026-10-01"))
+        def day_of(page):
+            return sitemap.changed_on(page, root=str(repo))
+        assert sitemap.refresh(xml, day_of) == self._xml(
+            ("", "2026-10-20"), ("guide.html", "2026-10-20"))
+
+    def test_a_page_a_renderer_just_rewrote_is_dated_today(self, sitemap, tmp_path):
+        repo = self._repo(tmp_path, "2026-10-20")
+        (repo / "helper" / "docs" / "guide.html").write_text("guide, re-rendered")
+        import datetime as _dt
+        today = _dt.date(2026, 10, 29)
+        assert sitemap.changed_on("guide.html", root=str(repo), today=today) == "2026-10-29"
+        assert sitemap.changed_on("index.html", root=str(repo), today=today) == "2026-10-20"
+
+    def test_without_git_every_date_stays(self, sitemap, tmp_path):
+        xml = self._xml(("", "2026-10-01"))
+        def day_of(page):
+            return sitemap.changed_on(page, root=str(tmp_path))
+        assert sitemap.refresh(xml, day_of) == xml
+
+    def test_the_sync_runs_it_before_the_site_is_copied(self):
+        path = os.path.join(_ROOT, "sync-helper.sh")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        assert text.index("python3 render-sitemap.py") < text.index('copy_public_tree "$CLONE"\n')
+
+
+@pytest.mark.private_layout
 class TestTheChangelogPageNeverGoesBlank:
     """render-changelog.py fetches the releases with gh. When that fails —
     offline, logged out, rate-limited — the page it already has must stay:
@@ -15863,7 +15928,8 @@ class TestTheSyncRefusesAStalePage:
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
         start = text.index("if command -v uvx >/dev/null 2>&1; then\n  if ! python3 render-privacy.py")
-        end = text.index('copy_public_tree "$CLONE"', start)
+        # The renderers' block ends where the sitemap's dates are set.
+        end = text.index("python3 render-sitemap.py", start)
         return text[start:end]
 
     def _repo(self, tmp_path, gh_body, privacy_changed=False,

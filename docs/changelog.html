@@ -23,6 +23,10 @@
 <main class="policy">
 <h1>Changelog</h1>
 <p><em>Every release of Tapproval Base, the helper on your computer, newest first. Starting Claude Code once updates it. Generated from <a href="https://github.com/marcobelini/tapproval-helper/releases">the releases on GitHub</a>, which may already hold a newer one. Security fixes are also explained on <a href="security.html">the security page</a>.</em></p>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.96">Helper 1.1.96</a></h2>
+<p><em>2026-10-29</em></p>
+<p>Fix closed-session Codex replies on macOS when an inaccessible DeviceFS mount belongs to another filesystem.</p>
+<p>The helper recognizes only that complete, unrelated mount warning. Unknown activity, other diagnostics and live writer locks still prevent headless resumption. The existing internal Watch beta remains compatible; no new Watch build is required for this correction. Codex 3.0's remaining physical validation and everyday-use gates remain open.</p>
 <h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.94">1.1.94</a></h2>
 <p><em>2026-10-29</em></p>
 <p>On a Mac, one card that iCloud refuses no longer holds back the cards behind it: that card waits for its own retry, and the rest still reach a closed watch. Only a refusal that affects every card (iCloud busy or down, signed out, no network) still pauses them all. On Linux and Windows, pairing, waking at login and starting a session from the wrist now work as on a Mac.</p>
