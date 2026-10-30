@@ -60,6 +60,40 @@ from ClaudeRiskClassifier import Risk
 _POLL = 0.02
 
 
+_HOOKS = threading.excepthook, sys.excepthook
+_LAST_TEST = [None]
+
+
+def _crash_hooks_put_back(test):
+    """Put back the excepthooks the suite started with; fail, naming
+    ``test``, if they had been changed."""
+    left = (threading.excepthook, sys.excepthook) != _HOOKS
+    threading.excepthook, sys.excepthook = _HOOKS
+    if left:
+        pytest.fail("%s left the relay's crash hooks installed; patch "
+                    "install_crash_reporting or both excepthooks" % test)
+
+
+@pytest.fixture(autouse=True)
+def _no_crash_hooks_left_behind(request):
+    """A test that runs the relay's main() installs its crash hooks, and
+    they outlive the test: every later thread that dies — test_codex_approvals'
+    fake sockets among them — then writes into the owner's real crash log,
+    where the desk counted six such "Empty" crashes as the helper's own
+    (2026-10-30). Checked as the next test starts, because only then has
+    every monkeypatch of the last one been undone."""
+    blamed, _LAST_TEST[0] = _LAST_TEST[0], request.node.nodeid
+    _crash_hooks_put_back(blamed)
+    yield
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _no_crash_hooks_left_at_the_end():
+    """The same for the file's last test, which has no next one here."""
+    yield
+    _crash_hooks_put_back(_LAST_TEST[0])
+
+
 @pytest.fixture(autouse=True)
 def _no_leftover_conditions():
     """The relay's condition registry is module-wide, like SITE_RULES: a
@@ -12963,6 +12997,7 @@ class TestTheHelperReportsItsOwnCrashes:
         monkeypatch.delenv(crash_report.KEY_ENV, raising=False)
         chained = []
         monkeypatch.setattr(threading, "excepthook", lambda args: chained.append(args))
+        monkeypatch.setattr(sys, "excepthook", sys.excepthook)
         assert watch_relay.install_crash_reporting() is True
         try:
             def angry():
@@ -13612,6 +13647,7 @@ class TestTwoRelaysOnePort:
         monkeypatch.setattr(watch_relay, "Auth", lambda: _throwaway_auth(tmp_path))
         monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: None)
         monkeypatch.setattr(watch_relay, "helper_provenance", lambda: None)
+        monkeypatch.setattr(watch_relay, "install_crash_reporting", lambda: None)
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
@@ -14523,16 +14559,24 @@ class TestRelayRoutes:
         assert [t["text"] for t in first["turns"]] == ["Fix it", "Fixed"]
         assert first["reset"] is True
 
+        written_at = []
+
         def finish():
             with rollout.open("a") as handle:
                 handle.write(TestCodexThreads._line("event_msg", {"type": "task_started"}))
+            written_at.append(time.monotonic())
         timer = threading.Timer(0.3, finish)
         timer.start()
         try:
             started = time.monotonic()
             _, news = self._call(base + "/thread?id=cx-thread1&after=%d&wait=3"
                                  % first["mark"], token=auth.bootstrap)
-            assert time.monotonic() - started < 2
+            received_at = time.monotonic()
+            assert received_at - started < 2, {
+                "request_seconds": received_at - started,
+                "writer_seconds": written_at[0] - started if written_at else None,
+                "after_write_seconds": received_at - written_at[0] if written_at else None,
+            }
             assert news["turns"] == [] and news["state"] == "running"
             assert news["reset"] is False and news["mark"] > first["mark"]
         finally:
@@ -14575,10 +14619,13 @@ class TestRelayRoutes:
         assert status == 200 and first["reset"] is True
         assert [t["text"] for t in first["turns"]] == ["Hi"]
 
+        written_at = []
+
         def answer():
             with open(transcript, "a") as handle:
                 handle.write(json.dumps({"message": {"role": "assistant", "content": [
                     {"type": "text", "text": "Hello"}]}, "timestamp": "2"}) + "\n")
+            written_at.append(time.monotonic())
         threading.Timer(0.5, answer).start()
         started = time.monotonic()
         status, news = self._call(base + "/thread?id=eeee5555&after=%d&wait=10"
@@ -14586,7 +14633,11 @@ class TestRelayRoutes:
         took = time.monotonic() - started
         assert status == 200 and [t["text"] for t in news["turns"]] == ["Hello"]
         assert news["reset"] is False and news["mark"] == os.path.getsize(transcript)
-        assert 0.4 < took < 2.0, "answered when the line landed, not at the wait's end"
+        assert 0.4 < took < 2.0, {
+            "request_seconds": took,
+            "writer_seconds": written_at[0] - started if written_at else None,
+            "after_write_seconds": time.monotonic() - written_at[0] if written_at else None,
+        }
 
     def test_a_watch_before_catching_up_is_answered_as_it_always_was(
             self, relay, monkeypatch, tmp_path):
@@ -15709,6 +15760,97 @@ class TestTheSitemapDatesFollowThePages:
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
         assert text.index("python3 render-sitemap.py") < text.index('copy_public_tree "$CLONE"\n')
+
+    def test_the_dates_are_set_on_the_committed_sitemap(self, sitemap, tmp_path):
+        # The sync tolerates this file uncommitted, because a --check
+        # rewrites it; an uncommitted entry must not ride along.
+        repo = self._repo(tmp_path, "2026-10-20")
+        (repo / "helper" / "docs" / "sitemap.xml").write_text(self._xml(("", "2026-10-01")))
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c",
+                        "user.email=t@example.invalid", "commit", "-q", "-m", "map"],
+                       check=True, capture_output=True)
+        (repo / "helper" / "docs" / "sitemap.xml").write_text(
+            self._xml(("", "2026-10-01"), ("stray.html", "2026-10-01")))
+        assert sitemap.committed(str(repo)) == self._xml(("", "2026-10-01"))
+        assert sitemap.committed(str(tmp_path)) is None
+
+
+@pytest.mark.private_layout
+class TestIndexNowIsToldWhatChanged:
+    """After a sync, ping-indexnow.py tells Bing and the other IndexNow
+    engines which pages the push changed. The engines trust the message
+    only if the key file at the site root holds its own name, and the sync
+    must not stop when the doorbell is not heard: the site is already out."""
+
+    @pytest.fixture
+    def ping(self):
+        path = os.path.join(_ROOT, "ping-indexnow.py")
+        if not os.path.exists(path):
+            pytest.skip("ping-indexnow.py lives in the product repo only")
+        spec = importlib.util.spec_from_file_location("ping_indexnow", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_site_carries_one_key_file_holding_its_own_name(self, ping):
+        docs = os.path.join(HELPER_DIR, "docs")
+        keys = [n for n in os.listdir(docs) if ping.KEY_FILE.match(n)]
+        assert len(keys) == 1
+        assert ping.key(docs) == keys[0][:-4]
+
+    def test_only_pages_and_llms_txt_are_announced(self, ping):
+        changed = ["docs/index.html", "docs/compare.html", "docs/sitemap.xml",
+                   "docs/llms.txt", "docs/0123456789abcdef0123456789abcdef.txt",
+                   "docs/img/icon.png"]
+        assert ping.urls_for(changed) == [ping.SITE, ping.SITE + "compare.html",
+                                          ping.SITE + "llms.txt"]
+
+    def test_the_message_names_the_key_where_the_engines_can_check_it(self, ping, tmp_path):
+        (tmp_path / "abcdef0123456789abcdef0123456789.txt").write_text(
+            "abcdef0123456789abcdef0123456789")
+        sent = []
+        def send(body):
+            sent.append(body)
+            return 200
+        assert ping.main(["docs/compare.html"], send=send, docs=str(tmp_path)) == 0
+        assert sent == [{"host": ping.HOST, "key": "abcdef0123456789abcdef0123456789",
+                         "keyLocation": ping.SITE + "abcdef0123456789abcdef0123456789.txt",
+                         "urlList": [ping.SITE + "compare.html"]}]
+
+    def test_nothing_is_sent_without_a_changed_page_or_a_valid_key(self, ping, tmp_path):
+        (tmp_path / "abcdef0123456789abcdef0123456789.txt").write_text("someone else's")
+        sent = []
+        assert ping.main(["docs/sitemap.xml"], send=sent.append, docs=str(tmp_path)) == 0
+        assert ping.main(["docs/index.html"], send=sent.append, docs=str(tmp_path)) == 0
+        assert sent == []
+
+    def test_an_unreachable_service_never_fails_the_sync(self, ping, tmp_path):
+        import urllib.error
+        (tmp_path / "abcdef0123456789abcdef0123456789.txt").write_text(
+            "abcdef0123456789abcdef0123456789")
+        def down(body):
+            raise urllib.error.URLError("offline")
+        assert ping.main(["docs/index.html"], send=down, docs=str(tmp_path)) == 0
+
+    def test_the_sync_rings_only_after_the_push_to_main(self):
+        path = os.path.join(_ROOT, "sync-helper.sh")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        ring = text.index("python3 ping-indexnow.py")
+        assert text.index('git -C "$CLONE" push -q origin main') < ring
+        assert text.index("--check: nothing pushed") < ring
+        assert text.index('push -q --force origin "HEAD:refs/heads/$BRANCH"') < ring
+        assert text[ring:].split("\n", 1)[0].endswith("|| true")
+
+    def test_a_check_leaves_nothing_the_real_sync_refuses(self):
+        # --check runs the renderers, which rewrite these three; the sync
+        # that follows refused the rewritten sitemap on 2026-10-30.
+        path = os.path.join(_ROOT, "sync-helper.sh")
+        with open(path, encoding="utf-8") as handle:
+            dirty = handle.read().split("DIRTY=$(", 1)[1].split(")\n", 1)[0]
+        for page in ("privacy.html", "changelog.html", "sitemap.xml"):
+            assert "':!helper/docs/%s'" % page in dirty
 
 
 @pytest.mark.private_layout
@@ -16964,22 +17106,22 @@ class TestTheLocalFallbackRunsWhatCiRuns:
         block = local[local.index('for version in $PYTHONS; do'):]
         assert "&\n" in block[:400], "each interpreter in the background"
         assert 'wait "${PY_PIDS[$i]}"' in local
-        assert 'record "$code" "pytest $version$note"' in local
+        assert 'record "$code" "pytest $version"' in local
 
-    def test_pytest_runs_alongside_the_watch_jobs_and_is_still_judged(self):
-        """Waiting for pytest before the watch jobs put 80-90 s in front of
-        every run, half of a light one (2026-10-15). It now runs while they
-        do, and is judged before the summary: started but never waited for
-        would be a matrix nobody reads."""
+    def test_pytest_finishes_before_watch_work_and_is_still_judged(self):
+        """Keep the full parallel matrix, without overlapping Xcode and
+        simulators on the same Mac. A started matrix must still be judged
+        in both entry points, including failures, before the summary."""
         _, local = self._files()
+        lint = local.index("# --- lint")
         watch = local.index("# --- the watch app")
         summary = local.index('say "Summary (')
         alone = local.index('[ "$WHICH" = pytest ] && judge_pytest')
         everything = local.index('then judge_pytest; fi')
-        assert alone < watch, "on its own, pytest is judged at once"
-        assert watch < everything < summary, (
-            "in a full run, judged after the watch jobs and before the summary")
-        assert "ran alongside" in local, "the summary says why its time is short"
+        assert alone < lint, "on its own, pytest is judged at once"
+        assert lint < everything < watch < summary, (
+            "in a full run, the matrix finishes before Xcode and simulators start")
+        assert local.count("judge_pytest; fi") == 1 and local.count("&& judge_pytest") == 1
 
     SHELLCHECK = "git ls-files -z '*.sh' ':!:design/**' | xargs -0 shellcheck"
 
