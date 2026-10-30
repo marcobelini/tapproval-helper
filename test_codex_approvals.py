@@ -410,6 +410,240 @@ def test_connection_notice_reports_failure_and_recovery():
     assert "codex_sync" not in relay._CONDITIONS
 
 
+def test_successful_reconciliation_clears_failed_hook_attach_on_same_socket():
+    wire, statuses = Wire(), []
+    adapter = ApprovalSync(CardQueue(), connect=lambda: wire, status=statuses.append)
+    try:
+        assert not adapter.attach("not-on-this-server")
+        assert statuses[-1]
+        wire.loaded.append("not-on-this-server")
+        wire.statuses["not-on-this-server"] = {
+            "type": "active", "activeFlags": ["waitingOnApproval"]}
+        adapter.reconcile()
+        assert statuses[-1] is None
+        assert adapter.last_error is None
+        assert not wire.closed
+        assert [m["params"]["threadId"] for m in wire.sent
+                if m.get("method") == "thread/resume"] == ["not-on-this-server"]
+    finally:
+        adapter.stop()
+
+
+def test_initialize_does_not_clear_warning_before_reconciliation(monkeypatch):
+    wire, statuses = Wire(), []
+    adapter = ApprovalSync(CardQueue(), connect=lambda: wire, status=statuses.append)
+    send = wire.send
+
+    def fail_read(message):
+        if message.get("method") == "thread/read":
+            assert None not in statuses, "handshake alone must not declare recovery"
+            wire.incoming.put({"id": message["id"], "error": {
+                "code": -32603, "message": "private server failure"}})
+        else:
+            send(message)
+
+    monkeypatch.setattr(wire, "send", fail_read)
+    try:
+        with pytest.raises(OSError, match="thread/read"):
+            adapter.reconcile()
+        assert None not in statuses
+    finally:
+        adapter.stop()
+
+
+def test_successful_attachment_alone_does_not_clear_observer_failure():
+    wire, statuses = Wire(), []
+    adapter = ApprovalSync(CardQueue(), connect=lambda: wire, status=statuses.append)
+    try:
+        assert not adapter.attach("not-on-this-server")
+        wire.loaded.append("not-on-this-server")
+        assert adapter.attach("not-on-this-server")
+        assert adapter.attach("thread-1")
+        assert statuses and all(statuses)
+        adapter.reconcile()
+        assert statuses[-1] is None
+    finally:
+        adapter.stop()
+
+
+def test_other_healthy_threads_cannot_clear_missing_target_warning():
+    wire, statuses = Wire(), []
+    adapter = ApprovalSync(CardQueue(), connect=lambda: wire, status=statuses.append)
+    try:
+        assert not adapter.attach("missing-target")
+        assert adapter.attach("thread-1")
+        adapter.reconcile()
+        assert statuses and all(statuses)
+        assert adapter.last_error
+        assert not any(m.get("method") == "thread/resume"
+                       and m["params"]["threadId"] == "missing-target" for m in wire.sent)
+    finally:
+        adapter.stop()
+
+
+def test_native_thread_closure_retires_its_failed_attachment():
+    wire, statuses = Wire(), []
+    adapter = ApprovalSync(CardQueue(), connect=lambda: wire, status=statuses.append)
+    try:
+        assert not adapter.attach("closed-target")
+        adapter.handle({"method": "thread/closed", "params": {
+            "threadId": "closed-target"}}, wire)
+        adapter.reconcile()
+        assert statuses[-1] is None
+        assert adapter.last_error is None
+    finally:
+        adapter.stop()
+
+
+def test_failed_waiting_thread_attach_does_not_report_reconciliation_recovery(monkeypatch):
+    wire, statuses = Wire(), []
+    wire.statuses["thread-1"] = {"type": "active", "activeFlags": ["waitingOnApproval"]}
+    adapter = ApprovalSync(CardQueue(), connect=lambda: wire, status=statuses.append)
+    send = wire.send
+
+    def fail_resume(message):
+        if message.get("method") == "thread/resume":
+            wire.incoming.put({"id": message["id"], "error": {
+                "code": -32603, "message": "resume rejected"}})
+        else:
+            send(message)
+
+    monkeypatch.setattr(wire, "send", fail_resume)
+    try:
+        adapter.reconcile()
+        assert statuses and all(statuses)
+        assert wire.closed
+    finally:
+        adapter.stop()
+
+
+def test_reader_disconnect_reports_unavailable_and_withdraws_cards(monkeypatch):
+    monkeypatch.setattr(classifier, "write_audit", lambda *_a: None)
+    wire, statuses, cards = Wire(), [], CardQueue()
+    adapter = ApprovalSync(cards, connect=lambda: wire, status=statuses.append)
+    try:
+        assert adapter.attach("thread-1")
+        adapter.handle(request(), wire)
+        until(lambda: len(cards.pending()) == 1)
+        wire.incoming.put(None)
+        # Closing the wire precedes the reader's status callback. Wait for
+        # the externally visible disconnect result, not that intermediate step.
+        until(lambda: wire.closed and statuses and statuses[-1]
+              and not cards.pending())
+        assert statuses and statuses[-1]
+        assert adapter.last_error
+        assert not cards.pending()
+    finally:
+        adapter.stop()
+
+
+def test_observer_error_diagnostics_are_bounded_and_omit_server_text(monkeypatch, capsys):
+    statuses = []
+    adapter = ApprovalSync(CardQueue(), connect=Wire, status=statuses.append)
+    send = Wire.send
+
+    def fail_read(wire, message):
+        if message.get("method") == "thread/read":
+            wire.incoming.put({"id": message["id"], "error": {
+                "code": -32603, "message": "private command and conversation"}})
+        else:
+            send(wire, message)
+
+    monkeypatch.setattr(Wire, "send", fail_read)
+    polls = []
+
+    def next_poll(_seconds):
+        polls.append(True)
+        if len(polls) == 3:
+            adapter._stop.set()
+
+    monkeypatch.setattr(adapter._stop, "wait", next_poll)
+    try:
+        adapter._observe()
+        entries = [json.loads(line.removeprefix("codex observer: "))
+                   for line in capsys.readouterr().err.splitlines()
+                   if line.startswith("codex observer: ")]
+        assert len(polls) == 3
+        assert len(entries) == 1, "identical failed polls must not spam diagnostics"
+        assert entries[-1]["operation"] == "observe"
+        assert entries[-1]["rpc_method"] == "thread/read"
+        assert entries[-1]["rpc_code"] == -32603
+        assert "private" not in json.dumps(entries)
+        assert "thread-1" not in json.dumps(entries)
+    finally:
+        adapter.stop()
+
+
+def test_failed_poll_keeps_warning_through_reconnect_until_complete_recovery(monkeypatch):
+    first, second, statuses = Wire(), Wire(), []
+    connections = iter([first, second])
+    adapter = ApprovalSync(CardQueue(), connect=lambda: next(connections), status=statuses.append)
+    send = first.send
+
+    def fail_read(message):
+        if message.get("method") == "thread/read":
+            first.incoming.put({"id": message["id"], "error": {
+                "code": -32603, "message": "read failed"}})
+        else:
+            send(message)
+
+    monkeypatch.setattr(first, "send", fail_read)
+    polls = []
+
+    def next_poll(_seconds):
+        polls.append(True)
+        if len(polls) == 1:
+            assert statuses and all(statuses)
+        else:
+            adapter._stop.set()
+
+    monkeypatch.setattr(adapter._stop, "wait", next_poll)
+    try:
+        adapter._observe()
+        assert len(polls) == 2
+        assert first.closed and not second.closed
+        assert statuses[-1] is None and adapter.last_error is None
+        assert len([value for value in statuses if value is None]) == 1
+    finally:
+        adapter.stop()
+
+
+def test_stopped_or_replaced_reader_cannot_report_connection_failure(monkeypatch):
+    first, second, statuses = Wire(), Wire(), []
+    adapter = ApprovalSync(CardQueue(), connect=lambda: first, status=statuses.append)
+    entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+
+    def delayed_receive():
+        entered.set()
+        assert release.wait(2)
+        raise EOFError("old socket")
+
+    monkeypatch.setattr(first, "receive", delayed_receive)
+
+    def read_old():
+        adapter._read(first)
+        exited.set()
+
+    with adapter._lock:
+        adapter._socket = first
+        adapter._ever_connected = True
+    reader = threading.Thread(target=read_old, daemon=True)
+    reader.start()
+    try:
+        assert entered.wait(2)
+        with adapter._lock:
+            adapter._socket = second
+        release.set()
+        assert exited.wait(2)
+        assert not statuses and not second.closed
+        adapter.stop()
+        adapter._read(second)
+        assert not statuses
+    finally:
+        release.set()
+        adapter.stop()
+
+
 def test_terminal_input_is_a_native_approval_with_its_own_description(sync):
     _adapter, wire, cards = sync
     message = request(command="\n")
@@ -741,7 +975,8 @@ class TestCodexTalkingBack:
         rollout.write_text(json.dumps({'type': 'session_meta', 'payload': {
             'id': sid, 'cwd': str(workspace), 'originator': 'codex-tui'}}) + '\n')
         monkeypatch.setenv('CODEX_HOME', str(home))
-        monkeypatch.setattr(sessions, 'open_rollout_paths', lambda _paths: set())
+        monkeypatch.setattr(sessions.subprocess, 'run', lambda command, **_kwargs:
+                            sessions.subprocess.CompletedProcess(command, 1, '', ''))
         spawned = []
         def spawn(command, log, cwd=None):
             spawned.append((command, log, cwd))
@@ -834,7 +1069,8 @@ class TestCodexTalkingBack:
 
     def test_a_live_thread_on_another_server_is_never_resumed_headlessly(self, setup, monkeypatch):
         _, sessions, _, path, _, socket, spawned, send = setup
-        monkeypatch.setattr(sessions, 'open_rollout_paths', lambda _: {str(path)})
+        monkeypatch.setattr(sessions.subprocess, 'run', lambda command, **_kwargs:
+                            sessions.subprocess.CompletedProcess(command, 0, 'n' + str(path), ''))
         socket.loaded = []
         assert 'permission limits' in send(connect=lambda: socket)
         assert not spawned
@@ -848,7 +1084,8 @@ class TestCodexTalkingBack:
             'type': 'workspace-write', 'network_access': True}}])
     def test_queue_does_not_pretend_to_apply_limits(self, setup, monkeypatch, policy):
         talk, sessions, _, path, _, _, spawned, send = setup
-        monkeypatch.setattr(sessions, 'open_rollout_paths', lambda _: {str(path)})
+        monkeypatch.setattr(sessions.subprocess, 'run', lambda command, **_kwargs:
+                            sessions.subprocess.CompletedProcess(command, 0, 'n' + str(path), ''))
         with path.open('a') as handle:
             handle.write(json.dumps({'type': 'turn_context', 'payload': policy}) + '\n')
         assert not talk.queue_safe(str(path))
@@ -858,7 +1095,8 @@ class TestCodexTalkingBack:
     def test_a_verified_restricted_live_queue_uses_only_its_uuid(self, setup, monkeypatch):
         import subprocess
         _, sessions, sid, path, _, _, spawned, send = setup
-        monkeypatch.setattr(sessions, 'open_rollout_paths', lambda _: {str(path)})
+        monkeypatch.setattr(sessions.subprocess, 'run', lambda command, **_kwargs:
+                            sessions.subprocess.CompletedProcess(command, 0, 'n' + str(path), ''))
         with path.open('a') as handle:
             handle.write(json.dumps({'type': 'turn_context', 'payload': {
                 'approval_policy': 'never', 'sandbox_policy': {
@@ -1031,3 +1269,31 @@ class TestCodexTalkingBack:
                 'cwd': str(workspace), 'approval_policy': 'on-request', 'sandbox_policy': {
                     'type': 'workspace-write', 'network_access': False, 'writable_roots': roots}}}) + '\n')
         assert not talk.queue_safe(str(path))
+
+
+@pytest.mark.parametrize('outcome', ['closed', 'live', 'incomplete', 'failed', 'timeout'])
+def test_legacy_activity_performs_one_process_inspection(tmp_path, monkeypatch, outcome):
+    import subprocess
+    import codex_sessions as sessions
+    import codex_talk as talk
+    home = tmp_path / 'home'
+    home.mkdir()
+    path = home / 'rollout.jsonl'
+    path.write_text('{}\n')
+    monkeypatch.setenv('CODEX_HOME', str(home))
+    monkeypatch.setattr(sessions, '_proc_open_paths', lambda _paths: set())
+    calls = []
+
+    def inspect(command, **kwargs):
+        calls.append(command)
+        assert kwargs['timeout'] == 3
+        if outcome == 'timeout':
+            raise subprocess.TimeoutExpired(command, 3)
+        return subprocess.CompletedProcess(command, 2 if outcome == 'failed' else 1,
+            'n' + str(path) + '\n' if outcome == 'live' else '',
+            'inspection incomplete' if outcome == 'incomplete' else '')
+
+    monkeypatch.setattr(sessions.subprocess, 'run', inspect)
+    expected = True if outcome == 'live' else False if outcome == 'closed' else None
+    assert talk.activity(str(path), 'legacy-thread') is expected
+    assert len(calls) == 1, 'one wrist send must not repeat its process inspection'

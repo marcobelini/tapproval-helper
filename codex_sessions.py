@@ -128,17 +128,24 @@ def _rollout_meta(path):
     return None
 
 
-def _lsof_open_paths(paths):
-    """Paths in *paths* that lsof sees open, or an empty set on failure."""
+def _lsof_query(paths):
+    """One bounded inspection; retain diagnostics for callers proving closure."""
     if not paths:
-        return set()
+        return None
     try:
         # Absolute paths need no ``--`` (macOS lsof does not consistently
         # accept it); filtering by uid makes a file held by another account
         # insufficient evidence that *this* user's Codex session is active.
-        run = subprocess.run(["lsof", "-a", "-F", "n", "-u", _host.current_user() or ""] + list(paths),
-                             capture_output=True, text=True, timeout=3)
+        return subprocess.run(["lsof", "-a", "-F", "n", "-u", _host.current_user() or ""] + list(paths),
+                              capture_output=True, text=True, timeout=3)
     except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _lsof_open_paths(paths, inspection=None):
+    """Paths lsof sees open; optionally reuse an inspection already performed."""
+    run = inspection if inspection is not None else _lsof_query(paths)
+    if run is None:
         return set()
     # lsof returns 1 when none of the requested paths is open.  Its field
     # output may also include unrelated file descriptors of the same process,
