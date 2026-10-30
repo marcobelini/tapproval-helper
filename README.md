@@ -454,3 +454,21 @@ half is in this repository.
 If it earns its place in your setup, the useful thing is to tell one
 other person who leaves Claude running unattended:
 https://tapproval.thoughtfulsteward.org
+
+
+### Codex Desktop transport — internal 3.0 beta
+
+Helper 1.1.98 includes an opt-in Desktop CLI adapter for builds that keep
+Desktop's native server separate from the managed daemon. It preserves
+startup arguments and permission settings and uses a private Unix socket;
+Claude Code behavior and pairing are unchanged. This is a Tapproval
+integration, not an official Desktop extension.
+
+Set `TAPPROVAL_CODEX_REAL_CLI` to Desktop's bundled Codex executable, then
+run `python3 ~/.tapproval/codex_desktop.py --prepare-launcher` followed by
+the installed application path. Finish active work and quit Desktop, then
+open `~/.tapproval/data/codex-desktop-launcher/Launch Codex.command`.
+Preparation does not launch or stop anything; the launcher refuses while
+Desktop is running. Use it for bridged launches. A normal application
+launch restores the ordinary transport without changing saved sessions.
+Actual Desktop/Watch approval validation still gates public 3.0.

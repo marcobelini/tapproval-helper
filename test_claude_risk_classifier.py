@@ -4769,6 +4769,13 @@ class TestTheDoubleTapIsTheWatchsOwn:
         end_line = end_line[:end_line.index("\n}\n")]
         assert "line.handGestureShortcut(.primaryAction, isEnabled: pinchable)" in end_line
         assert 'accessibilityIdentifier("endLine")' in end_line
+        # No press look of the button's own: `.plain` dimmed the whole
+        # screen on every pinch (builds 190 and 193); the line fades alone.
+        assert ".buttonStyle(LineOnlyPress())" in end_line
+        assert ".buttonStyle(.plain)" not in end_line
+        press = source[source.index("private struct LineOnlyPress: ButtonStyle {"):]
+        press = press[:press.index("\n}\n")]
+        assert "configuration.isPressed" not in press
 
     def test_the_end_line_ends_the_thread_and_sends_nothing(self):
         source = dict(self._sources())["SessionDetail.swift"]
@@ -4792,6 +4799,25 @@ def _signing_vectors():
         pytest.skip("no watch app in this layout")
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _no_cryptokit(tmp_path):
+    """Why a test that compiles RelaySigning.swift must skip, or None.
+    Linux and Windows can have swiftc without Apple's CryptoKit: GitHub's
+    ubuntu runner does, and both signing tests failed there on 2026-10-30
+    with "no such module 'CryptoKit'". Only that exact refusal skips; any
+    other compiler failure is left for the test itself to report."""
+    import shutil
+    import subprocess
+    if not shutil.which("swiftc"):
+        return "no Swift compiler on this machine"
+    probe = tmp_path / "cryptokit_probe.swift"
+    probe.write_text("import CryptoKit\n")
+    tried = subprocess.run(["swiftc", "-typecheck", str(probe)],
+                           capture_output=True, text=True, timeout=300)
+    if tried.returncode and "no such module 'CryptoKit'" in tried.stderr:
+        return "this Swift has no CryptoKit (it is Apple's)"
+    return None
 
 
 @pytest.mark.private_layout
@@ -4852,12 +4878,12 @@ class TestSigningVectors:
         """Not the shape but the bytes: RelaySigning.swift compiled on its
         own, every vector through it, plus the bridge's signed request
         verified by verify_signature with a changed query refused."""
-        import shutil
         import subprocess
         source = os.path.join(_ROOT, "WatchApp", "Shared", "RelaySigning.swift")
         v = _signing_vectors()
-        if not shutil.which("swiftc"):
-            pytest.skip("no Swift compiler on this machine")
+        skip = _no_cryptokit(tmp_path)
+        if skip:
+            pytest.skip(skip)
         driver = tmp_path / "main.swift"   # top-level code lives only in main.swift
         driver.write_text(
             'import Foundation\n'
@@ -13572,13 +13598,17 @@ class TestTwoRelaysOnePort:
         """The tunnel can take a minute to start (an adopted one that no
         longer answers is probed five times). The relay serves the hook,
         the bridge and the watch at home meanwhile (2026-10-21)."""
-        started = time.monotonic()
-        served_at = []
-        release = threading.Event()
-        monkeypatch.setattr(watch_relay, "_start_tunnel",
-                            lambda *a, **k: release.wait(3))
+        served_while_starting = []
+        release, tunnel_finished = threading.Event(), threading.Event()
+
+        def start_tunnel(*a, **k):
+            release.wait(3)
+            tunnel_finished.set()
+
+        monkeypatch.setattr(watch_relay, "_start_tunnel", start_tunnel)
         monkeypatch.setattr(watch_relay._RelayServer, "serve_forever",
-                            lambda self, *a, **k: served_at.append(time.monotonic()))
+                            lambda self, *a, **k:
+                            served_while_starting.append(not tunnel_finished.is_set()))
         monkeypatch.setattr(watch_relay, "Auth", lambda: _throwaway_auth(tmp_path))
         monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: None)
         monkeypatch.setattr(watch_relay, "helper_provenance", lambda: None)
@@ -13590,8 +13620,7 @@ class TestTwoRelaysOnePort:
                                      "--no-bonjour", "--tunnel"]) == 0
         finally:
             release.set()
-        assert served_at, "never served"
-        assert served_at[0] - started < 1.5, "the relay waited for its tunnel to start"
+        assert served_while_starting == [True], "the relay waited for its tunnel to start"
 
     def test_bonjour_is_not_kept_waiting_by_the_tunnel(self, monkeypatch):
         import argparse
@@ -16723,7 +16752,7 @@ class TestCiRunsWhatTheChangeCanBreak:
 
     def test_the_checkout_is_deep_enough_to_see_the_base(self):
         (workflow,) = _ci_files(".github/workflows/tests.yml")
-        for job in ("mini", "build-watch"):
+        for job in ("mini", "build-watch", "purchase"):
             body = workflow.split("\n  %s:\n" % job, 1)[1]
             body = body[:body.find("\n\n  ")] if "\n\n  " in body else body
             assert "fetch-depth: 2" in body, job
@@ -16888,7 +16917,7 @@ class TestTheLocalFallbackRunsWhatCiRuns:
         ordinary case, not a freak one."""
         _, local = self._files()
         watch = local.split("# --- the watch app", 1)[1]
-        assert 'CI_SIM="Tapproval CI"' in watch
+        assert 'CI_SIM="Tapproval CI"' in local
         # Found or made on demand by sim-own.sh, whose own tests hold that.
         own = watch.index('sim-own.sh "$CI_SIM"')
         shared = watch.index("sharing the first one listed")
@@ -16899,7 +16928,7 @@ class TestTheLocalFallbackRunsWhatCiRuns:
         its flows lock, and CI failed with no test to blame (#871)."""
         import subprocess
         _, local = self._files()
-        start = local.index('  CI_SIM="Tapproval CI"')
+        start = local.index('CI_SIM="Tapproval CI"')
         naming = local[start:local.index("\n", local.index("CI_SIM=", start + 20)) + 1]
         script = naming + 'echo "$CI_SIM|$CI_SIM Flows|$CI_SIM iPhone"\n'
 
@@ -16946,7 +16975,7 @@ class TestTheLocalFallbackRunsWhatCiRuns:
         watch = local.index("# --- the watch app")
         summary = local.index('say "Summary (')
         alone = local.index('[ "$WHICH" = pytest ] && judge_pytest')
-        everything = local.index('[ "$WHICH" = all ] && judge_pytest')
+        everything = local.index('then judge_pytest; fi')
         assert alone < watch, "on its own, pytest is judged at once"
         assert watch < everything < summary, (
             "in a full run, judged after the watch jobs and before the summary")
@@ -17000,11 +17029,24 @@ class TestTheLocalFallbackRunsWhatCiRuns:
         and holds nothing of its own that could drift again."""
         workflow, _ = self._files()
         job = workflow.split("\n  build-watch:\n", 1)[1]
-        job = job.split("\n  ", 1)[0] if re.search(r"\n  \w", job) else job
+        job = re.split(r"\n  (?=\w)", job, maxsplit=1)[0]
         runs = re.findall(r"^\s*- run: (.+)$", job, re.MULTILINE)
         assert runs == ["./ci-local.sh watch"], runs
         assert "xcodebuild" not in job
         assert "vars.CI_RUNNER != 'self-hosted'" in job, "still only the fallback"
+
+    @pytest.mark.private_layout
+    def test_purchase_gate_runs_on_its_working_host_in_both_runner_modes(self):
+        workflow, local = self._files()
+        job = workflow.split("\n  purchase:\n", 1)[1]
+        assert "runs-on: macos-15" in job
+        assert "CI_RUNNER" not in job, "native runner choice cannot bypass purchase proof"
+        assert "github.event.action != 'closed'" in job
+        assert "TAPPROVAL_LEGACY_STOREKIT_SDK: '1'" in job
+        assert "- run: ./ci-local.sh purchase" in job
+        assert '"$WHICH" = purchase ] && [ "$PURCHASES_PROVEN" != 1' in local
+        assert 'record 1 "purchase runtime proof"' in local
+        assert 'WatchApp/ci_skips.py "$PURCHASE_LOG"' in local
 
     def test_the_dependency_refusal_is_checked_in_both(self):
         workflow, local = self._files()
@@ -17225,6 +17267,10 @@ class TestCiCanBeMovedToThisMacAndBack:
                           workflow.split("\njobs:\n", 1)[1], re.MULTILINE)
         assert len(jobs) >= 4, [name for name, _ in jobs]
         for name, body in jobs:
+            if name == "purchase":
+                assert "CI_RUNNER" not in body, "purchase proof is required in both modes"
+                assert "runs-on: macos-15" in body
+                continue
             guard = re.search(r"if: vars\.CI_RUNNER (==|!=) 'self-hosted'", body)
             assert guard, "%s has no CI_RUNNER guard; it would run on both" % name
             runs_on = re.search(r"runs-on: (.+)", body).group(1)
@@ -18809,7 +18855,7 @@ def test_the_two_ci_workflows_share_their_test_steps():
     # private workflow had already banned (2026-10-14 tech-debt audit).
     def runs(path):
         return [line.strip() for line in python_steps(path, "shellcheck")
-                if line.strip().startswith("- run:") or line.strip().startswith("- uses:")]
+                if line.strip() and not line.lstrip().startswith("#")]
     assert runs(private) == runs(public)
 
 
@@ -19119,7 +19165,8 @@ class TestStandardLibraryOnly:
     #: pytest is the one third-party import allowed, and only here: the
     #: test suite is not what a user's interpreter is asked to run.
     ALLOWED_THIRD_PARTY = {"test_claude_risk_classifier.py": {"pytest"},
-                           "test_codex_approvals.py": {"pytest"}, "test_activity.py": {"pytest"}}
+                           "test_codex_approvals.py": {"pytest"}, "test_activity.py": {"pytest"},
+                           "test_codex_desktop.py": {"pytest"}}
 
     @staticmethod
     def _root_modules():

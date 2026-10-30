@@ -40,8 +40,8 @@ def message(text, brief=True):
 class Client:
     """Short-lived RPC client; the shared server owns accepted turns."""
 
-    def __init__(self, connect=None):
-        path = os.path.join(sessions._home(), "app-server-control", "app-server-control.sock")
+    def __init__(self, connect=None, socket_path=None):
+        path = socket_path or os.path.join(sessions._home(), "app-server-control", "app-server-control.sock")
         self.wire = (connect or (lambda: LocalWebSocket(path)))()
         self.sequence = 0
         try:
@@ -71,6 +71,41 @@ class Client:
 
     def close(self):
         self.wire.close()
+
+
+def _owner_client(sid, connect):
+    from codex_desktop import server_sockets
+    selected = None
+    try:
+        for endpoint in ([None] if connect is not None else server_sockets()):
+            try:
+                candidate = Client(connect, socket_path=endpoint)
+            except (OSError, EOFError):
+                continue
+            try:
+                cursor = None
+                for _page in range(64):
+                    page = candidate.rpc("thread/loaded/list", {"cursor": cursor})
+                    if sid in page.get("data", []):
+                        if selected is not None:
+                            raise ValueError("Thread is loaded on multiple Codex servers; close the duplicate before sending")
+                        selected, candidate = candidate, None
+                        break
+                    cursor = page.get("nextCursor")
+                    if not cursor:
+                        break
+                else:
+                    raise ValueError("Codex loaded-thread listing exceeded its bound")
+            except (OSError, EOFError) as error:
+                raise ValueError("Codex connection lost; check the session before retrying") from error
+            finally:
+                if candidate is not None:
+                    candidate.close()
+        return selected
+    except BaseException:
+        if selected is not None:
+            selected.close()
+        raise
 
 
 def context(path):
@@ -148,7 +183,13 @@ def _lsof_complete_for(path, stderr):
 
 def activity(path, sid):
     """True/False/unknown; failure to inspect activity is never 'closed'."""
-    if os.path.realpath(path) in sessions.open_rollout_paths([path]):
+    # Keep one result for both positive discovery and legacy closure proof.
+    # Repeating lsof here could consume two three-second process deadlines
+    # inside a wrist request, even when both searches completed normally.
+    result = sessions._lsof_query([path])
+    opened = sessions._lsof_open_paths([path], result) if result is not None else set()
+    target = os.path.realpath(path)
+    if target in opened or target in sessions._proc_open_paths([path]):
         return True
     lock = os.path.join(sessions._home(), "thread-writer-locks", sid + ".lock")
     try:
@@ -160,13 +201,9 @@ def activity(path, sid):
     except FileNotFoundError:
         # Legacy rollouts predate writer locks. lsof's empty successful
         # search is different from not being able to inspect processes.
-        try:
-            result = subprocess.run(["lsof", "-a", "-F", "n", "-u", _host.current_user() or "", path],
-                                    capture_output=True, text=True, timeout=3)
-            if result.returncode in (0, 1) and _lsof_complete_for(path, result.stderr):
-                return any(line == "n" + path for line in result.stdout.splitlines())
-        except (OSError, subprocess.SubprocessError):
-            pass
+        if (result is not None and result.returncode in (0, 1)
+                and _lsof_complete_for(path, result.stderr)):
+            return False
     except OSError:
         pass
     return None
@@ -191,15 +228,8 @@ def send(prefix, text, binary, spawn, log, brief=True, connect=None, runner=None
     # a different process. Only loaded/list proves this server owns it.
     client = None
     try:
-        client = Client(connect)
-        loaded, cursor = set(), None
-        for _page in range(64):
-            page = client.rpc("thread/loaded/list", {"cursor": cursor})
-            loaded.update(page.get("data", []))
-            cursor = page.get("nextCursor")
-            if not cursor:
-                break
-        if sid in loaded:
+        client = _owner_client(sid, connect)
+        if client is not None:
             client.rpc("thread/resume", {"threadId": sid, "excludeTurns": True})
             # One mutation, never retried on a transport failure. The
             # server accepts input into the same thread, including while

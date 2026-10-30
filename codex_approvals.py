@@ -32,7 +32,8 @@ APPROVAL_METHODS = {
 class LocalWebSocket:
     """A bounded RFC 6455 client for Codex's user-private Unix socket."""
 
-    def __init__(self, path, timeout=3):
+    def __init__(self, path, timeout=3, max_message=MAX_MESSAGE):
+        self.max_message = max_message
         if not hasattr(socket, "AF_UNIX"):
             raise OSError("this computer's Python has no Unix sockets")
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -86,7 +87,7 @@ class LocalWebSocket:
         return data
 
     def _send(self, payload, opcode=1):
-        if len(payload) > MAX_MESSAGE:
+        if len(payload) > self.max_message:
             raise ValueError("oversized WebSocket message")
         length = len(payload)
         prefix = (bytes([128 | opcode, 128 | length]) if length < 126
@@ -114,7 +115,7 @@ class LocalWebSocket:
                 length = struct.unpack("!H", self._take(2))[0]
             elif length == 127:
                 length = struct.unpack("!Q", self._take(8))[0]
-            if length + len(fragments) > MAX_MESSAGE:
+            if length + len(fragments) > self.max_message:
                 raise ValueError("oversized WebSocket message")
             if opcode >= 8 and (not final or length > 125):
                 raise ValueError("invalid WebSocket control frame")
@@ -295,13 +296,29 @@ def handoff_card(message):
             "session_id": params["threadId"], "project": "Codex"}
 
 
+class _RpcError(OSError):
+    """Keep the failed method/code without logging the server's private text."""
+
+    def __init__(self, method, error):
+        self.method = method
+        self.code = error.get("code") if isinstance(error, dict) else None
+        if type(self.code) is not int:
+            self.code = None
+        message = error.get("message") if isinstance(error, dict) else None
+        super().__init__("Codex rejected %s: %s" % (method, message) if message else
+                         "Codex did not accept %s" % method)
+
+
 class ApprovalSync:
     """One local Codex connection, with Codex as the authority for resolution."""
 
-    def __init__(self, queue, connect=None, card_title=None, status=None):
+    def __init__(self, queue, connect=None, card_title=None, status=None, socket_path=None,
+                 ownership_guard=None, keep_open=False):
         self.queue = queue
+        self.ownership_guard = ownership_guard
+        self.keep_open = keep_open
         home = os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex")
-        self.socket_path = os.path.join(home, "app-server-control", "app-server-control.sock")
+        self.socket_path = socket_path or os.path.join(home, "app-server-control", "app-server-control.sock")
         self.connect = connect or (lambda: LocalWebSocket(self.socket_path))
         self._custom_connect = connect is not None
         self.card_title = card_title or (lambda card: card)
@@ -311,6 +328,8 @@ class ApprovalSync:
         self._socket = None
         self._responses = {}
         self._attached = set()
+        self._failed_attachments = set()
+        self._seen_loaded = set()
         self._generations = {}
         self._pending = {}
         self._items = {}
@@ -323,7 +342,26 @@ class ApprovalSync:
         self._stop = threading.Event()
         self._monitor = None
         self._ever_connected = False
+        self._healthy = None
+        self._last_diagnostic = None
         self.last_error = None
+
+    def _report_failure(self, error, operation, report=True):
+        with self._lock:
+            if self._stop.is_set():
+                return
+            self.last_error = str(error) or type(error).__name__
+            self._healthy = False
+            diagnostic = {"event": "unavailable", "operation": operation,
+                          "error_type": type(error).__name__}
+            if isinstance(error, _RpcError):
+                diagnostic.update(rpc_method=error.method, rpc_code=error.code)
+            signature = tuple(diagnostic.items())
+            if signature != self._last_diagnostic:
+                print("codex observer: " + json.dumps(diagnostic), file=sys.stderr)
+                self._last_diagnostic = signature
+            if report:
+                self.status(self.last_error)
 
     def _ensure_connection(self):
         """Called under the RPC lock, never changes session configuration."""
@@ -338,6 +376,7 @@ class ApprovalSync:
             sock = self.connect()
             if instance != self._instance:
                 self._finished.clear()
+                self._seen_loaded.clear()
                 self._instance = instance
             self._socket = sock
             threading.Thread(target=self._read, args=(sock,),
@@ -347,8 +386,6 @@ class ApprovalSync:
             "capabilities": {"experimentalApi": True}})
         sock.send({"method": "initialized"})
         self._ever_connected = True
-        self.last_error = None
-        self.status(None)
 
     def start(self):
         """Observe loaded sessions even when an approval has no hook."""
@@ -364,11 +401,19 @@ class ApprovalSync:
             try:
                 self.reconcile()
             except (OSError, ValueError, EOFError, TypeError, KeyError, AttributeError) as error:
-                self.last_error = str(error)
                 self.close()
-                if self._ever_connected and not self._stop.is_set():
-                    self.status(self.last_error)
+                self._report_failure(error, "observe", report=self._ever_connected)
             self._stop.wait(1)
+
+    @staticmethod
+    def _loaded_page(page):
+        if not isinstance(page, dict):
+            raise ValueError("Codex returned an invalid loaded-thread page")
+        data, cursor = page.get("data"), page.get("nextCursor")
+        if (not isinstance(data, list) or not all(isinstance(sid, str) for sid in data)
+                or (cursor is not None and not isinstance(cursor, str))):
+            raise ValueError("Codex returned an invalid loaded-thread page")
+        return data, cursor
 
     def reconcile(self):
         """Recover pending requests, not historical/stored conversations."""
@@ -376,24 +421,53 @@ class ApprovalSync:
             self._ensure_connection()
             loaded = set()
             cursor = None
-            while True:
-                page = self._rpc("thread/loaded/list", {"cursor": cursor})
-                loaded.update(sid for sid in page.get("data", []) if isinstance(sid, str))
-                cursor = page.get("nextCursor")
+            for _page in range(64):
+                data, cursor = self._loaded_page(self._rpc("thread/loaded/list", {"cursor": cursor}))
+                loaded.update(data)
                 if not cursor:
                     break
+            else:
+                raise ValueError("Codex loaded-thread listing exceeded its bound")
+            with self._lock:
+                for sid in self._failed_attachments - loaded:
+                    if sid in self._seen_loaded:
+                        self._finish_thread(sid)
+                self._seen_loaded = loaded | (self._seen_loaded & self._failed_attachments)
             for sid in loaded:
                 with self._lock:
-                    if sid in self._attached:
-                        continue
+                    attached = sid in self._attached
+                if attached:
+                    if self.ownership_guard and not self.ownership_guard(sid):
+                        self._suspend_thread(sid)
+                        self._report_failure(OSError("Codex thread ownership is unavailable"),
+                                             "ownership")
+                        return
+                    continue
                 info = self._rpc("thread/read", {"threadId": sid, "includeTurns": False})
                 status = (info.get("thread") or {}).get("status") or {}
                 if any(flag in status.get("activeFlags", [])
                        for flag in ("waitingOnApproval", "waitingOnUserInput")):
-                    self.attach(sid)
+                    if self.ownership_guard and not self.ownership_guard(sid):
+                        self._suspend_thread(sid)
+                        self._report_failure(OSError("Codex thread ownership is unavailable"),
+                                             "ownership")
+                        return
+                    if not self.attach(sid):
+                        return  # attach already reported failure; do not clear it
             with self._lock:
                 for sid in self._attached - loaded:
                     self._finish_thread(sid)
+                # A handshake or a successful attachment alone does not prove
+                # that all loaded threads can be observed. Recover only after
+                # the whole poll, with the same connection still available.
+                if self._socket is None:
+                    raise OSError("Codex disconnected during reconciliation")
+                if not self._stop.is_set() and not self._failed_attachments:
+                    self.last_error = None
+                    self._last_diagnostic = None
+                    if self._healthy is not True:
+                        self._healthy = True
+                        self.status(None)
 
     def stop(self):
         self._stop.set()
@@ -431,10 +505,24 @@ class ApprovalSync:
             if key[0] == thread_id:
                 self._finish(key)
         self._attached.discard(thread_id)
+        self._failed_attachments.discard(thread_id)
         self._generations.pop(thread_id, None)
         self._cwd.pop(thread_id, None)
         self._hook_events.pop(thread_id, None)
         self._items = {key: item for key, item in self._items.items() if key[0] != thread_id}
+
+    def _suspend_thread(self, thread_id):
+        """Withdraw ambiguous ownership without inventing native resolution."""
+        with self._lock:
+            for key in list(self._pending):
+                if key[0] == thread_id:
+                    self._finish(key, terminal=False)
+            self._attached.discard(thread_id)
+            self._generations.pop(thread_id, None)
+            self._cwd.pop(thread_id, None)
+            self._hook_events.pop(thread_id, None)
+            self._items = {key: item for key, item in self._items.items() if key[0] != thread_id}
+            self._failed_attachments.add(thread_id)
 
     def _rpc(self, method, params, timeout=3):
         with self._lock:
@@ -448,10 +536,7 @@ class ApprovalSync:
                 raise OSError("Codex disconnected")
             sock.send({"id": request_id, "method": method, "params": params})
             if not done.wait(timeout) or "result" not in result:
-                error = result.get("error") or {}
-                if isinstance(error, dict) and error.get("message"):
-                    raise OSError("Codex rejected %s: %s" % (method, error["message"]))
-                raise OSError("Codex did not accept %s" % method)
+                raise _RpcError(method, result.get("error"))
             return result["result"]
         finally:
             with self._lock:
@@ -473,18 +558,23 @@ class ApprovalSync:
                             del events[:-32]
                     if thread_id in self._attached and self._socket is not None:
                         self._generations[thread_id] += 1
+                        self._failed_attachments.discard(thread_id)
                         return True
                 self._ensure_connection()
                 cursor = None
-                while True:
-                    page = self._rpc("thread/loaded/list", {"cursor": cursor})
-                    if thread_id in page.get("data", []):
+                for _page in range(64):
+                    data, cursor = self._loaded_page(self._rpc("thread/loaded/list", {"cursor": cursor}))
+                    if thread_id in data:
+                        with self._lock:
+                            self._seen_loaded.add(thread_id)
                         break
-                    cursor = page.get("nextCursor")
                     if not cursor:
-                        self.last_error = "Thread is not loaded on this Codex server"
-                        self.status(self.last_error)
+                        self._failed_attachments.add(thread_id)
+                        self._report_failure(OSError("Thread is not loaded on this Codex server"),
+                                             "attach")
                         return False
+                else:
+                    raise ValueError("Codex loaded-thread listing exceeded its bound")
                 # No config/model/permission overrides: join the live session.
                 # Register the lease before sending: resume can replay a request
                 # and its resolution immediately after its response, before the
@@ -495,20 +585,40 @@ class ApprovalSync:
                 self._rpc("thread/resume", {"threadId": thread_id, "excludeTurns": True})
                 with self._lock:
                     if self._socket is None:
+                        self._failed_attachments.add(thread_id)
                         return False
+                    self._failed_attachments.discard(thread_id)
                 return True
             except (OSError, ValueError, EOFError, TypeError, KeyError, AttributeError) as error:
-                self.last_error = str(error)
                 self.close()
-                self.status(self.last_error)
+                self._failed_attachments.add(thread_id)
+                self._report_failure(error, "attach")
                 return False
+
+    def owns(self, thread_id):
+        """Read-only ownership check; never resumes a stored thread."""
+        with self._rpc_lock:
+            self._ensure_connection()
+            cursor = None
+            for _page in range(64):
+                data, cursor = self._loaded_page(self._rpc("thread/loaded/list", {"cursor": cursor}))
+                if thread_id in data:
+                    with self._lock:
+                        self._seen_loaded.add(thread_id)
+                    return True
+                if not cursor:
+                    return False
+            raise ValueError("Codex loaded-thread listing exceeded its bound")
 
     def _read(self, sock):
         try:
             while True:
                 self.handle(sock.receive(), sock)
-        except (OSError, ValueError, EOFError, TypeError, KeyError, AttributeError):
-            pass
+        except (OSError, ValueError, EOFError, TypeError, KeyError, AttributeError) as error:
+            with self._lock:
+                if self._socket is sock:
+                    self.close()
+                    self._report_failure(error, "receive", report=self._ever_connected)
         finally:
             with self._lock:
                 if self._socket is sock:
@@ -646,7 +756,7 @@ class ApprovalSync:
                 self._hook_events.pop(thread_id, None)
                 self._items = {key: value for key, value in self._items.items()
                                if key[0] != thread_id}
-                if not self._attached and self._monitor is None:
+                if not self._attached and self._monitor is None and not self.keep_open:
                     self.close()
                     return
             try:
@@ -663,6 +773,13 @@ class ApprovalSync:
             card = dict(self.card_title(card), post_id=self._card_id(key))
             _card_id, decision, _answer = self.queue.submit(
                 card, float("inf"), resolved_elsewhere=done.is_set, admission_lock=self._lock)
+            # Ownership checks may query other servers. Never perform them
+            # under this server's lock, and recheck the native lease below.
+            if (decision in ("allow", "deny") and not done.is_set()
+                    and card.get("kind") != "handoff" and self.ownership_guard
+                    and not self.ownership_guard(key[0])):
+                self._suspend_thread(key[0])
+                return
             with self._lock:
                 if (decision in ("allow", "deny") and not done.is_set()
                         and card.get("kind") != "handoff"
@@ -705,3 +822,203 @@ class ApprovalSync:
                 done.set()
             if sock is not None:
                 sock.close()
+
+
+class ApprovalHub:
+    """Observe servers independently and recover only the affected targets."""
+
+    def __init__(self, queue, card_title=None, status=None, paths=None):
+        from codex_desktop import server_sockets
+        self.queue, self.card_title = queue, card_title
+        self.status = status or (lambda error: None)
+        self.paths = paths or server_sockets
+        self._lock = threading.RLock()
+        self._syncs = {}
+        self._tokens = {}
+        self._states = {}
+        self._target_errors = {}
+        self._recovering = {}
+        self._known_owners = {}
+        self._reported = object()
+        self._stop = threading.Event()
+        self._monitor = None
+        self.last_error = None
+
+    def _publish(self):
+        # Called under the hub lock. Status callbacks only report conditions;
+        # no server operation is performed while this lock is held.
+        errors = list(self._target_errors.values()) + list(self._states.values())
+        error = next((value for value in errors if value), None)
+        self.last_error = error
+        if error != self._reported:
+            self._reported = error
+            self.status(error)
+
+    def _state(self, path, token, error):
+        with self._lock:
+            if self._tokens.get(path) is not token or self._stop.is_set():
+                return
+            self._states[path] = error
+            if not error:
+                # ApprovalSync reports healthy only after its complete poll.
+                # An unrelated server cannot discharge these target failures.
+                for sid, owner in list(self._recovering.items()):
+                    if owner == path:
+                        self._target_errors.pop(sid, None)
+                        self._recovering.pop(sid, None)
+            self._publish()
+
+    def _refresh(self):
+        stops = []
+        with self._lock:
+            if self._stop.is_set():
+                return []
+            paths = self.paths()
+            for path in paths:
+                if path not in self._syncs:
+                    token = object()
+                    self._tokens[path] = token
+                    sync = ApprovalSync(
+                        self.queue, card_title=self.card_title, socket_path=path,
+                        status=lambda error, p=path, t=token: self._state(p, t, error),
+                        ownership_guard=lambda sid, p=path, t=token: self._can_own(sid, p, t),
+                        keep_open=True)
+                    self._syncs[path] = sync
+            for path in list(self._syncs):
+                if path not in paths:
+                    stops.append(self._syncs.pop(path))
+                    self._tokens.pop(path, None)
+                    self._states.pop(path, None)
+                    for sid, owner in list(self._recovering.items()):
+                        if owner == path:
+                            self._recovering.pop(sid, None)
+            result = [self._syncs[path] for path in paths]
+        # Readers report health under their own lock. Never take a server lock
+        # while holding the hub lock, including during discovery and shutdown.
+        for sync in stops:
+            sync.stop()
+        return result
+
+    def _owners(self, thread_id):
+        with self._lock:
+            candidates = list(self._syncs.items())
+        owners, uncertain, verified = [], False, {}
+        for path, sync in candidates:
+            try:
+                if sync.owns(thread_id):
+                    owners.append((path, sync))
+                verified[path] = sync
+            except (OSError, EOFError, ValueError) as error:
+                absent = (isinstance(error, (FileNotFoundError, ConnectionRefusedError))
+                          and not sync._ever_connected)
+                uncertain = uncertain or not absent
+        with self._lock:
+            if owners:
+                paths = {path for path, _sync in owners}
+                if uncertain:
+                    self._known_owners.setdefault(thread_id, set()).update(paths)
+                else:
+                    self._known_owners[thread_id] = paths
+        return owners, uncertain, verified
+
+    def _problem(self, thread_id, owners, uncertain):
+        error = ("Codex server ownership could not be verified" if uncertain else
+                 "Thread is loaded on multiple Codex servers" if len(owners) > 1 else
+                 "Thread is not loaded on an accessible Codex server")
+        with self._lock:
+            if not self._stop.is_set():
+                self._target_errors[thread_id] = error
+                self._recovering.pop(thread_id, None)
+                self._publish()
+        return False
+
+    def _mark_recovering(self, thread_id, path, owner):
+        with owner._lock:
+            with self._lock:
+                if self._syncs.get(path) is not owner or self._stop.is_set():
+                    return False
+                self._recovering[thread_id] = path
+                owner._healthy = None  # require a fresh complete poll
+                return True
+
+    def _can_own(self, thread_id, path, token):
+        with self._lock:
+            if self._tokens.get(path) is not token or self._stop.is_set():
+                return False
+        owners, uncertain, _verified = self._owners(thread_id)
+        if not uncertain and len(owners) == 1 and owners[0][0] == path:
+            return self._mark_recovering(thread_id, path, owners[0][1])
+        return self._problem(thread_id, owners, uncertain)
+
+    def _attach_owner(self, thread_id, approval, owners, uncertain):
+        if not uncertain and len(owners) == 1:
+            path, owner = owners[0]
+            if owner.attach(thread_id, approval):
+                return self._mark_recovering(thread_id, path, owner)
+        return self._problem(thread_id, owners, uncertain)
+
+    def attach(self, thread_id, approval=None):
+        if not isinstance(thread_id, str) or not 0 < len(thread_id) <= 64:
+            return False
+        self._refresh()
+        owners, uncertain, _verified = self._owners(thread_id)
+        return self._attach_owner(thread_id, approval, owners, uncertain)
+
+    def _retry_targets(self):
+        with self._lock:
+            failed = list(self._target_errors)
+        for sid in failed:
+            if self._stop.is_set():
+                return
+            with self._lock:
+                previous = set(self._known_owners.get(sid, ()))
+            owners, uncertain, verified = self._owners(sid)
+            if not uncertain and len(owners) == 1:
+                self._attach_owner(sid, None, owners, uncertain)
+            elif not owners and not uncertain and previous and previous <= verified.keys():
+                # Every previously verified owner now authoritatively lists
+                # this target as unloaded. Unknown targets cannot use this path.
+                for path in previous:
+                    sync = verified[path]
+                    with sync._lock:
+                        sync._finish_thread(sid)
+                        sync._healthy = None
+                with self._lock:
+                    if all(self._syncs.get(path) is verified[path] for path in previous):
+                        self._target_errors.pop(sid, None)
+                        self._recovering.pop(sid, None)
+                        self._known_owners.pop(sid, None)
+                        self._publish()
+
+    def start(self):
+        with self._lock:
+            if self._monitor is None:
+                self._monitor = threading.Thread(target=self._observe,
+                                                 name="codex-desktop-look", daemon=True)
+                self._monitor.start()
+
+    def _observe(self):
+        while not self._stop.is_set():
+            # One reconciler avoids cross-server RPC lock cycles during the
+            # ownership census; each native reader remains independent.
+            for sync in self._refresh():
+                if self._stop.is_set():
+                    return
+                try:
+                    sync.reconcile()
+                except (OSError, ValueError, EOFError, TypeError, KeyError, AttributeError) as error:
+                    sync.close()
+                    sync._report_failure(error, "observe", report=sync._ever_connected)
+            self._retry_targets()
+            self._stop.wait(1)
+
+    def stop(self):
+        self._stop.set()
+        with self._lock:
+            syncs = list(self._syncs.values())
+            self._syncs.clear()
+            self._tokens.clear()
+            self._states.clear()
+            self._recovering.clear()
+        for sync in syncs:
+            sync.stop()

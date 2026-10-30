@@ -1464,15 +1464,23 @@ class CardQueue:
             # the terminal, so the wrist must not keep a card that takes
             # taps nothing will act on.
             with self._lock:
-                self._pending.pop(card_id, None)
-                self._decisions.pop(card_id, None)
+                if self._pending.get(card_id) is None or self._pending.get(card_id) is entry:
+                    self._pending.pop(card_id, None)
+                    self._decisions.pop(card_id, None)
             raise
         with self._lock:
             # Whatever happened, the card is no longer pending: either it
             # was decided, or it expired and the watch must not answer a
             # question the hook has already given up on.
-            self._pending.pop(card_id, None)
-            decision, answer = self._decisions.pop(card_id, ("none", None))
+            current = self._pending.get(card_id)
+            if current is entry or current is None:
+                self._pending.pop(card_id, None)
+                decision, answer = self._decisions.pop(card_id, ("none", None))
+            else:
+                # A native reconnect may repost the same stable card ID.
+                # A retired waiter must not retract or consume its replacement.
+                decision, answer = "none", None
+                reason = "answered-elsewhere"
             if decision == "always":
                 if replayable:
                     self._session_allows.add(rule)
@@ -1705,11 +1713,11 @@ def _codex_sync_status(error):
 
 def codex_approval_sync(queue):
     """The hook and background observer share one native request ledger."""
-    from codex_approvals import ApprovalSync
+    from codex_approvals import ApprovalHub
     with queue._lock:
         sync = getattr(queue, "codex_sync", None)
         if sync is None:
-            sync = ApprovalSync(queue, card_title=with_session_title, status=_codex_sync_status)
+            sync = ApprovalHub(queue, card_title=with_session_title, status=_codex_sync_status)
             queue.codex_sync = sync
     return sync
 
