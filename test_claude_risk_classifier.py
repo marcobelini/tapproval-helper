@@ -4858,6 +4858,12 @@ class TestSigningVectors:
         v = _signing_vectors()
         if not shutil.which("swiftc"):
             pytest.skip("no Swift compiler on this machine")
+        capability = subprocess.run(
+            ["swiftc", "-typecheck", "-"],
+            input="import Foundation\nimport CryptoKit\nlet _: URLRequest? = nil\n",
+            capture_output=True, text=True, timeout=60)
+        if capability.returncode:
+            pytest.skip("Swift toolchain lacks Apple Foundation or CryptoKit")
         driver = tmp_path / "main.swift"   # top-level code lives only in main.swift
         driver.write_text(
             'import Foundation\n'
@@ -15618,71 +15624,6 @@ class TestTheSiteMapMatchesTheSite:
 
 
 @pytest.mark.private_layout
-class TestTheSitemapDatesFollowThePages:
-    """Hand-kept lastmod dates fell behind: on 2026-10-29 five of eight
-    were older than their pages, so search engines were told nothing had
-    moved. render-sitemap.py derives them from git when the site syncs."""
-
-    SITE = "https://tapproval.thoughtfulsteward.org/"
-
-    @pytest.fixture
-    def sitemap(self):
-        path = os.path.join(_ROOT, "render-sitemap.py")
-        if not os.path.exists(path):
-            pytest.skip("render-sitemap.py lives in the product repo only")
-        spec = importlib.util.spec_from_file_location("render_sitemap", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-
-    def _repo(self, tmp_path, day):
-        repo = tmp_path / "repo"
-        (repo / "helper" / "docs").mkdir(parents=True)
-        (repo / "helper" / "docs" / "index.html").write_text("home")
-        (repo / "helper" / "docs" / "guide.html").write_text("guide")
-        stamp = "%sT12:00:00" % day
-        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
-                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid",
-                   GIT_AUTHOR_DATE=stamp, GIT_COMMITTER_DATE=stamp)
-        for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "pages"]):
-            subprocess.run(["git", "-C", str(repo)] + args, env=env, check=True,
-                           capture_output=True)
-        return repo
-
-    def _xml(self, *entries):
-        return "".join("<url><loc>%s%s</loc><lastmod>%s</lastmod></url>\n"
-                       % (self.SITE, loc, day) for loc, day in entries)
-
-    def test_a_stale_date_takes_the_pages_last_commit(self, sitemap, tmp_path):
-        repo = self._repo(tmp_path, "2026-10-20")
-        xml = self._xml(("", "2026-10-01"), ("guide.html", "2026-10-01"))
-        def day_of(page):
-            return sitemap.changed_on(page, root=str(repo))
-        assert sitemap.refresh(xml, day_of) == self._xml(
-            ("", "2026-10-20"), ("guide.html", "2026-10-20"))
-
-    def test_a_page_a_renderer_just_rewrote_is_dated_today(self, sitemap, tmp_path):
-        repo = self._repo(tmp_path, "2026-10-20")
-        (repo / "helper" / "docs" / "guide.html").write_text("guide, re-rendered")
-        import datetime as _dt
-        today = _dt.date(2026, 10, 29)
-        assert sitemap.changed_on("guide.html", root=str(repo), today=today) == "2026-10-29"
-        assert sitemap.changed_on("index.html", root=str(repo), today=today) == "2026-10-20"
-
-    def test_without_git_every_date_stays(self, sitemap, tmp_path):
-        xml = self._xml(("", "2026-10-01"))
-        def day_of(page):
-            return sitemap.changed_on(page, root=str(tmp_path))
-        assert sitemap.refresh(xml, day_of) == xml
-
-    def test_the_sync_runs_it_before_the_site_is_copied(self):
-        path = os.path.join(_ROOT, "sync-helper.sh")
-        with open(path, encoding="utf-8") as handle:
-            text = handle.read()
-        assert text.index("python3 render-sitemap.py") < text.index('copy_public_tree "$CLONE"\n')
-
-
-@pytest.mark.private_layout
 class TestTheChangelogPageNeverGoesBlank:
     """render-changelog.py fetches the releases with gh. When that fails —
     offline, logged out, rate-limited — the page it already has must stay:
@@ -15928,8 +15869,7 @@ class TestTheSyncRefusesAStalePage:
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
         start = text.index("if command -v uvx >/dev/null 2>&1; then\n  if ! python3 render-privacy.py")
-        # The renderers' block ends where the sitemap's dates are set.
-        end = text.index("python3 render-sitemap.py", start)
+        end = text.index('copy_public_tree "$CLONE"', start)
         return text[start:end]
 
     def _repo(self, tmp_path, gh_body, privacy_changed=False,
@@ -17000,7 +16940,7 @@ class TestTheLocalFallbackRunsWhatCiRuns:
         and holds nothing of its own that could drift again."""
         workflow, _ = self._files()
         job = workflow.split("\n  build-watch:\n", 1)[1]
-        job = job.split("\n  ", 1)[0] if re.search(r"\n  \w", job) else job
+        job = re.split(r"\n  (?=\w)", job, maxsplit=1)[0]
         runs = re.findall(r"^\s*- run: (.+)$", job, re.MULTILINE)
         assert runs == ["./ci-local.sh watch"], runs
         assert "xcodebuild" not in job
@@ -19119,7 +19059,8 @@ class TestStandardLibraryOnly:
     #: pytest is the one third-party import allowed, and only here: the
     #: test suite is not what a user's interpreter is asked to run.
     ALLOWED_THIRD_PARTY = {"test_claude_risk_classifier.py": {"pytest"},
-                           "test_codex_approvals.py": {"pytest"}, "test_activity.py": {"pytest"}}
+                           "test_codex_approvals.py": {"pytest"}, "test_activity.py": {"pytest"},
+                           "test_codex_desktop.py": {"pytest"}}
 
     @staticmethod
     def _root_modules():

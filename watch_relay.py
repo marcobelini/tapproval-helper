@@ -1705,11 +1705,11 @@ def _codex_sync_status(error):
 
 def codex_approval_sync(queue):
     """The hook and background observer share one native request ledger."""
-    from codex_approvals import ApprovalSync
+    from codex_approvals import ApprovalHub
     with queue._lock:
         sync = getattr(queue, "codex_sync", None)
         if sync is None:
-            sync = ApprovalSync(queue, card_title=with_session_title, status=_codex_sync_status)
+            sync = ApprovalHub(queue, card_title=with_session_title, status=_codex_sync_status)
             queue.codex_sync = sync
     return sync
 

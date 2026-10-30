@@ -32,7 +32,8 @@ APPROVAL_METHODS = {
 class LocalWebSocket:
     """A bounded RFC 6455 client for Codex's user-private Unix socket."""
 
-    def __init__(self, path, timeout=3):
+    def __init__(self, path, timeout=3, max_message=MAX_MESSAGE):
+        self.max_message = max_message
         if not hasattr(socket, "AF_UNIX"):
             raise OSError("this computer's Python has no Unix sockets")
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -86,7 +87,7 @@ class LocalWebSocket:
         return data
 
     def _send(self, payload, opcode=1):
-        if len(payload) > MAX_MESSAGE:
+        if len(payload) > self.max_message:
             raise ValueError("oversized WebSocket message")
         length = len(payload)
         prefix = (bytes([128 | opcode, 128 | length]) if length < 126
@@ -114,7 +115,7 @@ class LocalWebSocket:
                 length = struct.unpack("!H", self._take(2))[0]
             elif length == 127:
                 length = struct.unpack("!Q", self._take(8))[0]
-            if length + len(fragments) > MAX_MESSAGE:
+            if length + len(fragments) > self.max_message:
                 raise ValueError("oversized WebSocket message")
             if opcode >= 8 and (not final or length > 125):
                 raise ValueError("invalid WebSocket control frame")
@@ -298,10 +299,10 @@ def handoff_card(message):
 class ApprovalSync:
     """One local Codex connection, with Codex as the authority for resolution."""
 
-    def __init__(self, queue, connect=None, card_title=None, status=None):
+    def __init__(self, queue, connect=None, card_title=None, status=None, socket_path=None):
         self.queue = queue
         home = os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex")
-        self.socket_path = os.path.join(home, "app-server-control", "app-server-control.sock")
+        self.socket_path = socket_path or os.path.join(home, "app-server-control", "app-server-control.sock")
         self.connect = connect or (lambda: LocalWebSocket(self.socket_path))
         self._custom_connect = connect is not None
         self.card_title = card_title or (lambda card: card)
@@ -502,6 +503,20 @@ class ApprovalSync:
                 self.close()
                 self.status(self.last_error)
                 return False
+
+    def owns(self, thread_id):
+        """Read-only ownership check; never resumes a stored thread."""
+        with self._rpc_lock:
+            self._ensure_connection()
+            cursor = None
+            for _page in range(64):
+                page = self._rpc("thread/loaded/list", {"cursor": cursor})
+                if thread_id in page.get("data", []):
+                    return True
+                cursor = page.get("nextCursor")
+                if not cursor:
+                    return False
+            raise ValueError("Codex loaded-thread listing exceeded its bound")
 
     def _read(self, sock):
         try:
@@ -705,3 +720,78 @@ class ApprovalSync:
                 done.set()
             if sock is not None:
                 sock.close()
+
+
+class ApprovalHub:
+    """Observe the default server and opt-in Desktop servers independently."""
+
+    def __init__(self, queue, card_title=None, status=None, paths=None):
+        from codex_desktop import server_sockets
+        self.queue, self.card_title = queue, card_title
+        self.status = status or (lambda error: None)
+        self.paths = paths or server_sockets
+        self._lock = threading.RLock()
+        self._syncs = {}
+        self._stop = threading.Event()
+        self._monitor = None
+        self.last_error = None
+
+    def _refresh(self):
+        with self._lock:
+            if self._stop.is_set():
+                return []
+            paths = self.paths()
+            for path in paths:
+                if path not in self._syncs:
+                    # A healthy unrelated server cannot clear a failed target's
+                    # status. Only successful attachment proves that target.
+                    sync = ApprovalSync(self.queue, card_title=self.card_title,
+                                        socket_path=path, status=self._failed)
+                    self._syncs[path] = sync
+                    if self._monitor is not None:
+                        sync.start()
+            for path in list(self._syncs):
+                if path not in paths:
+                    self._syncs.pop(path).stop()
+            return [self._syncs[path] for path in paths]
+
+    def _failed(self, error):
+        if error and error != "Thread is not loaded on this Codex server":
+            self.last_error = error
+            self.status(error)
+
+    def attach(self, thread_id, approval=None):
+        owners = []
+        for sync in self._refresh():
+            try:
+                if sync.owns(thread_id):
+                    owners.append(sync)
+            except (OSError, EOFError, ValueError):
+                continue
+        if len(owners) == 1 and owners[0].attach(thread_id, approval):
+            self.last_error = None
+            self.status(None)
+            return True
+        self.last_error = ("Thread is loaded on multiple Codex servers" if len(owners) > 1
+                           else "Thread is not loaded on an accessible Codex server")
+        self.status(self.last_error)
+        return False
+
+    def start(self):
+        with self._lock:
+            if self._monitor is None:
+                self._monitor = threading.Thread(target=self._observe,
+                                                 name="codex-desktop-look", daemon=True)
+                self._monitor.start()
+
+    def _observe(self):
+        while not self._stop.is_set():
+            self._refresh()
+            self._stop.wait(1)
+
+    def stop(self):
+        self._stop.set()
+        with self._lock:
+            for sync in self._syncs.values():
+                sync.stop()
+            self._syncs.clear()
