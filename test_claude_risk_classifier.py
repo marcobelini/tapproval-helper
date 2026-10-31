@@ -2979,6 +2979,23 @@ class TestCodexCatalog:
         row = cx._catalog_row(self.row(name=None, preview="Check the garden"))
         assert row["title"] == "Check the garden"
 
+    @pytest.mark.parametrize("status,direct", [({"type": "notLoaded"}, None),
+        ({"type": "idle"}, False)])
+    def test_local_queue_and_resume_routes_keep_reply_controls(self, tmp_path, monkeypatch, status, direct):
+        import codex_sessions as cx
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        workspace = tmp_path / "work"
+        workspace.mkdir()
+        path = TestCodexActiveSessions()._rollout(tmp_path, session_id="catalog-0001", cwd=str(workspace))
+        thread = self.row(cwd=str(workspace), path=str(path), status=status, canAcceptDirectInput=direct)
+        rows, _, _ = self.read([{"data": [thread]}])
+        assert rows[0]["can_send"] is True
+        # A catalog row without a matching local transcript is not enough.
+        thread["id"] = "catalog-other"
+        assert cx._catalog_row(thread)["can_send"] is False
+        thread.update(id="catalog-0001", path=str(tmp_path / "outside.jsonl"))
+        assert cx._catalog_row(thread)["can_send"] is False
+
     def test_pagination_preserves_old_chats_and_deduplicates(self):
         rows, _, calls = self.read([
             {"data": [self.row()], "nextCursor": "older"},
@@ -17254,31 +17271,49 @@ class TestTheLocalFallbackRunsWhatCiRuns:
         _, local = self._files()
         watch = local.split("# --- the watch app", 1)[1]
         assert 'CI_SIM="Tapproval CI"' in local
-        # Found or made on demand by sim-own.sh, whose own tests hold that.
-        own = watch.index('sim-own.sh "$CI_SIM"')
+        # Found or made on demand by sim-own.sh (by hand, sim-shared.sh),
+        # whose own tests hold that.
+        own = watch.index('own_sim 46mm "$CI_SIM"')
         shared = watch.index("sharing the first one listed")
         assert own < shared, "look for CI's own simulator before borrowing one"
 
     def test_a_run_by_hand_never_shares_cis_simulators(self):
         """On CI's names a run by hand killed a CI run's test host and held
-        its flows lock, and CI failed with no test to blame (#871)."""
+        its flows lock, and CI failed with no test to blame (#871). By hand
+        it takes the shared ones, one per kind (#1082), never CI's."""
         import subprocess
         _, local = self._files()
         start = local.index('CI_SIM="Tapproval CI"')
-        naming = local[start:local.index("\n", local.index("CI_SIM=", start + 20)) + 1]
-        script = naming + 'echo "$CI_SIM|$CI_SIM Flows|$CI_SIM iPhone"\n'
+        naming = local[start:local.index("\ngive_sim()", start) + 1]
+        script = (naming + 'echo "$CI_SIM|${CI_SIM:+$CI_SIM Flows}|${CI_SIM:+$CI_SIM iPhone}"\n'
+                  'own_sim 46mm "$CI_SIM" type rt\n')
+        bin_dir = tempfile.mkdtemp()
+        os.makedirs(os.path.join(bin_dir, "WatchApp"))
+        for helper in ("sim-own.sh", "sim-shared.sh"):
+            with open(os.path.join(bin_dir, "WatchApp", helper), "w") as stub:
+                stub.write('#!/bin/sh\necho "%s $*"\n' % helper)
+            os.chmod(os.path.join(bin_dir, "WatchApp", helper), 0o755)
 
         def names(**env):
             run_env = {k: v for k, v in os.environ.items() if k != "GITHUB_ACTIONS"}
             run_env.update(env)
-            return subprocess.run(["bash", "-c", script], env=run_env, capture_output=True,
-                                  text=True, check=True).stdout.strip().split("|")
-        assert names(GITHUB_ACTIONS="true") == [
-            "Tapproval CI", "Tapproval CI Flows", "Tapproval CI iPhone"]
-        assert names() == ["Tapproval Local", "Tapproval Local Flows", "Tapproval Local iPhone"]
+            out = subprocess.run(["bash", "-c", script], env=run_env, capture_output=True,
+                                 cwd=bin_dir, text=True, check=True).stdout.strip()
+            return out.split("\n")
+        try:
+            ci = names(GITHUB_ACTIONS="true")
+            assert ci[0].split("|") == ["Tapproval CI", "Tapproval CI Flows", "Tapproval CI iPhone"]
+            assert ci[1] == "sim-own.sh Tapproval CI type rt", ci
+            by_hand = names()
+            assert by_hand[0].split("|") == ["", "", ""], by_hand
+            assert by_hand[1].startswith("sim-shared.sh take 46mm type rt "), by_hand
+        finally:
+            shutil.rmtree(bin_dir)
         # Every simulator name the script uses comes from that one choice.
         assert local.count('"Tapproval CI') == 1, "a CI simulator named outside the choice"
-        assert 'FLOWS_SIM_PREFIX="$CI_SIM Flows"' in local and 'IOS_SIM="$CI_SIM iPhone"' in local
+        assert "Tapproval Local" not in local
+        assert 'FLOWS_SIM_PREFIX="${CI_SIM:+$CI_SIM Flows}"' in local
+        assert 'IOS_SIM="${CI_SIM:+$CI_SIM iPhone}"' in local
 
     def test_a_run_that_dies_without_a_failing_test_says_why(self):
         """The output filter keeps assertions and totals. A killed test host
@@ -17815,11 +17850,11 @@ class TestWatchSimulatorsAreChosenBySize:
             assert "./sim-udid.sh" in script, name
 
     OURS = {"com.apple.CoreSimulator.SimRuntime.watchOS-27-0": [
-        ("Tapproval Flows 41mm", "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", "Shutdown"),
-        ("Tapproval Flows 50mm", "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB", "Shutdown")]}
+        ("Tapproval Watch 41mm", "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", "Shutdown"),
+        ("Tapproval Watch 50mm", "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB", "Shutdown")]}
     OLD = {"com.apple.CoreSimulator.SimRuntime.watchOS-26-5": [
-        ("Tapproval Flows 41mm", "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC", "Shutdown"),
-        ("Tapproval Flows 50mm", "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD", "Shutdown")]}
+        ("Tapproval Watch 41mm", "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC", "Shutdown"),
+        ("Tapproval Watch 50mm", "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD", "Shutdown")]}
     SHARED = {"com.apple.CoreSimulator.SimRuntime.watchOS-27-0": [
         ("Apple Watch SE 4 (41mm)", "11111111-1111-1111-1111-111111111111", "Shutdown"),
         ("Apple Watch Ultra 5 (50mm)", "22222222-2222-2222-2222-222222222222", "Shutdown")]}
@@ -17861,7 +17896,7 @@ class TestWatchSimulatorsAreChosenBySize:
         app = tmp_path / "WatchApp"
         app.mkdir()
         for name in ("watch-flows.sh", "sim-devtype.sh", "sim-udid.sh", "sim-retire.sh",
-                     "sim-runtime.sh", "sim-tidy.sh", "sim-own.sh"):
+                     "sim-runtime.sh", "sim-tidy.sh", "sim-own.sh", "sim-shared.sh"):
             shutil.copy(os.path.join(_ROOT, "WatchApp", name), app / name)
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
@@ -17897,9 +17932,10 @@ class TestWatchSimulatorsAreChosenBySize:
             fake.chmod(0o755)
         env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]),
                    TMPDIR=str(tmp_path), SIM_DEVICES_DIR=str(data), SIM_TIDY_MB="0",
-                   FLOWS_LOCK_WAIT="1")
+                   FLOWS_LOCK_WAIT="1", SIM_LOCK_DIR=str(tmp_path / "locks"))
         env.pop("FLOWS_KEEP_SIM", None)
         env.pop("FLOWS_SIM_PREFIX", None)
+        env.pop("SIM_LOCK_WAIT", None)
         env.pop("FLOWS_WORKERS", None)
         if workers is not None:
             env["FLOWS_WORKERS"] = str(workers)
@@ -17908,7 +17944,7 @@ class TestWatchSimulatorsAreChosenBySize:
         if keep:
             env["FLOWS_KEEP_SIM"] = "1"
         if lock_pid is not None:
-            lock = tmp_path / "tapproval-flows-Tapproval-Flows.lock"
+            lock = tmp_path / "tapproval-flows-Tapproval-Watch.lock"
             lock.mkdir()
             (lock / "pid").write_text("%d\n" % lock_pid)
         run = subprocess.run(["bash", str(app / "watch-flows.sh")], env=env,
@@ -17991,7 +18027,7 @@ class TestWatchSimulatorsAreChosenBySize:
         for short, old in (("41mm", "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC"),
                            ("50mm", "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD")):
             create = [i for i, e in enumerate(events)
-                      if e.startswith("simctl create Tapproval Flows %s " % short)]
+                      if e.startswith("simctl create Tapproval Watch %s " % short)]
             assert len(create) == 1 and "simctl delete %s" % old in events, events
             assert create[0] < events.index("simctl delete %s" % old), \
                 "retired before a replacement existed: %s" % events
@@ -18034,7 +18070,7 @@ class TestWatchSimulatorsAreChosenBySize:
         assert run.returncode == 1, run.stdout + run.stderr
         assert "another flows run" in run.stderr, run.stderr
         assert "build" not in events, "it ran beside the other: %s" % events
-        assert (tmp_path / "tapproval-flows-Tapproval-Flows.lock").is_dir(), \
+        assert (tmp_path / "tapproval-flows-Tapproval-Watch.lock").is_dir(), \
             "the refused run removed the other run's lock"
 
     @pytest.mark.private_layout
@@ -18043,7 +18079,7 @@ class TestWatchSimulatorsAreChosenBySize:
         gone.wait()
         run, events = self._flows(tmp_path, lock_pid=gone.pid)
         assert run.returncode == 0, run.stdout + run.stderr
-        assert not (tmp_path / "tapproval-flows-Tapproval-Flows.lock").exists()
+        assert not (tmp_path / "tapproval-flows-Tapproval-Watch.lock").exists()
 
     def _helper_run(self, tmp_path, script, *args, devices=None, env=None):
         bin_dir = tmp_path / "bin"
@@ -18071,10 +18107,10 @@ class TestWatchSimulatorsAreChosenBySize:
     @pytest.mark.private_layout
     def test_a_runtime_narrows_the_lookup_to_it(self, tmp_path):
         devices = dict(self.OLD, **self.OURS)
-        run, _ = self._helper_run(tmp_path, "sim-udid.sh", "Tapproval Flows 41mm",
+        run, _ = self._helper_run(tmp_path, "sim-udid.sh", "Tapproval Watch 41mm",
                                   "com.apple.CoreSimulator.SimRuntime.watchOS-27-0", devices=devices)
         assert run.stdout == "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA\n", run.stderr
-        run, _ = self._helper_run(tmp_path, "sim-udid.sh", "Tapproval Flows 41mm",
+        run, _ = self._helper_run(tmp_path, "sim-udid.sh", "Tapproval Watch 41mm",
                                   "com.apple.CoreSimulator.SimRuntime.watchOS-27-0", devices=self.OLD)
         assert run.stdout == "", run.stdout
 
@@ -22660,11 +22696,282 @@ class TestOurSimulatorsFollowTheNewestRuntime:
         order is made once (2026-10-18)."""
         ci = open(os.path.join(_ROOT, "ci-local.sh"), encoding="utf-8").read()
         flows = open(os.path.join(_ROOT, "WatchApp", "watch-flows.sh"), encoding="utf-8").read()
-        assert 'sim-own.sh "$CI_SIM"' in ci and 'sim-own.sh "$IOS_SIM"' in ci
-        assert './sim-own.sh "$own"' in flows
+        assert 'own_sim 46mm "$CI_SIM"' in ci and 'own_sim iPhone "$IOS_SIM"' in ci
+        assert 'WatchApp/sim-own.sh "$2"' in ci and 'WatchApp/sim-shared.sh take "$1"' in ci
+        assert './sim-own.sh "$own"' in flows and './sim-shared.sh take "$short"' in flows
         for script in (ci, flows):
             assert "simctl create" not in script
             assert "sim-retire.sh" not in script
+
+
+@pytest.mark.private_layout
+class TestFlowsShareOneSimulatorPerKind:
+    """Each flow, and each session that set a prefix of its own, made
+    simulators of its own per test name and face: "Tapproval Pill 40mm",
+    "Tapproval Unattended Handoff 49mm", "KeepPlan Flows 40mm" ... 58 on
+    2026-10-30, and with Tapmerge's about 10 GB a day (#1082). Now every
+    hand-run flow takes the one simulator of its kind (sim-shared.sh), in
+    turn; CI keeps its own. All against a stand-in xcrun that remembers
+    what it made, never the real simctl."""
+
+    RT = "com.apple.CoreSimulator.SimRuntime.watchOS-27-0"
+    SCRIPTS = ("watch-flows.sh", "e2e-lib.sh", "sim-shared.sh", "sim-own.sh", "sim-udid.sh",
+               "sim-retire.sh", "sim-runtime.sh", "sim-devtype.sh", "sim-tidy.sh", "stop-tree.sh")
+    E2E = ("pill-e2e.sh", "place-e2e.sh", "tap-e2e.sh", "mark-e2e.sh", "codex-e2e.sh")
+
+    # A stand-in xcrun with a memory: what `simctl create` makes is listed
+    # from then on, and every create, boot, shutdown, erase and delete is
+    # written to the events file.
+    XCRUN = r'''#!/usr/bin/env python3
+import json, os, sys, uuid
+here = os.environ["STUB_DIR"]
+state_path = os.path.join(here, "devices.json")
+state = json.load(open(state_path))
+args = sys.argv[1:]
+def log(line):
+    with open(os.path.join(here, "events"), "a") as f:
+        f.write(line + "\n")
+def save():
+    json.dump(state, open(state_path, "w"))
+def find(udid):
+    for devices in state["devices"].values():
+        for d in devices:
+            if d["udid"] == udid:
+                return d
+    return {}
+if args[:3] == ["simctl", "list", "-j"] and args[3:4] == ["runtimes"]:
+    print(open(os.path.join(here, "runtimes.json")).read())
+elif args[:2] == ["simctl", "list"] and "-j" in args:
+    print(json.dumps(state))
+elif args[:2] == ["simctl", "list"]:
+    for rt, devices in state["devices"].items():
+        print("-- %s --" % rt)
+        for d in devices:
+            print("    %s (%s) (%s)" % (d["name"], d["udid"], d["state"]))
+elif args[:2] == ["simctl", "create"]:
+    name, devtype, rt = args[2:5]
+    udid = str(uuid.uuid4()).upper()
+    state["devices"].setdefault(rt, []).append(
+        {"name": name, "udid": udid, "state": "Shutdown", "isAvailable": True})
+    save()
+    log("create %s" % name)
+    print(udid)
+elif args[:2] == ["simctl", "delete"]:
+    for rt in state["devices"]:
+        state["devices"][rt] = [d for d in state["devices"][rt] if d["udid"] != args[2]]
+    save()
+    log("delete %s" % args[2])
+elif args[:2] == ["simctl", "boot"]:
+    find(args[2])["state"] = "Booted"
+    save()
+    log("boot %s" % args[2])
+elif args[:2] == ["simctl", "shutdown"]:
+    find(args[2])["state"] = "Shutdown"
+    save()
+    log("shutdown %s" % args[2])
+elif args[:2] == ["simctl", "erase"]:
+    log("erase %s" % args[2])
+elif args[:2] == ["simctl", "bootstatus"]:
+    pass
+else:
+    sys.exit(1)
+'''
+    XCODEBUILD = r'''#!/bin/bash
+dest=$(printf "%s\n" "$@" | grep -m1 "^id=")
+case "$1" in
+  build-for-testing) echo "** TEST BUILD SUCCEEDED **" ;;
+  test-without-building) echo "test $dest" >> "$STUB_DIR/events"; echo "** TEST SUCCEEDED **" ;;
+  *) exit 2 ;;
+esac
+'''
+
+    def _mac(self, tmp_path, devices=None):
+        """A WatchApp folder of the real scripts beside a stand-in Xcode;
+        returns (app folder, environment, events file)."""
+        app = tmp_path / "WatchApp"
+        app.mkdir()
+        for name in self.SCRIPTS + self.E2E + ("auto-update-e2e.sh",):
+            source = os.path.join(_ROOT, "WatchApp", name)
+            if os.path.exists(source):
+                shutil.copy(source, app / name)
+        stub = tmp_path / "stub"
+        stub.mkdir()
+        (stub / "runtimes.json").write_text(json.dumps(TestWatchSimulatorsAreChosenBySize.RUNTIMES))
+        (stub / "devices.json").write_text(json.dumps({"devices": devices or {}}))
+        (stub / "events").write_text("")
+        for name, body in (("xcrun", self.XCRUN), ("xcodebuild", self.XCODEBUILD)):
+            (stub / name).write_text(body)
+            (stub / name).chmod(0o755)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("GITHUB_", "FLOWS_", "ALL_SIZES", "SIM_"))
+               and not k.endswith(("_SIM_PREFIX", "_FACE", "_KEEP_SIM"))}
+        env.update(PATH="%s:%s" % (stub, os.environ["PATH"]), STUB_DIR=str(stub),
+                   TMPDIR=str(tmp_path) + "/", SIM_LOCK_DIR=str(tmp_path / "locks"),
+                   SIM_DEVICES_DIR=str(tmp_path / "Devices"), FLOWS_LOCK_WAIT="1",
+                   SIM_LOCK_WAIT="1")
+        return app, env, stub / "events"
+
+    @staticmethod
+    def _names(tmp_path):
+        state = json.loads((tmp_path / "stub" / "devices.json").read_text())
+        return sorted(d["name"] for devices in state["devices"].values() for d in devices)
+
+    @staticmethod
+    def _tested_on(events):
+        return sorted(set(e.split("id=")[1] for e in events if e.startswith("test id=")))
+
+    def test_two_flows_runs_under_different_names_get_the_same_two_simulators(self, tmp_path):
+        """Sessions ran the flows as "KeepPlan Flows" and "E2E166 Flows" (both
+        still on this Mac on 2026-10-31), each making two faces of its own."""
+        app, env, events = self._mac(tmp_path)
+        seen = []
+        for prefix in ("KeepPlan Flows", "E2E166 Flows", None):
+            run_env = dict(env)
+            if prefix:
+                run_env["FLOWS_SIM_PREFIX"] = prefix
+            events.write_text("")
+            run = subprocess.run(["bash", str(app / "watch-flows.sh")], env=run_env,
+                                 capture_output=True, text=True, timeout=60)
+            assert run.returncode == 0, run.stdout + run.stderr
+            seen.append(self._tested_on(events.read_text().splitlines()))
+        assert self._names(tmp_path) == ["Tapproval Watch 41mm", "Tapproval Watch 50mm"], \
+            self._names(tmp_path)
+        assert len(seen[0]) == 2 and seen[0] == seen[1] == seen[2], seen
+
+    def test_every_e2e_script_takes_the_same_faces(self, tmp_path):
+        """Each e2e script's own call, as the script writes it, run one after
+        another: one simulator per face between them, not one per script."""
+        app, env, events = self._mac(tmp_path)
+        got = {}
+        for script in self.E2E:
+            text = (app / script).read_text()
+            prefix = [line for line in text.splitlines() if line.startswith("PREFIX=")]
+            call = next(line.strip() for line in text.splitlines()
+                        if line.strip().startswith("e2e_pick_faces"))
+            snippet = "\n".join(['set -uo pipefail', '. "%s/e2e-lib.sh" || exit 1' % app]
+                                + prefix + [call, 'echo "${E2E_UDIDS[*]}"',
+                                            'e2e_finish "" 1 /nonexistent'])
+            run = subprocess.run(["bash", "-c", snippet], env=env, cwd=app,
+                                 capture_output=True, text=True, timeout=60)
+            assert run.returncode == 0, script + run.stdout + run.stderr
+            got[script] = run.stdout.split()
+        assert self._names(tmp_path) == ["Tapproval Watch 41mm", "Tapproval Watch 50mm"], \
+            self._names(tmp_path)
+        assert len(set(map(tuple, got.values()))) == 1, got
+        assert not list((tmp_path / "locks").glob("*.lock")), "a run kept its simulator"
+
+    def _take(self, app, env, kind="41mm", devtype="se4-41", holder=None, *extra, wait=None):
+        run_env = dict(env)
+        if wait is not None:
+            run_env["SIM_LOCK_WAIT"] = str(wait)
+        return subprocess.run(
+            [str(app / "sim-shared.sh"), "take", kind, devtype, self.RT,
+             str(holder or os.getpid()), *extra],
+            env=run_env, capture_output=True, text=True, timeout=60)
+
+    def test_a_flow_that_needs_a_clean_simulator_gets_it_erased(self, tmp_path):
+        """The Auto-update flow wants a Keychain with no key but its own:
+        it erased a simulator of its own; now it erases the shared one it
+        holds, switched off first, rather than making one."""
+        app, env, events = self._mac(tmp_path)
+        plain = self._take(app, env)
+        assert plain.returncode == 0, plain.stderr
+        udid = plain.stdout.strip()
+        assert not any(e.startswith("erase") for e in events.read_text().splitlines())
+        subprocess.run([str(app / "sim-shared.sh"), "give", "41mm", str(os.getpid())],
+                       env=env, check=True)
+        events.write_text("")
+        clean = self._take(app, env, "41mm", "se4-41", None, "clean")
+        assert clean.returncode == 0 and clean.stdout.strip() == udid, clean.stderr
+        assert events.read_text().splitlines() == ["shutdown " + udid, "erase " + udid]
+        assert self._names(tmp_path) == ["Tapproval Watch 41mm"]
+        auto = (app / "auto-update-e2e.sh").read_text()
+        assert re.search(r'sim-shared\.sh take "\$short" .* \$\$ clean\)', auto), \
+            "auto-update-e2e.sh no longer asks for an erased simulator"
+        assert "sim-own.sh" not in auto
+
+    def test_a_second_flow_waits_its_turn_and_then_gets_the_same_one(self, tmp_path):
+        app, env, events = self._mac(tmp_path)
+        first = subprocess.Popen(["sleep", "300"])
+        second = subprocess.Popen(["sleep", "300"])
+        try:
+            udid = self._take(app, env, holder=first.pid).stdout.strip()
+            assert udid
+            events.write_text("")
+            waiting = subprocess.Popen(
+                [str(app / "sim-shared.sh"), "take", "41mm", "se4-41", self.RT, str(second.pid)],
+                env=dict(env, SIM_LOCK_WAIT="30"), stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True)
+            time.sleep(2)
+            assert waiting.poll() is None, "it did not wait: %s" % (waiting.communicate(),)
+            assert events.read_text() == "", "it touched the simulator in use"
+            subprocess.run([str(app / "sim-shared.sh"), "give", "41mm", str(first.pid)],
+                           env=env, check=True)
+            out, err = waiting.communicate(timeout=30)
+            assert waiting.returncode == 0 and out.strip() == udid, err
+            assert "waiting for Tapproval Watch 41mm" in err
+            lock = tmp_path / "locks" / "Tapproval-Watch-41mm.lock"
+            assert (lock / "pid").read_text().strip() == str(second.pid)
+        finally:
+            first.kill()
+            second.kill()
+
+    def test_a_simulator_still_in_use_is_refused_and_left_alone(self, tmp_path):
+        app, env, events = self._mac(tmp_path)
+        holder = subprocess.Popen(["sleep", "300"])
+        try:
+            assert self._take(app, env, holder=holder.pid).returncode == 0
+            events.write_text("")
+            busy = self._take(app, env, "41mm", "se4-41", None, "clean", wait=1)
+            assert busy.returncode == 3 and "in use" in busy.stderr, busy.stderr
+            assert busy.stdout == "" and events.read_text() == "", events.read_text()
+            lock = tmp_path / "locks" / "Tapproval-Watch-41mm.lock"
+            assert (lock / "pid").read_text().strip() == str(holder.pid)
+            # Giving back is the holder's alone.
+            subprocess.run([str(app / "sim-shared.sh"), "give", "41mm", str(os.getpid())],
+                           env=env, check=True)
+            assert lock.is_dir(), "another flow freed a simulator it did not hold"
+        finally:
+            holder.kill()
+
+    def test_a_simulator_whose_flow_is_gone_is_taken_over(self, tmp_path):
+        app, env, _ = self._mac(tmp_path)
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        assert self._take(app, env, holder=gone.pid).returncode == 0
+        again = self._take(app, env)
+        assert again.returncode == 0 and again.stdout.strip(), again.stderr
+
+    def test_an_iphone_and_each_face_are_named_by_kind(self, tmp_path):
+        app, env, _ = self._mac(tmp_path)
+        for kind in ("iPhone", "40mm", "49mm"):
+            run = subprocess.run([str(app / "sim-shared.sh"), "name", kind], env=env,
+                                 capture_output=True, text=True, check=True)
+            assert run.stdout.strip() == ("Tapproval iPhone" if kind == "iPhone"
+                                          else "Tapproval Watch " + kind)
+        bad = subprocess.run([str(app / "sim-shared.sh"), "name", "Pill 40mm"], env=env,
+                             capture_output=True, text=True)
+        assert bad.returncode == 2
+
+    def test_ci_keeps_its_own_faces(self, tmp_path):
+        """The runner on this Mac uses "Tapproval CI Flows NNmm", found or made
+        by name and never queued behind a run by hand."""
+        app, env, _ = self._mac(tmp_path)
+        run = subprocess.run(["bash", str(app / "watch-flows.sh")],
+                             env=dict(env, FLOWS_SIM_PREFIX="Tapproval CI Flows"),
+                             capture_output=True, text=True, timeout=60)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert self._names(tmp_path) == ["Tapproval CI Flows 41mm", "Tapproval CI Flows 50mm"]
+        assert not (tmp_path / "locks").exists() or not list((tmp_path / "locks").iterdir())
+
+    def test_no_script_names_a_simulator_per_test(self):
+        """The way back to 58: a per-script name, or a prefix a session can set."""
+        for path in glob.glob(os.path.join(_ROOT, "WatchApp", "*.sh")):
+            text = open(path, encoding="utf-8").read()
+            name = os.path.basename(path)
+            assert not re.search(r"sim-own\.sh \"Tapproval", text), name
+            if name != "watch-flows.sh":   # CI's own prefix, honoured only with "CI" in it
+                assert "_SIM_PREFIX" not in text, name
 
 
 class TestTheWatchUsesFourTextSizes:

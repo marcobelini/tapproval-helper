@@ -254,6 +254,24 @@ def active_sessions(limit=12, sessions_dir=None, index_path=None, open_paths=Non
     return rows
 
 
+def _catalog_delivery_path(thread):
+    """A local transcript supports the existing queue/resume dispatcher.
+
+    This is an affordance, never a claim that a thread is closed or a grant
+    to send. The dispatcher rechecks ownership, activity and policy on tap.
+    """
+    path, cwd = thread.get("path"), thread.get("cwd")
+    if (not isinstance(path, str) or not isinstance(cwd, str)
+            or not os.path.isabs(cwd) or not os.path.isdir(cwd)):
+        return None
+    root = os.path.realpath(os.path.join(_home(), "sessions"))
+    real = os.path.realpath(path)
+    if not real.startswith(root + os.sep):
+        return None
+    meta = _rollout_meta(real)
+    return real if meta and meta["session_id"] == thread.get("id") else None
+
+
 def _catalog_row(thread):
     """Membership is the native interactive catalog, not a file descriptor."""
     if not isinstance(thread, dict):
@@ -293,7 +311,8 @@ def _catalog_row(thread):
             "running_tool": None, "running_tasks": 0, "wake_at": None,
             # Visibility never grants a send capability. The send path still
             # rechecks unique native ownership and the permission context.
-            "can_send": thread.get("canAcceptDirectInput") is True}
+            "can_send": (thread.get("canAcceptDirectInput") is True
+                         or _catalog_delivery_path(thread) is not None)}
 
 
 def _read_catalog(client_factory=None, endpoints=None):
@@ -346,7 +365,7 @@ def _read_catalog(client_factory=None, endpoints=None):
                 runtime = row if old is None or (row["live"], rank[row["state"]]) > (old["live"], rank[old["state"]]) else old
                 rows[sid] = dict(newest, **{key: runtime[key] for key in
                     ("live", "state", "state_reason", "can_send")})
-                if owners[sid] != 1:
+                if owners[sid] > 1:
                     rows[sid]["can_send"] = False
                 if sid in server_paths:
                     paths[sid] = server_paths[sid]
