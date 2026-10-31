@@ -15009,6 +15009,7 @@ class TestTheRelayRefusesASimulator:
         ("/decision", {"id": "ghost", "decision": "allow"}),
         ("/say", {"session_id": "x", "text": "hi"}),
         ("/new", {"path": "/x", "text": "hi"}),
+        ("/new-agent", {"path": "/x", "text": "hi", "agent": "codex"}),
         ("/end", {"session_id": "x"}),
         # A simulator's tap must not change the owner's Claude Code settings.
         ("/auto-update", {"on": True}),
@@ -15056,7 +15057,7 @@ class TestTheRelayRefusesASimulator:
     def test_the_answering_routes_carry_the_rule(self):
         post = watch_relay.RelayHandler.ROUTES["POST"]
         guarded = {p for p, (_, rules) in post.items() if rules.get("no_simulator")}
-        assert guarded == {"/decision", "/say", "/new", "/end", "/auto-update"}
+        assert guarded == {"/decision", "/say", "/new", "/new-agent", "/end", "/auto-update"}
 
     @pytest.mark.parametrize("tag", ["1", "yes"])
     @pytest.mark.parametrize("path,body", GUARDED)
@@ -19538,7 +19539,8 @@ class TestStandardLibraryOnly:
     #: test suite is not what a user's interpreter is asked to run.
     ALLOWED_THIRD_PARTY = {"test_claude_risk_classifier.py": {"pytest"},
                            "test_codex_approvals.py": {"pytest"}, "test_activity.py": {"pytest"},
-                           "test_codex_desktop.py": {"pytest"}}
+                           "test_codex_desktop.py": {"pytest"},
+                           "test_new_session_agent.py": {"pytest"}}
 
     @staticmethod
     def _root_modules():
@@ -20207,6 +20209,28 @@ class TestIssue400:
         second = relay_call(base + "/new", token="bootstraptoken", method="POST", body=body)
         assert first[1] == receipt[1] == second[1] == {"ok": True, "status": "started"}
         assert ran == [("/p", "go")]
+
+    def test_explicit_agent_is_delivered_once_and_pinned_by_the_receipt(self, relay, monkeypatch):
+        base, ran = relay
+        monkeypatch.setattr(watch_relay, "start_session",
+                            lambda path, text, agent=None: ran.append((path, text, agent)) or "started")
+        body = {"path": "/p", "text": "go", "agent": "codex", "request_id": "a" * 32}
+        first = relay_call(base + "/new-agent", token="bootstraptoken", method="POST", body=body)
+        again = relay_call(base + "/new-agent", token="bootstraptoken", method="POST", body=body)
+        assert first == again == (200, {"ok": True, "status": "started"})
+        changed = relay_call(base + "/new-agent", token="bootstraptoken", method="POST",
+                             body=dict(body, agent="claude"))
+        assert changed[0] == 409
+        assert ran == [("/p", "go", "codex")]
+
+    @pytest.mark.parametrize("agent", [None, "", "other", ["codex"]])
+    def test_explicit_agent_route_requires_a_valid_choice(self, relay, agent):
+        base, ran = relay
+        answer = relay_call(base + "/new-agent", token="bootstraptoken", method="POST",
+                            body={"path": "/p", "text": "go", "agent": agent})
+        assert answer[0] == 400
+        assert answer[1]["retry_safe"] is True
+        assert ran == []
 
     def test_new_receipt_cannot_be_reused_for_other_words_or_read_by_another_device(self, relay):
         base, ran = relay

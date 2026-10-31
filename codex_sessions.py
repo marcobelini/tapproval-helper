@@ -11,9 +11,11 @@ to make a session-list row.
 from __future__ import annotations
 
 import json
+import base64
 import os
 import re
 import subprocess
+import stat
 import threading
 import time
 from collections import OrderedDict
@@ -489,6 +491,64 @@ def _tool_category(payload):
     return _TOOL_NAMES.get(name, "tool")
 
 
+def _reply_images(markdown, cwd):
+    """Attach bounded local raster images explicitly linked by the assistant.
+
+    Never fetch URLs or read outside the rollout's project (including symlinks).
+    Reuse the watch's bounded cache and authenticated /image route.
+    """
+    from watch_dashboard import remember_image, IMAGE_MAX_BYTES
+    if not cwd or not os.path.isabs(cwd):
+        return []
+    root = os.path.realpath(cwd)
+    refs = []
+    lines, fence = [], None
+    for line in markdown.splitlines():
+        marker = re.match(r'^\s*(`{3,}|~{3,})', line)
+        if marker:
+            token = marker.group(1)
+            if fence is None:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence):
+                fence = None
+            continue
+        if fence is None:
+            lines.append(re.sub(r'(`+).*?\1', '', line))
+    prose = '\n'.join(lines)
+    for match in re.finditer(r'!\[[^\]\n]*\]\(\s*(?:<([^>\n]+)>|([^\s)]+))\s*\)', prose):
+        if len(refs) >= 8:
+            break
+        target = match.group(1) or match.group(2)
+        if re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*:', target):
+            continue
+        path = os.path.realpath(os.path.join(root, target))
+        try:
+            if os.path.commonpath([root, path]) != root:
+                continue
+            # Nonblocking open also refuses a FIFO/device without hanging.
+            fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0)
+                         | getattr(os, 'O_NOFOLLOW', 0))
+            with os.fdopen(fd, 'rb') as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > IMAGE_MAX_BYTES * 3 // 4:
+                    continue
+                data = handle.read(IMAGE_MAX_BYTES * 3 // 4 + 1)
+            if len(data) > IMAGE_MAX_BYTES * 3 // 4:
+                continue
+            media = ('image/png' if data.startswith(b'\x89PNG\r\n\x1a\n') else
+                     'image/jpeg' if data.startswith(b'\xff\xd8\xff') else
+                     'image/gif' if data.startswith((b'GIF87a', b'GIF89a')) else None)
+            if not media:
+                continue
+            ref = remember_image({'source': {'type': 'base64', 'media_type': media,
+                                             'data': base64.b64encode(data).decode('ascii')}})
+            if ref and ref not in refs:
+                refs.append(ref)
+        except (OSError, ValueError):
+            continue
+    return refs
+
+
 def _fold(state, row, number):
     """Read Codex shapes only; formatting below is shared with Claude."""
     payload = row.get("payload")
@@ -568,6 +628,9 @@ def _fold(state, row, number):
     state["tool_run"] = None
     turn = {"role": role, "kind": "text", "text": text, "at": at, "n": number}
     if role == "assistant":
+        pictures = _reply_images(raw, state.get('cwd'))
+        if pictures:
+            turn['images'] = pictures
         marked = blocks(raw, always=True)
         if marked != [{"kind": "text", "text": text}]:
             turn["blocks"] = marked
@@ -600,7 +663,9 @@ def thread_info(path, mark=None, limit=14, card_waiting=False):
             state["identity"] != identity or stat.st_size < state["offset"])
         if state is None or replaced:
             floor = _tail_start(path)
+            meta = _rollout_meta(path) or {}
             state = {"identity": identity, "offset": floor, "floor": floor,
+                     "cwd": meta.get("cwd"),
                      "turns": [], "calls": {}, "busy": None, "last_said": None,
                      "tool_run": None, "changed": {}, "seen_calls": OrderedDict()}
             _THREADS[path] = state
