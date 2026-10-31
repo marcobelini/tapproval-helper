@@ -2864,7 +2864,13 @@ def trust_folder(path, config=None):
     return True
 
 
-def start_session(path, text, projects_dir=None, platform=None):
+def start_session_from_request(body):
+    """Preserve legacy launches while honoring an explicit assistant choice."""
+    choice = {"agent": body["agent"]} if "agent" in body else {}
+    return start_session(str(body.get("path", ""))[:512], body.get("text", ""), **choice)
+
+
+def start_session(path, text, projects_dir=None, platform=None, agent=None):
     """Open a REAL Claude Code session on this computer, in ``path``, with ``text``
     as its first message. Returns a short status; "started" on success.
 
@@ -2880,6 +2886,8 @@ def start_session(path, text, projects_dir=None, platform=None):
     the person's code folders), or a Terminal that will not open (no one logged in at the screen — the
     usual reason). Never raises, never blocks longer than a few seconds.
     """
+    if agent not in (None, "claude", "codex"):
+        return "unknown agent"
     text = " ".join(str(text or "").split())
     if not text:
         return "empty"
@@ -2896,7 +2904,7 @@ def start_session(path, text, projects_dir=None, platform=None):
     project = next((row for row in known_projects(projects_dir) if row["path"] == path), None)
     if project is None:
         return "unknown project"
-    codex = project.get("agent") == "codex"
+    codex = (agent or project.get("agent")) == "codex"
     if codex:
         from ClaudeRiskClassifier import ensure_codex_on_path
         from codex_talk import flags
@@ -4094,6 +4102,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             # token, like /say: a command Claude runs is a local process,
             # and it must not open sessions of its own on this machine.
             "/new": ("_post_new", dict(token=True, no_simulator=True)),
+            # Separate route: an older helper must refuse an explicit choice,
+            # rather than ignore the field and launch the other assistant.
+            "/new-agent": ("_post_new_agent", dict(token=True, no_simulator=True)),
             # token: a key from EVERY source. Loopback is a local process,
             # and a command Claude runs is a local process too — it must
             # not be able to answer its own card or speak into a session.
@@ -4543,6 +4554,13 @@ class RelayHandler(BaseHTTPRequestHandler):
             _remember_send(key, answer)
         self._send_json(answer)
 
+    def _post_new_agent(self, path, query):
+        body = self._read_json() or {}
+        if body.get("agent") not in ("claude", "codex"):
+            self._send_json({"ok": False, "status": "unknown agent", "retry_safe": True}, 400)
+            return
+        self._post_new(path, query)
+
     def _post_new(self, path, query):
         # Opens a Terminal on this Mac.
         body = self._read_json() or {}
@@ -4550,7 +4568,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._tracked_new(body)
             return
         self._serialised_send(lambda body: (
-            start_session(str(body.get("path", ""))[:512], body.get("text", "")),
+            start_session_from_request(body),
             "started"), path)
 
     def _new_receipt_store(self):
@@ -4605,7 +4623,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             # a relay restart or over the other route, can only read it.
             answer = store.claim(key, fingerprint)
             if answer is None:
-                status = start_session(str(body.get("path", ""))[:512], body.get("text", ""))
+                status = start_session_from_request(body)
                 answer = {"ok": status == "started", "status": status}
                 if not answer["ok"]:
                     # False alone is not proof that nothing launched:
@@ -4613,7 +4631,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     # after Terminal accepted the command. Keep new and
                     # unclassified outcomes conservative by default.
                     answer["retry_safe"] = status in {
-                        "empty", "unknown project", "claude not on PATH", "signed out",
+                        "empty", "unknown project", "unknown agent", "claude not on PATH", "signed out",
                         "Codex is not installed on your computer",
                         "a first message cannot start with ! or #",
                         "new sessions need Codex's own installer on Windows",
