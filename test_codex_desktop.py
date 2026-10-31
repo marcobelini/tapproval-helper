@@ -242,6 +242,16 @@ def test_watch_sender_refuses_duplicate_native_owners(monkeypatch):
     assert all(connection.closed for connection in opened)
 
 
+def test_absent_socket_is_known_absent_without_transport_support(tmp_path, monkeypatch):
+    """CLI routes do not require Unix-socket support when no socket exists."""
+    import codex_talk
+    def unsupported(_path):
+        raise OSError('this Python has no Unix sockets')
+    monkeypatch.setattr(codex_talk, 'LocalWebSocket', unsupported)
+    with pytest.raises(FileNotFoundError):
+        codex_talk.Client(socket_path=str(tmp_path / 'missing.sock'))
+
+
 @pytest.mark.parametrize('page', [
     {'data': 'target'}, {'data': ['target', {}]},
     {'data': ['target'], 'nextCursor': 1},

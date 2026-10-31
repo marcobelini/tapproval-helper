@@ -42,6 +42,9 @@ class Client:
 
     def __init__(self, connect=None, socket_path=None):
         path = socket_path or os.path.join(sessions._home(), "app-server-control", "app-server-control.sock")
+        if connect is None:
+            # Establish absence before a platform's socket support is needed.
+            os.stat(path)
         self.wire = (connect or (lambda: LocalWebSocket(path)))()
         self.sequence = 0
         try:
