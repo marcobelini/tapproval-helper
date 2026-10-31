@@ -1063,6 +1063,7 @@ class TestCodexTalkingBack:
         assert command[:2] == ['/bin/codex', 'exec']
         assert command[2] == '--skip-git-repo-check'
         assert command[3:3 + len(talk.flags())] == talk.flags()
+        assert 'approvals_reviewer="user"' in command
         assert command[-4:-1] == ['resume', sid, '--']
         from tapproval_wire import codex_wrist_words
         assert codex_wrist_words(command[-1]) == '--dangerously-bypass-approvals-and-sandbox'
@@ -1174,6 +1175,7 @@ class TestCodexTalkingBack:
         import shlex
         script = scripts[0].split(' && ', 1)[1].strip()
         assert shlex.split(script) == ['/opt/a path/codex'] + talk.flags() + ['--', text]
+        assert 'approvals_reviewer="user"' in shlex.split(script)
 
     def test_unknown_activity_never_starts_a_second_writer(self, setup, monkeypatch):
         talk, _, _, _, _, _, spawned, send = setup

@@ -2970,6 +2970,10 @@ def start_session(path, text, projects_dir=None, platform=None):
             return started
         also = (opened.stderr or opened.stdout or "").strip().splitlines()
         not_opened = also[-1] if also else "no reason given"
+    except subprocess.TimeoutExpired:
+        # Launch Services may already have accepted the .command file.
+        # A second launch through AppleScript could create two sessions.
+        return "unknown"
     except (OSError, subprocess.SubprocessError) as error:
         not_opened = str(error)
     apple = ('tell application "Terminal"\n'
@@ -4012,6 +4016,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             "/pending": ("_get_pending", {}),
             "/health": ("_get_health", {}),
             "/projects": ("_get_projects", {}),
+            "/new-receipt": ("_get_new_receipt", dict(token=True, no_simulator=True)),
             "/skills": ("_get_skills", {}),
             "/sessions": ("_get_sessions", {}),
             "/activity": ("_get_activity", {}),
@@ -4472,9 +4477,92 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def _post_new(self, path, query):
         # Opens a Terminal on this Mac.
+        body = self._read_json() or {}
+        if isinstance(body, dict) and "request_id" in body:
+            self._tracked_new(body)
+            return
         self._serialised_send(lambda body: (
             start_session(str(body.get("path", ""))[:512], body.get("text", "")),
             "started"), path)
+
+    def _new_receipt_store(self):
+        return NewReceipts(self.auth.path + ".new.sqlite3")
+
+    def _new_receipt_key(self, request_id):
+        import uuid
+        # Canonical UUIDs only; never a caller-controlled filename.
+        value = uuid.UUID(str(request_id)).hex
+        return _send_key(self._presented(), "/new-receipt", value)
+
+    def _get_new_receipt(self, path, query):
+        try:
+            key = self._new_receipt_key(query.get("id", [""])[0])
+            answer = self._new_receipt_store().read(key)
+        except ValueError:
+            self._send_json({"ok": False, "status": "invalid request id"}, 400)
+            return
+        except (OSError, NewReceipts.Error):
+            self._send_json({"ok": False, "status": "unknown"}, 503)
+            return
+        self._send_json(answer or {"ok": False, "status": "unknown"}, 200 if answer else 404)
+
+    def _tracked_new(self, body):
+        try:
+            key = self._new_receipt_key(body["request_id"])
+        except ValueError:
+            self._send_json({"ok": False, "status": "invalid request id"}, 400)
+            return
+        fingerprint = _send_key("", "/new", body)
+        store = self._new_receipt_store()
+        try:
+            answer = store.read(key, fingerprint)
+        except ValueError:
+            self._send_json({"ok": False, "status": "request id already used"}, 409)
+            return
+        except (OSError, NewReceipts.Error):
+            self._send_json({"ok": False, "status": "receipt unavailable"}, 503)
+            return
+        if answer is not None:
+            self._send_json(answer)
+            return
+        who = self._presented() or self.client_address[0]
+        if self._over_limit("say", who, 6, 60, "too many messages"):
+            return
+        gate = LIMITS.gate("say", 1)
+        if not gate.acquire(blocking=False):
+            self._send_json({"ok": False, "status": "a message is already being sent"}, 429)
+            return
+        try:
+            # Commit the claim before any launch. A duplicate, even after
+            # a relay restart or over the other route, can only read it.
+            answer = store.claim(key, fingerprint)
+            if answer is None:
+                status = start_session(str(body.get("path", ""))[:512], body.get("text", ""))
+                answer = {"ok": status == "started", "status": status}
+                if not answer["ok"]:
+                    # False alone is not proof that nothing launched:
+                    # Claude's trust handoff and launcher errors may come
+                    # after Terminal accepted the command. Keep new and
+                    # unclassified outcomes conservative by default.
+                    answer["retry_safe"] = status in {
+                        "empty", "unknown project", "claude not on PATH", "signed out",
+                        "Codex is not installed on your computer",
+                        "a first message cannot start with ! or #",
+                        "new sessions need Codex's own installer on Windows",
+                        "new sessions need Claude Code's own installer on Windows",
+                    }
+                store.finish(key, answer)
+        except ValueError:
+            self._send_json({"ok": False, "status": "request id already used"}, 409)
+            return
+        except (OSError, NewReceipts.Error):
+            # If completion could not be saved, the durable pending claim
+            # remains. Never turn uncertainty into permission to relaunch.
+            self._send_json({"ok": False, "status": "unknown"}, 503)
+            return
+        finally:
+            gate.release()
+        self._send_json(answer)
 
     def _post_say(self, path, query):
         # Only an explicit false turns brevity off: a watch that predates
@@ -4724,6 +4812,70 @@ def _recent_send(key):
 def _remember_send(key, answer):
     with _RECENT_SENDS_LOCK:
         _RECENT_SENDS[key] = (_send_clock(), dict(answer))
+
+
+class NewReceipts:
+    """Durable, device-scoped New claims. No prompts, paths or tokens on disk.
+
+    A pending claim after a crash is deliberately not executed on restart.
+    Receipt lookup is read-only with respect to launching a session.
+    """
+    import sqlite3
+    Error = sqlite3.Error
+
+    def __init__(self, path):
+        self.path = path
+
+    def _connect(self):
+        os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        os.close(fd)
+        os.chmod(self.path, 0o600)
+        _host.restrict_to_owner(self.path)
+        connection = self.sqlite3.connect(self.path, timeout=1)
+        try:
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("CREATE TABLE IF NOT EXISTS receipts "
+                               "(key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, answer TEXT NOT NULL)")
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
+    def read(self, key, fingerprint=None):
+        if not os.path.exists(self.path):
+            return None
+        connection = self._connect()
+        try:
+            row = connection.execute("SELECT fingerprint, answer FROM receipts WHERE key=?", (key,)).fetchone()
+            if not row:
+                return None
+            if fingerprint is not None and row[0] != fingerprint:
+                raise ValueError("request id already used")
+            return json.loads(row[1])
+        finally:
+            connection.close()
+
+    def claim(self, key, fingerprint):
+        connection = self._connect()
+        try:
+            with connection:
+                inserted = connection.execute("INSERT OR IGNORE INTO receipts VALUES (?, ?, ?)",
+                    (key, fingerprint, json.dumps({"ok": False, "status": "pending"}))).rowcount
+                row = connection.execute("SELECT fingerprint, answer FROM receipts WHERE key=?", (key,)).fetchone()
+                if row[0] != fingerprint:
+                    raise ValueError("request id already used")
+            return None if inserted else json.loads(row[1])
+        finally:
+            connection.close()
+
+    def finish(self, key, answer):
+        connection = self._connect()
+        try:
+            with connection:
+                connection.execute("UPDATE receipts SET answer=? WHERE key=?", (json.dumps(answer), key))
+        finally:
+            connection.close()
 
 
 # A caller, or the link to it, that went away mid-request: the watch

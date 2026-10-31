@@ -14183,7 +14183,7 @@ class TestNewSessionFromTheWatch:
         assert ".command" in status, "the fallback must say it was tried too"
 
     def _start(self, tmp_path, monkeypatch, text="Fix CI; it's red",
-               open_ok=True, osascript=None):
+               open_ok=True, osascript=None, open_error=None):
         """start_session with Terminal faked. Returns (status, the commands
         run in order, the shell line Terminal was given). ``osascript`` is
         what scripting Terminal does: None succeeds, an exception is
@@ -14201,6 +14201,8 @@ class TestNewSessionFromTheWatch:
                 with open(command_file) as handle:
                     lines["file"] = handle.read().splitlines()
                 os.unlink(command_file)
+                if open_error is not None:
+                    raise open_error
                 return sp.CompletedProcess(cmd, 0 if open_ok else 1, "",
                                            "" if open_ok else "LSOpenURLsWithRole() failed")
             if cmd[0] == "osascript":
@@ -14285,6 +14287,13 @@ class TestNewSessionFromTheWatch:
         # decoded, both cwd and message are shell-quoted, so a message with
         # quotes or semicolons cannot escape into the shell.
         assert shell_line == self._expected_line(tmp_path)
+
+    def test_a_timed_out_open_is_not_launched_again_through_applescript(self, tmp_path, monkeypatch):
+        import subprocess as sp
+        status, calls, _, _ = self._start(tmp_path, monkeypatch,
+                                         open_error=sp.TimeoutExpired("open", 8))
+        assert status == "unknown"
+        assert calls == ["open"]
 
     def test_a_session_started_from_the_wrist_is_nobodys_child(self, tmp_path, monkeypatch):
         """2026-09-24: Terminal.app had been launched from inside a Claude
@@ -19967,6 +19976,110 @@ class TestIssue400:
         assert ran == [("/p", "go")]
         assert first == (200, {"ok": True, "status": "started"})
         assert second == (200, {"ok": True, "status": "started", "repeat": True})
+
+    def test_new_receipt_survives_the_short_repeat_window(self, relay, monkeypatch):
+        base, ran = relay
+        body = {"path": "/p", "text": "go", "request_id": "1" * 32}
+        first = relay_call(base + "/new", token="bootstraptoken", method="POST", body=body)
+        monkeypatch.setattr(watch_relay, "_send_clock", lambda: float("inf"))
+        receipt = relay_call(base + "/new-receipt?id=" + body["request_id"], token="bootstraptoken")
+        second = relay_call(base + "/new", token="bootstraptoken", method="POST", body=body)
+        assert first[1] == receipt[1] == second[1] == {"ok": True, "status": "started"}
+        assert ran == [("/p", "go")]
+
+    def test_new_receipt_cannot_be_reused_for_other_words_or_read_by_another_device(self, relay):
+        base, ran = relay
+        body = {"path": "/p", "text": "go", "request_id": "2" * 32}
+        assert relay_call(base + "/new", token="bootstraptoken", method="POST", body=body)[1]["ok"]
+        status, _ = relay_call(base + "/new", token="bootstraptoken", method="POST",
+                               body=dict(body, text="other"))
+        assert status == 409
+        status, _ = relay_call(base + "/new-receipt?id=" + body["request_id"], token="devicetoken")
+        assert status == 404
+        assert ran == [("/p", "go")]
+
+    def test_new_claim_is_durable_before_launch_and_reopens_as_pending(self, tmp_path):
+        store = watch_relay.NewReceipts(str(tmp_path / "new.sqlite3"))
+        key, fingerprint = "device-request-hash", "body-hash"
+        assert store.claim(key, fingerprint) is None
+        reopened = watch_relay.NewReceipts(str(tmp_path / "new.sqlite3"))
+        assert reopened.claim(key, fingerprint) == {"ok": False, "status": "pending"}
+        answer = {"ok": True, "status": "started"}
+        reopened.finish(key, answer)
+        assert store.read(key) == answer
+
+    def test_new_receipt_recovers_after_the_client_socket_times_out(self, relay, monkeypatch):
+        import socket
+        import threading
+        base, ran = relay
+        entered, release = threading.Event(), threading.Event()
+        def delayed(path, text):
+            ran.append((path, text))
+            entered.set()
+            assert release.wait(5)
+            return "started"
+        monkeypatch.setattr(watch_relay, "start_session", delayed)
+        body = {"path": "/p", "text": "go", "request_id": "4" * 32}
+        failures = []
+        def lost_reply():
+            request = urllib.request.Request(base + "/new", method="POST",
+                data=json.dumps(body).encode(), headers={"X-Tapproval-Token": "bootstraptoken",
+                                                        "Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(request, timeout=0.2) as response:
+                    response.read()
+            except socket.timeout as error:
+                failures.append(error)
+        client = threading.Thread(target=lost_reply)
+        client.start()
+        try:
+            assert entered.wait(3)
+            client.join(2)
+            assert not client.is_alive() and len(failures) == 1
+            url = base + "/new-receipt?id=" + body["request_id"]
+            assert relay_call(url, token="bootstraptoken")[1]["status"] == "pending"
+            # Even a second POST in this isolated test cannot launch again.
+            assert relay_call(base + "/new", token="bootstraptoken", method="POST", body=body)[1]["status"] == "pending"
+        finally:
+            release.set()
+            client.join(3)
+        for _ in range(100):
+            receipt = relay_call(url, token="bootstraptoken")[1]
+            if receipt.get("status") == "started":
+                break
+            time.sleep(0.01)
+        assert receipt == {"ok": True, "status": "started"}
+        assert ran == [("/p", "go")]
+
+    def test_concurrent_new_claims_have_one_owner(self, tmp_path):
+        import concurrent.futures
+        path = str(tmp_path / "claims.sqlite3")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            answers = list(pool.map(lambda _: watch_relay.NewReceipts(path).claim("one", "body"), range(4)))
+        assert answers.count(None) == 1
+        assert answers.count({"ok": False, "status": "pending"}) == 3
+
+    def test_failed_receipt_storage_never_launches_a_session(self, relay, monkeypatch):
+        base, ran = relay
+        def broken(*_args):
+            raise OSError("disk full")
+        monkeypatch.setattr(watch_relay.NewReceipts, "claim", broken)
+        status, _ = relay_call(base + "/new", token="bootstraptoken", method="POST",
+                               body={"path": "/p", "text": "go", "request_id": "3" * 32})
+        assert status == 503
+        assert not ran
+
+    @pytest.mark.parametrize("status,safe", [("unknown project", True),
+        (watch_relay.AWAITS_TRUST, False), ("unknown", False),
+        ("could not open Terminal: timed out", False)])
+    def test_only_prelaunch_failures_authorise_another_new_submission(self, relay, monkeypatch, status, safe):
+        base, ran = relay
+        monkeypatch.setattr(watch_relay, "start_session", lambda path, text: ran.append(1) or status)
+        body = {"path": "/p", "text": "go", "request_id": "6" * 32}
+        answer = relay_call(base + "/new", token="bootstraptoken", method="POST", body=body)[1]
+        assert answer == {"ok": False, "status": status, "retry_safe": safe}
+        assert relay_call(base + "/new", token="bootstraptoken", method="POST", body=body)[1] == answer
+        assert ran == [1]
 
     def test_the_same_send_over_the_other_route_runs_once(self, fresh_auth, monkeypatch):
         """2026-10-19 review: the repeat key took the raw path, and through
