@@ -273,6 +273,7 @@ def send(prefix, text, binary, spawn, log, brief=True, connect=None, runner=None
 
 def flags():
     return ["--sandbox", "workspace-write", "-c", 'approval_policy="on-request"',
+            "-c", 'approvals_reviewer="user"',
             "-c", "sandbox_workspace_write.network_access=false",
             "-c", "sandbox_workspace_write.writable_roots=[]",
             "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",

@@ -1,10 +1,8 @@
-"""Read active local Codex rollouts without changing Codex.
+"""Read Codex's local chat catalog and conversation without changing Codex.
 
-Codex keeps durable rollout JSONL files under ``~/.codex/sessions``.  A
-rollout is history, not proof that a session is still open, so this reader
-only returns a row when the rollout file is presently open by a process owned
-by the current user.  That deliberately fails closed: an unreadable process
-table means no Codex row, never a list of stale conversations.
+Codex's native interactive chat catalog decides list membership, including
+idle and unloaded chats visible in Remote. Rollouts supply conversation
+content; an open file descriptor is not evidence of catalog membership.
 
 The module is intentionally independent of Claude Code's transcript reader.
 It owns only the small amount of Codex-specific file format knowledge needed
@@ -198,12 +196,15 @@ def _entrypoint(originator):
 
 
 def active_sessions(limit=12, sessions_dir=None, index_path=None, open_paths=None):
-    """Verified-active Codex sessions, in the relay's existing row shape.
+    """Codex Remote's local catalog, in the relay's existing row shape.
 
-    ``open_paths`` is an optional test seam.  In production it is discovered
-    from open file descriptors.  A rollout that is not open is intentionally
-    not returned, regardless of its timestamp.
+    Explicit ``sessions_dir`` / ``open_paths`` retain the isolated legacy
+    transcript-fixture seam. Production membership uses native metadata,
+    never file descriptors. ``limit=None`` supplies all rows for pagination.
     """
+    if sessions_dir is None and open_paths is None:
+        rows = catalog_snapshot()["sessions"]
+        return rows if limit is None else rows[:limit]
     root = sessions_dir or os.path.join(_home(), "sessions")
     entries = _rollouts(root)
     paths = [path for _mtime, path in entries]
@@ -248,15 +249,181 @@ def active_sessions(limit=12, sessions_dir=None, index_path=None, open_paths=Non
             "agent": "codex",
             "can_send": True,
         })
-        if len(rows) >= limit:
+        if limit is not None and len(rows) >= limit:
             break
     return rows
+
+
+def _catalog_row(thread):
+    """Membership is the native interactive catalog, not a file descriptor."""
+    if not isinstance(thread, dict):
+        raise ValueError("Invalid Codex catalog row")
+    sid, cwd = thread.get("id"), thread.get("cwd")
+    status = thread.get("status")
+    if (not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9-]{8,64}", sid)
+            or not isinstance(cwd, str) or not isinstance(status, dict)
+            or status.get("type") not in ("active", "idle", "notLoaded", "systemError")
+            or type(thread.get("updatedAt")) is not int):
+        raise ValueError("Invalid Codex catalog identity or status")
+    if thread.get("ephemeral") or thread.get("parentThreadId"):
+        return None
+    source = thread.get("source")
+    if isinstance(source, dict) or source in ("exec", "subAgent", "subAgentReview",
+                                             "subAgentCompact", "subAgentThreadSpawn", "subAgentOther"):
+        return None
+    flags = status.get("activeFlags", [])
+    if not isinstance(flags, list) or not all(isinstance(flag, str) for flag in flags):
+        raise ValueError("Invalid Codex catalog flags")
+    asking = any(flag in flags for flag in ("waitingOnApproval", "waitingOnUserInput"))
+    state = "asking" if asking else "running" if status["type"] == "active" else "idle"
+    stamp = thread.get("recencyAt")
+    if type(stamp) is not int:
+        stamp = thread["updatedAt"]
+    title = thread.get("name")
+    if not isinstance(title, str) or not title.strip():
+        title = thread.get("preview")
+    return {"session_id": sid, "title": title.strip() if isinstance(title, str) and title.strip()
+            else "Codex session", "project": os.path.basename(cwd.rstrip("/")) or "Codex",
+            "path": cwd, "repo": "", "status": "Terminal" if source == "cli" else "Desktop",
+            "agent": "codex", "live": status["type"] in ("active", "idle"),
+            "side_thread": False, "modified": stamp,
+            "minutes_ago": max(0, int((time.time() - thread["updatedAt"]) / 60)),
+            "active_seconds_ago": max(0, int(time.time() - thread["updatedAt"])),
+            "state": state, "state_reason": "terminal" if asking else "turn" if state == "running" else "",
+            "running_tool": None, "running_tasks": 0, "wake_at": None,
+            # Visibility never grants a send capability. The send path still
+            # rechecks unique native ownership and the permission context.
+            "can_send": thread.get("canAcceptDirectInput") is True}
+
+
+def _read_catalog(client_factory=None, endpoints=None):
+    from codex_desktop import server_sockets
+    from codex_talk import Client
+    client_factory = client_factory or Client
+    endpoints = server_sockets() if endpoints is None else endpoints
+    rows, paths, owners, succeeded = {}, {}, {}, False
+    for endpoint in endpoints:
+        client = None
+        try:
+            client = client_factory(socket_path=endpoint)
+        except (OSError, EOFError, ValueError):
+            continue  # the optional managed endpoint need not exist
+        try:
+            cursor, seen, server_rows, server_paths = None, set(), {}, {}
+            deadline = time.monotonic() + 15
+            for _page in range(64):
+                if time.monotonic() > deadline:
+                    raise ValueError("Codex catalog exceeded its time bound")
+                page = client.rpc("thread/list", {"cursor": cursor, "limit": 100,
+                    "archived": False, "sortKey": "recency_at", "sortDirection": "desc",
+                    "useStateDbOnly": True})
+                if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+                    raise ValueError("Invalid Codex catalog page")
+                for thread in page["data"]:
+                    row = _catalog_row(thread)
+                    if row is not None:
+                        sid = row["session_id"]
+                        server_rows[sid] = row
+                        path = thread.get("path")
+                        if isinstance(path, str):
+                            server_paths[sid] = path
+                cursor = page.get("nextCursor")
+                if cursor is None:
+                    break
+                if not isinstance(cursor, str) or not cursor or cursor in seen:
+                    raise ValueError("Invalid Codex catalog cursor")
+                seen.add(cursor)
+            else:
+                raise ValueError("Codex catalog exceeded its page bound")
+            succeeded = True
+            for sid, row in server_rows.items():
+                owners[sid] = owners.get(sid, 0) + int(row["live"])
+                old = rows.get(sid)
+                newest = row if old is None or row["modified"] > old["modified"] else old
+                # Servers share durable metadata, but only the owner knows
+                # runtime state. A notLoaded copy must not erase a live one.
+                rank = {"asking": 3, "running": 2, "idle": 1}
+                runtime = row if old is None or (row["live"], rank[row["state"]]) > (old["live"], rank[old["state"]]) else old
+                rows[sid] = dict(newest, **{key: runtime[key] for key in
+                    ("live", "state", "state_reason", "can_send")})
+                if owners[sid] != 1:
+                    rows[sid]["can_send"] = False
+                if sid in server_paths:
+                    paths[sid] = server_paths[sid]
+        finally:
+            client.close()
+    if not succeeded:
+        raise OSError("Codex chat catalog is unavailable")
+    return sorted(rows.values(), key=lambda row: (-row["modified"], row["session_id"])), paths
+
+
+class SessionCatalog:
+    """A complete snapshot, refreshed off the HTTP thread; failures retain it."""
+
+    def __init__(self, reader=None):
+        self.reader = reader or _read_catalog
+        self.lock = threading.Lock()
+        self.rows, self.paths = [], {}
+        self.status, self.checked, self.busy = "loading", None, False
+
+    def refresh(self):
+        try:
+            rows, paths = self.reader()
+            with self.lock:
+                self.rows, self.paths, self.status = rows, paths, "ready"
+        except (OSError, EOFError, ValueError, TypeError, KeyError, AttributeError):
+            with self.lock:
+                self.status = "unavailable"
+        finally:
+            with self.lock:
+                self.checked, self.busy = time.monotonic(), False
+
+    def snapshot(self):
+        with self.lock:
+            if not self.busy and (self.checked is None or time.monotonic() - self.checked >= 4):
+                self.busy = True
+                threading.Thread(target=self.refresh, name="codex-chat-list", daemon=True).start()
+            rows = [dict(row) for row in self.rows]
+            if self.status != "ready":
+                for row in rows:
+                    row["can_send"] = False
+            return {"sessions": rows, "status": self.status}
+
+
+_CATALOG = None
+_CATALOG_HOME = None
+_CATALOG_LOCK = threading.Lock()
+
+
+def catalog_snapshot():
+    global _CATALOG, _CATALOG_HOME
+    home = _home()
+    # Claude-only installations do not need a Codex server or warning.
+    if not os.path.isdir(home):
+        return {"sessions": [], "status": "ready"}
+    with _CATALOG_LOCK:
+        if _CATALOG is None or _CATALOG_HOME != home:
+            _CATALOG, _CATALOG_HOME = SessionCatalog(), home
+        catalog = _CATALOG
+    return catalog.snapshot()
 
 
 def find_rollout(session_id, sessions_dir=None):
     """Resolve an unambiguous identity, never a caller-supplied path."""
     if not re.fullmatch(r"[A-Za-z0-9-]{8,64}", session_id or ""):
         return None
+    # Native metadata resolves older chats beyond the 128-recent-rollout
+    # discovery window. Never trust a server-provided path outside this home.
+    if sessions_dir is None and _CATALOG is not None and _CATALOG_HOME == _home():
+        with _CATALOG.lock:
+            path = _CATALOG.paths.get(session_id)
+        if path:
+            root = os.path.realpath(os.path.join(_home(), "sessions"))
+            real = os.path.realpath(path)
+            if real.startswith(root + os.sep):
+                meta = _rollout_meta(real)
+                if meta and meta["session_id"] == session_id:
+                    return real
     matches = []
     for _mtime, path in _rollouts(sessions_dir or os.path.join(_home(), "sessions")):
         if session_id not in os.path.basename(path):
