@@ -608,7 +608,8 @@ def _reply_images(markdown, cwd):
         if len(refs) >= 8:
             break
         target = match.group(1) or match.group(2)
-        if re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*:', target):
+        if (re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*:', target)
+                and not os.path.splitdrive(target)[0]):
             continue
         path = os.path.realpath(os.path.join(root, target))
         try:

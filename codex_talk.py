@@ -14,7 +14,7 @@ import time
 import tapproval_host as _host
 import tapproval_wire as wire
 
-from codex_approvals import LocalWebSocket
+from codex_approvals import ApprovalSync, LocalWebSocket
 import codex_sessions as sessions
 
 
@@ -80,18 +80,21 @@ def _owner_client(sid, connect):
         for endpoint in ([None] if connect is not None else server_sockets()):
             try:
                 candidate = Client(connect, socket_path=endpoint)
-            except (OSError, EOFError):
+            except (FileNotFoundError, ConnectionRefusedError):
                 continue
+            except (OSError, EOFError) as error:
+                raise ValueError("Codex server ownership could not be verified; "
+                                 "reopen the session before sending") from error
             try:
                 cursor = None
                 for _page in range(64):
                     page = candidate.rpc("thread/loaded/list", {"cursor": cursor})
-                    if sid in page.get("data", []):
+                    loaded, cursor = ApprovalSync._loaded_page(page)
+                    if sid in loaded:
                         if selected is not None:
                             raise ValueError("Thread is loaded on multiple Codex servers; close the duplicate before sending")
                         selected, candidate = candidate, None
                         break
-                    cursor = page.get("nextCursor")
                     if not cursor:
                         break
                 else:

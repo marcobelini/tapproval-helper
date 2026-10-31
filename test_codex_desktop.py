@@ -242,6 +242,52 @@ def test_watch_sender_refuses_duplicate_native_owners(monkeypatch):
     assert all(connection.closed for connection in opened)
 
 
+@pytest.mark.parametrize('page', [
+    {'data': 'target'}, {'data': ['target', {}]},
+    {'data': ['target'], 'nextCursor': 1},
+])
+def test_watch_sender_refuses_malformed_loaded_owner_page(monkeypatch, page):
+    import codex_talk
+    class Connection:
+        closed = False
+        def rpc(self, method, params):
+            assert method == 'thread/loaded/list'
+            return page
+        def close(self):
+            self.closed = True
+    connection = Connection()
+    monkeypatch.setattr(codex_talk, 'Client', lambda *args, **kwargs: connection)
+    monkeypatch.setattr(desktop, 'server_sockets', lambda: ['desktop'])
+    with pytest.raises(ValueError, match='loaded-thread page'):
+        codex_talk._owner_client('target', None)
+    assert connection.closed
+
+
+@pytest.mark.parametrize('failure', [TimeoutError, PermissionError, EOFError, OSError])
+@pytest.mark.parametrize('paths', [['owner', 'uncertain'], ['uncertain', 'owner']])
+def test_watch_sender_refuses_uncertain_other_server(monkeypatch, failure, paths):
+    import codex_talk
+    opened = []
+    class Connection:
+        closed = False
+        def rpc(self, method, params):
+            assert method == 'thread/loaded/list'
+            return {'data': ['target'], 'nextCursor': None}
+        def close(self):
+            self.closed = True
+    def client(*args, socket_path=None, **kwargs):
+        if socket_path == 'uncertain':
+            raise failure('not verified')
+        connection = Connection()
+        opened.append(connection)
+        return connection
+    monkeypatch.setattr(codex_talk, 'Client', client)
+    monkeypatch.setattr(desktop, 'server_sockets', lambda: paths)
+    with pytest.raises(ValueError, match='ownership could not be verified'):
+        codex_talk._owner_client('target', None)
+    assert all(connection.closed for connection in opened)
+
+
 @pytest.fixture
 def health_hub(monkeypatch):
     monkeypatch.setattr("ClaudeRiskClassifier.write_audit", lambda *_: None)

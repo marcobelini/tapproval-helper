@@ -1009,7 +1009,7 @@ class TestCodexTalkingBack:
                 self.closed = True
         socket = Socket()
         def unavailable():
-            raise OSError('no control socket')
+            raise FileNotFoundError('no control socket')
         def send(text='check the fix', connect=None, **kwargs):
             return talk.send(sid, text, '/bin/codex', spawn, '/tmp/isolated-say.log',
                              connect=connect or unavailable, **kwargs)
@@ -1054,6 +1054,22 @@ class TestCodexTalkingBack:
         assert 'check the session before retrying' in send(connect=lambda: socket)
         assert len([m for m in socket.sent if m.get('method') == 'turn/start']) == 1
         assert not spawned
+
+    @pytest.mark.parametrize('failure', [TimeoutError, PermissionError, EOFError, OSError])
+    def test_uncertain_native_connection_never_falls_back(self, setup, failure):
+        _, _, _, _, _, _, spawned, send = setup
+        def uncertain():
+            raise failure('not verified')
+        assert 'ownership could not be verified' in send(connect=uncertain)
+        assert not spawned
+
+    @pytest.mark.parametrize('failure', [FileNotFoundError, ConnectionRefusedError])
+    def test_absent_control_socket_preserves_closed_resume(self, setup, failure):
+        _, _, _, _, _, _, spawned, send = setup
+        def absent():
+            raise failure('absent')
+        assert send(connect=absent) == 'sent'
+        assert len(spawned) == 1
 
     def test_saved_session_resumes_its_exact_uuid_with_bounded_permissions(self, setup):
         talk, _, sid, _, workspace, _, spawned, send = setup
