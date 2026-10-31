@@ -2943,6 +2943,79 @@ class TestCodexActiveSessions:
 
 class TestCodexCatalog:
     @staticmethod
+    def database(tmp_path):
+        import sqlite3
+        path = tmp_path / "state_5.sqlite"
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, rollout_path TEXT, "
+                       "source TEXT, title TEXT, name TEXT, preview TEXT, updated_at INTEGER, "
+                       "recency_at_ms INTEGER, archived INTEGER, attached_thread_parent_id TEXT)")
+            db.execute("CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)")
+        return path
+
+    def test_native_database_lists_unloaded_chats_without_a_control_socket(self, tmp_path, monkeypatch):
+        import sqlite3
+        import codex_sessions as cx
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        path = self.database(tmp_path)
+        with sqlite3.connect(path) as db:
+            for sid, source, archived, parent, name, recency in [
+                ("catalog-0001", "cli", 0, None, "Renamed on phone", 200001),
+                ("catalog-0002", "vscode", 0, None, None, 200000),
+                ("catalog-0003", "cli", 1, None, "Archived", 300000),
+                ("catalog-0004", "exec", 0, None, "Background", 300000),
+                ("catalog-0005", '{"subagent":{"other":"guardian"}}', 0, None, "Review", 300000),
+                ("catalog-0006", "cli", 0, "catalog-0001", "Child", 300000)]:
+                db.execute("INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                           (sid, str(tmp_path), None, source, "Original title", name, "Preview",
+                            100, recency, archived, parent))
+        before = path.read_bytes()
+        rows, paths = cx._read_database_catalog(open_paths=set())
+        assert [row["session_id"] for row in rows] == ["catalog-0001", "catalog-0002"]
+        assert [row["title"] for row in rows] == ["Renamed on phone", "Preview"]
+        assert all(row["can_send"] is False for row in rows)
+        assert paths == {} and path.read_bytes() == before
+        # A new snapshot sees archive removal; it never reconstructs rows from history.
+        with sqlite3.connect(path) as db:
+            db.execute("UPDATE threads SET archived=1")
+        assert cx._read_database_catalog(open_paths=set()) == ([], {})
+
+    def test_missing_or_newer_incompatible_catalog_never_becomes_an_empty_success(self, tmp_path, monkeypatch):
+        import codex_sessions as cx
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        with pytest.raises(OSError):
+            cx._read_database_catalog(open_paths=set())
+        self.database(tmp_path)
+        (tmp_path / "state_6.sqlite").write_bytes(b"unsupported database")
+        with pytest.raises(OSError):
+            cx._read_database_catalog(open_paths=set())
+
+    def test_disconnected_native_transport_can_read_the_native_database(self):
+        import codex_sessions as cx
+        class MissingClient:
+            def __init__(self, **_kwargs):
+                raise FileNotFoundError("no control socket")
+        expected = ([{"session_id": "catalog-0001", "can_send": False}], {})
+        assert cx._read_catalog(MissingClient, ["missing"], database_reader=lambda: expected) == expected
+
+    def test_native_read_failure_discards_partial_pages_before_database_recovery(self):
+        import codex_sessions as cx
+        closed = []
+        class BrokenClient:
+            def __init__(self, **_kwargs):
+                self.first = True
+            def rpc(self, _method, _params):
+                if self.first:
+                    self.first = False
+                    return {"data": [TestCodexCatalog.row()], "nextCursor": "next"}
+                raise OSError("connection lost")
+            def close(self):
+                closed.append(True)
+        expected = ([{"session_id": "catalog-complete", "can_send": False}], {})
+        assert cx._read_catalog(BrokenClient, ["fixture"], database_reader=lambda: expected) == expected
+        assert closed == [True]
+
+    @staticmethod
     def row(sid="catalog-0001", **changes):
         return dict({"id": sid, "cwd": "/work/Example", "name": "Phone name",
                      "updatedAt": 100, "recencyAt": 200, "source": "appServer",
@@ -16863,10 +16936,9 @@ class TestSupersededRunsAreCancelled:
 
 @pytest.mark.private_layout
 class TestCiRunsWhatTheChangeCanBreak:
-    """ci-scope.sh: a pull request that touches nothing under WatchApp/ or
-    in CI's own files leaves out the watch flows and the purchase tests
-    (about ten of CI's sixteen minutes); anything else, or anything it
-    cannot tell, runs everything. Checked on real merge commits."""
+    """The local compatibility scope preserves full checks for shared code,
+    app and CI changes. Known documentation and rendering-only changes omit
+    unrelated Watch flows; uncertain history runs everything."""
 
     def _scope(self, tmp_path, changed, event="pull_request", merge=True,
                ref="refs/pull/1/merge"):
@@ -16876,6 +16948,7 @@ class TestCiRunsWhatTheChangeCanBreak:
         repo = tmp_path / "repo"
         repo.mkdir(parents=True)
         shutil.copy(os.path.join(_ROOT, "ci-scope.sh"), repo / "ci-scope.sh")
+        shutil.copy(os.path.join(_ROOT, "ci_plan.py"), repo / "ci_plan.py")
         env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
                    GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
 
@@ -16912,12 +16985,12 @@ class TestCiRunsWhatTheChangeCanBreak:
         return done.stdout.strip(), done.stderr
 
     def test_a_python_only_change_is_light(self, tmp_path):
-        scope, why = self._scope(tmp_path, ["watch_relay.py", "test_x.py"])
+        scope, why = self._scope(tmp_path, ["render_page.py", "test_x.py"])
         assert scope == "light", why
         assert "not needed" in why
 
     def test_a_docs_only_change_is_light(self, tmp_path):
-        assert self._scope(tmp_path, ["README.md2", "helper/docs/index.html"])[0] == "light"
+        assert self._scope(tmp_path, ["README.md", "helper/docs/index.html"])[0] == "light"
 
     def test_a_watch_change_runs_everything(self, tmp_path):
         scope, why = self._scope(tmp_path, ["watch_relay.py", "WatchApp/Tapproval/X.swift"])
@@ -16930,7 +17003,7 @@ class TestCiRunsWhatTheChangeCanBreak:
     def test_a_merge_to_main_is_judged_like_its_pr(self, tmp_path):
         """It re-ran the full flows on what its PR had just passed, ten
         minutes a merge (2026-10-24)."""
-        assert self._scope(tmp_path, ["watch_relay.py"], event="push",
+        assert self._scope(tmp_path, ["render_page.py"], event="push",
                            ref="refs/heads/main")[0] == "light"
         assert self._scope(tmp_path / "w", ["WatchApp/Tapproval/X.swift"], event="push",
                            ref="refs/heads/main")[0] == "full"
@@ -16946,7 +17019,7 @@ class TestCiRunsWhatTheChangeCanBreak:
 
     @pytest.mark.parametrize("path", [
         "WatchApp/asc/desk.py", "WatchApp/BUILD_NUMBER", "WatchApp/NOTES.md",
-        "APP_STORE.md", "design/x/y.html"])
+        "APP_STORE.md", "design/x/y.md"])
     def test_what_the_flows_cannot_see_is_light(self, tmp_path, path):
         """A "Ship build N" PR ran the full ten minutes for one digit."""
         assert self._scope(tmp_path, [path])[0] == "light", path
@@ -17109,7 +17182,7 @@ class TestCiRunsWhatTheChangeCanBreak:
         for job in ("mini", "build-watch", "purchase"):
             body = workflow.split("\n  %s:\n" % job, 1)[1]
             body = body[:body.find("\n\n  ")] if "\n\n  " in body else body
-            assert "fetch-depth: 2" in body, job
+            assert "fetch-depth: 0" in body, job
 
 
 @pytest.mark.private_layout
@@ -17639,6 +17712,9 @@ class TestCiCanBeMovedToThisMacAndBack:
                           workflow.split("\njobs:\n", 1)[1], re.MULTILINE)
         assert len(jobs) >= 4, [name for name, _ in jobs]
         for name, body in jobs:
+            if name in {"scope", "docs", "metadata", "ci-gate"}:
+                assert "runs-on: ubuntu-latest" in body
+                continue
             if name == "purchase":
                 assert "CI_RUNNER" not in body, "purchase proof is required in both modes"
                 assert "runs-on: macos-15" in body
@@ -19220,6 +19296,7 @@ def test_the_two_ci_workflows_share_their_test_steps():
         # the private fallback runs on one, as the runner is private.
         return [line for line in rest[:end]
                 if "vars.CI_RUNNER" not in line and "runs-on:" not in line
+                and not line.strip().startswith("needs:")
                 and not line.strip().startswith("os: [")
                 and "Every host the helper promises" not in line]
     assert python_steps(private) == python_steps(public)
@@ -19540,6 +19617,7 @@ class TestStandardLibraryOnly:
     ALLOWED_THIRD_PARTY = {"test_claude_risk_classifier.py": {"pytest"},
                            "test_codex_approvals.py": {"pytest"}, "test_activity.py": {"pytest"},
                            "test_codex_desktop.py": {"pytest"},
+                           "test_ci_plan.py": {"pytest"},
                            "test_new_session_agent.py": {"pytest"}}
 
     @staticmethod
@@ -21152,7 +21230,7 @@ class TestBonjourCandidatesAreReplaced:
 
 
 class TestTheAgentMarkIsReadable:
-    """The CC/CX mark under a session's tile (owner, 2026-10-15). At a fixed
+    """The CC/CX mark in session metadata (owner, 2026-10-31). At a fixed
     7 pt in the secondary grey it was the one label in the row that ignored
     the wearer's text size, and on a watch set to large text it all but
     vanished. It follows `.scaled`, like the rest of the row, in a grey
@@ -21164,7 +21242,7 @@ class TestTheAgentMarkIsReadable:
             pytest.skip("no watch app in this layout")
         with open(path, encoding="utf-8") as handle:
             source = handle.read()
-        block = re.search(r"Text\(AgentMark\.letters\(session\.agent\)\)(.*?)"
+        block = re.search(r'Text\((?:" · " \+ )?AgentMark\.letters\(session\.agent\)\)(.*?)'
                           r"\.accessibilityIdentifier\(\"agentMark\"\)", source, re.S)
         assert block, "the agent mark is not where this test looks for it"
         return block.group(1)
@@ -22965,6 +23043,79 @@ esac
         assert self._take(app, env, holder=gone.pid).returncode == 0
         again = self._take(app, env)
         assert again.returncode == 0 and again.stdout.strip(), again.stderr
+
+    @staticmethod
+    def _started(pid):
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                             capture_output=True, text=True).stdout
+        return " ".join(out.split())
+
+    def test_a_reused_process_number_does_not_hold_a_simulator(self, tmp_path):
+        """A lock names its holder by process number and start time: macOS
+        hands a dead flow's number to some later process, and the number
+        alone kept the simulator held for SIM_LOCK_WAIT, half an hour (#1087)."""
+        app, env, _ = self._mac(tmp_path)
+        stranger = subprocess.Popen(["sleep", "300"])
+        try:
+            lock = tmp_path / "locks" / "Tapproval-Watch-41mm.lock"
+            lock.mkdir(parents=True)
+            (lock / "pid").write_text("%d\n" % stranger.pid)
+            (lock / "start").write_text("Mon Jan  1 00:00:00 2001\n")
+            took = self._take(app, env, wait=2)
+            assert took.returncode == 0 and took.stdout.strip(), took.stderr
+            assert (lock / "pid").read_text().strip() == str(os.getpid())
+            assert (lock / "start").read_text().strip() == self._started(os.getpid())
+        finally:
+            stranger.kill()
+
+    def test_a_live_holder_with_its_own_start_time_is_still_waited_for(self, tmp_path):
+        app, env, events = self._mac(tmp_path)
+        holder = subprocess.Popen(["sleep", "300"])
+        try:
+            assert self._take(app, env, holder=holder.pid).returncode == 0
+            lock = tmp_path / "locks" / "Tapproval-Watch-41mm.lock"
+            assert (lock / "start").read_text().strip() == self._started(holder.pid)
+            events.write_text("")
+            busy = self._take(app, env, wait=1)
+            assert busy.returncode == 3 and "in use" in busy.stderr, busy.stderr
+            assert busy.stdout == "" and events.read_text() == "", events.read_text()
+            assert (lock / "pid").read_text().strip() == str(holder.pid)
+        finally:
+            holder.kill()
+
+    def _own(self, app, env, name, **more):
+        return subprocess.run([str(app / "sim-own.sh"), name, "se4-41", self.RT],
+                              env=dict(env, **more), capture_output=True, text=True, timeout=60)
+
+    def test_a_name_of_a_sessions_own_is_refused_and_nothing_is_made(self, tmp_path):
+        """A Codex session made "Tapproval Switcher 40mm 20261031" and its 49 mm
+        twin on 2026-10-31, the day after #1084, by calling sim-own.sh with a
+        name of its own. Only the shared names and CI's are made."""
+        app, env, events = self._mac(tmp_path)
+        for name in ("Tapproval Switcher 40mm 20261031", "KeepPlan Flows 41mm",
+                     "Tapproval Watch 41mm 2", "Tapproval Watch", "Tapproval iPhone 2",
+                     "Tapproval Pill 40mm"):
+            run = self._own(app, env, name)
+            assert run.returncode != 0 and run.stdout == "", name + run.stdout + run.stderr
+            assert "sim-shared.sh take" in run.stderr, run.stderr
+        assert self._names(tmp_path) == [] and events.read_text() == "", events.read_text()
+
+    def test_the_shared_names_and_cis_are_still_made(self, tmp_path):
+        app, env, _ = self._mac(tmp_path)
+        names = ["Tapproval Watch 41mm", "Tapproval iPhone", "Tapproval CI",
+                 "Tapproval CI Flows 50mm", "Tapproval CI iPhone"]
+        for name in names:
+            run = self._own(app, env, name)
+            assert run.returncode == 0 and run.stdout.strip(), name + run.stderr
+            assert "WARNING" not in run.stderr, run.stderr
+        assert self._names(tmp_path) == sorted(names)
+
+    def test_a_deliberate_one_off_needs_the_escape_hatch_and_is_warned(self, tmp_path):
+        app, env, _ = self._mac(tmp_path)
+        run = self._own(app, env, "Tapproval Repro 41mm", SIM_OWN_ANY_NAME="1")
+        assert run.returncode == 0 and run.stdout.strip(), run.stderr
+        assert "WARNING" in run.stderr and "14 days" in run.stderr, run.stderr
+        assert self._names(tmp_path) == ["Tapproval Repro 41mm"]
 
     def test_an_iphone_and_each_face_are_named_by_kind(self, tmp_path):
         app, env, _ = self._mac(tmp_path)
