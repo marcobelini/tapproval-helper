@@ -243,7 +243,8 @@ def prepare_launcher(cli, app):
     wrapper, launcher = root / "codex", root / "Launch Codex.command"
     common = "%s %s" % (shlex.quote(sys.executable), shlex.quote(module))
     contents = {
-        wrapper: '#!/bin/sh\nexec %s "$@"\n' % common,
+        wrapper: ('#!/bin/sh\nexport TAPPROVAL_CODEX_REAL_CLI=%s\nexec %s "$@"\n'
+                  % (shlex.quote(str(cli)), common)),
         launcher: ("#!/bin/sh\nexport CODEX_CLI_PATH=%s\nexport TAPPROVAL_CODEX_REAL_CLI=%s\n"
                    "exec %s --launch %s\n") % (
                        shlex.quote(str(wrapper)), shlex.quote(str(cli)), common, shlex.quote(str(app))),

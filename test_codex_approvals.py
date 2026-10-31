@@ -1024,6 +1024,7 @@ class TestCodexTalkingBack:
         assert params['threadId'] == sid
         assert params['sandboxPolicy'] == talk.POLICY
         assert params['approvalPolicy'] == 'on-request'
+        assert params['approvalsReviewer'] == 'user'
         assert params['runtimeWorkspaceRoots'] == [str(workspace)]
         assert 'check the fix' in params['input'][0]['text']
         from tapproval_wire import codex_wrist_words
@@ -1093,14 +1094,34 @@ class TestCodexTalkingBack:
         assert 'permission limits' in send()
         assert not spawned
 
-    def test_a_verified_restricted_live_queue_uses_only_its_uuid(self, setup, monkeypatch):
+    @pytest.mark.parametrize('reviewer', ['missing', None, 'auto_review', 'guardian_subagent', 'unknown', {}])
+    def test_live_queue_refuses_unverified_human_review(self, setup, monkeypatch, reviewer):
+        talk, sessions, _, path, workspace, _, spawned, send = setup
+        monkeypatch.setattr(sessions.subprocess, 'run', lambda command, **_kwargs:
+                            sessions.subprocess.CompletedProcess(command, 0, 'n' + str(path), ''))
+        policy = {'cwd': str(workspace), 'approval_policy': 'on-request',
+                  'sandbox_policy': {'type': 'workspace-write', 'network_access': False},
+                  'approvals_reviewer': 'user'}
+        with path.open('a') as handle:
+            handle.write(json.dumps({'type': 'turn_context', 'payload': policy}) + '\n')
+            policy['approvals_reviewer'] = reviewer
+            if reviewer == 'missing':
+                policy.pop('approvals_reviewer')
+            handle.write(json.dumps({'type': 'turn_context', 'payload': policy}) + '\n')
+        commands = []
+        assert not talk.queue_safe(str(path))
+        assert 'permission limits' in send(runner=lambda *args, **kwargs: commands.append(args))
+        assert commands == [] and spawned == []
+
+    @pytest.mark.parametrize('policy', ['never', 'on-request', 'untrusted'])
+    def test_a_verified_restricted_live_queue_uses_only_its_uuid(self, setup, monkeypatch, policy):
         import subprocess
         _, sessions, sid, path, _, _, spawned, send = setup
         monkeypatch.setattr(sessions.subprocess, 'run', lambda command, **_kwargs:
                             sessions.subprocess.CompletedProcess(command, 0, 'n' + str(path), ''))
         with path.open('a') as handle:
             handle.write(json.dumps({'type': 'turn_context', 'payload': {
-                'approval_policy': 'never', 'sandbox_policy': {
+                'approval_policy': policy, 'approvals_reviewer': 'user', 'sandbox_policy': {
                     'type': 'workspace-write', 'network_access': False}}}) + '\n')
         commands = []
         def run(command, **kwargs):
@@ -1268,7 +1289,8 @@ class TestCodexTalkingBack:
         talk, _, _, path, workspace, _, _, _ = setup
         with path.open('a') as handle:
             handle.write(json.dumps({'type': 'turn_context', 'payload': {
-                'cwd': str(workspace), 'approval_policy': 'on-request', 'sandbox_policy': {
+                'cwd': str(workspace), 'approval_policy': 'on-request',
+                'approvals_reviewer': 'user', 'sandbox_policy': {
                     'type': 'workspace-write', 'network_access': False, 'writable_roots': roots}}}) + '\n')
         assert not talk.queue_safe(str(path))
 

@@ -125,8 +125,8 @@ def context(path):
 def queue_safe(path):
     """The native queue inherits these limits; it cannot establish them.
 
-    Approval requests keep using the existing human approval flow. A
-    queued follow-up cannot narrow the filesystem or network policy.
+    Approval requests must already use human review. A queued follow-up
+    cannot change the reviewer or narrow the filesystem or network policy.
     """
     row = context(path) or {}
     sandbox = row.get("sandbox_policy")
@@ -141,7 +141,8 @@ def queue_safe(path):
            or (os.path.realpath(p) != root and not os.path.realpath(p).startswith(root + os.sep))
            for p in roots):
         return False
-    return (row.get("approval_policy") in ("never", "on-request", "untrusted")
+    return (row.get("approvals_reviewer") == "user"
+            and row.get("approval_policy") in ("never", "on-request", "untrusted")
             and sandbox.get("type") in ("workspace-write", "read-only")
             and sandbox.get("network_access") is False)
 
@@ -256,7 +257,8 @@ def send(prefix, text, binary, spawn, log, brief=True, connect=None, runner=None
     if live:
         if not queue_safe(path):
             return ("Open this Codex session through the shared app-server to send from your watch; "
-                    "its current connection cannot enforce the watch's permission limits")
+                    "its current connection cannot enforce the watch's permission limits "
+                    "and human approval review")
         try:
             result = (runner or subprocess.run)(
                 [binary, "queue", "--thread", sid, "--message", text],

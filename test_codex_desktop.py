@@ -511,3 +511,32 @@ def test_hub_recovery_accepts_verified_native_closure_but_not_an_unknown_target(
         sync.reconcile()
     hub._retry_targets()
     assert events[-1], "absence is not closure proof for a never-observed target"
+
+
+def test_prepared_wrapper_runs_without_launcher_environment(tmp_path, monkeypatch):
+    """Desktop tool subprocesses can retain the wrapper path but drop its env."""
+    import subprocess
+    import sys
+    if not hasattr(os, "getuid"):
+        pytest.skip("Desktop launcher requires a POSIX host")
+    monkeypatch.setattr(desktop.host, "is_mac", lambda: True)
+    monkeypatch.setattr(desktop.Path, "home", lambda: tmp_path)
+    cli = tmp_path / "real codex's executable"
+    cli.write_text("#!%s\nimport json, os, sys\nprint(json.dumps({"
+                   "'args': sys.argv[1:], 'path': os.environ.get('CODEX_CLI_PATH'), "
+                   "'adapter_env': os.environ.get('TAPPROVAL_CODEX_REAL_CLI')}))\n" % sys.executable)
+    cli.chmod(0o700)
+    app = tmp_path / "Desktop.app"
+    (app / "Contents").mkdir(parents=True)
+    (app / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleExecutable": "Desktop"}))
+    launcher = desktop.prepare_launcher(str(cli), str(app))
+    wrapper = launcher.parent / "codex"
+    env = dict(os.environ)
+    env.pop("TAPPROVAL_CODEX_REAL_CLI", None)
+    env["CODEX_CLI_PATH"] = str(wrapper)
+    result = subprocess.run([str(wrapper), "--version", "argument with spaces"],
+                            env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "args": ["--version", "argument with spaces"],
+        "path": str(cli), "adapter_env": None}
