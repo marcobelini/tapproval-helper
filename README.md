@@ -388,6 +388,21 @@ is never a granted one.**
 
 ## Troubleshooting
 
+### Codex sessions — 3.0 preview
+
+The matching Watch beta lists the same non-archived interactive chats as
+Codex Remote for this computer, including idle and unloaded chats. It loads
+older chats as you scroll. An open transcript file does not decide whether
+a chat belongs in the list; deliberate Watch Hide choices still apply.
+
+“Codex chats unavailable” means Base cannot reach the native chat catalog.
+The last list stays visible, with sends unavailable until the connection
+recovers. Codex's local app-server must be reachable. For Desktop, use the
+opt-in adapter's prepared launcher after finishing active work and quitting
+Desktop normally; do not interrupt a working session to reconnect it.
+The iCloud-only route still carries approvals; sessions need LAN or the
+travel connection. This preview still requires physical phone/Watch checks.
+
 ### Codex approval synchronization — 3.0 preview
 
 The extension in

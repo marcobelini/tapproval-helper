@@ -2713,15 +2713,16 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
 
 
 def active_sessions(limit=12, projects_dir=None, waiting=(), codex_rows=None):
-    """The one watch list: active Claude Code and verified-active Codex rows.
+    """The one watch list: active Claude Code and Codex Remote's local chats.
 
     Claude's reader remains authoritative for its own sessions.  Codex rows
-    come from its independent rollout reader and arrive only when a local
-    process still owns the corresponding rollout file.  With no Codex rows
+    come from the native interactive catalog, including unloaded chats.
+    With no Codex rows
     this returns Claude's existing answer unchanged, which keeps a
     Claude-only installation byte-for-byte as it was.
     """
-    claude = recent_sessions(limit=limit, projects_dir=projects_dir, waiting=waiting)
+    claude = recent_sessions(limit=limit if limit is not None else 12,
+                             projects_dir=projects_dir, waiting=waiting)
     if codex_rows is None:
         try:
             from codex_sessions import active_sessions as codex_active_sessions
@@ -2747,6 +2748,8 @@ def active_sessions(limit=12, projects_dir=None, waiting=(), codex_rows=None):
             continue
         seen.add(key)
         combined.append(row)
+    if limit is None:
+        return combined
     visible = combined[:limit]
     return visible + [row for row in combined[limit:]
                       if is_waiting(row) and row not in visible]

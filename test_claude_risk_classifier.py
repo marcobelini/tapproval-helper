@@ -2941,6 +2941,157 @@ class TestCodexActiveSessions:
         assert [row["session_id"] for row in rows] == ["cx-new", "cc-new", "cc-wait"]
 
 
+class TestCodexCatalog:
+    @staticmethod
+    def row(sid="catalog-0001", **changes):
+        return dict({"id": sid, "cwd": "/work/Example", "name": "Phone name",
+                     "updatedAt": 100, "recencyAt": 200, "source": "appServer",
+                     "status": {"type": "notLoaded"}, "canAcceptDirectInput": None}, **changes)
+
+    def read(self, pages):
+        import codex_sessions as cx
+        calls, closed = [], []
+
+        class Client:
+            def __init__(self, **_kwargs):
+                self.pages = iter(pages)
+
+            def rpc(self, method, params):
+                calls.append((method, params))
+                return next(self.pages)
+
+            def close(self):
+                closed.append(True)
+
+        rows, paths = cx._read_catalog(Client, ["fixture"])
+        assert closed == [True]
+        assert all(method == "thread/list" and params["useStateDbOnly"]
+                   and params["archived"] is False for method, params in calls)
+        return rows, paths, calls
+
+    def test_unloaded_chat_is_visible_without_an_open_rollout(self):
+        rows, _, _ = self.read([{"data": [self.row()]}])
+        assert rows[0]["title"] == "Phone name"
+        assert rows[0]["state"] == "idle" and rows[0]["can_send"] is False
+
+    def test_untitled_chat_uses_native_preview_like_the_phone(self):
+        import codex_sessions as cx
+        row = cx._catalog_row(self.row(name=None, preview="Check the garden"))
+        assert row["title"] == "Check the garden"
+
+    def test_pagination_preserves_old_chats_and_deduplicates(self):
+        rows, _, calls = self.read([
+            {"data": [self.row()], "nextCursor": "older"},
+            {"data": [self.row(), self.row("catalog-0002", name="Older", recencyAt=1)]}])
+        assert [row["title"] for row in rows] == ["Phone name", "Older"]
+        assert calls[1][1]["cursor"] == "older"
+
+    def test_background_reviews_and_ephemeral_threads_are_not_phone_chats(self):
+        rows, _, _ = self.read([{"data": [self.row(),
+            self.row("catalog-0002", parentThreadId="catalog-0001"),
+            self.row("catalog-0003", ephemeral=True),
+            self.row("catalog-0004", source={"subAgent": "review"})]}])
+        assert len(rows) == 1
+
+    def test_shared_history_keeps_runtime_owner_but_duplicate_owners_disable_sends(self):
+        import codex_sessions as cx
+        values = {
+            "history": self.row(),
+            "owner": self.row(status={"type": "active", "activeFlags": []}, canAcceptDirectInput=True),
+            "duplicate": self.row(status={"type": "idle"}, canAcceptDirectInput=True)}
+        class Client:
+            def __init__(self, socket_path):
+                self.endpoint = socket_path
+            def rpc(self, _method, _params):
+                return {"data": [values[self.endpoint]]}
+            def close(self):
+                pass
+        for endpoints in (["history", "owner"], ["owner", "history"]):
+            rows, _ = cx._read_catalog(Client, endpoints)
+            assert len(rows) == 1 and rows[0]["state"] == "running" and rows[0]["can_send"]
+        rows, _ = cx._read_catalog(Client, ["owner", "duplicate"])
+        assert len(rows) == 1 and rows[0]["can_send"] is False
+
+    @pytest.mark.parametrize("status,expected,reason", [
+        ({"type": "active", "activeFlags": []}, "running", "turn"),
+        ({"type": "active", "activeFlags": ["waitingOnApproval"]}, "asking", "terminal"),
+        ({"type": "active", "activeFlags": ["waitingOnUserInput"]}, "asking", "terminal"),
+        ({"type": "idle"}, "idle", ""),
+        ({"type": "notLoaded"}, "idle", "")])
+    def test_runtime_state_comes_from_native_metadata(self, status, expected, reason):
+        import codex_sessions as cx
+        row = cx._catalog_row(self.row(status=status))
+        assert (row["state"], row["state_reason"]) == (expected, reason)
+
+    @pytest.mark.parametrize("pages", [
+        [{"data": "bad"}],
+        [{"data": [{}]}],
+        [{"data": [], "nextCursor": "same"}, {"data": [], "nextCursor": "same"}],
+        [{"data": [], "nextCursor": 2}],
+        [{"data": [{"id": "catalog-0001", "cwd": "/work", "updatedAt": 1,
+                    "status": {"type": "invented"}}]}]])
+    def test_malformed_or_cyclic_catalog_is_rejected(self, pages):
+        with pytest.raises(ValueError):
+            self.read(pages)
+
+    def test_failed_refresh_keeps_snapshot_and_disables_sends_then_recovers(self):
+        import codex_sessions as cx
+        row = cx._catalog_row(self.row(status={"type": "idle"}, canAcceptDirectInput=True))
+        catalog = cx.SessionCatalog(lambda: ([row], {}))
+        catalog.refresh()
+        assert catalog.snapshot()["status"] == "ready"
+        def fail():
+            raise OSError("lost connection")
+        catalog.reader = fail
+        catalog.refresh()
+        snapshot = catalog.snapshot()
+        assert snapshot["status"] == "unavailable"
+        assert snapshot["sessions"][0]["session_id"] == row["session_id"]
+        assert snapshot["sessions"][0]["can_send"] is False
+        catalog.reader = lambda: ([], {})  # successful empty/archived result removes it
+        catalog.refresh()
+        assert catalog.snapshot() == {"sessions": [], "status": "ready"}
+
+    def test_transcript_beyond_recent_window_uses_validated_catalog_path(self, tmp_path, monkeypatch):
+        import codex_sessions as cx
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        path = TestCodexActiveSessions()._rollout(tmp_path, session_id="catalog-0001")
+        catalog = cx.SessionCatalog()
+        catalog.paths["catalog-0001"] = str(path)
+        monkeypatch.setattr(cx, "_CATALOG", catalog)
+        monkeypatch.setattr(cx, "_CATALOG_HOME", str(tmp_path))
+        monkeypatch.setattr(cx, "_rollouts", lambda _root: [])
+        assert cx.find_rollout("catalog-0001") == str(path)
+        catalog.paths["catalog-0001"] = str(tmp_path / "outside.jsonl")
+        assert cx.find_rollout("catalog-0001") is None
+
+
+class TestSessionPages:
+    def test_pages_keep_snapshot_order_and_waiting_cards_on_first_page(self):
+        pages = watch_relay.SessionPages()
+        rows = [{"session_id": "chat-%03d" % n} for n in range(30)]
+        first = pages.page(rows, waiting={"chat-029"})
+        assert len(first["sessions"]) == 13
+        assert first["sessions"][-1] == rows[29]
+        result = list(first["sessions"])
+        cursor = first["next_cursor"]
+        while cursor:
+            page = pages.page(cursor=cursor)
+            result.extend(page["sessions"])
+            cursor = page["next_cursor"]
+        assert len(result) == len({row["session_id"] for row in result}) == 30
+        assert pages.page(cursor=first["next_cursor"])["sessions"] == rows[12:24]
+
+    def test_expired_or_forged_cursor_cannot_open_a_snapshot(self, monkeypatch):
+        pages = watch_relay.SessionPages()
+        first = pages.page([{"session_id": str(n)} for n in range(20)])
+        with pytest.raises(ValueError):
+            pages.page(cursor="not-a-cursor")
+        monkeypatch.setattr(time, "monotonic", lambda: 10 ** 15)
+        with pytest.raises(ValueError):
+            pages.page(cursor=first["next_cursor"])
+
+
 class TestCodexThreads:
     """Codex's stored conversation feeds the existing watch thread wire."""
 
@@ -14183,7 +14334,7 @@ class TestNewSessionFromTheWatch:
         assert ".command" in status, "the fallback must say it was tried too"
 
     def _start(self, tmp_path, monkeypatch, text="Fix CI; it's red",
-               open_ok=True, osascript=None):
+               open_ok=True, osascript=None, open_error=None):
         """start_session with Terminal faked. Returns (status, the commands
         run in order, the shell line Terminal was given). ``osascript`` is
         what scripting Terminal does: None succeeds, an exception is
@@ -14201,6 +14352,8 @@ class TestNewSessionFromTheWatch:
                 with open(command_file) as handle:
                     lines["file"] = handle.read().splitlines()
                 os.unlink(command_file)
+                if open_error is not None:
+                    raise open_error
                 return sp.CompletedProcess(cmd, 0 if open_ok else 1, "",
                                            "" if open_ok else "LSOpenURLsWithRole() failed")
             if cmd[0] == "osascript":
@@ -14285,6 +14438,13 @@ class TestNewSessionFromTheWatch:
         # decoded, both cwd and message are shell-quoted, so a message with
         # quotes or semicolons cannot escape into the shell.
         assert shell_line == self._expected_line(tmp_path)
+
+    def test_a_timed_out_open_is_not_launched_again_through_applescript(self, tmp_path, monkeypatch):
+        import subprocess as sp
+        status, calls, _, _ = self._start(tmp_path, monkeypatch,
+                                         open_error=sp.TimeoutExpired("open", 8))
+        assert status == "unknown"
+        assert calls == ["open"]
 
     def test_a_session_started_from_the_wrist_is_nobodys_child(self, tmp_path, monkeypatch):
         """2026-09-24: Terminal.app had been launched from inside a Claude
@@ -14535,6 +14695,39 @@ class TestRelayRoutes:
                         "modified_seconds_ago": None, "state": "idle",
                         "state_reason": "", "wake_at": None}
 
+    def test_paged_session_route_preserves_legacy_and_returns_complete_catalog(self, relay, monkeypatch):
+        import codex_sessions as cx
+        base, _, auth = relay
+        rows = [cx._catalog_row(TestCodexCatalog.row("catalog-%04d" % n,
+                                                  recencyAt=1000 - n)) for n in range(31)]
+        monkeypatch.setattr(cx, "catalog_snapshot", lambda: {"sessions": rows, "status": "ready"})
+        monkeypatch.setattr(watch_dashboard, "recent_sessions", lambda **_kwargs: [])
+        _, old = self._call(base + "/sessions", token=auth.bootstrap)
+        assert set(old) == {"sessions"} and len(old["sessions"]) == 12
+        _, page = self._call(base + "/sessions?paged=1", token=auth.bootstrap)
+        result = list(page["sessions"])
+        while page["next_cursor"]:
+            assert page["codex_status"] == "ready"
+            _, page = self._call(base + "/sessions?cursor=" + page["next_cursor"], token=auth.bootstrap)
+            result += page["sessions"]
+        assert [row["session_id"] for row in result] == [row["session_id"] for row in rows]
+        code, _ = self._call(base + "/sessions?cursor=invalid", token=auth.bootstrap)
+        assert code == 409
+
+    def test_unavailable_catalog_is_not_presented_as_a_successful_empty_list(self, relay, monkeypatch):
+        import codex_sessions as cx
+        base, _, auth = relay
+        monkeypatch.setattr(cx, "catalog_snapshot", lambda: {"sessions": [], "status": "unavailable"})
+        monkeypatch.setattr(watch_dashboard, "recent_sessions", lambda **_kwargs: [])
+        code, page = self._call(base + "/sessions?paged=1", token=auth.bootstrap)
+        assert code == 200 and page["codex_status"] == "unavailable"
+        assert any(c["key"] == "codex_sessions" for c in watch_relay.conditions())
+        # Only this source's warning clears. Approval reconnection is separate.
+        watch_relay.note_condition("codex_sync", "Approval connection unavailable")
+        monkeypatch.setattr(cx, "catalog_snapshot", lambda: {"sessions": [], "status": "ready"})
+        self._call(base + "/sessions?paged=1", token=auth.bootstrap)
+        assert [c["key"] for c in watch_relay.conditions()] == ["codex_sync"]
+
     def test_a_codex_session_opens_the_same_thread_route(self, relay, monkeypatch, tmp_path):
         import codex_sessions as cx
         base, _, auth = relay
@@ -14549,7 +14742,8 @@ class TestRelayRoutes:
             + TestCodexThreads._line("event_msg", {"type": "task_complete"}))
         monkeypatch.setattr(watch_relay, "_find_transcript", lambda _sid: None)
         monkeypatch.setattr(watch_dashboard, "recent_sessions", lambda **_kw: [])
-        monkeypatch.setattr(cx, "open_rollout_paths", lambda _paths: {str(rollout)})
+        monkeypatch.setattr(cx, "catalog_snapshot", lambda: {
+            "sessions": cx.active_sessions(open_paths={str(rollout)}), "status": "ready"})
         status, listing = self._call(base + "/sessions", token=auth.bootstrap)
         assert status == 200
         [row] = listing["sessions"]
@@ -18310,7 +18504,7 @@ class TestTheReportingItselfIsChecked:
     # a key that is not here fails the first test below, which is the
     # moment to also give it a test that fires it — the entries here are
     # exercised by a test that fires them, not merely declared.
-    VOCABULARY = {"bonjour", "bridge", "bridge_install", "bridge_saves", "claude", "codex", "codex_sync", "crash",
+    VOCABULARY = {"bonjour", "bridge", "bridge_install", "bridge_saves", "claude", "codex", "codex_sync", "codex_sessions", "crash",
                   "dashboard", "helper", "icloud_off", "login_item_off", "no_tls", "outdated", "pairing",
                   "port", "signin", "stuck", "tunnel", "update"}
 
@@ -19967,6 +20161,110 @@ class TestIssue400:
         assert ran == [("/p", "go")]
         assert first == (200, {"ok": True, "status": "started"})
         assert second == (200, {"ok": True, "status": "started", "repeat": True})
+
+    def test_new_receipt_survives_the_short_repeat_window(self, relay, monkeypatch):
+        base, ran = relay
+        body = {"path": "/p", "text": "go", "request_id": "1" * 32}
+        first = relay_call(base + "/new", token="bootstraptoken", method="POST", body=body)
+        monkeypatch.setattr(watch_relay, "_send_clock", lambda: float("inf"))
+        receipt = relay_call(base + "/new-receipt?id=" + body["request_id"], token="bootstraptoken")
+        second = relay_call(base + "/new", token="bootstraptoken", method="POST", body=body)
+        assert first[1] == receipt[1] == second[1] == {"ok": True, "status": "started"}
+        assert ran == [("/p", "go")]
+
+    def test_new_receipt_cannot_be_reused_for_other_words_or_read_by_another_device(self, relay):
+        base, ran = relay
+        body = {"path": "/p", "text": "go", "request_id": "2" * 32}
+        assert relay_call(base + "/new", token="bootstraptoken", method="POST", body=body)[1]["ok"]
+        status, _ = relay_call(base + "/new", token="bootstraptoken", method="POST",
+                               body=dict(body, text="other"))
+        assert status == 409
+        status, _ = relay_call(base + "/new-receipt?id=" + body["request_id"], token="devicetoken")
+        assert status == 404
+        assert ran == [("/p", "go")]
+
+    def test_new_claim_is_durable_before_launch_and_reopens_as_pending(self, tmp_path):
+        store = watch_relay.NewReceipts(str(tmp_path / "new.sqlite3"))
+        key, fingerprint = "device-request-hash", "body-hash"
+        assert store.claim(key, fingerprint) is None
+        reopened = watch_relay.NewReceipts(str(tmp_path / "new.sqlite3"))
+        assert reopened.claim(key, fingerprint) == {"ok": False, "status": "pending"}
+        answer = {"ok": True, "status": "started"}
+        reopened.finish(key, answer)
+        assert store.read(key) == answer
+
+    def test_new_receipt_recovers_after_the_client_socket_times_out(self, relay, monkeypatch):
+        import socket
+        import threading
+        base, ran = relay
+        entered, release = threading.Event(), threading.Event()
+        def delayed(path, text):
+            ran.append((path, text))
+            entered.set()
+            assert release.wait(5)
+            return "started"
+        monkeypatch.setattr(watch_relay, "start_session", delayed)
+        body = {"path": "/p", "text": "go", "request_id": "4" * 32}
+        failures = []
+        def lost_reply():
+            request = urllib.request.Request(base + "/new", method="POST",
+                data=json.dumps(body).encode(), headers={"X-Tapproval-Token": "bootstraptoken",
+                                                        "Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(request, timeout=0.2) as response:
+                    response.read()
+            except socket.timeout as error:
+                failures.append(error)
+        client = threading.Thread(target=lost_reply)
+        client.start()
+        try:
+            assert entered.wait(3)
+            client.join(2)
+            assert not client.is_alive() and len(failures) == 1
+            url = base + "/new-receipt?id=" + body["request_id"]
+            assert relay_call(url, token="bootstraptoken")[1]["status"] == "pending"
+            # Even a second POST in this isolated test cannot launch again.
+            assert relay_call(base + "/new", token="bootstraptoken", method="POST", body=body)[1]["status"] == "pending"
+        finally:
+            release.set()
+            client.join(3)
+        for _ in range(100):
+            receipt = relay_call(url, token="bootstraptoken")[1]
+            if receipt.get("status") == "started":
+                break
+            time.sleep(0.01)
+        assert receipt == {"ok": True, "status": "started"}
+        assert ran == [("/p", "go")]
+
+    def test_concurrent_new_claims_have_one_owner(self, tmp_path):
+        import concurrent.futures
+        path = str(tmp_path / "claims.sqlite3")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            answers = list(pool.map(lambda _: watch_relay.NewReceipts(path).claim("one", "body"), range(4)))
+        assert answers.count(None) == 1
+        assert answers.count({"ok": False, "status": "pending"}) == 3
+
+    def test_failed_receipt_storage_never_launches_a_session(self, relay, monkeypatch):
+        base, ran = relay
+        def broken(*_args):
+            raise OSError("disk full")
+        monkeypatch.setattr(watch_relay.NewReceipts, "claim", broken)
+        status, _ = relay_call(base + "/new", token="bootstraptoken", method="POST",
+                               body={"path": "/p", "text": "go", "request_id": "3" * 32})
+        assert status == 503
+        assert not ran
+
+    @pytest.mark.parametrize("status,safe", [("unknown project", True),
+        (watch_relay.AWAITS_TRUST, False), ("unknown", False),
+        ("could not open Terminal: timed out", False)])
+    def test_only_prelaunch_failures_authorise_another_new_submission(self, relay, monkeypatch, status, safe):
+        base, ran = relay
+        monkeypatch.setattr(watch_relay, "start_session", lambda path, text: ran.append(1) or status)
+        body = {"path": "/p", "text": "go", "request_id": "6" * 32}
+        answer = relay_call(base + "/new", token="bootstraptoken", method="POST", body=body)[1]
+        assert answer == {"ok": False, "status": status, "retry_safe": safe}
+        assert relay_call(base + "/new", token="bootstraptoken", method="POST", body=body)[1] == answer
+        assert ran == [1]
 
     def test_the_same_send_over_the_other_route_runs_once(self, fresh_auth, monkeypatch):
         """2026-10-19 review: the repeat key took the raw path, and through
