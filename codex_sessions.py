@@ -317,9 +317,92 @@ def _catalog_row(thread):
                          or _catalog_delivery_path(thread) is not None)}
 
 
-def _read_catalog(client_factory=None, endpoints=None):
+def _read_database_catalog(open_paths=None):
+    """Read the native catalog when Desktop exposes no external control socket.
+
+    Catalog membership comes from Codex's database, including archive state,
+    not rollout history. This connection cannot change the database or start
+    a server. It never grants a send capability or claims native ownership.
+    """
+    import sqlite3
+    from urllib.parse import quote
+    home = os.path.realpath(_home())
+    try:
+        candidates = [(int(match.group(1)), name) for name in os.listdir(home)
+                      if (match := re.fullmatch(r"state_(\d+)\.sqlite", name))]
+        if not candidates:
+            raise OSError("Codex catalog is unavailable")
+        path = os.path.join(home, max(candidates)[1])
+        if os.path.islink(path):
+            raise OSError("Codex catalog is unavailable")
+        deadline = time.monotonic() + 2
+        db = sqlite3.connect("file:" + quote(path.replace(os.sep, "/"), safe="/:") + "?mode=ro",
+                             uri=True, timeout=0.25)
+        try:
+            db.execute("PRAGMA query_only=ON")
+            db.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
+            required = {"id", "cwd", "rollout_path", "source", "title", "updated_at", "archived"}
+            if not required <= columns:
+                raise OSError("Codex catalog schema is unavailable")
+            fields = [("substr(" + name + ",1,4096) AS " + name
+                       if name in {"name", "preview", "title", "cwd", "rollout_path"} else name)
+                      if name in columns else "NULL AS " + name for name in
+                      ("id", "cwd", "rollout_path", "source", "title", "updated_at",
+                       "name", "preview", "recency_at_ms", "recency_at")]
+            where = "archived=0 AND source IN ('cli','vscode','appServer')"
+            if "attached_thread_parent_id" in columns:
+                where += " AND attached_thread_parent_id IS NULL"
+            if "history_mode" in columns:
+                where += " AND (history_mode IS NULL OR history_mode != 'ephemeral')"
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "thread_spawn_edges" in tables:
+                where += " AND id NOT IN (SELECT child_thread_id FROM thread_spawn_edges)"
+            order = ("recency_at_ms" if "recency_at_ms" in columns else
+                     "recency_at" if "recency_at" in columns else "updated_at")
+            db.row_factory = sqlite3.Row
+            records = db.execute("SELECT " + ",".join(fields) + " FROM threads WHERE " + where
+                                 + " ORDER BY " + order + " DESC,id ASC LIMIT 6401").fetchall()
+            if len(records) > 6400:
+                raise OSError("Codex catalog exceeded its page bound")
+        finally:
+            db.close()
+    except (OSError, ValueError, sqlite3.Error) as error:
+        raise OSError("Codex catalog is unavailable") from error
+    rows, paths = [], {}
+    for record in records:
+        thread = dict(record)
+        thread.update(updatedAt=thread.pop("updated_at"), status={"type": "notLoaded"},
+                      path=thread.pop("rollout_path"))
+        recency = thread.get("recency_at_ms")
+        thread["recencyAt"] = (recency // 1000 if type(recency) is int else
+                               thread.get("recency_at") or thread["updatedAt"])
+        if not thread.get("preview"):
+            thread["preview"] = thread.get("title")
+        row = _catalog_row(thread)
+        if row is None:
+            continue
+        row["can_send"] = False
+        rows.append(row)
+        validated = _catalog_delivery_path(thread)
+        if validated:
+            paths[row["session_id"]] = validated
+    # File ownership can inform runtime activity only for existing catalog
+    # members; it cannot add a chat, revive an archived one or enable sends.
+    opened = (open_rollout_paths(list(paths.values())[:128]) if open_paths is None else open_paths)
+    for row in rows:
+        path = paths.get(row["session_id"])
+        if path and os.path.realpath(path) in opened:
+            info = thread_info(path)
+            row.update(live=True, state=info["state"], state_reason=info["state_reason"],
+                       running_tool=info["running_tool"])
+    return rows, paths
+
+
+def _read_catalog(client_factory=None, endpoints=None, database_reader=None):
     from codex_desktop import server_sockets
     from codex_talk import Client
+    use_database = database_reader is not None or (client_factory is None and endpoints is None)
     client_factory = client_factory or Client
     endpoints = server_sockets() if endpoints is None else endpoints
     rows, paths, owners, succeeded = {}, {}, {}, False
@@ -371,9 +454,15 @@ def _read_catalog(client_factory=None, endpoints=None):
                     rows[sid]["can_send"] = False
                 if sid in server_paths:
                     paths[sid] = server_paths[sid]
+        except (OSError, EOFError, ValueError, TypeError, KeyError):
+            if not use_database:
+                raise
+            continue
         finally:
             client.close()
     if not succeeded:
+        if use_database:
+            return (database_reader or _read_database_catalog)()
         raise OSError("Codex chat catalog is unavailable")
     return sorted(rows.values(), key=lambda row: (-row["modified"], row["session_id"])), paths
 
