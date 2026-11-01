@@ -14,7 +14,7 @@ import time
 import tapproval_host as _host
 import tapproval_wire as wire
 
-from codex_approvals import LocalWebSocket
+from codex_approvals import ApprovalSync, LocalWebSocket
 import codex_sessions as sessions
 
 
@@ -42,6 +42,9 @@ class Client:
 
     def __init__(self, connect=None, socket_path=None):
         path = socket_path or os.path.join(sessions._home(), "app-server-control", "app-server-control.sock")
+        if connect is None:
+            # Establish absence before a platform's socket support is needed.
+            os.stat(path)
         self.wire = (connect or (lambda: LocalWebSocket(path)))()
         self.sequence = 0
         try:
@@ -80,18 +83,21 @@ def _owner_client(sid, connect):
         for endpoint in ([None] if connect is not None else server_sockets()):
             try:
                 candidate = Client(connect, socket_path=endpoint)
-            except (OSError, EOFError):
+            except (FileNotFoundError, ConnectionRefusedError):
                 continue
+            except (OSError, EOFError) as error:
+                raise ValueError("Codex server ownership could not be verified; "
+                                 "reopen the session before sending") from error
             try:
                 cursor = None
                 for _page in range(64):
                     page = candidate.rpc("thread/loaded/list", {"cursor": cursor})
-                    if sid in page.get("data", []):
+                    loaded, cursor = ApprovalSync._loaded_page(page)
+                    if sid in loaded:
                         if selected is not None:
                             raise ValueError("Thread is loaded on multiple Codex servers; close the duplicate before sending")
                         selected, candidate = candidate, None
                         break
-                    cursor = page.get("nextCursor")
                     if not cursor:
                         break
                 else:
@@ -125,8 +131,8 @@ def context(path):
 def queue_safe(path):
     """The native queue inherits these limits; it cannot establish them.
 
-    Approval requests keep using the existing human approval flow. A
-    queued follow-up cannot narrow the filesystem or network policy.
+    Approval requests must already use human review. A queued follow-up
+    cannot change the reviewer or narrow the filesystem or network policy.
     """
     row = context(path) or {}
     sandbox = row.get("sandbox_policy")
@@ -141,7 +147,8 @@ def queue_safe(path):
            or (os.path.realpath(p) != root and not os.path.realpath(p).startswith(root + os.sep))
            for p in roots):
         return False
-    return (row.get("approval_policy") in ("never", "on-request", "untrusted")
+    return (row.get("approvals_reviewer") == "user"
+            and row.get("approval_policy") in ("never", "on-request", "untrusted")
             and sandbox.get("type") in ("workspace-write", "read-only")
             and sandbox.get("network_access") is False)
 
@@ -256,7 +263,8 @@ def send(prefix, text, binary, spawn, log, brief=True, connect=None, runner=None
     if live:
         if not queue_safe(path):
             return ("Open this Codex session through the shared app-server to send from your watch; "
-                    "its current connection cannot enforce the watch's permission limits")
+                    "its current connection cannot enforce the watch's permission limits "
+                    "and human approval review")
         try:
             result = (runner or subprocess.run)(
                 [binary, "queue", "--thread", sid, "--message", text],

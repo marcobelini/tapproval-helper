@@ -21230,7 +21230,7 @@ class TestBonjourCandidatesAreReplaced:
 
 
 class TestTheAgentMarkIsReadable:
-    """The CC/CX mark in session metadata (owner, 2026-10-31). At a fixed
+    """The CC/CX mark under each session's tile (owner, 2026-10-31). At a fixed
     7 pt in the secondary grey it was the one label in the row that ignored
     the wearer's text size, and on a watch set to large text it all but
     vanished. It follows `.scaled`, like the rest of the row, in a grey

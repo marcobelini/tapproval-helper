@@ -242,6 +242,62 @@ def test_watch_sender_refuses_duplicate_native_owners(monkeypatch):
     assert all(connection.closed for connection in opened)
 
 
+def test_absent_socket_is_known_absent_without_transport_support(tmp_path, monkeypatch):
+    """CLI routes do not require Unix-socket support when no socket exists."""
+    import codex_talk
+    def unsupported(_path):
+        raise OSError('this Python has no Unix sockets')
+    monkeypatch.setattr(codex_talk, 'LocalWebSocket', unsupported)
+    with pytest.raises(FileNotFoundError):
+        codex_talk.Client(socket_path=str(tmp_path / 'missing.sock'))
+
+
+@pytest.mark.parametrize('page', [
+    {'data': 'target'}, {'data': ['target', {}]},
+    {'data': ['target'], 'nextCursor': 1},
+])
+def test_watch_sender_refuses_malformed_loaded_owner_page(monkeypatch, page):
+    import codex_talk
+    class Connection:
+        closed = False
+        def rpc(self, method, params):
+            assert method == 'thread/loaded/list'
+            return page
+        def close(self):
+            self.closed = True
+    connection = Connection()
+    monkeypatch.setattr(codex_talk, 'Client', lambda *args, **kwargs: connection)
+    monkeypatch.setattr(desktop, 'server_sockets', lambda: ['desktop'])
+    with pytest.raises(ValueError, match='loaded-thread page'):
+        codex_talk._owner_client('target', None)
+    assert connection.closed
+
+
+@pytest.mark.parametrize('failure', [TimeoutError, PermissionError, EOFError, OSError])
+@pytest.mark.parametrize('paths', [['owner', 'uncertain'], ['uncertain', 'owner']])
+def test_watch_sender_refuses_uncertain_other_server(monkeypatch, failure, paths):
+    import codex_talk
+    opened = []
+    class Connection:
+        closed = False
+        def rpc(self, method, params):
+            assert method == 'thread/loaded/list'
+            return {'data': ['target'], 'nextCursor': None}
+        def close(self):
+            self.closed = True
+    def client(*args, socket_path=None, **kwargs):
+        if socket_path == 'uncertain':
+            raise failure('not verified')
+        connection = Connection()
+        opened.append(connection)
+        return connection
+    monkeypatch.setattr(codex_talk, 'Client', client)
+    monkeypatch.setattr(desktop, 'server_sockets', lambda: paths)
+    with pytest.raises(ValueError, match='ownership could not be verified'):
+        codex_talk._owner_client('target', None)
+    assert all(connection.closed for connection in opened)
+
+
 @pytest.fixture
 def health_hub(monkeypatch):
     monkeypatch.setattr("ClaudeRiskClassifier.write_audit", lambda *_: None)
@@ -511,3 +567,32 @@ def test_hub_recovery_accepts_verified_native_closure_but_not_an_unknown_target(
         sync.reconcile()
     hub._retry_targets()
     assert events[-1], "absence is not closure proof for a never-observed target"
+
+
+def test_prepared_wrapper_runs_without_launcher_environment(tmp_path, monkeypatch):
+    """Desktop tool subprocesses can retain the wrapper path but drop its env."""
+    import subprocess
+    import sys
+    if not hasattr(os, "getuid"):
+        pytest.skip("Desktop launcher requires a POSIX host")
+    monkeypatch.setattr(desktop.host, "is_mac", lambda: True)
+    monkeypatch.setattr(desktop.Path, "home", lambda: tmp_path)
+    cli = tmp_path / "real codex's executable"
+    cli.write_text("#!%s\nimport json, os, sys\nprint(json.dumps({"
+                   "'args': sys.argv[1:], 'path': os.environ.get('CODEX_CLI_PATH'), "
+                   "'adapter_env': os.environ.get('TAPPROVAL_CODEX_REAL_CLI')}))\n" % sys.executable)
+    cli.chmod(0o700)
+    app = tmp_path / "Desktop.app"
+    (app / "Contents").mkdir(parents=True)
+    (app / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleExecutable": "Desktop"}))
+    launcher = desktop.prepare_launcher(str(cli), str(app))
+    wrapper = launcher.parent / "codex"
+    env = dict(os.environ)
+    env.pop("TAPPROVAL_CODEX_REAL_CLI", None)
+    env["CODEX_CLI_PATH"] = str(wrapper)
+    result = subprocess.run([str(wrapper), "--version", "argument with spaces"],
+                            env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "args": ["--version", "argument with spaces"],
+        "path": str(cli), "adapter_env": None}
