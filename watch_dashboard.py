@@ -497,6 +497,42 @@ ENTRYPOINTS = {
 }
 
 
+# The Claude app keeps one file per Code-tab session, and its own archive
+# is a field in it. Read only, to tell the watch an archive it asked for
+# has happened (design/session-archive.md, wrist test 3).
+CLAUDE_APP_SESSIONS = os.path.join(os.path.expanduser("~"), "Library", "Application Support",
+                                   "Claude", "claude-code-sessions")
+CLAUDE_APP_FILES_READ = 400
+CLAUDE_APP_FILE_BYTES = 4 * 1024 * 1024
+
+
+def claude_app_archived(session_id, root=None):
+    """True or False from the app's own record of the session Claude Code
+    calls ``session_id``; None when there is no record (not this app, not
+    a Mac, unreadable). Newest files first, and a bounded number of them:
+    an answer that takes too long to find is not one."""
+    if not session_id:
+        return None
+    import glob
+    root = root or CLAUDE_APP_SESSIONS
+    paths = glob.glob(os.path.join(glob.escape(root), "*", "*", "local_*.json"))
+    try:
+        paths.sort(key=os.path.getmtime, reverse=True)
+    except OSError:
+        pass
+    for path in paths[:CLAUDE_APP_FILES_READ]:
+        try:
+            if os.path.getsize(path) > CLAUDE_APP_FILE_BYTES:
+                continue
+            with open(path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get(shape("claude_app.cli_session")) == session_id:
+            return data.get(shape("claude_app.archived")) is True
+    return None
+
+
 def session_registry(sessions_dir=None):
     """What Claude Code records about each live session, by id: where it
     runs, whether the phone can see it (Remote Control gave it a bridge
@@ -845,6 +881,14 @@ UPSTREAM_SHAPES = {
         ("startedAt", "When the registry says a session's process started, "
          "in milliseconds: a task output file born after it belongs to the "
          "live process, which writes the exit marker itself.", "2026-10-14"),
+    "claude_app.cli_session":
+        ("cliSessionId", "In the Claude app's per-session file under "
+         "claude-code-sessions/: the Claude Code session id the registry "
+         "and the transcript use.", "2026-11-01"),
+    "claude_app.archived":
+        ("isArchived", "In the same file: true once the session is archived "
+         "in the app, which also stops it and archives its phone copy "
+         "(wrist test 3, the app's archive_session tool).", "2026-11-01"),
     "registry.status":
         ("status", "The session registry's word on the turn, rewritten as "
          "it changes: busy from a prompt until the turn ends, idle after, "
