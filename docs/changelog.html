@@ -23,6 +23,17 @@
 <main class="policy">
 <h1>Changelog</h1>
 <p><em>Every release of Tapproval Base, the helper on your computer, newest first. Starting Claude Code once updates it. Generated from <a href="https://github.com/marcobelini/tapproval-helper/releases">the releases on GitHub</a>, which may already hold a newer one. Security fixes are also explained on <a href="security.html">the security page</a>.</em></p>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.104">1.1.104</a></h2>
+<p><em>2026-11-01</em></p>
+<p><strong>Tapproval Base</strong> is the computer half of Tapproval: it sends permission prompts to your Apple Watch and carries your answers back to the session that asked.</p>
+<p>Already installed? A terminal install updates itself when Claude Code starts. A plugin install updates when auto-update is on: in Claude Code, type <code>/plugin</code>, open Marketplaces, choose tapproval and pick Enable auto-update.</p>
+<h3>Since 1.1.103</h3>
+<ul>
+<li>A reply from the watch reaches a Codex session only once the helper has checked that the session's Codex server belongs to you. If it can't check, it asks you to reopen the session instead of sending.</li>
+<li>A queued Codex follow-up goes out only when the session still sends approvals to you for review, so a reply can't change who reviews them.</li>
+<li>On Windows, a file path that starts with a drive letter (C:\…) is no longer mistaken for a web address in Codex chats.</li>
+</ul>
+<p>These Codex changes need the matching internal 3.0 Watch beta; physical Watch checks, Desktop approval delivery and everyday-use checks still gate the public Codex 3.0 release.</p>
 <h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.103">1.1.103</a></h2>
 <p><em>2026-10-31</em></p>
 <p><strong>Tapproval Base</strong> is the computer half of Tapproval: it sends permission prompts to your Apple Watch and carries your answers back to the session that asked.</p>
