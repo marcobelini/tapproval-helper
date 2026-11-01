@@ -1804,7 +1804,8 @@ def session_thread(session_id, limit=THREAD_TURN_LIMIT, projects_dir=None):
 
 # The phone's wording, in both the shapes it uses: one run named on its own,
 # and several of a kind counted. It writes "Ran 4 commands", never
-# "Ran a command, ran a command, ran a command".
+# "Ran a command, ran a command, ran a command". The first name of each
+# entry is the kind's key, so two names of one kind are counted together.
 _TOOL_PHRASES = (
     (("Bash", "BashOutput"), "ran a command", "ran %d commands"),
     (("Edit", "Write", "NotebookEdit", "MultiEdit"), "edited a file",
@@ -1815,15 +1816,84 @@ _TOOL_PHRASES = (
     (("Task", "Agent"), "launched a task", "launched %d tasks"),
     (("TerminalInput",), "sent input to a terminal", "sent input %d times"),
     (("ComputerUse",), "used the computer", "used the computer %d times"),
+    (("Artifact",), "published a page", "published %d pages"),
+    (("AskUserQuestion",), "asked you a question", "asked you %d questions"),
+    (("ExitPlanMode",), "showed you a plan", "showed you %d plans"),
+    (("Skill",), "used a skill", "used %d skills"),
+    (("SendUserFile",), "sent you a file", "sent you %d files"),
+    (("PushNotification",), "sent you a notification",
+     "sent you %d notifications"),
+    (("SendMessage", "mcp__ccd_session_mgmt__send_message"),
+     "messaged a session", "messaged sessions %d times"),
+    (("mcp__ccd_session__start_session",), "started a session",
+     "started %d sessions"),
+    (("TaskStop", "KillShell"), "stopped a task", "stopped %d tasks"),
+    (("Monitor", "ScheduleWakeup"), "set a check-in", "set %d check-ins"),
 )
+
+# Claude keeping its own notes: its plan, its to-do list, its wrap-up, the
+# tools it loads. None of it touches your work, and it was half of every
+# "used a tool" on the wrist (2026-11-01), so it is left out of the thread.
+_QUIET_TOOLS = frozenset((
+    "ToolSearch", "TodoWrite", "TaskCreate", "TaskUpdate", "TaskList",
+    "TaskGet", "TaskOutput", "ReadNotifications",
+    "mcp__ccd_session__mark_chapter", "mcp__ccd_session__dismiss_task",
+))
+_QUIET_PREFIXES = ("mcp__ccd_turn__",)
+
+# A connector is named by its server; the calls inside it are counted.
+_MCP_SERVERS = (
+    (("github",), "used GitHub", "used GitHub %d times"),
+    (("browser", "chrome"), "used the browser", "used the browser %d times"),
+    (("simulator",), "used the simulator", "used the simulator %d times"),
+    (("computer-use",), "used the computer", "used the computer %d times"),
+    (("ccd_pr",), "checked the pull request",
+     "checked the pull request %d times"),
+    (("gmail",), "used mail", "used mail %d times"),
+    (("visualize",), "drew a picture", "drew %d pictures"),
+    # The desktop app's own servers (ccd_host, ccd_view, …), after ccd_pr.
+    (("ccd_",), "used the Claude app", "used the Claude app %d times"),
+)
+_SERVER_IS_AN_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _tool_family(name):
+    """``(key, one, many)`` for a tool: the kind it is counted as, and the
+    phone's words for one of it and for several. None for Claude's own
+    bookkeeping, which the wrist does not show."""
+    name = str(name or "")
+    if name in _QUIET_TOOLS or name.startswith(_QUIET_PREFIXES):
+        return None
+    for names, one, many in _TOOL_PHRASES:
+        if name in names:
+            return names[0], one, many
+    if name.startswith("mcp__"):
+        server, sep, _ = name[len("mcp__"):].rpartition("__")
+        server = server if sep else name[len("mcp__"):]
+        low = server.lower()
+        for keys, one, many in _MCP_SERVERS:
+            if any(key in low for key in keys):
+                return "mcp:" + keys[0], one, many
+        if not server or _SERVER_IS_AN_ID.match(server):
+            return "mcp:", "used a connector", "used connectors %d times"
+        words = " ".join(server.replace("_", " ").replace("-", " ").split())
+        return ("mcp:" + low, "used " + words,
+                "used " + words.replace("%", "%%") + " %d times")
+    # Codex pools every tool it will not name in one private bin, "tool".
+    if name in ("", "tool"):
+        return "tool", "used a tool", "used tools %d times"
+    return name, "used " + name, "used " + name.replace("%", "%%") + " %d times"
 
 
 def _tool_phrase(name, count=1):
-    """The phone app's wording for one tool run, or for several of a kind."""
-    for names, one, many in _TOOL_PHRASES:
-        if name in names:
-            return one if count < 2 else many % count
-    return "used a tool" if count < 2 else "used tools %d times" % count
+    """The phone app's wording for one tool run, or for several of a kind;
+    empty for bookkeeping the wrist leaves out."""
+    family = _tool_family(name)
+    if family is None:
+        return ""
+    _, one, many = family
+    return one if count < 2 else many % count
 
 
 # Background tasks announce themselves when launched and are receipted by
@@ -2013,20 +2083,28 @@ class _ToolRun:
     not change underneath the reader. The first line remains its identity.
     """
 
+    # A single call Claude described is named by its purpose, in the verb
+    # of its kind; anything else is named by kind and counted.
+    _DESCRIBED = {"Bash": "ran %s", "Task": "launched %s"}
+
     def __init__(self):
         self.counts = OrderedDict()
         self.description = ""
         self.turn = None
 
     def add(self, name, at="", number=None, description=""):
-        self.counts[name] = self.counts.get(name, 0) + 1
-        if self.turn is None:
-            self.description = description
+        key, one, many = _tool_family(name) or _tool_family("")
+        if key in self.counts:
+            self.counts[key][2] += 1
+        else:
+            self.counts[key] = [one, many, 1]
+        if self.turn is None and key in self._DESCRIBED:
+            self.description = self._DESCRIBED[key] % description if description else ""
         else:
             self.description = ""
-        phrase = ("ran %s" % self.description if self.description else
-                  ", ".join(_tool_phrase(tool, count)
-                            for tool, count in self.counts.items()))
+        phrase = self.description or ", ".join(
+            one if count < 2 else many % count
+            for one, many, count in self.counts.values())
         first = self.turn.get("n") if self.turn is not None else number
         self.turn = {"role": "assistant", "kind": "tool", "at": at,
                      "text": phrase[:1].upper() + phrase[1:]}
@@ -2044,6 +2122,8 @@ def _merge_tool_runs(turns):
 
     for turn in turns:
         if turn["kind"] == "tool":
+            if _tool_family(turn["text"]) is None:
+                continue               # bookkeeping: neither shown nor a break
             if run is None:
                 run = _ToolRun()
                 merged.append(None)
@@ -2327,9 +2407,10 @@ def _thread_line(state, line, limit):
             kept[part["id"]] = " ".join(str(tool_description).split())[:80]
             while len(kept) > _DESCRIPTIONS_KEPT:
                 kept.popitem(last=False)
-        state["running_tool"] = (
-            " ".join(str(tool_description or "").split())
-            or phrase[:1].upper() + phrase[1:])
+        if phrase:
+            state["running_tool"] = (
+                " ".join(str(tool_description or "").split())
+                or phrase[:1].upper() + phrase[1:])
     kind = "text"
     lead = str(text).lstrip()
     description = ""

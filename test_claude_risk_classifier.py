@@ -15612,6 +15612,61 @@ class TestMergeToolRuns:
         turns = [{"kind": "text", "role": "user", "text": "hi", "at": "1"}]
         assert wd._merge_tool_runs(turns) == turns
 
+    @staticmethod
+    def _run(*names, start=0):
+        return [{"kind": "tool", "text": name, "desc": "", "at": str(start + i),
+                 "n": start + i} for i, name in enumerate(names)]
+
+    def test_different_unnamed_tools_are_named_not_repeated(self):
+        # 2026-11-01: the wrist read "Used a tool, used a tool, used a tool".
+        import watch_dashboard as wd
+        merged = wd._merge_tool_runs(self._run("Artifact", "AskUserQuestion", "LSP"))
+        assert merged[0]["text"] == "Published a page, asked you a question, used LSP"
+        assert "a tool" not in merged[0]["text"]
+
+    def test_connector_calls_are_counted_by_their_server(self):
+        import watch_dashboard as wd
+        merged = wd._merge_tool_runs(self._run(
+            "mcp__github__create_pull_request", "mcp__github__merge_pull_request",
+            "mcp__github__get_me", "mcp__Claude_Browser__navigate",
+            "mcp__scheduled-tasks__update_scheduled_task",
+            "mcp__1a59c906-04da-521d-bda7-7f71b9f9e01c__read",
+            "mcp__ccd_host__get_storage_usage"))
+        assert merged[0]["text"] == ("Used GitHub 3 times, used the browser, "
+                                     "used scheduled tasks, used a connector, "
+                                     "used the Claude app")
+
+    def test_one_kind_is_counted_once_whatever_its_names(self):
+        import watch_dashboard as wd
+        merged = wd._merge_tool_runs(self._run("TaskStop", "KillShell", "LSP", "LSP"))
+        assert merged[0]["text"] == "Stopped 2 tasks, used LSP 2 times"
+
+    def test_housekeeping_stays_off_the_wrist(self):
+        import watch_dashboard as wd
+        quiet = self._run("ToolSearch", "mcp__ccd_turn__update_plan", "TodoWrite",
+                          "mcp__ccd_session__mark_chapter", "TaskUpdate")
+        assert wd._merge_tool_runs(quiet) == []
+        said = [{"kind": "text", "role": "assistant", "text": "Done.", "at": "9", "n": 9}]
+        assert wd._merge_tool_runs(quiet + said) == said
+
+    def test_a_run_that_opens_with_housekeeping_keeps_one_number(self):
+        import watch_dashboard as wd
+        first = self._run("ToolSearch", "Bash")
+        assert wd._merge_tool_runs(first)[0]["n"] == 1
+        grown = wd._merge_tool_runs(first + self._run("Bash", start=2))
+        assert grown == [{"role": "assistant", "kind": "tool", "at": "2", "n": 1,
+                          "text": "Ran 2 commands"}]
+
+    def test_a_described_task_is_launched_not_ran(self):
+        import watch_dashboard as wd
+        turns = [{"kind": "tool", "text": "Agent", "desc": "Find the bug", "at": "1"}]
+        assert wd._merge_tool_runs(turns)[0]["text"] == "Launched Find the bug"
+
+    def test_codexs_private_bin_still_reads_as_a_tool(self):
+        import watch_dashboard as wd
+        assert wd._tool_phrase("tool") == "used a tool"
+        assert wd._tool_phrase("tool", 7) == "used tools 7 times"
+
 
 class TestConnectingToAnExistingSession:
     """2026-09-24: the watch listed only live sessions, and a message to a
