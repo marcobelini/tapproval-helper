@@ -1648,8 +1648,8 @@ class DashboardUnavailable(OSError):
 _DASHBOARD_ERROR = None
 try:
     from watch_dashboard import (  # noqa: E402
-        activity_summary, card_session_title, recap_summary, _find_transcript, image_bytes,
-        inbox_ready,
+        activity_summary, card_session_title, claude_app_archived, recap_summary,
+        _find_transcript, image_bytes, inbox_ready,
         _message_of, _parse_thread, _read_appended,
         project_root, prompts_at_the_mac, recent_sessions, active_sessions, registry_turn, resolve_session,
         session_registry, session_state, shape, thread_after, thread_tool_id,
@@ -1680,6 +1680,9 @@ except Exception as _error:  # noqa: BLE001 — any import-time failure, not onl
 
     def inbox_ready(*_args, **_kwargs):
         return False            # the old route, which needs nothing from here
+
+    def claude_app_archived(*_args, **_kwargs):
+        return None             # no word from the app: an archive stays asked
 
     THREAD_TURN_LIMIT = 14      # watch_dashboard's own value
 
@@ -2364,6 +2367,119 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False, age
     return "could not start: %s" % error if error else "sent"
 
 
+# What a Claude app session is asked when the wearer archives it. Fixed
+# words, never the wearer's: its Claude calls the app's own archive tool on
+# itself, and the wearer approves that on the wrist like any permission
+# (wrist test 3, 2026-11-01).
+ARCHIVE_ASK = "Archive this session with your session tool."
+# Codex's own wrist-ready sentences from codex_talk, passed through as they
+# are. Anything else it says may carry the chat's id, and is not.
+CODEX_ARCHIVE_WORDS = ("Codex is open on two servers", "Can't reach Codex on this Mac",
+                       "Can't verify which Codex server owns this chat")
+FULL_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _card_waits(session_id, waiting):
+    return any(str(card) and (session_id.startswith(str(card)) or str(card).startswith(session_id))
+               for card in waiting)
+
+
+def _codex_archive_word(answer, done):
+    if answer.get("ok"):
+        return done
+    if answer.get("uncertain"):
+        return "uncertain"
+    reason = str(answer.get("reason") or "")
+    if reason in CODEX_ARCHIVE_WORDS:
+        return reason
+    # "Codex refused: <its message>", cut at 60 with the chat's id in it.
+    # Most often the chat is open in Codex Desktop ("active writer").
+    return "codex refused" if reason.startswith("Codex refused") else "could not %s" % (
+        "archive" if done == "archived" else "restore")
+
+
+def _archive_codex(prefix, waiting):
+    import codex_sessions
+    from codex_talk import archive_codex_thread
+    catalog = codex_sessions.catalog_snapshot()
+    if catalog.get("status") != "ready":
+        return None, "Codex chats are unavailable"
+    # Only a chat on Codex's own list, the one the watch was shown: never
+    # one known only from a file or the database.
+    found = [str(row.get("session_id")) for row in catalog.get("sessions") or ()
+             if str(row.get("session_id") or "").startswith(prefix)]
+    if len(found) != 1:
+        return None, "unknown session"
+    if _card_waits(found[0], waiting):
+        return found[0], "card waiting"
+    return found[0], _codex_archive_word(archive_codex_thread(found[0]), "archived")
+
+
+def _archive_claude(prefix, waiting, projects_dir=None):
+    registry = session_registry()
+    session_id, _ = resolve_session(prefix, projects_dir, registry=registry)
+    if not session_id:
+        return None, "unknown session"
+    if _card_waits(session_id, waiting):
+        return session_id, "card waiting"
+    entry = registry.get(session_id)
+    origin = (entry or {}).get("status")
+    if entry is None or origin == "Terminal":
+        # Ending a terminal session archives its phone row (wrist test 1);
+        # a closed one may still have a copy a wrist message started.
+        word = end_session(session_id, waiting)
+        return session_id, "archived" if word == "ended" else word
+    if origin == "Desktop":
+        if claude_app_archived(session_id):
+            return session_id, "archived"
+        # Its inbox or nothing. The headless route is another process: it
+        # cannot archive the app's session, and would only add a turn.
+        if (inbox_ready(entry, _find_transcript(session_id, projects_dir))
+                and post_to_inbox(entry, ARCHIVE_ASK, brief=True)):
+            return session_id, "asked"
+        return session_id, "open it in the Claude app"
+    return session_id, "can't archive here"
+
+
+def archive_session(prefix, waiting=(), agent=None, projects_dir=None):
+    """Archive a session where it lives, from the wrist. Returns "archived",
+    "asked" (a Claude app session was asked to archive itself, which the
+    wearer approves on the wrist), or a word the watch turns into a
+    sentence; never raises past the caller's budget.
+
+    Never while a card waits for the session, and for Codex only a chat on
+    its own list (design/session-archive.md, P0 item 4)."""
+    prefix = str(prefix or "")[:64]
+    if agent not in (None, "claude", "codex"):
+        return "unknown agent"
+    if not prefix:
+        return "unknown session"
+    import codex_sessions
+    codex = agent == "codex" or (agent is None and codex_sessions.find_rollout(prefix))
+    try:
+        session_id, word = (_archive_codex if codex else _archive_claude)(prefix, waiting)
+    except Exception as error:  # noqa: BLE001 — one tap must not take the relay down
+        session_id, word = None, "could not archive"
+        print("relay: archive failed: %s: %s" % (type(error).__name__, error), file=sys.stderr)
+    print("relay: archive %s %s %s" % ("codex" if codex else "claude",
+                                       (session_id or prefix)[:8], word), file=sys.stderr)
+    return word
+
+
+def restore_session(prefix, agent=None):
+    """Bring back a chat this watch archived. Only Codex has a way back
+    the Mac may take; anything else is resumed at the computer."""
+    prefix = str(prefix or "")[:64]
+    if agent != "codex":
+        return "resume it from your computer"
+    if not FULL_ID.match(prefix):
+        return "unknown session"
+    from codex_talk import unarchive_codex_thread
+    word = _codex_archive_word(unarchive_codex_thread(prefix), "restored")
+    print("relay: restore codex %s %s" % (prefix[:8], word), file=sys.stderr)
+    return word
+
+
 # The built-ins the watch offers by name, as (description, hint). Built-ins
 # live inside the CLI, not on disk, so they cannot be discovered. The two
 # reviews read and do not write. /design and /slides (Claude Code 2.1.310,
@@ -2927,35 +3043,65 @@ def start_session(path, text, projects_dir=None, platform=None, agent=None):
     # its first answer, as a reply sent into a session already does. It
     # stays Concise if the person later sits down at it; `/output-style`
     # changes that there.
-    script = 'unset %s; cd %s && claude --settings %s -- %s' % (
-        " ".join(HOST_SESSION_MARKERS), shlex.quote(path),
-        shlex.quote(BRIEF_REPLY_SETTINGS), shlex.quote(text))
+    program = binary if codex else "claude"
+    if not on_mac and _host.is_windows():
+        # A program, never a .cmd or .ps1 wrapper (npm's): a batch file
+        # reads its arguments again, so "a&calc" in the wearer's text
+        # would run calc. Claude Code's and Codex's own installers give
+        # an .exe; anything else is refused, in words, before anything
+        # has started.
+        program = binary if codex else shutil.which("claude")
+        if not program or not program.lower().endswith(".exe"):
+            return "new sessions need %s's own installer on Windows" % (
+                "Codex" if codex else "Claude Code")
+    words = [program, "--settings", BRIEF_REPLY_SETTINGS, "--", text]
+    thread = None
     if codex:
-        script = 'unset %s; cd %s && %s' % (
-            " ".join(HOST_SESSION_MARKERS), shlex.quote(path),
-            shlex.join([binary] + flags() + ["--", text]))
+        # Started on the shared server, the chat is one the phone and the
+        # desktop app can open, and Terminal only shows it. Started by a
+        # Terminal with flags(), it ran a private server the phone refused
+        # as "used by another session" (2026-11-01).
+        from codex_talk import attach_flags, shared_socket, start as start_codex
+        try:
+            thread = start_codex(path, text)
+        except ValueError as error:
+            return str(error)
+        if thread is None:
+            note_condition("codex_shared_service",
+                "Codex's background service is not running, so a session "
+                "started from your watch opens only in Terminal and your "
+                "iPhone cannot open it. Opening Codex once in Terminal on "
+                "your computer starts the service.")
+            words = [program] + flags() + ["--", text]
+        else:
+            clear_condition("codex_shared_service")
+            words = ([program, "resume", "--remote", "unix://" + shared_socket()]
+                     + attach_flags() + [thread])
+    script = 'unset %s; cd %s && %s' % (
+        " ".join(HOST_SESSION_MARKERS), shlex.quote(path), shlex.join(words))
+    window = _open_session_window(path, script, words, on_mac)
+    if window is None:
+        return started
+    if thread:
+        # The chat already runs where the phone and the watch reach it.
+        print("relay: new session: Codex started without a window (%s)" % window,
+              file=sys.stderr)
+        return started
+    return window
+
+
+def _open_session_window(path, script, words, on_mac):
+    """Show a new session on the screen. None when shown, else words."""
     if not on_mac:
         # The same session in PowerShell words for Windows; Linux runs the
-        # bash script above. Every word is a literal, the binary's included.
-        words = ([binary] + flags() if codex
-                 else ["claude", "--settings", BRIEF_REPLY_SETTINGS]) + ["--", text]
-        if _host.is_windows():
-            # A program, never a .cmd or .ps1 wrapper (npm's): a batch file
-            # reads its arguments again, so "a&calc" in the wearer's text
-            # would run calc. Claude Code's and Codex's own installers give
-            # an .exe; anything else is refused, in words.
-            program = binary if codex else shutil.which("claude")
-            if not program or not program.lower().endswith(".exe"):
-                return "new sessions need %s's own installer on Windows" % (
-                    "Codex" if codex else "Claude Code")
-            words[0] = program
+        # bash script. Every word is a literal, the binary's included.
         windows = "%s; Set-Location -LiteralPath %s -ErrorAction Stop; & %s" % (
             "; ".join("Remove-Item -ErrorAction SilentlyContinue Env:%s" % name
                       for name in HOST_SESSION_MARKERS),
             _host.powershell_literal(path),
             " ".join(_host.powershell_literal(word) for word in words))
         ok, why = _host.open_terminal(script, windows)
-        return started if ok else "could not open a terminal: %s" % why
+        return None if ok else "could not open a terminal: %s" % why
     # json.dumps is the right escaper for the quotes and backslashes an
     # AppleScript string literal understands — but only with
     # ensure_ascii=False. Left at its default it writes \u00e5 for "å",
@@ -2984,7 +3130,7 @@ def start_session(path, text, projects_dir=None, platform=None, agent=None):
         opened = subprocess.run(["open", command_file], capture_output=True,
                                 text=True, timeout=8)
         if opened.returncode == 0:
-            return started
+            return None
         also = (opened.stderr or opened.stdout or "").strip().splitlines()
         not_opened = also[-1] if also else "no reason given"
     except subprocess.TimeoutExpired:
@@ -2999,7 +3145,7 @@ def start_session(path, text, projects_dir=None, platform=None, agent=None):
              'end tell' % _applescript_literal(script))
     ok, why = _run_osascript(apple)
     if ok:
-        return started
+        return None
     return "could not open Terminal: %s (nor a .command file: %s)" % (
         why, not_opened)
 
@@ -4110,6 +4256,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             # not be able to answer its own card or speak into a session.
             "/say": ("_post_say", dict(token=True, no_simulator=True)),
             "/end": ("_post_end", dict(token=True, no_simulator=True)),
+            "/archive": ("_post_archive", dict(token=True, no_simulator=True)),
+            "/restore": ("_post_restore", dict(token=True, no_simulator=True)),
             "/auto-update": ("_post_auto_update", dict(token=True, no_simulator=True)),
             # The watch reporting its own trouble. A device token, like
             # /say: a local process must not be able to file a fault in
@@ -4670,6 +4818,75 @@ class RelayHandler(BaseHTTPRequestHandler):
         self._serialised_send(lambda body: (
             end_session(str(body.get("session_id", ""))[:64], waiting), "ended"), path)
 
+    def _post_archive(self, path, query):
+        # Archives a session where it lives, under the budget and gate a
+        # send has: it may stop a process, and must never act twice.
+        waiting = [card["session_id"] for card in self.queue.pending() if card.get("session_id")]
+        body = self._read_json() or {}
+        act = lambda body: archive_session(  # noqa: E731
+            str(body.get("session_id", ""))[:64], waiting, agent=body.get("agent"))
+        if isinstance(body, dict) and "request_id" in body:
+            self._tracked_archive(body, act)
+            return
+        self._serialised_send(lambda body: _archive_answer(act(body)), path)
+
+    def _tracked_archive(self, body, act):
+        import uuid
+        store = NewReceipts(self.auth.path + ".archive.sqlite3")
+        try:
+            key = _send_key(self._presented(), "/archive-receipt", uuid.UUID(str(body["request_id"])).hex)
+        except ValueError:
+            self._send_json({"ok": False, "status": "invalid request id"}, 400)
+            return
+        fingerprint = _send_key("", "/archive", body)
+        try:
+            answer = store.read(key, fingerprint)
+        except ValueError:
+            self._send_json({"ok": False, "status": "request id already used"}, 409)
+            return
+        except (OSError, NewReceipts.Error):
+            self._send_json({"ok": False, "status": "receipt unavailable"}, 503)
+            return
+        if answer is not None:
+            # Asked once, never again: the app's own record says when the
+            # wearer's approval has archived it.
+            if answer.get("status") == "asked" and claude_app_archived(
+                    str(body.get("session_id", ""))[:64]):
+                answer = {"ok": True, "status": "archived"}
+                try:
+                    store.finish(key, answer)
+                except (OSError, NewReceipts.Error):
+                    pass        # the app's record is the truth; the next ask reads it again
+            self._send_json(answer)
+            return
+        who = self._presented() or self.client_address[0]
+        if self._over_limit("say", who, 6, 60, "too many messages"):
+            return
+        gate = LIMITS.gate("say", 1)
+        if not gate.acquire(blocking=False):
+            self._send_json({"ok": False, "status": "a message is already being sent"}, 429)
+            return
+        try:
+            answer = store.claim(key, fingerprint)
+            if answer is None:
+                status, good = _archive_answer(act(body))
+                answer = {"ok": status == good, "status": status}
+                store.finish(key, answer)
+        except ValueError:
+            self._send_json({"ok": False, "status": "request id already used"}, 409)
+            return
+        except (OSError, NewReceipts.Error):
+            self._send_json({"ok": False, "status": "unknown"}, 503)
+            return
+        finally:
+            gate.release()
+        self._send_json(answer)
+
+    def _post_restore(self, path, query):
+        self._serialised_send(lambda body: (
+            restore_session(str(body.get("session_id", ""))[:64], agent=body.get("agent")),
+            "restored"), path)
+
     def _post_auto_update(self, path, query):
         """The watch's "Keep the helper up to date" switch: {"on": bool}.
         Answers with what Claude Code's settings now say, not with what was
@@ -4898,6 +5115,12 @@ def _recent_send(key):
 def _remember_send(key, answer):
     with _RECENT_SENDS_LOCK:
         _RECENT_SENDS[key] = (_send_clock(), dict(answer))
+
+
+def _archive_answer(status):
+    """(status, the good word): "asked" is a good answer too, one the
+    wearer finishes on the wrist."""
+    return status, status if status in ("archived", "asked") else "archived"
 
 
 class NewReceipts:
