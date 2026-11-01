@@ -40,6 +40,7 @@ class LocalWebSocket:
         self.sock.settimeout(timeout)
         self._buffer = b""
         self._ready = False
+        self._receive_deadline = None
         self._write_lock = threading.Lock()
         try:
             self.sock.connect(path)
@@ -70,6 +71,11 @@ class LocalWebSocket:
 
     def _read(self):
         while True:
+            if self._receive_deadline is not None:
+                remaining = self._receive_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Codex RPC deadline expired")
+                self.sock.settimeout(remaining)
             try:
                 data = self.sock.recv(65536)
                 break
@@ -106,6 +112,9 @@ class LocalWebSocket:
         fragments = bytearray()
         started = False
         while True:
+            if (self._receive_deadline is not None
+                    and time.monotonic() >= self._receive_deadline):
+                raise TimeoutError("Codex RPC deadline expired")
             first, second = self._take(2)
             opcode, final = first & 15, bool(first & 128)
             if first & 112 or second & 128:
@@ -137,6 +146,20 @@ class LocalWebSocket:
                 if not isinstance(value, dict):
                     raise ValueError("expected a JSON-RPC object")
                 return value
+
+    def receive_until(self, deadline):
+        """Bound the whole receipt, including silence and partial frames.
+
+        Ordinary approval listeners retain their long-lived receive loop.
+        An RPC caller closes after a timeout: a partial frame is uncertain.
+        """
+        previous_timeout = self.sock.gettimeout()
+        self._receive_deadline = deadline
+        try:
+            return self.receive()
+        finally:
+            self._receive_deadline = None
+            self.sock.settimeout(previous_timeout)
 
     def close(self):
         try:

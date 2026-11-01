@@ -158,6 +158,57 @@ posix_scripts = pytest.mark.skipif(
 _BASH = shutil.which("bash") or "bash"
 
 
+class TestHostRoundtripRelayIsolation:
+    """The host check redirects the plugin before launching any hook."""
+
+    def test_live_relay_cannot_be_the_replacement(self):
+        import e2e_host_roundtrip as host
+        with pytest.raises(SystemExit, match="refusing to reach the live relay"):
+            host.plugin_hook(host.LIVE_RELAY)
+
+    @pytest.mark.parametrize("port", [38977, 48977, 58977])
+    @pytest.mark.parametrize("exec_form", [False, True])
+    def test_owned_port_containing_live_port_digits_is_redirected(
+            self, tmp_path, monkeypatch, port, exec_form):
+        import e2e_host_roundtrip as host
+        command = "CLAUDE_RISK_RELAY=%s python3 hook.py" % host.LIVE_RELAY
+        hook = {"type": "command", "command": command, "timeout": 86460}
+        if exec_form:
+            hook.update(command="python3", args=["hook.py", "--relay", host.LIVE_RELAY])
+        folder = tmp_path / "hooks"
+        folder.mkdir()
+        (folder / "hooks.json").write_text(json.dumps({"hooks": {
+            "PermissionRequest": [{"hooks": [hook]}]}}), encoding="utf-8")
+        monkeypatch.setattr(host, "ROOT", str(tmp_path))
+        base = "http://127.0.0.1:%d" % port
+        redirected = host.plugin_hook(base)
+        expected = dict(hook)
+        if exec_form:
+            expected["args"] = ["hook.py", "--relay", base]
+        else:
+            expected["command"] = command.replace(host.LIVE_RELAY, base)
+        assert redirected == expected
+
+    @pytest.mark.parametrize("endpoint", [
+        "http://localhost:8977", "http://[::1]:8977", "127.0.0.1:8977",
+    ])
+    @pytest.mark.parametrize("exec_form", [False, True])
+    def test_unrewritable_live_port_is_refused_even_beside_rewritable_url(
+            self, tmp_path, monkeypatch, endpoint, exec_form):
+        import e2e_host_roundtrip as host
+        command = "probe %s %s" % (host.LIVE_RELAY, endpoint)
+        hook = {"type": "command", "command": command}
+        if exec_form:
+            hook.update(command="probe", args=[host.LIVE_RELAY, endpoint])
+        folder = tmp_path / "hooks"
+        folder.mkdir()
+        (folder / "hooks.json").write_text(json.dumps({"hooks": {
+            "PermissionRequest": [{"hooks": [hook]}]}}), encoding="utf-8")
+        monkeypatch.setattr(host, "ROOT", str(tmp_path))
+        with pytest.raises(SystemExit, match="refusing to reach the live relay"):
+            host.plugin_hook("http://127.0.0.1:38977")
+
+
 @pytest.fixture
 def _mac_uid(monkeypatch):
     """launchd's gui/<uid> domain, for the Mac-only tests on a host

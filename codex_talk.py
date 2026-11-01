@@ -22,6 +22,15 @@ POLICY = {"type": "workspaceWrite", "networkAccess": False,
           "writableRoots": [], "excludeTmpdirEnvVar": True,
           "excludeSlashTmp": True}
 RECAP = "Summarise the goal, current task and next action in under forty words."
+ARCHIVE_TIMEOUT = 15
+
+
+class RpcRefused(ValueError):
+    """A definitive server refusal, distinct from a missing receipt."""
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__("Codex refused the message: %s" % reason)
 
 
 def message(text, brief=True):
@@ -55,18 +64,18 @@ class Client:
             self.wire.close()
             raise
 
-    def rpc(self, method, params):
+    def rpc(self, method, params, timeout=3):
         self.sequence += 1
         identity = "wrist-%d" % self.sequence
         self.wire.send({"id": identity, "method": method, "params": params})
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            value = self.wire.receive()
+            receive_until = getattr(self.wire, "receive_until", None)
+            value = receive_until(deadline) if receive_until else self.wire.receive()
             if value.get("id") != identity or "method" in value:
                 continue
             if "error" in value:
-                raise ValueError("Codex refused the message: %s" %
-                                 str(value["error"].get("message", "unsupported interface"))[:200])
+                raise RpcRefused(str(value["error"].get("message", "unsupported interface"))[:200])
             if "result" not in value:
                 raise ValueError("Codex returned an invalid receipt")
             return value["result"]
@@ -112,6 +121,45 @@ def _owner_client(sid, connect):
         if selected is not None:
             selected.close()
         raise
+
+
+def _archive_thread(thread_id, method):
+    client = None
+    try:
+        try:
+            client = _owner_client(thread_id, None)
+            if client is None:
+                client = Client()
+        except (OSError, EOFError, ValueError, TypeError, KeyError, AttributeError) as error:
+            reason = ("Codex is open on two servers" if "multiple Codex servers" in str(error)
+                      else "Can't reach Codex on this Mac" if isinstance(error, (OSError, EOFError))
+                      else "Can't verify which Codex server owns this chat")
+            return {"ok": False, "reason": reason}
+        try:
+            receipt = client.rpc(method, {"threadId": thread_id}, timeout=ARCHIVE_TIMEOUT)
+            if not isinstance(receipt, dict):
+                raise ValueError("invalid archive receipt")
+            return {"ok": True}
+        except RpcRefused as error:
+            return {"ok": False, "reason": ("Codex refused: " + error.reason)[:60]}
+        except (OSError, EOFError, ValueError, TypeError, KeyError, AttributeError):
+            # The mutation may have happened. Never fall back or retry it.
+            action = "archive" if method == "thread/archive" else "restore"
+            return {"ok": False, "uncertain": True,
+                    "reason": "Couldn't confirm %s; check Codex" % action}
+    finally:
+        if client is not None:
+            client.close()
+
+
+def archive_codex_thread(thread_id):
+    """Archive on the single owner, or the default socket if loaded nowhere."""
+    return _archive_thread(thread_id, "thread/archive")
+
+
+def unarchive_codex_thread(thread_id):
+    """Restore through the same routing seam; confirmation belongs to the UI."""
+    return _archive_thread(thread_id, "thread/unarchive")
 
 
 def context(path):

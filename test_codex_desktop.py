@@ -3,13 +3,16 @@ import json
 import os
 import plistlib
 import stat
+import socket
+import time
 
 import pytest
 
 import codex_desktop as desktop
-from codex_approvals import ApprovalHub, ApprovalSync
+import codex_talk as talk
+from codex_approvals import ApprovalHub, ApprovalSync, LocalWebSocket
 from watch_relay import CardQueue
-from test_codex_approvals import Wire, request, until, resolved
+from test_codex_approvals import Wire, HandshakeSocket, request, until, resolved
 
 
 @pytest.mark.parametrize("args,expected", [
@@ -596,3 +599,198 @@ def test_prepared_wrapper_runs_without_launcher_environment(tmp_path, monkeypatc
     assert json.loads(result.stdout) == {
         "args": ["--version", "argument with spaces"],
         "path": str(cli), "adapter_env": None}
+
+
+@pytest.fixture
+def servers(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    default = str(tmp_path / "app-server-control" / "app-server-control.sock")
+    loaded = {"desktop": ["target"], default: []}
+    opened = []
+    faults = {}
+    client = talk.Client
+
+    class ArchiveWire(Wire):
+        def send(self, message):
+            method = message.get("method")
+            fault = faults.get((self.path, method))
+            if fault is not None:
+                self.sent.append(message)
+                if isinstance(fault, Exception):
+                    self.incoming.put(fault)
+                else:
+                    self.incoming.put({"id": message["id"], **fault})
+            elif method in ("thread/archive", "thread/unarchive"):
+                self.sent.append(message)
+                # Success needs no notification, including already archived.
+                self.incoming.put({"id": message["id"], "result": {}})
+            else:
+                super().send(message)
+
+        def receive(self):
+            value = super().receive()
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+    def make(connect=None, socket_path=None):
+        assert connect is None
+        path = socket_path or default
+        if path not in loaded:
+            raise FileNotFoundError(path)
+        wire = ArchiveWire(loaded[path])
+        wire.path = path
+        opened.append(wire)
+        return client(connect=lambda: wire)
+
+    monkeypatch.setattr(talk, "Client", make)
+    monkeypatch.setattr(desktop, "server_sockets", lambda: list(loaded))
+    yield loaded, opened, faults, default
+    assert all(w.closed for w in opened)
+
+
+def mutations(opened):
+    return [(w.path, m) for w in opened for m in w.sent
+            if m.get("method") in ("thread/archive", "thread/unarchive")]
+
+
+@pytest.mark.parametrize("method", ["archive", "unarchive"])
+@pytest.mark.parametrize("owner", ["desktop", "default", None])
+def test_routes_to_single_owner_or_default_without_resuming(servers, method, owner):
+    loaded, opened, _faults, default = servers
+    loaded["desktop"] = ["target"] if owner == "desktop" else []
+    loaded[default] = ["target"] if owner == "default" else []
+    assert getattr(talk, method + "_codex_thread")("target") == {"ok": True}
+    calls = mutations(opened)
+    assert len(calls) == 1
+    assert calls[0][0] == ("desktop" if owner == "desktop" else default)
+    assert calls[0][1]["method"] == "thread/" + method
+    assert calls[0][1]["params"] == {"threadId": "target"}
+    assert not any(m.get("method") in ("thread/resume", "turn/start")
+                   for w in opened for m in w.sent)
+
+
+@pytest.mark.parametrize("method", ["archive", "unarchive"])
+@pytest.mark.parametrize("failure", ["duplicate", "discovery", "malformed", "absent",
+                                    "default_absent", "init", "discovery_refused"])
+def test_refuses_before_mutation_and_closes_all_clients(servers, method, failure):
+    loaded, opened, faults, default = servers
+    if failure == "duplicate":
+        loaded[default] = ["target"]
+    elif failure == "discovery":
+        faults[(default, "thread/loaded/list")] = EOFError("lost")
+    elif failure == "malformed":
+        faults[(default, "thread/loaded/list")] = {"result": {"data": "target"}}
+    elif failure == "init":
+        faults[(default, "initialize")] = TimeoutError("silent")
+    elif failure == "default_absent":
+        loaded["desktop"] = []
+        del loaded[default]
+    elif failure == "discovery_refused":
+        faults[(default, "thread/loaded/list")] = {"error": {"message": "unavailable"}}
+    else:
+        loaded.clear()
+    result = getattr(talk, method + "_codex_thread")("target")
+    assert result["ok"] is False
+    assert not result.get("uncertain")
+    assert 0 < len(result["reason"]) <= 60
+    if failure == "duplicate":
+        assert result["reason"] == "Codex is open on two servers"
+    if failure in ("absent", "default_absent"):
+        assert result["reason"] == "Can't reach Codex on this Mac"
+    assert not mutations(opened)
+
+
+@pytest.mark.parametrize("method", ["archive", "unarchive"])
+@pytest.mark.parametrize("failure", [TimeoutError("late"), EOFError("lost"),
+                                    OSError("connection reset")])
+def test_lost_mutation_receipt_is_uncertain_and_never_retried(servers, method, failure):
+    _loaded, opened, faults, _default = servers
+    faults[("desktop", "thread/" + method)] = failure
+    result = getattr(talk, method + "_codex_thread")("target")
+    assert result["ok"] is False and result["uncertain"] is True
+    assert "confirm" in result["reason"].lower()
+    assert len(result["reason"]) <= 60
+    assert len(mutations(opened)) == 1
+
+
+@pytest.mark.parametrize("method", ["archive", "unarchive"])
+@pytest.mark.parametrize("reason", ["active writer", "conflict: thread is busy", "x" * 200])
+def test_rpc_refusal_uses_archive_words_and_preserves_reason(servers, method, reason):
+    _loaded, opened, faults, _default = servers
+    faults[("desktop", "thread/" + method)] = {"error": {"message": reason}}
+    result = getattr(talk, method + "_codex_thread")("target")
+    assert result == {"ok": False, "reason": ("Codex refused: " + reason)[:60]}
+    assert len(mutations(opened)) == 1
+
+
+def test_archive_uses_named_longer_rpc_deadline(servers, monkeypatch):
+    _loaded, _opened, _faults, _default = servers
+    original = talk.Client
+    calls = []
+    def make(*args, **kwargs):
+        client = original(*args, **kwargs)
+        rpc = client.rpc
+        def record(method, params, **options):
+            calls.append((method, options))
+            return rpc(method, params, **options)
+        client.rpc = record
+        return client
+    monkeypatch.setattr(talk, "Client", make)
+    assert talk.archive_codex_thread("target") == {"ok": True}
+    assert talk.ARCHIVE_TIMEOUT == 15
+    assert ("thread/archive", {"timeout": talk.ARCHIVE_TIMEOUT}) in calls
+
+
+@pytest.mark.parametrize("receipt", [None, "archived", [], 1])
+def test_invalid_mutation_receipt_is_uncertain(servers, receipt):
+    _loaded, opened, faults, _default = servers
+    faults[("desktop", "thread/archive")] = {"result": receipt}
+    result = talk.archive_codex_thread("target")
+    assert result["ok"] is False and result["uncertain"] is True
+    assert len(mutations(opened)) == 1
+
+
+def test_rpc_can_wait_past_send_deadline_and_ignore_notifications(monkeypatch):
+    clock = [0]
+    monkeypatch.setattr(talk.time, "monotonic", lambda: clock[0])
+    class DelayedWire:
+        def send(self, message):
+            assert message["method"] == "thread/archive"
+        def receive_until(self, deadline):
+            assert deadline == 15
+            clock[0] += 4
+            if clock[0] == 4:
+                return {"method": "thread/archived", "params": {"threadId": "target"}}
+            return {"id": "wrist-1", "result": {}}
+    client = talk.Client.__new__(talk.Client)
+    client.sequence, client.wire = 0, DelayedWire()
+    assert client.rpc("thread/archive", {"threadId": "target"},
+                      timeout=talk.ARCHIVE_TIMEOUT) == {}
+    assert clock[0] == 8
+
+
+@pytest.mark.parametrize("frames", [b"", b"\x81\x10{", b"\x89\x01?"])
+def test_rpc_deadline_bounds_silent_partial_and_ping_only_transport(monkeypatch, frames):
+    fake = HandshakeSocket(frames)
+    fake.gettimeout = lambda: 3
+    original_recv = fake.recv
+    def recv(size):
+        if fake.data:
+            return original_recv(size)
+        time.sleep(.002)
+        raise socket.timeout()
+    fake.recv = recv
+    monkeypatch.setattr("codex_approvals.socket.socket", lambda *args: fake)
+    monkeypatch.setattr("codex_approvals.socket.AF_UNIX", 1, raising=False)
+    wire = LocalWebSocket("/isolated")
+    start = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            client = talk.Client.__new__(talk.Client)
+            client.sequence, client.wire = 0, wire
+            client.rpc("thread/archive", {"threadId": "target"}, timeout=.02)
+        assert time.monotonic() - start < .5
+        assert wire._receive_deadline is None
+    finally:
+        wire.close()
