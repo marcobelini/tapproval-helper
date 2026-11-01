@@ -186,6 +186,8 @@ def one_card(name, argv, env, base, token, home, answer, wait):
 
 def plugin_hook(base):
     """The plugin's PermissionRequest hook, aimed at this run's relay."""
+    if base == LIVE_RELAY:
+        raise SystemExit("refusing to reach the live relay")
     # helper/hooks here; hooks/ at the root of the public repo.
     path = next(p for p in (os.path.join(ROOT, "helper", "hooks", "hooks.json"),
                             os.path.join(ROOT, "hooks", "hooks.json"))
@@ -197,11 +199,13 @@ def plugin_hook(base):
         if key not in hook:
             continue
         text = json.dumps(hook[key])
-        if "8977" in text:
-            text = text.replace(LIVE_RELAY, base)
-            if "8977" in text:
-                raise SystemExit("the plugin hook names port 8977 in a form this run "
-                                 "cannot redirect; refusing to reach the live relay")
+        # Check the source before substituting: the owned free port can
+        # itself contain 8977 (38977, for example). Only the known live
+        # URL is redirectable; every other spelling still stops the run.
+        if "8977" in text.replace(LIVE_RELAY, ""):
+            raise SystemExit("the plugin hook names port 8977 in a form this run "
+                             "cannot redirect; refusing to reach the live relay")
+        text = text.replace(LIVE_RELAY, base)
         text = text.replace("${CLAUDE_PLUGIN_ROOT}", ROOT.replace("\\", "/"))
         text = text.replace("CLAUDE_RISK_RELAY_WAIT=86400", "CLAUDE_RISK_RELAY_WAIT=20")
         hook[key] = json.loads(text)
