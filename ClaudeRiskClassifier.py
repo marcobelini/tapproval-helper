@@ -111,7 +111,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.106"
+__version__ = "1.1.107"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -241,7 +241,8 @@ _HIDDEN_NAME_GLOB = (r"\.[\w-][\w.-]*(?:[*?]|\[!?[A-Za-z][^\]\s]*\]|\{[^}\s]*\})
 _HIDDEN_GLOB_BARE = re.compile(r"(?:^|[\s=/])(?:%s|\.[*?])" % _HIDDEN_NAME_GLOB)
 _HIDDEN_GLOB_WORD = re.compile(r"(?:[\w./-]*/)?%s" % _HIDDEN_NAME_GLOB)
 _QUOTED = re.compile(r"'([^']*)'|\"((?:\\.|[^\"\\])*)\"")
-_HEREDOC_MARK = re.compile(r"<<(-?)[ \t]*(['\"]?)([\w.@:+-]+)\2")
+# A heredoc's marker: group 1 the `-` that strips tabs, group 3 the delimiter.
+_HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)([\w.@:+-]+)\2")
 
 
 def _without_heredoc_bodies(text):
@@ -256,7 +257,7 @@ def _without_heredoc_bodies(text):
                 pending.pop(0)
             continue
         kept.append(line)
-        pending = [(m.group(3), bool(m.group(1))) for m in _HEREDOC_MARK.finditer(line)]
+        pending = [(m.group(3), bool(m.group(1))) for m in _HEREDOC.finditer(line)]
     return "\n".join(kept)
 
 
@@ -980,8 +981,6 @@ CATASTROPHIC_TARGETS = re.compile(
 class _Unread(Exception):
     """A substitution the reader could not take apart."""
 
-
-_HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)([\w.@:+-]+)\2")
 
 
 def _substitutions(text):
@@ -2535,39 +2534,32 @@ def _mcp_headline(tool, action):
     return " · ".join(pieces)
 
 
-def _questions(tool_input):
-    """AskUserQuestion's questions, each as (text, option labels, whether
-    several may be chosen). Labels are flattened to one line, which is
-    what lets a multi-select answer carry one label per line."""
+def _question_entries(tool_input):
+    """AskUserQuestion's questions, read once: each as (text, heading,
+    [(label, explanation)], whether several may be chosen). Labels are
+    flattened to one line, which is what lets a multi-select answer carry
+    one label per line. The heading and the explanations were dropped
+    until 2026-10-16, so the wrist offered bare names where the terminal
+    says what each one means."""
     questions = (tool_input or {}).get("questions") if isinstance(tool_input, dict) else None
     found = []
     for entry in (questions if isinstance(questions, list) else [])[:4]:
         if not isinstance(entry, dict):
             continue
-        found.append((str(entry.get("question", "")), [
-            " ".join(str(o.get("label", "")).split())
+        found.append((str(entry.get("question", "")), str(entry.get("header") or ""), [
+            (" ".join(str(o.get("label", "")).split()), str(o.get("description") or ""))
             for o in (entry.get("options") or [])
             if isinstance(o, dict) and o.get("label")
         ][:4], entry.get("multiSelect") is True))
-    return found or [("", [], False)]
-
-
-def _question_parts(tool_input):
-    """Each question's heading and its options' explanations, in step with
-    _questions (same questions, same options, same order). Both were
-    dropped until 2026-10-16, so the wrist offered bare names where the
-    terminal says what each one means."""
-    questions = (tool_input or {}).get("questions") if isinstance(tool_input, dict) else None
-    found = []
-    for entry in (questions if isinstance(questions, list) else [])[:4]:
-        if not isinstance(entry, dict):
-            continue
-        found.append((str(entry.get("header") or ""), [
-            str(o.get("description") or "")
-            for o in (entry.get("options") or [])
-            if isinstance(o, dict) and o.get("label")
-        ][:4]))
     return found
+
+
+def _questions(tool_input):
+    """Each question as (text, option labels, whether several may be
+    chosen); one empty question when there are none."""
+    return [(text, [label for label, _ in options], multi)
+            for text, _header, options, multi in _question_entries(tool_input)
+            ] or [("", [], False)]
 
 
 def questions_need_typing(tool_input):
@@ -2592,10 +2584,10 @@ def question_cards(card, tool_input, headline_chars=HEADLINE_CHARS,
     A question that allows several answers says so (``multi_select``);
     a watch older than that field taps one, which is still an answer.
     """
-    found = _questions(tool_input)
-    parts = _question_parts(tool_input)
+    found = _question_entries(tool_input) or [("", "", [], False)]
     cards = []
-    for index, (question, options, multi) in enumerate(found):
+    for index, (question, header, pairs, multi) in enumerate(found):
+        options = [label for label, _ in pairs]
         question = _fit_lines(question, TEXT_CHARS) or "Claude has a question"
         if len(found) > 1:
             question = "%d of %d · %s" % (index + 1, len(found), question)
@@ -2604,15 +2596,14 @@ def question_cards(card, tool_input, headline_chars=HEADLINE_CHARS,
                    detail=_fit(" · ".join(options), detail_chars))
         for key in ("options", "multi_select", "question_header", "option_details"):
             one.pop(key, None)
-        header, details = parts[index] if index < len(parts) else ("", [])
         if _fit(header, TEXT_CHARS):
             one["question_header"] = _fit(header, TEXT_CHARS)
         if options:
             one["options"] = options
             if multi:
                 one["multi_select"] = True
-            details = [_fit_lines(d, TEXT_CHARS) for d in details]
-            if any(details) and len(details) == len(options):
+            details = [_fit_lines(d, TEXT_CHARS) for _, d in pairs]
+            if any(details):
                 one["option_details"] = details
         cards.append(one)
     return cards
@@ -2691,6 +2682,16 @@ def wrist_card(tool, tool_input, risk,
 # --------------------------------------------------------------------------
 
 
+# Environment variables that override one policy key each, as text.
+_ENV_POLICY = (
+    ("CLAUDE_RISK_MODE", "mode"),
+    ("CLAUDE_RISK_AUDIT_LOG", "audit_log"),
+    ("CLAUDE_RISK_RELAY", "relay"),
+    ("CLAUDE_RISK_AUTO_ALLOW", "auto_allow_at_or_below"),
+    ("CLAUDE_RISK_AUTH_FILE", "auth_file"),
+)
+
+
 def load_policy(env=None):
     """Merge the default policy with an optional JSON file and env overrides."""
     env = os.environ if env is None else env
@@ -2707,16 +2708,9 @@ def load_policy(env=None):
             print("ClaudeRiskClassifier: bad config %s (%s)" % (config_path, error),
                   file=sys.stderr)
 
-    if env.get("CLAUDE_RISK_MODE"):
-        policy["mode"] = env["CLAUDE_RISK_MODE"]
-    if env.get("CLAUDE_RISK_AUDIT_LOG"):
-        policy["audit_log"] = env["CLAUDE_RISK_AUDIT_LOG"]
-    if env.get("CLAUDE_RISK_RELAY"):
-        policy["relay"] = env["CLAUDE_RISK_RELAY"]
-    if env.get("CLAUDE_RISK_AUTO_ALLOW"):
-        policy["auto_allow_at_or_below"] = env["CLAUDE_RISK_AUTO_ALLOW"]
-    if env.get("CLAUDE_RISK_AUTH_FILE"):
-        policy["auth_file"] = env["CLAUDE_RISK_AUTH_FILE"]
+    for name, key in _ENV_POLICY:
+        if env.get(name):
+            policy[key] = env[name]
     if env.get("CLAUDE_RISK_RELAY_WAIT"):
         try:
             policy["relay_wait"] = float(env["CLAUDE_RISK_RELAY_WAIT"])
@@ -3030,10 +3024,6 @@ def _relay_key(policy):
 
 # The hook always signs v2, the query included even when empty: the
 # relay's own rule (tapproval_wire), not a copy of it.
-def _relay_signature(key, method, path, stamp, nonce, body, query=""):
-    return wire.sign_request(key, method, path, stamp, nonce, body, query=query)
-
-
 _relay_proof2 = wire.relay_proof2
 
 
@@ -3071,6 +3061,19 @@ def _relay_listening(relay, until):
     return False
 
 
+def _signed_post(key, url, body):
+    """A POST of ``body`` to the relay, signed with ``key``, and the nonce
+    its answer's proof must name. A fresh nonce each call: the relay
+    refuses one it has seen."""
+    import urllib.parse
+    import urllib.request
+    signature, nonce = wire.signed_header(
+        key, "POST", urllib.parse.unquote(urllib.parse.urlsplit(url).path), body)
+    return urllib.request.Request(url, data=body, headers={
+        "Content-Type": "application/json",
+        "X-Tapproval-Signature": signature}), nonce
+
+
 def ask_watch(card, policy, project=None):
     """Offer an escalated card to the watch relay. Returns the verdict.
 
@@ -3080,10 +3083,7 @@ def ask_watch(card, policy, project=None):
     decision string, no key file, an answer without the relay's proof —
     collapses to "none" and the normal prompt appears. Never raises.
     """
-    import hmac
     import time
-    import urllib.error
-    import urllib.parse
     import urllib.request
     import uuid
 
@@ -3114,13 +3114,7 @@ def ask_watch(card, policy, project=None):
         # cost six bytes a letter against the relay's 256 KB body.
         body = json.dumps({"card": payload, "wait": remaining},
                           ensure_ascii=False).encode("utf-8")
-        # A fresh nonce each time: the relay refuses one it has seen.
-        signature, nonce = wire.signed_header(
-            key, "POST", urllib.parse.unquote(urllib.parse.urlsplit(url).path), body)
-        request = urllib.request.Request(
-            url, data=body,
-            headers={"Content-Type": "application/json",
-                     "X-Tapproval-Signature": signature})
+        request, nonce = _signed_post(key, url, body)
         try:
             with urllib.request.urlopen(
                     request, timeout=remaining + RELAY_REPLY_GRACE) as reply:
@@ -3142,12 +3136,7 @@ def ask_watch(card, policy, project=None):
                 print("ClaudeRiskClassifier: no relay came back, so the "
                       "terminal asks", file=sys.stderr)
                 return "none", None
-    # Bytes, not str: compare_digest raises TypeError on a str with a
-    # non-ASCII character, and http.client decodes headers as latin-1, so
-    # an impostor's header broke the "never raises" promise here while the
-    # relay's twin was already fixed (2026-10-25 review).
-    if not hmac.compare_digest(proof.encode("utf-8", "replace"),
-                               _relay_proof2(key, nonce, status, raw).encode("ascii")):
+    if not wire.proves_relay(key, nonce, status, raw, proof):
         # Something answered on the relay's port without the relay's key.
         print("ClaudeRiskClassifier: the answer did not prove the relay's "
               "key, so the terminal asks", file=sys.stderr)
@@ -3493,8 +3482,6 @@ def prepare_codex_sync(event, policy):
     A failed attachment leaves the question with Codex. It must never create
     a separate watch approval. Merely reaching a local port is not proof.
     """
-    import hmac
-    import urllib.parse
     import urllib.request
 
     session_id = event.get("session_id")
@@ -3507,17 +3494,12 @@ def prepare_codex_sync(event, policy):
     if event.get("tool_name") == "apply_patch":
         payload["approval"] = {name: event.get(name) for name in (
             "session_id", "turn_id", "transcript_path", "cwd", "tool_name", "tool_input")}
-    body = json.dumps(payload).encode("utf-8")
-    signature, nonce = wire.signed_header(
-        key, "POST", urllib.parse.unquote(urllib.parse.urlsplit(url).path), body)
-    request = urllib.request.Request(url, data=body, headers={
-        "Content-Type": "application/json", "X-Tapproval-Signature": signature})
+    request, nonce = _signed_post(key, url, json.dumps(payload).encode("utf-8"))
     try:
         with urllib.request.urlopen(request, timeout=10) as reply:
             raw, status = reply.read(), reply.status
             proof = reply.headers.get("X-Tapproval-Proof2") or ""
-        if not hmac.compare_digest(proof.encode("utf-8", "replace"),
-                                   _relay_proof2(key, nonce, status, raw).encode("ascii")):
+        if not wire.proves_relay(key, nonce, status, raw, proof):
             return False
         return status == 200 and json.loads(raw).get("attached") is True
     except (OSError, ValueError, AttributeError):
@@ -3535,8 +3517,7 @@ def run_hook(stdin=None, stdout=None, agent=None):
     try:
         if from_console:
             # As UTF-8, whatever the console's code page (Windows).
-            import tapproval_host
-            raw = tapproval_host.read_stdin_text()
+            raw = _host.read_stdin_text()
         else:
             raw = stdin.read()
         event = json.loads(raw) if raw and raw.strip() else {}
@@ -4312,7 +4293,6 @@ CODEX_APP_BINARIES = (
     "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
     "/Applications/ChatGPT.app/Contents/Resources/codex",
 )
-CODEX_APP_BINARY = CODEX_APP_BINARIES[0]
 
 
 def _codex_home():

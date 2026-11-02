@@ -10,7 +10,6 @@ to make a session-list row.
 """
 from __future__ import annotations
 
-import json
 import base64
 import os
 import re
@@ -60,12 +59,12 @@ def _home():
     return os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex")
 
 
-def _json_object(line):
-    try:
-        value = json.loads(line)
-    except (TypeError, ValueError):
-        return None
-    return value if isinstance(value, dict) else None
+def control_socket():
+    """The shared server Codex's own Terminal and the phone both reach."""
+    return os.path.join(_home(), "app-server-control", "app-server-control.sock")
+
+
+_json_object = wire.json_object
 
 
 def _rollouts(root):
@@ -736,7 +735,9 @@ def thread_info(path, mark=None, limit=14, card_waiting=False):
     are parsed on a warm poll; a replaced/shrunken file resets the thread.
     The cache and cold read are bounded, as for Claude's transcript reader.
     """
-    from watch_dashboard import _read_appended, _tail_start, _keep_what_was_said
+    from watch_dashboard import (THREAD_CATCH_UP, THREAD_FIRST_LOOK, THREAD_TURNS_HELD,
+                                 THREAD_TURNS_KEPT, _keep_what_was_said, _read_appended,
+                                 _tail_start)
     reply = {"turns": [], "running_tasks": 0, "running_tool": None,
              "modified_seconds_ago": None, "state": "idle",
              "state_reason": "", "wake_at": None}
@@ -772,8 +773,8 @@ def thread_info(path, mark=None, limit=14, card_waiting=False):
             row = _json_object(line)
             if row:
                 _fold(state, row, starts[index])
-            if len(state["turns"]) > 160:
-                state["turns"] = state["turns"][-120:]
+            if len(state["turns"]) > THREAD_TURNS_HELD:
+                state["turns"] = state["turns"][-THREAD_TURNS_KEPT:]
                 state["floor"] = state["turns"][0]["n"]
                 state["changed"] = {n: changed for n, changed in state["changed"].items()
                                     if n >= state["floor"]}
@@ -784,11 +785,11 @@ def thread_info(path, mark=None, limit=14, card_waiting=False):
             visible = _keep_what_was_said(turns, said, limit)
         else:
             reset = replaced or mark <= 0 or mark > offset or mark < state["floor"]
-            visible = (_keep_what_was_said(turns, said, 40) if reset
+            visible = (_keep_what_was_said(turns, said, THREAD_FIRST_LOOK) if reset
                        else [t for t in turns
                              if state["changed"].get(t["n"], t["n"]) >= mark])
-            if len(visible) > 60:
-                visible, reset = visible[-60:], True
+            if len(visible) > THREAD_CATCH_UP:
+                visible, reset = visible[-THREAD_CATCH_UP:], True
             reply.update(mark=offset, reset=reset)
         reply["turns"] = list(visible)
         active = max(0, int(time.time() - stat.st_mtime))

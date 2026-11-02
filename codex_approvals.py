@@ -195,10 +195,11 @@ def file_hook_input(params, event):
     path = event.get("transcript_path")
     if not isinstance(command, str) or not command or not isinstance(path, str):
         return None
+    from codex_sessions import shape
     try:
         with open(path, "rb") as source:
             first = json.loads(source.readline(MAX_MESSAGE))
-            if first.get("type") != "session_meta" or (
+            if first.get("type") != shape("record.meta") or (
                     first.get("payload") or {}).get("id") != params["threadId"]:
                 return None
             source.seek(0, os.SEEK_END)
@@ -211,13 +212,13 @@ def file_hook_input(params, event):
         for raw in records:
             row = json.loads(raw)
             call = row.get("payload") or {}
-            if (row.get("type") != "response_item" or call.get("name") != "apply_patch"
+            if (row.get("type") != shape("record.item") or call.get("name") != "apply_patch"
                     or call.get("call_id") != params["itemId"]
                     or (call.get("internal_chat_message_metadata_passthrough") or {}).get(
                         "turn_id") != params["turnId"]):
                 continue
-            patch = call.get("input") if call.get("type") == "custom_tool_call" else None
-            if call.get("type") == "function_call":
+            patch = call.get("input") if call.get("type") == shape("item.custom_call") else None
+            if call.get("type") == shape("item.call"):
                 patch = json.loads(call.get("arguments") or "{}").get("input")
             matches.append(patch)
         return dict(event) if matches == [command] else None
@@ -340,8 +341,10 @@ class ApprovalSync:
         self.queue = queue
         self.ownership_guard = ownership_guard
         self.keep_open = keep_open
-        home = os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex")
-        self.socket_path = socket_path or os.path.join(home, "app-server-control", "app-server-control.sock")
+        if socket_path is None:
+            from codex_sessions import control_socket
+            socket_path = control_socket()
+        self.socket_path = socket_path
         self.connect = connect or (lambda: LocalWebSocket(self.socket_path))
         self._custom_connect = connect is not None
         self.card_title = card_title or (lambda card: card)
@@ -438,19 +441,25 @@ class ApprovalSync:
             raise ValueError("Codex returned an invalid loaded-thread page")
         return data, cursor
 
+    @classmethod
+    def _loaded_pages(cls, rpc):
+        """Each page of ``thread/loaded/list``, as the thread ids it names,
+        following the cursor; a listing longer than 64 pages raises."""
+        cursor = None
+        for _page in range(64):
+            data, cursor = cls._loaded_page(rpc("thread/loaded/list", {"cursor": cursor}))
+            yield data
+            if not cursor:
+                return
+        raise ValueError("Codex loaded-thread listing exceeded its bound")
+
     def reconcile(self):
         """Recover pending requests, not historical/stored conversations."""
         with self._rpc_lock:
             self._ensure_connection()
             loaded = set()
-            cursor = None
-            for _page in range(64):
-                data, cursor = self._loaded_page(self._rpc("thread/loaded/list", {"cursor": cursor}))
+            for data in self._loaded_pages(self._rpc):
                 loaded.update(data)
-                if not cursor:
-                    break
-            else:
-                raise ValueError("Codex loaded-thread listing exceeded its bound")
             with self._lock:
                 for sid in self._failed_attachments - loaded:
                     if sid in self._seen_loaded:
@@ -584,20 +593,16 @@ class ApprovalSync:
                         self._failed_attachments.discard(thread_id)
                         return True
                 self._ensure_connection()
-                cursor = None
-                for _page in range(64):
-                    data, cursor = self._loaded_page(self._rpc("thread/loaded/list", {"cursor": cursor}))
+                for data in self._loaded_pages(self._rpc):
                     if thread_id in data:
                         with self._lock:
                             self._seen_loaded.add(thread_id)
                         break
-                    if not cursor:
-                        self._failed_attachments.add(thread_id)
-                        self._report_failure(OSError("Thread is not loaded on this Codex server"),
-                                             "attach")
-                        return False
                 else:
-                    raise ValueError("Codex loaded-thread listing exceeded its bound")
+                    self._failed_attachments.add(thread_id)
+                    self._report_failure(OSError("Thread is not loaded on this Codex server"),
+                                         "attach")
+                    return False
                 # No config/model/permission overrides: join the live session.
                 # Register the lease before sending: resume can replay a request
                 # and its resolution immediately after its response, before the
@@ -622,16 +627,12 @@ class ApprovalSync:
         """Read-only ownership check; never resumes a stored thread."""
         with self._rpc_lock:
             self._ensure_connection()
-            cursor = None
-            for _page in range(64):
-                data, cursor = self._loaded_page(self._rpc("thread/loaded/list", {"cursor": cursor}))
+            for data in self._loaded_pages(self._rpc):
                 if thread_id in data:
                     with self._lock:
                         self._seen_loaded.add(thread_id)
                     return True
-                if not cursor:
-                    return False
-            raise ValueError("Codex loaded-thread listing exceeded its bound")
+            return False
 
     def _read(self, sock):
         try:

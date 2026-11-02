@@ -775,11 +775,3 @@ def read_stdin_text():
     if isinstance(data, bytes):
         return data.decode("utf-8", "replace")
     return data
-
-
-def utf8_stdout():
-    """Make print() write UTF-8 to stdout, which carries the decision."""
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except (AttributeError, ValueError, OSError):
-        pass

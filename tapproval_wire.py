@@ -103,6 +103,17 @@ def relay_proof2(token, nonce, status, body):
                     hashlib.sha256).hexdigest()
 
 
+
+def proves_relay(token, nonce, status, body, proof):
+    """Whether ``proof`` (an answer's X-Tapproval-Proof2) is the relay's
+    relay_proof2 over this nonce, status and body. Compared as bytes:
+    compare_digest raises TypeError on a str with a non-ASCII character,
+    and http.client decodes headers as latin-1, so an impostor's header
+    once broke a caller's "never raises" (2026-10-25 review)."""
+    import hmac
+    return hmac.compare_digest(str(proof or "").encode("utf-8", "replace"),
+                               relay_proof2(token, nonce, status, body).encode("ascii"))
+
 def read_bootstrap(path):
     """The bootstrap out of a relay key file, or "" when there is none to
     read. Never raises: no key is an answer, and the caller decides."""

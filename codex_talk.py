@@ -21,6 +21,9 @@ import codex_sessions as sessions
 POLICY = {"type": "workspaceWrite", "networkAccess": False,
           "writableRoots": [], "excludeTmpdirEnvVar": True,
           "excludeSlashTmp": True}
+# Opening a chat loads the person's plugins first. The watch outwaits a
+# slow answer through /new-receipt, so wait rather than call it lost.
+START_TIMEOUT = 15
 RECAP = "Summarise the goal, current task and next action in under forty words."
 ARCHIVE_TIMEOUT = 15
 
@@ -50,7 +53,7 @@ class Client:
     """Short-lived RPC client; the shared server owns accepted turns."""
 
     def __init__(self, connect=None, socket_path=None):
-        path = socket_path or os.path.join(sessions._home(), "app-server-control", "app-server-control.sock")
+        path = socket_path or shared_socket()
         if connect is None:
             # Establish absence before a platform's socket support is needed.
             os.stat(path)
@@ -98,19 +101,12 @@ def _owner_client(sid, connect):
                 raise ValueError("Codex server ownership could not be verified; "
                                  "reopen the session before sending") from error
             try:
-                cursor = None
-                for _page in range(64):
-                    page = candidate.rpc("thread/loaded/list", {"cursor": cursor})
-                    loaded, cursor = ApprovalSync._loaded_page(page)
+                for loaded in ApprovalSync._loaded_pages(candidate.rpc):
                     if sid in loaded:
                         if selected is not None:
                             raise ValueError("Thread is loaded on multiple Codex servers; close the duplicate before sending")
                         selected, candidate = candidate, None
                         break
-                    if not cursor:
-                        break
-                else:
-                    raise ValueError("Codex loaded-thread listing exceeded its bound")
             except (OSError, EOFError) as error:
                 raise ValueError("Codex connection lost; check the session before retrying") from error
             finally:
@@ -325,6 +321,66 @@ def send(prefix, text, binary, spawn, log, brief=True, connect=None, runner=None
     command = [binary, "exec", "--skip-git-repo-check"] + flags() + ["resume", sid, "--", text]
     error = spawn(command, log, cwd=cwd)
     return "could not start Codex: %s" % error if error else "sent"
+
+
+def shared_socket():
+    """The shared server Codex's own Terminal and the phone both reach."""
+    return sessions.control_socket()
+
+
+def start(cwd, text, connect=None):
+    """Begin a wrist session on the shared server; return its thread id.
+
+    A Terminal started with ``flags()`` runs a private server of its own:
+    Codex joins the shared one only when a start carries no overrides
+    (0.166), and the phone then refuses the chat as "used by another
+    session". thread/start carries the same limits instead, the human
+    reviewer included, and they stay with the chat for every later turn,
+    whoever types it. None means no shared server is running. Raises
+    ValueError in words; a lost receipt is never retried.
+    """
+    try:
+        client = Client(connect, socket_path=shared_socket())
+    except (FileNotFoundError, ConnectionRefusedError):
+        return None
+    except (OSError, EOFError) as error:
+        raise ValueError("Codex's background service did not answer: %s" % error) from error
+    try:
+        limits = {"approvalPolicy": "on-request", "approvalsReviewer": "user",
+                  "runtimeWorkspaceRoots": [cwd]}
+        thread = client.rpc("thread/start", dict(limits, cwd=cwd, sandbox="workspace-write",
+            config={"sandbox_workspace_write": {
+                "network_access": False, "writable_roots": [],
+                "exclude_tmpdir_env_var": True, "exclude_slash_tmp": True}}),
+            timeout=START_TIMEOUT)
+        sid = ((thread or {}).get("thread") or {}).get("id") if isinstance(thread, dict) else None
+        if not isinstance(sid, str) or not sid:
+            raise ValueError("Codex returned an invalid receipt")
+        receipt = client.rpc("turn/start", dict(limits, threadId=sid,
+            input=[{"type": "text", "text": text}], sandboxPolicy=dict(POLICY)),
+            timeout=START_TIMEOUT)
+        if not isinstance(receipt, dict) or not (receipt.get("turn") or {}).get("id"):
+            raise ValueError("Codex returned an invalid receipt")
+        return sid
+    except (OSError, EOFError) as error:
+        raise ValueError("Codex connection lost; check the session before retrying: %s" % error) from error
+    finally:
+        client.close()
+
+
+def attach_flags():
+    """What a Terminal attaching to a watch chat must carry.
+
+    The first client to open a chat applies its own config to it, which
+    without these would hand back the temporary folders (verified on
+    0.166). --remote refuses writable_roots, so folders the person lists
+    in their own config apply to what they type there; each wrist send
+    resets them through turn/start.
+    """
+    return ["-c", 'approval_policy="on-request"', "-c", 'approvals_reviewer="user"',
+        "-c", "sandbox_workspace_write.network_access=false",
+        "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+        "-c", "sandbox_workspace_write.exclude_slash_tmp=true"]
 
 
 def flags():
