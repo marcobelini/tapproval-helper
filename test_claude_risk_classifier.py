@@ -24157,6 +24157,14 @@ class TestSealing:
                                         b"POST /say") == self.CK_BODY
 
 
+def _parses_as_json(raw):
+    try:
+        json.loads(raw)
+    except ValueError:  # UnicodeDecodeError included
+        return False
+    return True
+
+
 class TestSealedTravelRoad:
     """Through the tunnel a 2.1 watch seals what it sends and asks for a
     sealed answer, so Cloudflare's edge carries bytes it cannot read."""
@@ -24196,8 +24204,9 @@ class TestSealedTravelRoad:
             status, raw, headers, nonce, aad = self._call(url, key, {"id": "no-such-card",
                                                                      "decision": "allow"})
             # Not b"ok" anywhere: two random bytes of ciphertext spell it
-            # often enough to fail CI (PR #1135). Clear JSON starts with "{".
-            assert b"no-such-card" not in raw and not raw.lstrip().startswith(b"{"), \
+            # often enough to fail CI (PR #1135). Nor a leading "{": one
+            # byte in 256 is one, which failed CI on #1155. Clear JSON parses.
+            assert b"no-such-card" not in raw and not _parses_as_json(raw), \
                 "the answer crossed in clear"
             assert headers.get("Content-Type") == "application/octet-stream"
             opened = tapproval_wire.open_body(key, raw, b"answer " + aad)
