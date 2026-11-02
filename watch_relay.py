@@ -2478,7 +2478,8 @@ def archive_session(prefix, waiting=(), agent=None, projects_dir=None):
     import codex_sessions
     codex = agent == "codex" or (agent is None and codex_sessions.find_rollout(prefix))
     try:
-        session_id, word = (_archive_codex if codex else _archive_claude)(prefix, waiting)
+        session_id, word = (_archive_codex(prefix, waiting) if codex
+                            else _archive_claude(prefix, waiting, projects_dir))
     except Exception as error:  # noqa: BLE001 — one tap must not take the relay down
         session_id, word = None, "could not archive"
         print("relay: archive failed: %s: %s" % (type(error).__name__, error), file=sys.stderr)
@@ -3439,19 +3440,27 @@ def _normal_ip(ip):
 def _local_addresses(run=None):
     """Every address on this machine's interfaces — Wi-Fi, Ethernet, the
     tailnet, IPv6 — as address objects. Never raises; empty when no lister
-    answers. `ifconfig` on a Mac, `ip -o addr` where that is what there is.
+    answers. `ifconfig` on a Mac, `ip -o addr` where that is what there is,
+    `ipconfig` on Windows, which has neither and so listed nothing until the
+    2026-11-01 review. Read with bad bytes replaced: an adapter's name in
+    the console's code page must not cost the addresses beside it.
 
     A process here can bind its socket to one of this Mac's addresses and
     dial another, so "the peer is the address it dialled" alone let it pair
     as a watch and answer its own CRITICAL card (2026-10-19 review)."""
     run = run or subprocess.run
     found = set()
-    for argv in (["ifconfig"], ["ip", "-o", "addr"]):
+    inet = r"\binet6?\s+([0-9A-Fa-f:.%a-zA-Z0-9]+?)(?:/\d+)?(?=\s)"
+    # "IPv4 Address. . . : 192.168.1.42(Preferred)", "IPv4-Adresse …" too.
+    ipconfig = r"IPv[46][^:\r\n]*:\s*([0-9A-Fa-f:.]+(?:%\w+)?)"
+    for argv, pattern in ((["ifconfig"], inet), (["ip", "-o", "addr"], inet),
+                          (["ipconfig"], ipconfig)):
         try:
-            out = run(argv, capture_output=True, text=True, timeout=3).stdout or ""
+            out = run(argv, capture_output=True, text=True, errors="replace",
+                      timeout=3).stdout or ""
         except (OSError, subprocess.SubprocessError, ValueError):
             continue
-        for match in re.finditer(r"\binet6?\s+([0-9A-Fa-f:.%a-zA-Z0-9]+?)(?:/\d+)?(?=\s)", out):
+        for match in re.finditer(pattern, out):
             address = _normal_ip(match.group(1))
             if address is not None:
                 found.add(address)

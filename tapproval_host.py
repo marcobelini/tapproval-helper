@@ -235,8 +235,11 @@ def _windows_processes():
     """(pid, owner, command) from CIM: the owner only where Windows tells a
     normal user, which is its own processes. Never raises."""
     import subprocess
+    # UTF-8 both ends: read in the console's code page, one process with a
+    # non-ASCII command line raised through every caller (2026-11-01 review).
     script = (
         "$ErrorActionPreference='SilentlyContinue';"
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
         "Get-CimInstance Win32_Process | ForEach-Object {"
         " $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner;"
         " $u = if ($o.User) { if ($o.Domain) { \"$($o.Domain)\\$($o.User)\" } else { $o.User } } else { '' };"
@@ -244,8 +247,8 @@ def _windows_processes():
     try:
         out = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive",
                               "-Command", script], capture_output=True, text=True,
-                             timeout=30).stdout
-    except (OSError, subprocess.SubprocessError):
+                             encoding="utf-8", errors="replace", timeout=30).stdout or ""
+    except (OSError, subprocess.SubprocessError, ValueError):
         return []
     found = []
     for line in out.splitlines():
