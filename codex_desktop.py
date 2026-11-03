@@ -1,22 +1,23 @@
-"""Opt-in Desktop CLI adapter: one native server, stdio proxy and private socket.
+"""Opt-in Desktop stdio connection to the phone's shared Codex owner.
 
-The Desktop client still owns initialization, turns and approval decisions.
-Only its transport changes. No daemon, permission or pairing settings change.
+Desktop initialization and approvals pass through unchanged. Its startup
+defaults and app-tool binding travel with its own thread requests instead
+of creating another process that competes for the thread's writer lock.
 """
 from __future__ import annotations
 
+import copy
 import json
+import math
 import os
 import plistlib
+import re
 import select
 import shlex
-import signal
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
-import time
 from pathlib import Path
 
 import tapproval_host as host
@@ -108,13 +109,134 @@ def bridge_args(args):
     tail = args[index + 1:]
     if tail and not tail[0].startswith("-"):
         return False
-    return not any(arg in ("--print-startup-config", "--startup-sign-out", "--help",
-                           "-h", "--stdio", "--listen") or arg.startswith("--listen=")
-                   for arg in tail)
+    for offset, arg in enumerate(tail):
+        if arg in ("--print-startup-config", "--startup-sign-out", "--help", "-h"):
+            return False
+        if arg == "--listen" and (offset + 1 == len(tail) or tail[offset + 1] != "stdio://"):
+            return False
+        if arg.startswith("--listen=") and arg != "--listen=stdio://":
+            return False
+    return True
 
 
-def proxy_stdio(path):
-    """Translate framing only; all RPC ownership stays with the native server."""
+def _config_key(key):
+    """Dotted CLI keys, including quoted plugin names, without a TOML dependency."""
+    parts = []
+    while key:
+        match = re.match(r'''(?:"(?:[^"\\]|\\.)*"|'[^']*'|[A-Za-z0-9_@/-]+)(?=\.|$)''', key)
+        if not match:
+            raise ValueError("Codex shared connection cannot translate a Desktop config key")
+        part = match[0]
+        parts.append(json.loads(part) if part.startswith('"') else part.strip("'"))
+        key = key[len(part):]
+        if key:
+            key = key[1:]
+            if not key:
+                raise ValueError("Codex shared connection cannot translate a Desktop config key")
+    if not parts:
+        raise ValueError("Codex shared connection cannot translate a Desktop config key")
+    return parts
+
+
+def _config_value(text):
+    # Desktop currently supplies booleans. Also retain ordinary JSON/TOML
+    # scalar/array overrides; refuse richer TOML instead of silently losing
+    # a setting or starting a private server behind the phone's back.
+    if text.startswith("'") and text.endswith("'") and "'" not in text[1:-1]:
+        return text[1:-1]
+    try:
+        value = json.loads(text)
+    except ValueError as error:
+        raise ValueError("Codex shared connection cannot translate a Desktop config value") from error
+    def valid(item):
+        if isinstance(item, list):
+            return all(valid(part) for part in item)
+        return (isinstance(item, (str, bool, int)) or
+                isinstance(item, float) and math.isfinite(item))
+    if not valid(value):
+        raise ValueError("Codex shared connection cannot translate a Desktop config value")
+    return value
+
+
+def shared_overrides(args, env):
+    """Translate Desktop CLI defaults into native per-thread JSON config.
+
+    A managed server cannot inherit Desktop's pipe environment. Carry only
+    the app's existing tool-runtime variables with the enabled app-tools
+    server; do not copy arbitrary environment values or global config.
+    """
+    config = {}
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg in ("app-server", "--analytics-default-enabled", "--stdio", "--listen=stdio://"):
+            continue
+        if arg == "--listen" and index < len(args) and args[index] == "stdio://":
+            index += 1
+            continue
+        if arg in ("-c", "--config", "--enable", "--disable"):
+            if index >= len(args):
+                raise ValueError("Codex shared connection is missing a Desktop option value")
+            value = args[index]
+            index += 1
+            value = ("features." + value + "=" + ("true" if arg == "--enable" else "false")
+                     if arg in ("--enable", "--disable") else value)
+        elif arg.startswith(("--config=", "--enable=", "--disable=")):
+            option, value = arg.split("=", 1)
+            if option != "--config":
+                value = "features." + value + "=" + ("true" if option == "--enable" else "false")
+        else:
+            raise ValueError("Codex shared connection cannot apply this Desktop startup option")
+        if "=" not in value:
+            raise ValueError("Codex shared connection is missing a Desktop config value")
+        key, value = value.split("=", 1)
+        parts = _config_key(key.strip())
+        current = config
+        for part in parts[:-1]:
+            current = current.setdefault(part, {})
+            if not isinstance(current, dict):
+                raise ValueError("Codex shared connection has conflicting Desktop config keys")
+        current[parts[-1]] = _config_value(value.strip())
+    bindings = {key: env[key] for key in (
+        "CODEX_APP_TOOLS_PIPE_PATH", "CODEX_MCP_NODE_PATH", "CODEX_BROWSER_USE_NODE_PATH",
+        "CODEX_ELECTRON_RESOURCES_PATH", "CODEX_CLI_PATH") if env.get(key)}
+    plugins = config.get("plugins", {})
+    if not isinstance(plugins, dict):
+        raise ValueError("Codex shared connection has invalid Desktop plugin defaults")
+    servers = [config.get("mcp_servers", {})]
+    servers += [plugin.get("mcp_servers", {}) for plugin in plugins.values()
+                if isinstance(plugin, dict)]
+    for entries in servers:
+        server = entries.get("codex_app") if isinstance(entries, dict) else None
+        if isinstance(server, dict) and server.get("enabled") is True:
+            existing = server.setdefault("env", {})
+            if not isinstance(existing, dict):
+                raise ValueError("Codex shared connection has invalid Desktop app-tool bindings")
+            existing.update(bindings)
+    return config
+
+
+def thread_request(message, overrides):
+    """Defaults on this Desktop connection, with explicit request settings winning."""
+    if not overrides or message.get("method") not in ("thread/start", "thread/resume", "thread/fork"):
+        return message
+    params = message.get("params")
+    if (not isinstance(params, dict) or
+            params.get("config") is not None and not isinstance(params["config"], dict)):
+        raise ValueError("Invalid Desktop thread configuration on shared connection")
+    def merge(low, high):
+        result = copy.deepcopy(low)
+        for key, value in high.items():
+            result[key] = (merge(result[key], value)
+                           if isinstance(result.get(key), dict) and isinstance(value, dict)
+                           else copy.deepcopy(value))
+        return result
+    return dict(message, params=dict(params, config=merge(overrides, params.get("config") or {})))
+
+
+def proxy_stdio(path, overrides=None):
+    """One shared owner, preserving framing and the connection's thread defaults."""
     from codex_approvals import LocalWebSocket
     limit = 16 * 1024 * 1024
     wire = LocalWebSocket(path, max_message=limit)
@@ -149,7 +271,7 @@ def proxy_stdio(path):
                     message = json.loads(line)
                     if not isinstance(message, dict):
                         raise ValueError("expected Desktop JSON-RPC object")
-                    wire.send(message)
+                    wire.send(thread_request(message, overrides))
             if len(buffered) > limit:
                 raise ValueError("oversized Desktop message")
         return 1 if failed.is_set() else 0
@@ -160,7 +282,7 @@ def proxy_stdio(path):
 
 
 def run(cli, args):
-    """Keep the original config arguments on the server, never on a new thread."""
+    """Join the phone's owner; never spawn a competing Desktop app-server."""
     cli = str(Path(cli).resolve(strict=True))
     env = dict(os.environ)
     # Child tools must resolve the real CLI rather than recurse into the adapter.
@@ -171,61 +293,13 @@ def run(cli, args):
         return subprocess.call([cli, *args], env=env)
     if host.native_windows():
         raise ValueError("The Desktop socket adapter currently requires a POSIX host")
-    root = codex_home() / "tapproval-desktop"
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if not _private_directory(root):
-        raise ValueError("Desktop adapter directory must be private and owned by this user")
-    folder = Path(tempfile.mkdtemp(prefix="s-", dir=str(root)))
-    path = folder / "rpc.sock"
-    server = descriptor = None
-    previous = {}
-    try:
-        descriptor = os.open(folder / "live.lock", os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-        if not host.try_lock(descriptor):
-            raise ValueError("Desktop adapter lifecycle lock is already held")
-        if len(os.fsencode(path)) > 100:
-            raise ValueError("Codex home is too long for a private Unix socket")
-        server = subprocess.Popen([cli, *args, "--listen", "unix://" + str(path)],
-                                  env=env, stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.DEVNULL)
-        def stop(_signum, _frame):
-            raise KeyboardInterrupt
-        for number in (signal.SIGTERM, signal.SIGINT):
-            previous[number] = signal.signal(number, stop)
-        deadline = time.monotonic() + 10
-        while not path.exists():
-            if server.poll() is not None:
-                return server.returncode or 1
-            if time.monotonic() >= deadline:
-                raise TimeoutError("Desktop app-server did not open its private socket")
-            time.sleep(.025)
-        record = folder / "owner.json"
-        with record.open("x") as output:
-            os.chmod(record, 0o600)
-            json.dump({"pid": server.pid, "home": str(codex_home())}, output)
-        return proxy_stdio(str(path))
-    except KeyboardInterrupt:
-        return 130
-    finally:
-        # These are children created here, never a shared daemon or other chat.
-        for child in (server,):
-            if child is not None and child.poll() is None:
-                child.terminate()
-                try:
-                    child.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.wait()
-        for number, handler in previous.items():
-            signal.signal(number, handler)
-        if descriptor is not None:
-            os.close(descriptor)
-        for name in ("owner.json", "rpc.sock", "live.lock"):
-            try:
-                (folder / name).unlink()
-            except FileNotFoundError:
-                pass
-        folder.rmdir()
+    overrides = shared_overrides(args, env)
+    from codex_talk import _shared_client, shared_socket
+    client = _shared_client(binary=cli)
+    client.close()
+    # Disconnecting the Desktop closes only its client, never the shared
+    # server or a phone/watch turn. No writer ownership needs transferring.
+    return proxy_stdio(shared_socket(), overrides=overrides)
 
 
 def prepare_launcher(cli, app):

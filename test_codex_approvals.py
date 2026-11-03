@@ -1008,6 +1008,8 @@ class TestCodexTalkingBack:
             def close(self):
                 self.closed = True
         socket = Socket()
+        monkeypatch.setattr(talk, '_shared_client',
+                            lambda **kwargs: talk.Client(connect=lambda: socket))
         def unavailable():
             raise FileNotFoundError('no control socket')
         def send(text='check the fix', connect=None, **kwargs):
@@ -1039,14 +1041,16 @@ class TestCodexTalkingBack:
         assert row['side_thread'] is False
 
     def test_a_moved_session_uses_its_latest_working_directory(self, setup):
-        _, _, _, path, workspace, _, spawned, send = setup
+        _, _, _, path, workspace, socket, spawned, send = setup
         moved = workspace.parent / 'moved-workspace'
         moved.mkdir()
         workspace.rmdir()
         with path.open('a') as handle:
             handle.write(json.dumps({'type': 'turn_context', 'payload': {'cwd': str(moved)}}) + '\n')
         assert send() == 'sent'
-        assert spawned[0][2] == str(moved)
+        assert not spawned
+        [resume] = [m['params'] for m in socket.sent if m.get('method') == 'thread/resume']
+        assert resume['runtimeWorkspaceRoots'] == [str(moved)]
 
     def test_lost_mutation_receipt_never_falls_back_or_retries(self, setup):
         _, _, _, _, _, socket, spawned, send = setup
@@ -1064,26 +1068,45 @@ class TestCodexTalkingBack:
         assert not spawned
 
     @pytest.mark.parametrize('failure', [FileNotFoundError, ConnectionRefusedError])
-    def test_absent_control_socket_preserves_closed_resume(self, setup, failure):
-        _, _, _, _, _, _, spawned, send = setup
+    def test_absent_owner_uses_shared_closed_resume_without_an_exec_writer(self, setup, failure):
+        _, _, sid, _, _, socket, spawned, send = setup
         def absent():
             raise failure('absent')
         assert send(connect=absent) == 'sent'
-        assert len(spawned) == 1
+        assert not spawned
+        assert [m['params']['threadId'] for m in socket.sent
+                if m.get('method') == 'thread/resume'] == [sid]
 
     def test_saved_session_resumes_its_exact_uuid_with_bounded_permissions(self, setup):
-        talk, _, sid, _, workspace, _, spawned, send = setup
+        talk, _, sid, _, workspace, socket, spawned, send = setup
         assert send('--dangerously-bypass-approvals-and-sandbox') == 'sent'
-        [call] = spawned
-        command, _, cwd = call
-        assert cwd == str(workspace)
-        assert command[:2] == ['/bin/codex', 'exec']
-        assert command[2] == '--skip-git-repo-check'
-        assert command[3:3 + len(talk.flags())] == talk.flags()
-        assert 'approvals_reviewer="user"' in command
-        assert command[-4:-1] == ['resume', sid, '--']
+        assert not spawned
+        [resume] = [m['params'] for m in socket.sent if m.get('method') == 'thread/resume']
+        assert resume == dict(talk._thread_defaults(str(workspace)), threadId=sid, excludeTurns=True)
+        [turn] = [m['params'] for m in socket.sent if m.get('method') == 'turn/start']
+        assert turn['threadId'] == sid and turn['sandboxPolicy'] == talk.POLICY
+        assert turn['approvalsReviewer'] == 'user'
         from tapproval_wire import codex_wrist_words
-        assert codex_wrist_words(command[-1]) == '--dangerously-bypass-approvals-and-sandbox'
+        assert codex_wrist_words(turn['input'][0]['text']) == '--dangerously-bypass-approvals-and-sandbox'
+
+    def test_closed_shared_resume_lost_turn_receipt_never_spawns_or_retries(self, setup):
+        _, _, _, _, _, socket, spawned, send = setup
+        socket.fail = 'turn/start'
+        assert 'check the session before retrying' in send()
+        assert len([row for row in socket.sent if row.get('method') == 'turn/start']) == 1
+        assert socket.closed and not spawned
+
+    def test_closed_resume_refuses_another_thread_in_the_receipt(self, setup, monkeypatch):
+        talk, _, _, _, _, _, spawned, send = setup
+        class WrongThread:
+            def rpc(self, method, params, **kwargs):
+                assert method == 'thread/resume', 'must not submit input to a different thread'
+                return {'thread': {'id': 'some-other-thread'}}
+            def close(self):
+                pass
+        monkeypatch.setattr(talk, '_shared_client', lambda **kwargs: WrongThread())
+        assert 'invalid resume receipt' in send()
+        assert not spawned
 
     def test_a_live_thread_on_another_server_is_never_resumed_headlessly(self, setup, monkeypatch):
         _, sessions, _, path, _, socket, spawned, send = setup
@@ -1194,6 +1217,9 @@ class TestCodexTalkingBack:
         import subprocess
         import watch_relay as relay
         talk, _, _, _, workspace, _, _, _ = setup
+        received = []
+        monkeypatch.setattr(talk, 'start', lambda cwd, text:
+                            received.append((cwd, text)) or 'shared-thread')
         monkeypatch.setattr(relay, 'known_projects', lambda *_args: [{
             'path': str(workspace), 'name': 'workspace', 'minutes_ago': 0, 'agent': 'codex'}])
         monkeypatch.setattr(classifier, 'ensure_codex_on_path', lambda: '/opt/a path/codex')
@@ -1211,7 +1237,10 @@ class TestCodexTalkingBack:
         assert relay.start_session(str(workspace), text, platform='darwin') == 'started'
         import shlex
         script = scripts[0].split(' && ', 1)[1].strip()
-        assert shlex.split(script) == ['/opt/a path/codex'] + talk.flags() + ['--', text]
+        assert received == [(str(workspace), text)]
+        assert shlex.split(script) == ['/opt/a path/codex', 'resume', '--remote',
+            'unix://' + talk.shared_socket()] + talk.attach_flags() + ['shared-thread']
+        assert '$(touch no)' not in script
         assert 'approvals_reviewer="user"' in shlex.split(script)
 
     def test_unknown_activity_never_starts_a_second_writer(self, setup, monkeypatch):
@@ -1222,7 +1251,7 @@ class TestCodexTalkingBack:
 
     def test_an_existing_writer_lock_is_live_even_if_lsof_finds_nothing(self, setup):
         import tapproval_host
-        talk, sessions, sid, path, _, _, spawned, send = setup
+        talk, sessions, sid, path, _, socket, spawned, send = setup
         lock_path = sessions._home() + '/thread-writer-locks/' + sid + '.lock'
         with open(lock_path, 'rb') as handle:
             assert tapproval_host.try_lock(handle.fileno())
@@ -1234,7 +1263,7 @@ class TestCodexTalkingBack:
     def test_closed_legacy_reply_survives_an_unrelated_devicefs_mount(self, setup, monkeypatch):
         import os
         import subprocess
-        talk, sessions, sid, path, _, _, spawned, send = setup
+        talk, sessions, sid, path, _, socket, spawned, send = setup
         os.unlink(sessions._home() + '/thread-writer-locks/' + sid + '.lock')
         monkeypatch.setattr(talk._host, 'is_mac', lambda: True)
         mount = str(path.parent.parent / 'unrelated-DeviceFS')
@@ -1244,8 +1273,9 @@ class TestCodexTalkingBack:
         monkeypatch.setattr(talk.subprocess, 'run', lambda *a, **k:
                             subprocess.CompletedProcess(a[0], 1, '', warning))
         assert send() == 'sent'
-        assert len(spawned) == 1
-        assert spawned[0][0][-4:] == ['resume', sid, '--', talk.message('check the fix', True)]
+        assert not spawned
+        [turn] = [m['params'] for m in socket.sent if m.get('method') == 'turn/start']
+        assert turn['threadId'] == sid and turn['input'][0]['text'] == talk.message('check the fix', True)
 
     def test_legacy_open_rollout_never_resumes_despite_devicefs_warning(self, setup, monkeypatch):
         import os
