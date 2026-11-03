@@ -6,6 +6,8 @@ import ClaudeRiskClassifier as classifier
 
 @pytest.mark.parametrize('chosen,recent', [('codex', None), ('claude', 'codex')])
 def test_explicit_agent_controls_the_launched_command(monkeypatch, chosen, recent):
+    import codex_talk
+    monkeypatch.setattr(codex_talk, 'start', lambda *_: 'thread-new')
     monkeypatch.setattr(relay, 'known_projects', lambda *_: [
         {'path': '/project', 'agent': recent}])
     monkeypatch.setattr(classifier, 'ensure_codex_on_path', lambda: '/bin/codex')
@@ -39,7 +41,13 @@ def _no_real_codex(tmp_path, monkeypatch):
     """A Codex start may reach the shared server in CODEX_HOME. Never the
     owner's: it would open a real chat on his phone."""
     monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'no-codex'))
+    import codex_talk
+    native_start = codex_talk._start_shared_service
+    def refuse(_binary):
+        raise ValueError('Codex background service unavailable in isolated test')
+    monkeypatch.setattr(codex_talk, '_start_shared_service', refuse)
     relay.clear_condition('codex_shared_service')
+    yield native_start
 
 
 class Wire:
@@ -89,6 +97,73 @@ def test_codex_start_carries_the_watch_limits_on_the_shared_server():
     assert wire.closed
 
 
+def test_new_codex_bootstraps_only_the_shared_service_before_creating_a_chat(monkeypatch):
+    import codex_talk
+    calls = []
+    wire = Wire()
+    attempts = []
+    def connect():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise FileNotFoundError('background service absent')
+        return wire
+    monkeypatch.setattr(codex_talk, '_start_shared_service',
+                        lambda binary: calls.append(binary), raising=False)
+    assert codex_talk.start('/project', 'hello', connect=connect,
+                           binary='/bin/codex') == 'thread-new'
+    assert calls == ['/bin/codex'] and len(wire.calls('thread/start')) == 1
+    assert len(wire.calls('turn/start')) == 1 and wire.closed
+
+
+@pytest.mark.parametrize('failure', [PermissionError, TimeoutError, EOFError])
+def test_uncertain_shared_service_never_bootstraps_or_creates_a_private_chat(monkeypatch, failure):
+    import codex_talk
+    def connect():
+        raise failure('uncertain')
+    monkeypatch.setattr(codex_talk, '_start_shared_service',
+                        lambda binary: pytest.fail('must not start another server'), raising=False)
+    with pytest.raises(ValueError, match='background service'):
+        codex_talk.start('/project', 'hello', connect=connect, binary='/bin/codex')
+
+
+def test_shared_service_start_is_native_idempotent_and_has_no_permission_overrides(monkeypatch, _no_real_codex):
+    import subprocess
+    import codex_talk
+    called = []
+    monkeypatch.setattr(codex_talk.subprocess, 'run', lambda args, **kwargs:
+        called.append((args, kwargs)) or subprocess.CompletedProcess(args, 0, '', ''))
+    _no_real_codex('/path with spaces/codex')
+    [(args, kwargs)] = called
+    assert args == ['/path with spaces/codex', 'app-server', 'daemon', 'start']
+    assert kwargs == {'stdin': subprocess.DEVNULL, 'capture_output': True,
+                      'text': True, 'timeout': codex_talk.START_TIMEOUT}
+
+
+def test_a_running_shared_service_is_not_started_again(monkeypatch):
+    import codex_talk
+    monkeypatch.setattr(codex_talk, '_start_shared_service',
+                        lambda binary: pytest.fail('an existing service must be untouched'))
+    wire = Wire()
+    client = codex_talk._shared_client(binary='/bin/codex', connect=lambda: wire)
+    client.close()
+    assert wire.closed and not wire.calls('thread/start')
+
+
+def test_shared_start_failure_never_creates_a_thread_or_retries_service_start(monkeypatch):
+    import codex_talk
+    attempts, starts = [], []
+    def absent():
+        attempts.append(1)
+        raise FileNotFoundError('absent')
+    def failed(binary):
+        starts.append(binary)
+        raise ValueError('background service start could not be confirmed')
+    monkeypatch.setattr(codex_talk, '_start_shared_service', failed)
+    with pytest.raises(ValueError, match='could not be confirmed'):
+        codex_talk.start('/project', 'hello', connect=absent, binary='/bin/codex')
+    assert attempts == [1] and starts == ['/bin/codex']
+
+
 def test_codex_start_lost_receipt_is_uncertain_and_never_retried():
     import codex_talk
     wire = Wire(drop='turn/start')
@@ -99,7 +174,8 @@ def test_codex_start_lost_receipt_is_uncertain_and_never_retried():
 
 def test_codex_start_without_a_shared_server_says_so():
     import codex_talk
-    assert codex_talk.start('/project', 'hello') is None   # CODEX_HOME has no socket
+    with pytest.raises(ValueError, match='background service'):
+        codex_talk.start('/project', 'hello', binary='/bin/codex')
 
 
 def _codex_project(monkeypatch, start):

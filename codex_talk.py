@@ -316,11 +316,29 @@ def send(prefix, text, binary, spawn, log, brief=True, connect=None, runner=None
             return "sent" if result.returncode == 0 else "Codex could not queue the message"
         except (OSError, subprocess.SubprocessError):
             return "Codex queue did not acknowledge the message; check the session before retrying"
-    # Closed sessions resume their own UUID. Options precede the resume
-    # subcommand because exec-resume does not accept --sandbox itself.
-    command = [binary, "exec", "--skip-git-repo-check"] + flags() + ["resume", sid, "--", text]
-    error = spawn(command, log, cwd=cwd)
-    return "could not start Codex: %s" % error if error else "sent"
+    # A private exec-resume would take the writer away from the phone and
+    # Desktop. Reopen the same UUID on the shared owner instead. Native
+    # writer locking still refuses a different process that appeared
+    # after the activity census; never fall back after that refusal.
+    try:
+        client = _shared_client(binary=binary, connect=connect)
+        reopened = client.rpc("thread/resume", dict(_thread_defaults(cwd),
+            threadId=sid, excludeTurns=True), timeout=START_TIMEOUT)
+        if (not isinstance(reopened, dict) or not isinstance(reopened.get("thread"), dict)
+                or reopened["thread"].get("id") != sid):
+            return "Codex returned an invalid resume receipt; check the session before retrying"
+        receipt = client.rpc("turn/start", {"threadId": sid,
+            "input": [{"type": "text", "text": text}], "sandboxPolicy": dict(POLICY),
+            "approvalPolicy": "on-request", "approvalsReviewer": "user",
+            "runtimeWorkspaceRoots": [cwd]}, timeout=START_TIMEOUT)
+        if not isinstance(receipt, dict) or not (receipt.get("turn") or {}).get("id"):
+            return "Codex returned an invalid receipt; check the session before retrying"
+        return "sent"
+    except (OSError, EOFError, ValueError, TypeError, KeyError, AttributeError) as error:
+        return "Codex shared resume could not be confirmed; check the session before retrying: %s" % error
+    finally:
+        if client is not None:
+            client.close()
 
 
 def shared_socket():
@@ -328,7 +346,63 @@ def shared_socket():
     return sessions.control_socket()
 
 
-def start(cwd, text, connect=None):
+def _start_shared_service(binary):
+    """Idempotent native start, never restart/update or a private fallback."""
+    try:
+        result = subprocess.run([binary, "app-server", "daemon", "start"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=START_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError("Codex's background service start could not be confirmed; "
+                         "check Codex on your computer before trying again") from error
+    if result.returncode:
+        raise ValueError("Codex's background service could not start; "
+                         "open Codex on your computer before trying again")
+
+
+def _shared_client(binary=None, connect=None):
+    """Reach the common owner; only proven absence permits an idempotent start.
+
+    No thread mutation has happened yet, so retrying an absent socket is
+    safe. An uncertain handshake or permission error is never absence.
+    """
+    try:
+        return Client(connect, socket_path=shared_socket())
+    except (FileNotFoundError, ConnectionRefusedError):
+        pass
+    except (OSError, EOFError) as error:
+        raise ValueError("Codex's background service did not answer; "
+                         "check the connection before trying again") from error
+    if not binary:
+        from ClaudeRiskClassifier import ensure_codex_on_path
+        binary = ensure_codex_on_path()
+    if not binary:
+        raise ValueError("Codex's background service is unavailable; "
+                         "Codex is not installed on your computer")
+    _start_shared_service(binary)
+    deadline = time.monotonic() + START_TIMEOUT
+    while True:
+        try:
+            return Client(connect, socket_path=shared_socket())
+        except (FileNotFoundError, ConnectionRefusedError):
+            if time.monotonic() >= deadline:
+                raise ValueError("Codex's background service is not ready; "
+                                 "check Codex on your computer before trying again") from None
+            time.sleep(.05)
+        except (OSError, EOFError) as error:
+            raise ValueError("Codex's background service did not answer; "
+                             "check the connection before trying again") from error
+
+
+def _thread_defaults(cwd):
+    """Same permissions for a wrist-created thread and a closed-thread resume."""
+    return {"approvalPolicy": "on-request", "approvalsReviewer": "user",
+        "runtimeWorkspaceRoots": [cwd], "sandbox": "workspace-write",
+        "config": {"sandbox_workspace_write": {
+            "network_access": False, "writable_roots": [],
+            "exclude_tmpdir_env_var": True, "exclude_slash_tmp": True}}}
+
+
+def start(cwd, text, connect=None, binary=None):
     """Begin a wrist session on the shared server; return its thread id.
 
     A Terminal started with ``flags()`` runs a private server of its own:
@@ -336,22 +410,15 @@ def start(cwd, text, connect=None):
     (0.166), and the phone then refuses the chat as "used by another
     session". thread/start carries the same limits instead, the human
     reviewer included, and they stay with the chat for every later turn,
-    whoever types it. None means no shared server is running. Raises
-    ValueError in words; a lost receipt is never retried.
+    whoever types it. A missing shared service is started idempotently;
+    failure is an explicit refusal, never a Terminal-only private chat.
+    Raises ValueError in words; a lost receipt is never retried.
     """
-    try:
-        client = Client(connect, socket_path=shared_socket())
-    except (FileNotFoundError, ConnectionRefusedError):
-        return None
-    except (OSError, EOFError) as error:
-        raise ValueError("Codex's background service did not answer: %s" % error) from error
+    client = _shared_client(binary=binary, connect=connect)
     try:
         limits = {"approvalPolicy": "on-request", "approvalsReviewer": "user",
                   "runtimeWorkspaceRoots": [cwd]}
-        thread = client.rpc("thread/start", dict(limits, cwd=cwd, sandbox="workspace-write",
-            config={"sandbox_workspace_write": {
-                "network_access": False, "writable_roots": [],
-                "exclude_tmpdir_env_var": True, "exclude_slash_tmp": True}}),
+        thread = client.rpc("thread/start", dict(_thread_defaults(cwd), cwd=cwd),
             timeout=START_TIMEOUT)
         sid = ((thread or {}).get("thread") or {}).get("id") if isinstance(thread, dict) else None
         if not isinstance(sid, str) or not sid:

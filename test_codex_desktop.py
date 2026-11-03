@@ -15,6 +15,85 @@ from watch_relay import CardQueue
 from test_codex_approvals import Wire, HandshakeSocket, request, until, resolved
 
 
+@pytest.mark.parametrize('transport', [[], ['--stdio'], ['--listen', 'stdio://'], ['--listen=stdio://']])
+def test_desktop_joins_the_phone_server_without_creating_a_private_writer(tmp_path, monkeypatch, transport):
+    monkeypatch.setattr(desktop.host, 'native_windows', lambda: False)
+    real = tmp_path / 'codex'
+    real.touch()
+    calls = []
+    class Shared:
+        def close(self):
+            calls.append('closed-preflight')
+    monkeypatch.setattr(talk, '_shared_client', lambda **kwargs: Shared(), raising=False)
+    monkeypatch.setattr(desktop.subprocess, 'Popen',
+                        lambda *args, **kwargs: pytest.fail('must not create a private Desktop server'))
+    monkeypatch.setattr(desktop, 'proxy_stdio',
+                        lambda path, **kwargs: calls.append((path, kwargs)) or 0)
+    assert desktop.run(str(real), ['app-server'] + transport + ['-c', 'features.code_mode_host=true']) == 0
+    assert calls == ['closed-preflight', (talk.shared_socket(), {
+        'overrides': {'features': {'code_mode_host': True}}})]
+
+
+def test_desktop_overrides_keep_app_tools_bound_to_the_desktop_connection():
+    values = desktop.shared_overrides([
+        '-c', 'features.code_mode_host=true', 'app-server', '--analytics-default-enabled',
+        '-c', 'plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+    ], {'CODEX_APP_TOOLS_PIPE_PATH': '/private/desktop-pipe',
+        'CODEX_MCP_NODE_PATH': '/signed/node', 'UNRELATED_SECRET': 'never-forward'})
+    assert values == {
+        'features': {'code_mode_host': True},
+        'plugins': {'codex-app-tools@openai-bundled': {'mcp_servers': {'codex_app': {
+            'enabled': True, 'env': {'CODEX_APP_TOOLS_PIPE_PATH': '/private/desktop-pipe',
+                                    'CODEX_MCP_NODE_PATH': '/signed/node'}}}}}}
+
+
+@pytest.mark.parametrize('method', ['thread/start', 'thread/resume', 'thread/fork'])
+def test_shared_desktop_defaults_preserve_explicit_thread_settings(method):
+    original = {'id': 7, 'method': method, 'params': {'threadId': 'same-id',
+        'approvalsReviewer': 'user', 'config': {'features': {'code_mode_host': False}}}}
+    updated = desktop.thread_request(original, {'features': {'code_mode_host': True},
+        'plugins': {'app': {'enabled': True}}})
+    assert updated['id'] == 7 and updated['params']['threadId'] == 'same-id'
+    assert updated['params']['approvalsReviewer'] == 'user'
+    assert updated['params']['config'] == {
+        'features': {'code_mode_host': False}, 'plugins': {'app': {'enabled': True}}}
+    assert original['params']['config'] == {'features': {'code_mode_host': False}}
+
+
+@pytest.mark.parametrize('message', [
+    {'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'desktop'}}},
+    {'id': 2, 'method': 'turn/start', 'params': {'threadId': 'same-id'}},
+    {'id': 3, 'result': {'decision': 'decline'}},
+    {'method': 'initialized'},
+])
+def test_shared_desktop_does_not_change_other_protocol_messages(message):
+    assert desktop.thread_request(message, {'features': {'code_mode_host': True}}) is message
+
+
+@pytest.mark.parametrize('args', [
+    ['app-server', '--code-mode-host', 'http://a-host'],
+    ['app-server', '-c', 'features.code_mode_host={unsupported=true}'],
+])
+def test_shared_desktop_refuses_untranslatable_startup_options(args):
+    with pytest.raises(ValueError, match='shared'):
+        desktop.shared_overrides(args, {})
+
+
+@pytest.mark.parametrize('value', [False, 0, [], 'not-an-object'])
+def test_shared_desktop_refuses_malformed_thread_config_without_sending(value):
+    with pytest.raises(ValueError, match='configuration'):
+        desktop.thread_request({'id': 3, 'method': 'thread/start', 'params': {'config': value}},
+                               {'features': {'code_mode_host': True}})
+
+
+def test_shared_desktop_supports_quoted_plugin_names_and_typed_defaults():
+    assert desktop.shared_overrides(['app-server', '--config=model="local"', '-c',
+        'plugins."a.plugin@bundled".enabled=true', '--enable=code_mode_host',
+        '--disable', 'apps'], {}) == {
+            'model': 'local', 'plugins': {'a.plugin@bundled': {'enabled': True}},
+            'features': {'code_mode_host': True, 'apps': False}}
+
+
 @pytest.mark.parametrize("args,expected", [
     (["-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled",
       "-c", "plugins.codex-app-tools.enabled=true"], True),
@@ -24,7 +103,9 @@ from test_codex_approvals import Wire, HandshakeSocket, request, until, resolved
     (["app-server", "daemon", "version"], False),
     (["app-server", "generate-json-schema"], False),
     (["app-server", "--listen=unix:///custom"], False),
-    (["app-server", "--stdio"], False),
+    (["app-server", "--stdio"], True),
+    (["app-server", "--listen", "stdio://"], True),
+    (["app-server", "--listen=stdio://"], True),
     (["app-server", "--help"], False),
     (["-c", "app-server", "exec", "hi"], False),
     (["exec", "app-server"], False),
@@ -99,43 +180,28 @@ def test_rejects_symlinked_session_directory(endpoint):
     assert desktop.desktop_sockets() == []
 
 
-def test_server_args_are_preserved_and_only_own_children_are_stopped(tmp_path, monkeypatch):
+def test_startup_defaults_follow_desktop_threads_without_owning_the_shared_service(tmp_path, monkeypatch):
     if not hasattr(os, "getuid"):
         pytest.skip("Desktop adapter is opt-in on POSIX")
-    # Use a short root; no real process or socket is launched in this test.
-    monkeypatch.setattr(desktop, "codex_home", lambda: tmp_path)
-    monkeypatch.setattr(desktop.os, "fsencode", lambda _path: b"short")
-    monkeypatch.setattr(desktop.Path, "exists", lambda _path: True)
     calls = []
-    class Child:
-        pid = os.getpid()
-        returncode = None
-        def poll(self):
-            return self.returncode
-        def wait(self, timeout=None):
-            self.returncode = 0
-            return 0
-        def terminate(self):
-            self.returncode = 0
-        def kill(self):
-            pytest.fail("graceful child cleanup should suffice")
-    def spawn(args, **kwargs):
-        calls.append((args, kwargs))
-        return Child()
-    monkeypatch.setattr(desktop.subprocess, "Popen", spawn)
-    proxied = []
-    monkeypatch.setattr(desktop, "proxy_stdio", lambda path: proxied.append(path) or 0)
+    class Shared:
+        def close(self):
+            calls.append('closed-only-this-client')
+    monkeypatch.setattr(talk, '_shared_client', lambda **kwargs: Shared())
+    monkeypatch.setattr(desktop.subprocess, 'Popen',
+                        lambda *args, **kwargs: pytest.fail('a private server was spawned'))
+    monkeypatch.setattr(desktop, "proxy_stdio", lambda path, **kwargs:
+                        calls.append((path, kwargs)) or 0)
     real = tmp_path / "codex"
     real.touch()
     args = ["-c", "features.code_mode_host=true", "app-server", "-c",
             'approval_policy="on-request"', "-c", "plugins.codex-app-tools.enabled=true"]
     monkeypatch.setenv("CODEX_CLI_PATH", "/wrapper")
     assert desktop.run(str(real), args) == 0
-    assert calls[0][0][1:-2] == args
-    assert calls[0][0][-2] == "--listen"
-    assert proxied == [calls[0][0][-1].removeprefix("unix://")]
-    assert calls[0][1]["env"]["CODEX_CLI_PATH"] == str(real)
-    assert not list((tmp_path / "tapproval-desktop").iterdir())
+    assert calls == ['closed-only-this-client', (talk.shared_socket(), {'overrides': {
+        'features': {'code_mode_host': True}, 'approval_policy': 'on-request',
+        'plugins': {'codex-app-tools': {'enabled': True}}}})]
+    assert not (tmp_path / 'tapproval-desktop').exists()
 
 
 def test_hub_routes_native_answers_to_the_owning_server(monkeypatch):
