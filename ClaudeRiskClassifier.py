@@ -111,7 +111,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.107"
+__version__ = "1.1.108"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -217,7 +217,13 @@ SECRET_PATH = re.compile(
     r"/proc/[^/\s]+/environ|\.tfstate\b|"
     # Claude Code's own account file, the browsers' saved cookies and
     # logins, the Messages database, and a search for a private key.
-    r"\.claude\.json\b|[/\\]Cookies\b|[/\\]Login\\? Data\b|Messages[/\\]chat\.db|PRIVATE KEY)",
+    r"\.claude\.json\b|[/\\]Cookies\b|[/\\]Login\\? Data\b|Messages[/\\]chat\.db|PRIVATE KEY|"
+    # Codex's own account file, and a secret folder named without its
+    # slash: `grep -r "" ~/.aws` and `ls ~/.ssh` read SAFE while the same
+    # with a trailing `/` read HIGH (2026-11-01 review). A whole name only:
+    # `notes.aws` and `.sshd_config_backups` are not the folder.
+    r"\.codex[/\\]auth\.json\b|"
+    r"(?<![\w-])\.(?:aws|ssh|gnupg|appstoreconnect)(?![\w.-])|\.tapproval[/\\]data(?![\w.-]))",
     re.I,
 )
 
@@ -1678,14 +1684,31 @@ def _read_tool_risk(tool, tool_input):
     `cat` of the same file is: Read on ~/.ssh/id_rsa was SAFE, and whoever
     reads the relay's key file can answer a card (2026-10-24 review).
     Grep's pattern is what it searches for, not where, so only Glob's
-    counts."""
-    keys = ("file_path", "notebook_path", "path") + (("pattern",) if tool == "Glob" else ())
+    counts; Grep's `glob` is where, and read SAFE until the 2026-11-01
+    review (`glob: ".aws/*"`)."""
+    keys = ("file_path", "notebook_path", "path", "glob") + (("pattern",) if tool == "Glob" else ())
     for key in keys:
         value = tool_input.get(key)
-        # A folder named on its own (`~/.aws`) is the folder's contents.
-        if isinstance(value, str) and SECRET_PATH.search(value.replace("\\", "/") + "/"):
+        if isinstance(value, str) and _names_a_secret_path(value):
             return Risk.HIGH, ["secret-read"]
     return Risk.SAFE, ["read-only-tool"]
+
+
+def _names_a_secret_path(value):
+    """True for a path, or a wildcard over one, that names a secret store.
+    A folder named on its own (`~/.aws`) is the folder's contents, and a
+    wildcard inside a hidden folder (`**/.ss?/*`) is read as the shell's
+    rule reads it."""
+    value = value.replace("\\", "/")
+    return bool(SECRET_PATH.search(value + "/") or SECRET_GLOB.search(" " + value))
+
+
+def _path_like(value):
+    """A tool input that is a path rather than prose: one line, short, and
+    shaped like a path. An MCP message about "the credentials doc" is not a
+    read of one."""
+    return ("\n" not in value and len(value) < 1024 and " " not in value.strip()
+            and (value.startswith(("/", "~", ".", "$HOME")) or "/" in value or "\\" in value))
 
 
 READ_ONLY_TOOLS = frozenset(
@@ -1903,6 +1926,11 @@ def classify(event):
         # The name says what kind of call; the input says what it does: a
         # `query` carrying DROP TABLE read LOW (2026-10-24 review).
         risk, rules = _scan_content(" ".join(_strings_in(tool_input)), *_mcp_risk(tool))
+        # A connector that reads files reads secrets too: an MCP read of
+        # ~/.ssh/id_rsa read LOW (2026-11-01 review). Raised, never lowered.
+        if risk < Risk.HIGH and any(_path_like(v) and _names_a_secret_path(v)
+                                    for v in _strings_in(tool_input)):
+            risk, rules = Risk.HIGH, rules + ["secret-read"]
     elif not tool:
         risk, rules = Risk.MEDIUM, ["missing-tool-name"]
     else:

@@ -466,6 +466,11 @@ def _read_catalog(client_factory=None, endpoints=None, database_reader=None):
     return sorted(rows.values(), key=lambda row: (-row["modified"], row["session_id"])), paths
 
 
+# How long a chat Codex has just archived stays off the snapshot, whatever
+# a read already under way when it was archived says (archive-e2e.sh, #1170).
+FORGET_SECONDS = 30.0
+
+
 class SessionCatalog:
     """A complete snapshot, refreshed off the HTTP thread; failures retain it."""
 
@@ -474,11 +479,32 @@ class SessionCatalog:
         self.lock = threading.Lock()
         self.rows, self.paths = [], {}
         self.status, self.checked, self.busy = "loading", None, False
+        self.forgotten = {}
+
+    def forget(self, session_id):
+        """Codex said archived: off the snapshot now, not after the next
+        read or two, which is how an archived chat came back on the wrist
+        for seconds as if its archive had failed."""
+        with self.lock:
+            self.forgotten[session_id] = time.monotonic()
+            self.rows = [row for row in self.rows if row.get("session_id") != session_id]
+            self.paths.pop(session_id, None)
+
+    def recall(self, session_id):
+        """Codex said restored: its own list decides again, read at once."""
+        with self.lock:
+            self.forgotten.pop(session_id, None)
+            self.checked = None
 
     def refresh(self):
         try:
             rows, paths = self.reader()
             with self.lock:
+                now = time.monotonic()
+                self.forgotten = {sid: at for sid, at in self.forgotten.items()
+                                  if now - at < FORGET_SECONDS}
+                rows = [row for row in rows if row.get("session_id") not in self.forgotten]
+                paths = {sid: path for sid, path in paths.items() if sid not in self.forgotten}
                 self.rows, self.paths, self.status = rows, paths, "ready"
         except (OSError, EOFError, ValueError, TypeError, KeyError, AttributeError):
             with self.lock:
@@ -515,6 +541,22 @@ def catalog_snapshot():
             _CATALOG, _CATALOG_HOME = SessionCatalog(), home
         catalog = _CATALOG
     return catalog.snapshot()
+
+
+def forget_chat(session_id):
+    """A chat Codex archived leaves this home's snapshot at once."""
+    with _CATALOG_LOCK:
+        catalog = _CATALOG if _CATALOG_HOME == _home() else None
+    if catalog is not None:
+        catalog.forget(session_id)
+
+
+def recall_chat(session_id):
+    """A chat Codex restored is looked for on its list at once."""
+    with _CATALOG_LOCK:
+        catalog = _CATALOG if _CATALOG_HOME == _home() else None
+    if catalog is not None:
+        catalog.recall(session_id)
 
 
 def find_rollout(session_id, sessions_dir=None):

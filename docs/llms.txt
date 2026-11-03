@@ -1,11 +1,11 @@
 # Tapproval
 
-> Approve Claude Code's permission prompts from an Apple Watch. When the
+> Approve Claude Code's and Codex's permission prompts from an Apple Watch. When the
 > agent on your computer asks permission, the question appears on the
 > watch, marked with one of five risk tiers, and one tap answers it.
 > No account and no server of ours. Independent; not affiliated with Anthropic.
 > Made for Claude Code users and vibe coders who step away while Claude works.
-> Claude Code today; Codex support is coming in version 3.0, alongside it.
+> Claude Code and Codex, side by side, since version 3.0.
 > Not to be confused with tapproval.vercel.app, a separate phone-notification
 > tool by another developer.
 
@@ -38,15 +38,15 @@
   when told: "Install the Tapproval plugin from marcobelini/tapproval-helper".
 - Works on the same Wi-Fi, or away from home through a private travel address.
 
-## Coming in 3.0: Codex
+## Codex (since 3.0)
 - Codex sessions join the same list as Claude Code's, each marked CC or CX;
   Codex's permission questions arrive as cards marked with
   their risk; a Codex conversation can be followed live, replied to, or
   started from the watch. The helper's one install covers both agents.
 
 ## Price
-- The first 100 answers are free; then $5 once unlocks unlimited answers
-  for good. No subscription. An optional $1 tip is offered too.
+- The first 100 answers are free, shared by Claude Code and Codex; then
+  $5 once unlocks unlimited answers for each agent, for good. No subscription. An optional $1 tip is offered too.
 - Reading sessions and the day's overview stays free.
 
 ## Where to get it

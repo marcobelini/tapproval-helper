@@ -3193,6 +3193,38 @@ class TestCodexCatalog:
         catalog.refresh()
         assert catalog.snapshot() == {"sessions": [], "status": "ready"}
 
+    def test_an_archived_chat_leaves_the_snapshot_at_once(self):
+        """archive-e2e.sh (#1170, 2026-11-02): the watch asks for the list
+        the moment Codex says archived, and the snapshot, up to two
+        refreshes old, still had the chat: it came back on the wrist for
+        seconds, as if the archive had failed. A refresh already reading
+        Codex when the archive lands must not bring it back either."""
+        import codex_sessions as cx
+        row = cx._catalog_row(self.row(status={"type": "idle"}))
+        sid = row["session_id"]
+        catalog = cx.SessionCatalog(lambda: ([row], {sid: "/x.jsonl"}))
+        catalog.refresh()
+        catalog.forget(sid)
+        assert catalog.snapshot()["sessions"] == []
+        assert sid not in catalog.paths
+        catalog.refresh()                       # began before the archive
+        assert catalog.snapshot()["sessions"] == []
+        catalog.recall(sid)                     # restored: Codex's word again
+        assert catalog.checked is None, "a restore asks Codex again at once"
+        catalog.refresh()
+        assert [r["session_id"] for r in catalog.snapshot()["sessions"]] == [sid]
+
+    def test_a_forgotten_chat_returns_when_codex_still_lists_it_later(self, monkeypatch):
+        import codex_sessions as cx
+        row = cx._catalog_row(self.row(status={"type": "idle"}))
+        catalog = cx.SessionCatalog(lambda: ([row], {}))
+        clock = [100.0]
+        monkeypatch.setattr(cx.time, "monotonic", lambda: clock[0])
+        catalog.forget(row["session_id"])
+        clock[0] += cx.FORGET_SECONDS + 1
+        catalog.refresh()
+        assert [r["session_id"] for r in catalog.snapshot()["sessions"]] == [row["session_id"]]
+
     def test_transcript_beyond_recent_window_uses_validated_catalog_path(self, tmp_path, monkeypatch):
         import codex_sessions as cx
         monkeypatch.setenv("CODEX_HOME", str(tmp_path))
@@ -15390,6 +15422,43 @@ class TestLocalMeansLocal:
             return Done()
         assert {str(a) for a in watch_relay._local_addresses(run)} == {"10.0.0.5", "fe80::a"}
 
+    def test_windows_addresses_are_listed_too(self):
+        """Windows has neither ifconfig nor ip, so the list came back empty
+        there and the self-pair guard had nothing to compare (2026-11-01
+        review). ipconfig's own words, with the zone and "(Preferred)"."""
+        out = ("Windows IP Configuration\r\n\r\nEthernet adapter Ethernet:\r\n\r\n"
+               "   Connection-specific DNS Suffix  . : lan\r\n"
+               "   Link-local IPv6 Address . . . . . : fe80::1c2d:3e4f:5a6b:7c8d%12\r\n"
+               "   IPv4 Address. . . . . . . . . . . : 192.168.1.42(Preferred)\r\n"
+               "   Subnet Mask . . . . . . . . . . . : 255.255.255.0\r\n"
+               "   Default Gateway . . . . . . . . . : 192.168.1.1\r\n"
+               "Unknown adapter Tailscale:\r\n"
+               "   IPv4-Adresse  . . . . . . . . . . : 100.64.0.7\r\n")
+
+        class Done:
+            stdout = out
+
+        def run(argv, **_kw):
+            if argv == ["ipconfig"]:
+                return Done()
+            raise OSError("not here")
+        assert {str(a) for a in watch_relay._local_addresses(run)} == {
+            "fe80::1c2d:3e4f:5a6b:7c8d", "192.168.1.42", "100.64.0.7"}
+
+    def test_a_lister_whose_words_will_not_decode_is_read_anyway(self):
+        seen = []
+
+        class Done:
+            stdout = "   IPv4 Address. . . : 10.1.2.3\n"
+
+        def run(argv, **kw):
+            seen.append(kw)
+            if argv == ["ipconfig"]:
+                return Done()
+            raise OSError("not here")
+        assert {str(a) for a in watch_relay._local_addresses(run)} == {"10.1.2.3"}
+        assert all(kw.get("errors") == "replace" for kw in seen), seen
+
     def test_no_lister_answers_nothing(self):
         def run(argv, **_kw):
             raise OSError("none")
@@ -23022,7 +23091,8 @@ class TestFlowsShareOneSimulatorPerKind:
     RT = "com.apple.CoreSimulator.SimRuntime.watchOS-27-0"
     SCRIPTS = ("watch-flows.sh", "e2e-lib.sh", "sim-shared.sh", "sim-own.sh", "sim-udid.sh",
                "sim-retire.sh", "sim-runtime.sh", "sim-devtype.sh", "sim-tidy.sh", "stop-tree.sh")
-    E2E = ("pill-e2e.sh", "place-e2e.sh", "tap-e2e.sh", "mark-e2e.sh", "codex-e2e.sh")
+    E2E = ("pill-e2e.sh", "place-e2e.sh", "tap-e2e.sh", "mark-e2e.sh", "codex-e2e.sh",
+           "archive-e2e.sh")
 
     # A stand-in xcrun with a memory: what `simctl create` makes is listed
     # from then on, and every create, boot, shutdown, erase and delete is
@@ -23858,6 +23928,28 @@ class TestASessionCanBeArchivedFromTheWrist:
         assert watch_relay.restore_session(self.THREAD, agent="codex") == "restored"
         assert acted == [("restore", self.THREAD)]
 
+    @pytest.mark.parametrize("answer,told", [
+        ({"ok": True}, [("forget", THREAD)]),
+        ({"ok": False, "uncertain": True}, []),
+        ({"ok": False, "reason": "Codex refused: active writer"}, []),
+    ])
+    def test_only_an_archive_codex_confirmed_leaves_the_list_at_once(
+            self, stage, monkeypatch, answer, told):
+        """The relay's copy of Codex's list forgets a chat the moment Codex
+        says it is archived (archive-e2e.sh, #1170), and only then: an
+        uncertain one may still be there, and the wearer should see it."""
+        import codex_sessions
+        arrange, acted, _ = stage
+        arrange(codex=True, codex_answer=answer)
+        heard = []
+        monkeypatch.setattr(codex_sessions, "forget_chat", lambda sid: heard.append(("forget", sid)))
+        monkeypatch.setattr(codex_sessions, "recall_chat", lambda sid: heard.append(("recall", sid)))
+        watch_relay.archive_session(self.THREAD[:12], agent="codex")
+        assert heard == told
+        heard.clear()
+        watch_relay.restore_session(self.THREAD, agent="codex")
+        assert heard == ([("recall", self.THREAD)] if answer.get("ok") else [])
+
     def test_only_codex_can_be_restored_from_the_wrist(self, stage):
         arrange, acted, _ = stage
         arrange({"status": "Terminal", "pid": 1})
@@ -23950,6 +24042,300 @@ class TestASessionCanBeArchivedFromTheWrist:
             {"ok": True, "status": "restored"}
         assert ran == [("restore", self.THREAD)]
 
+
+
+class TestArchiveAtItsEdges:
+    """The edges of job F the first tests left open (archive test plan,
+    2026-11-02): the paths a tap takes when something is not as it should
+    be, the HTTP layer with nothing stubbed but the act itself, and
+    restore's own refusals. Every one names what the wearer would see."""
+
+    SID = TestASessionCanBeArchivedFromTheWrist.SID
+    THREAD = TestASessionCanBeArchivedFromTheWrist.THREAD
+    stage = TestASessionCanBeArchivedFromTheWrist.stage
+    relay = TestASessionCanBeArchivedFromTheWrist.relay
+    _app_file = TestASessionCanBeArchivedFromTheWrist._app_file
+
+    # -- Codex ---------------------------------------------------------------
+
+    def test_a_chat_codex_cannot_be_sent_to_is_still_codexs_to_archive(self, stage):
+        """`can_send` false is a send rule, not an archive rule: a Desktop-only
+        chat or one with no local transcript is archivable, and Codex's own
+        owner check refuses a chat open on two servers (design note
+        corrected 2026-11-02)."""
+        arrange, acted, catalog = stage
+        arrange(codex=True)
+        catalog["sessions"] = [{"session_id": self.THREAD, "can_send": False}]
+        assert watch_relay.archive_session(self.THREAD) == "archived"
+        arrange(codex=True, codex_answer={"ok": False, "reason": "Codex is open on two servers"})
+        assert watch_relay.archive_session(self.THREAD) == "Codex is open on two servers"
+
+    def test_a_list_still_loading_after_a_restart_is_not_a_list(self, stage):
+        arrange, acted, catalog = stage
+        arrange(codex=True)
+        catalog["status"] = "loading"
+        assert watch_relay.archive_session(self.THREAD) == "Codex chats are unavailable"
+        assert acted == []
+
+    def test_a_prefix_that_names_two_chats_names_none(self, stage):
+        arrange, acted, catalog = stage
+        arrange(codex=True)
+        catalog["sessions"] = [{"session_id": self.THREAD},
+                               {"session_id": self.THREAD[:8] + "-ffff-4fff-8fff-ffffffffffff"}]
+        assert watch_relay.archive_session(self.THREAD[:8]) == "unknown session"
+        assert acted == []
+
+    def test_a_failure_inside_is_one_word_and_one_log_line(self, stage, monkeypatch, capsys):
+        import codex_talk
+        arrange, acted, _ = stage
+        arrange(codex=True)
+        monkeypatch.setattr(codex_talk, "archive_codex_thread",
+                            lambda thread: (_ for _ in ()).throw(RuntimeError("boom")))
+        assert watch_relay.archive_session(self.THREAD) == "could not archive"
+        err = capsys.readouterr().err
+        assert "relay: archive failed: RuntimeError: boom" in err
+        assert "relay: archive codex 01a19801 could not archive" in err
+
+    def test_without_an_agent_a_chat_codex_no_longer_lists_is_unknown(self, stage):
+        """An archived or unloaded chat has no rollout where find_rollout
+        looks, so a request that does not say "codex" takes the Claude road
+        and finds nothing. Every watch that archives sends the agent."""
+        arrange, acted, _ = stage
+        arrange(codex=False)
+        assert watch_relay.archive_session(self.THREAD) == "unknown session"
+        assert acted == []
+
+    # -- Claude, with end_session itself -------------------------------------
+
+    @pytest.fixture
+    def ending(self, stage, monkeypatch):
+        """end_session itself, with only the processes and the signal stood in."""
+        arrange, acted, _ = stage
+        killed = []
+        monkeypatch.setattr(watch_relay.os, "kill", lambda pid, sig: killed.append(pid))
+        monkeypatch.setattr(watch_relay, "_gone", lambda pid: True)
+        monkeypatch.setattr(watch_relay, "END_WAIT_SECONDS", 0.5)
+
+        def processes(listed):
+            # After arrange(), which stands end_session in.
+            monkeypatch.setattr(watch_relay, "end_session", _REAL_END_SESSION)
+            monkeypatch.setattr(watch_relay, "_our_claude_processes", lambda: listed)
+        return arrange, processes, killed
+
+    def test_a_closed_session_with_nothing_running_is_not_live(self, ending):
+        arrange, processes, killed = ending
+        arrange()
+        processes([])
+        assert watch_relay.archive_session(self.SID) == "not live"
+        assert killed == []
+
+    def test_a_closed_session_with_a_wrist_copy_is_archived_by_ending_the_copy(self, ending):
+        arrange, processes, killed = ending
+        arrange()
+        processes([(4321, "claude --resume %s -p hi" % self.SID)])
+        assert watch_relay.archive_session(self.SID) == "archived"
+        assert killed == [4321]
+
+    def test_a_registry_pid_that_is_no_longer_claude_is_never_signalled(self, ending):
+        arrange, processes, killed = ending
+        arrange({"status": "Terminal", "pid": 999})
+        processes([])
+        assert watch_relay.archive_session(self.SID) == "not ours"
+        assert killed == []
+
+    def test_the_folder_the_caller_names_is_the_one_searched(self, stage, monkeypatch):
+        """archive_session took a projects_dir and dropped it, so a caller
+        that named a folder was answered from ~/.claude/projects."""
+        arrange, acted, _ = stage
+        arrange({"status": "Terminal", "pid": 1})
+        searched = []
+        monkeypatch.setattr(watch_relay, "resolve_session",
+                            lambda prefix, projects_dir=None, registry=None:
+                            searched.append(projects_dir) or (self.SID, "/tmp"))
+        watch_relay.archive_session(self.SID, projects_dir="/somewhere/else")
+        assert searched == ["/somewhere/else"]
+
+    # -- the Claude app --------------------------------------------------------
+
+    def test_the_app_is_asked_in_the_wrists_own_inbox_words(self, stage, monkeypatch):
+        """The ask goes through the same envelope as any wrist message
+        (brief, "⌚" first), never as bare text the session might ignore."""
+        import tapproval_wire as wire
+        arrange, acted, _ = stage
+        arrange({"status": "Desktop", "pid": 1}, archived=False)
+        sent = []
+        monkeypatch.setattr(watch_relay, "post_to_inbox",
+                            lambda entry, text, brief=False, timeout=None:
+                            sent.append(wire.wrist_inbox_message(text, brief=brief)) or True)
+        assert watch_relay.archive_session(self.SID) == "asked"
+        assert sent == [wire.wrist_inbox_message(watch_relay.ARCHIVE_ASK, brief=True)]
+        assert watch_relay.ARCHIVE_ASK in sent[0]
+
+    def test_a_denied_ask_stays_asked(self, relay):
+        """The wearer said no to the app's card: the app never archived it,
+        so a retry with the same id says "asked" again and asks nothing."""
+        base, ran, words = relay
+        words["archive"] = "asked"
+        words["app"] = False
+        body = {"session_id": self.SID, "request_id": "5" * 32}
+        for _ in range(2):
+            assert relay_call(base + "/archive", token="devicetoken", method="POST",
+                              body=body)[1] == {"ok": True, "status": "asked"}
+        assert len(ran) == 1
+
+    # -- the route, with the real queue, receipts and limits -------------------
+
+    def test_a_card_in_the_queue_reaches_the_archive_as_waiting(self, fresh_auth, monkeypatch):
+        watch_relay.LIMITS.reset()
+        seen = []
+        monkeypatch.setattr(watch_relay, "archive_session",
+                            lambda prefix, waiting=(), agent=None:
+                            seen.append(list(waiting)) or "card waiting")
+        server, queue = watch_relay.serve(port=0, auth=_known_watch(fresh_auth))
+        _serve(server)
+        try:
+            threading.Thread(target=lambda: queue.submit(
+                {"tier": "HIGH", "headline": "x", "detail": "x", "session_id": self.SID}, 3.0),
+                daemon=True).start()
+            deadline = time.monotonic() + 2
+            while not queue.pending() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            reply = relay_call(base + "/archive", token="devicetoken", method="POST",
+                               body={"session_id": self.SID[:8]})
+        finally:
+            server.shutdown()
+            server.server_close()
+        assert reply == (200, {"ok": False, "status": "card waiting"})
+        assert seen == [[self.SID]]
+
+    def test_a_request_id_that_is_not_one_is_refused(self, relay):
+        base, ran, _ = relay
+        reply = relay_call(base + "/archive", token="devicetoken", method="POST",
+                           body={"session_id": self.SID, "request_id": "not-an-id"})
+        assert reply == (400, {"ok": False, "status": "invalid request id"})
+        assert ran == []
+
+    def test_a_claim_a_crash_left_is_never_acted_on_again(self, relay, fresh_auth):
+        """A relay that died between the claim and the answer may have
+        stopped the session. The same id is answered "pending", which the
+        watch shows as "check your computer", and nothing runs twice."""
+        import uuid
+        base, ran, _ = relay
+        body = {"session_id": self.SID, "request_id": "6" * 32}
+        store = watch_relay.NewReceipts(fresh_auth.path + ".archive.sqlite3")
+        key = watch_relay._send_key("devicetoken", "/archive-receipt", uuid.UUID("6" * 32).hex)
+        store.claim(key, watch_relay._send_key("", "/archive", body))
+        reply = relay_call(base + "/archive", token="devicetoken", method="POST", body=body)
+        assert reply == (200, {"ok": False, "status": "pending"})
+        assert ran == []
+
+    def test_a_receipt_store_that_cannot_be_read_is_said(self, relay, monkeypatch):
+        base, ran, _ = relay
+
+        def broken(self, key, fingerprint):
+            raise OSError("disk")
+        monkeypatch.setattr(watch_relay.NewReceipts, "read", broken)
+        reply = relay_call(base + "/archive", token="devicetoken", method="POST",
+                           body={"session_id": self.SID, "request_id": "7" * 32})
+        assert reply == (503, {"ok": False, "status": "receipt unavailable"})
+        assert ran == []
+
+    @pytest.mark.parametrize("route", ["/archive", "/restore"])
+    def test_archive_and_restore_share_the_send_budget(self, relay, route):
+        """Six sends a minute from one watch, archive and restore included:
+        a stuck list cannot be emptied faster than messages can be sent.
+        The refusal carries no status word, which the watch reads by its
+        HTTP 429."""
+        base, ran, _ = relay
+        for n in range(6):
+            relay_call(base + "/archive", token="devicetoken", method="POST",
+                       body={"session_id": self.SID[:8 + n]})
+        status, reply = relay_call(base + route, token="devicetoken", method="POST",
+                                   body={"session_id": self.THREAD, "agent": "codex"})
+        assert status == 429 and "status" not in reply and reply.get("error")
+
+    # -- restore's own refusals --------------------------------------------------
+
+    @pytest.mark.parametrize("answer,word", [
+        ({"ok": False, "reason": "Codex refused: active writer 01a19801-08ad"}, "codex refused"),
+        ({"ok": False, "uncertain": True}, "uncertain"),
+        ({"ok": False, "reason": "Can't reach Codex on this Mac"}, "Can't reach Codex on this Mac"),
+        ({"ok": False, "reason": "Codex is open on two servers"}, "Codex is open on two servers"),
+        ({"ok": False, "reason": "Can't verify which Codex server owns this chat"},
+         "Can't verify which Codex server owns this chat"),
+        ({"ok": False, "reason": "anything else"}, "could not restore"),
+    ])
+    def test_restores_refusals_reach_the_wrist_as_words(self, stage, capsys, answer, word):
+        arrange, acted, _ = stage
+        arrange(codex_answer=answer)
+        assert watch_relay.restore_session(self.THREAD, agent="codex") == word
+        assert "relay: restore codex 01a19801 %s" % word in capsys.readouterr().err
+
+    @pytest.mark.parametrize("prefix", [THREAD.upper(), THREAD[:30], THREAD + "0", ""])
+    def test_only_a_whole_chat_id_is_restored(self, stage, prefix):
+        """Codex's list no longer shows an archived chat, so nothing can
+        complete a prefix: only the id the watch kept is accepted."""
+        arrange, acted, _ = stage
+        arrange()
+        assert watch_relay.restore_session(prefix, agent="codex") == "unknown session"
+        assert acted == []
+
+    def test_a_restore_sent_twice_in_half_a_minute_is_done_once(self, relay):
+        base, ran, _ = relay
+        body = {"session_id": self.THREAD, "agent": "codex"}
+        first = relay_call(base + "/restore", token="devicetoken", method="POST", body=body)
+        second = relay_call(base + "/restore", token="devicetoken", method="POST", body=body)
+        assert first[1]["status"] == second[1]["status"] == "restored"
+        assert second[1].get("repeat") is True and len(ran) == 1
+
+    # -- the app's record, at its limits ------------------------------------------
+
+    def test_an_oversized_app_file_is_not_read(self, tmp_path, monkeypatch):
+        self._app_file(tmp_path, "local_big.json", self.SID, True)
+        monkeypatch.setattr(watch_dashboard, "CLAUDE_APP_FILE_BYTES", 10)
+        assert watch_dashboard.claude_app_archived(self.SID, root=str(tmp_path)) is None
+
+    def test_only_the_newest_app_files_are_read(self, tmp_path, monkeypatch):
+        self._app_file(tmp_path, "local_old.json", self.SID, True)
+        old = tmp_path / "acct" / "org" / "local_old.json"
+        os.utime(old, (1, 1))
+        self._app_file(tmp_path, "local_new.json", "someone-else", False)
+        monkeypatch.setattr(watch_dashboard, "CLAUDE_APP_FILES_READ", 1)
+        assert watch_dashboard.claude_app_archived(self.SID, root=str(tmp_path)) is None
+
+    # -- /thread's hold for a chat that is nowhere -----------------------------------
+
+    def test_when_every_waiter_is_busy_the_answer_is_at_once(self):
+        """Eight archived rows held at once must not hold a ninth question:
+        it is answered "nothing" straight away."""
+        held = [watch_relay._THREAD_WAITERS.acquire(blocking=False) for _ in range(8)]
+        try:
+            started = time.monotonic()
+            assert watch_relay.thread_appears(lambda: "found", 5) is None
+            assert time.monotonic() - started < 0.2
+        finally:
+            for ok in held:
+                if ok:
+                    watch_relay._THREAD_WAITERS.release()
+
+    def test_a_card_arriving_ends_the_hold(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "THREAD_WAIT_STEP", 0.01)
+        calls = []
+        started = time.monotonic()
+        assert watch_relay.thread_appears(lambda: None, 5,
+                                          still=lambda: calls.append(1) or len(calls) < 3) is None
+        assert time.monotonic() - started < 1
+
+    def test_the_hold_is_never_longer_than_its_cap(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "THREAD_WAIT_MAX", 0.2)
+        monkeypatch.setattr(watch_relay, "THREAD_WAIT_STEP", 0.02)
+        started = time.monotonic()
+        assert watch_relay.thread_appears(lambda: None, 60) is None
+        assert time.monotonic() - started < 1
+
+
+_REAL_END_SESSION = watch_relay.end_session
 
 # ---- the encrypted listener (#645 S4) --------------------------------------
 
@@ -24163,6 +24549,37 @@ def _parses_as_json(raw):
     except ValueError:  # UnicodeDecodeError included
         return False
     return True
+
+
+class TestWindowsProcessList:
+    """`_windows_processes` read PowerShell in the console's code page and
+    caught no decode error, so one process with a non-ASCII command line
+    raised through every caller (2026-11-01 review)."""
+
+    def test_it_asks_for_utf8_and_replaces_what_will_not_decode(self, monkeypatch):
+        import subprocess
+        import tapproval_host
+        seen = {}
+
+        class Done:
+            stdout = "42\tPC\\me\tclaude --resume caf\ufffd\n"
+
+        def run(argv, **kw):
+            seen.update(kw, script=argv[-1])
+            return Done()
+        monkeypatch.setattr(subprocess, "run", run)
+        assert tapproval_host._windows_processes() == [(42, "PC\\me", "claude --resume caf\ufffd")]
+        assert seen.get("encoding") == "utf-8" and seen.get("errors") == "replace", seen
+        assert "OutputEncoding" in seen["script"], "PowerShell must write UTF-8 to read it as UTF-8"
+
+    def test_a_decode_error_is_nothing_not_a_crash(self, monkeypatch):
+        import subprocess
+        import tapproval_host
+
+        def run(argv, **kw):
+            raise UnicodeDecodeError("cp1252", b"\x81", 0, 1, "undefined")
+        monkeypatch.setattr(subprocess, "run", run)
+        assert tapproval_host._windows_processes() == []
 
 
 class TestSealedTravelRoad:
@@ -24824,6 +25241,41 @@ class TestWhatTheShellUnquotes:
     ])
     def test_an_ordinary_read_stays_safe(self, tool, tool_input):
         assert crc.classify({"tool_name": tool, "tool_input": tool_input})["risk"] == Risk.SAFE
+
+    # The 2026-11-01 review: each of these read SAFE or LOW on main.
+    @pytest.mark.parametrize("command", [
+        'grep -r "" ~/.aws', "ls ~/.ssh", "tar czf x.tgz ~/.gnupg",
+        "cat ~/.codex/auth.json", "rg token $HOME/.appstoreconnect",
+    ])
+    def test_a_secret_folder_named_without_its_slash_is_a_secret_read(self, command):
+        assert crc.classify_bash(command)[0] >= Risk.HIGH, crc.classify_bash(command)
+
+    @pytest.mark.parametrize("command", [
+        "cat notes.aws", "ls ~/.sshd_config_backups", "grep x my.gnupg-guide.md",
+        "cat ~/.codex/config.toml",
+    ])
+    def test_a_name_that_only_contains_one_stays_as_it_was(self, command):
+        assert "secret-access" not in crc.classify_bash(command)[1], crc.classify_bash(command)
+
+    @pytest.mark.parametrize("tool, tool_input", [
+        ("Read", {"file_path": "/Users/u/.codex/auth.json"}),
+        ("Grep", {"pattern": "x", "path": "/Users/u", "glob": ".aws/*"}),
+        ("Grep", {"pattern": "x", "glob": "**/.ss?/*"}),
+        ("mcp__fs__read_file", {"path": "/Users/u/.ssh/id_rsa"}),
+        ("mcp__fs__read_text_file", {"path": "~/.aws"}),
+    ])
+    def test_a_secret_named_any_other_way_is_a_secret_read(self, tool, tool_input):
+        result = crc.classify({"tool_name": tool, "tool_input": tool_input})
+        assert result["risk"] >= Risk.HIGH, result
+
+    @pytest.mark.parametrize("tool, tool_input", [
+        ("Grep", {"pattern": "x", "glob": "*.py"}),
+        ("mcp__slack__send_message", {"text": "the credentials doc is ready"}),
+        ("mcp__fs__read_file", {"path": "/Users/u/proj/README.md"}),
+    ])
+    def test_and_no_further(self, tool, tool_input):
+        result = crc.classify({"tool_name": tool, "tool_input": tool_input})
+        assert "secret-read" not in result["rules"], result
 
     def test_git_internals_in_any_case(self):
         assert crc.classify_path("/Users/u/proj/.GIT/hooks/pre-commit",

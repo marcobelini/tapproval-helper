@@ -2433,7 +2433,12 @@ def _archive_codex(prefix, waiting):
         return None, "unknown session"
     if _card_waits(found[0], waiting):
         return found[0], "card waiting"
-    return found[0], _codex_archive_word(archive_codex_thread(found[0]), "archived")
+    word = _codex_archive_word(archive_codex_thread(found[0]), "archived")
+    if word == "archived":
+        # Off the relay's copy of Codex's list now: the watch asks for the
+        # list the moment it hears this (archive-e2e.sh, #1170).
+        codex_sessions.forget_chat(found[0])
+    return found[0], word
 
 
 def _archive_claude(prefix, waiting, projects_dir=None):
@@ -2478,7 +2483,8 @@ def archive_session(prefix, waiting=(), agent=None, projects_dir=None):
     import codex_sessions
     codex = agent == "codex" or (agent is None and codex_sessions.find_rollout(prefix))
     try:
-        session_id, word = (_archive_codex if codex else _archive_claude)(prefix, waiting)
+        session_id, word = (_archive_codex(prefix, waiting) if codex
+                            else _archive_claude(prefix, waiting, projects_dir))
     except Exception as error:  # noqa: BLE001 — one tap must not take the relay down
         session_id, word = None, "could not archive"
         print("relay: archive failed: %s: %s" % (type(error).__name__, error), file=sys.stderr)
@@ -2497,6 +2503,9 @@ def restore_session(prefix, agent=None):
         return "unknown session"
     from codex_talk import unarchive_codex_thread
     word = _codex_archive_word(unarchive_codex_thread(prefix), "restored")
+    if word == "restored":
+        import codex_sessions
+        codex_sessions.recall_chat(prefix)
     print("relay: restore codex %s %s" % (prefix[:8], word), file=sys.stderr)
     return word
 
@@ -3439,19 +3448,27 @@ def _normal_ip(ip):
 def _local_addresses(run=None):
     """Every address on this machine's interfaces — Wi-Fi, Ethernet, the
     tailnet, IPv6 — as address objects. Never raises; empty when no lister
-    answers. `ifconfig` on a Mac, `ip -o addr` where that is what there is.
+    answers. `ifconfig` on a Mac, `ip -o addr` where that is what there is,
+    `ipconfig` on Windows, which has neither and so listed nothing until the
+    2026-11-01 review. Read with bad bytes replaced: an adapter's name in
+    the console's code page must not cost the addresses beside it.
 
     A process here can bind its socket to one of this Mac's addresses and
     dial another, so "the peer is the address it dialled" alone let it pair
     as a watch and answer its own CRITICAL card (2026-10-19 review)."""
     run = run or subprocess.run
     found = set()
-    for argv in (["ifconfig"], ["ip", "-o", "addr"]):
+    inet = r"\binet6?\s+([0-9A-Fa-f:.%a-zA-Z0-9]+?)(?:/\d+)?(?=\s)"
+    # "IPv4 Address. . . : 192.168.1.42(Preferred)", "IPv4-Adresse …" too.
+    ipconfig = r"IPv[46][^:\r\n]*:\s*([0-9A-Fa-f:.]+(?:%\w+)?)"
+    for argv, pattern in ((["ifconfig"], inet), (["ip", "-o", "addr"], inet),
+                          (["ipconfig"], ipconfig)):
         try:
-            out = run(argv, capture_output=True, text=True, timeout=3).stdout or ""
+            out = run(argv, capture_output=True, text=True, errors="replace",
+                      timeout=3).stdout or ""
         except (OSError, subprocess.SubprocessError, ValueError):
             continue
-        for match in re.finditer(r"\binet6?\s+([0-9A-Fa-f:.%a-zA-Z0-9]+?)(?:/\d+)?(?=\s)", out):
+        for match in re.finditer(pattern, out):
             address = _normal_ip(match.group(1))
             if address is not None:
                 found.add(address)
