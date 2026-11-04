@@ -33,6 +33,7 @@ footer { padding:36px 0 56px; border-top:1px solid var(--hair); color:var(--mute
 .cta { min-height:48px; box-sizing:border-box }
 .grid.three { grid-template-columns:repeat(3,minmax(0,1fr)) } .grid.two { grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px } .grid.two .card { padding:18px }
 .eyebrow { font-size:12px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--coral); margin:0 0 10px }
+.soon { display:inline-block; vertical-align:middle; font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); border:1px solid var(--hair); border-radius:999px; padding:1px 8px; margin-left:10px }
 .codex { display:grid; grid-template-columns:1.25fr .75fr; gap:40px; align-items:center } .codex h2 { font-size:32px; line-height:1.15 } .codex .note { color:#c9c9ce; font-size:15px; margin:20px 0 0 }
 .wrist { justify-self:center; width:min(100%,280px); aspect-ratio:416/496; border-radius:52px; background:#000; box-shadow:0 30px 80px rgba(0,0,0,.6), inset 0 0 0 1px rgba(255,255,255,.12); padding:22px 14px 0; overflow:hidden; font-size:13px }
 .wrist-top { display:flex; align-items:center; gap:6px; margin:0 6px 12px; color:var(--muted); font-size:14px } .wrist-top b { margin-left:auto; margin-right:24px; color:var(--text); font-size:21px; font-weight:600 }

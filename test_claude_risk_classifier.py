@@ -2994,6 +2994,243 @@ class TestCodexActiveSessions:
 
 class TestCodexCatalog:
     @staticmethod
+    def _comparison():
+        # Product-only validation tool: the public helper omits it. Load
+        # it only in private_layout tests, as the login-item tests do.
+        return importlib.import_module("codex_catalog_check")
+
+    def test_status_transitions_are_logged_once_without_session_details(self, capsys):
+        import codex_sessions as cx
+        row = {"session_id": "private-session-id", "title": "private user text", "can_send": True}
+        catalog = cx.SessionCatalog(lambda: ([row], {}))
+        catalog.refresh()
+        catalog.refresh()
+        def fail():
+            raise OSError("private connection detail")
+        catalog.reader = fail
+        catalog.refresh()
+        catalog.refresh()
+        assert catalog.snapshot() == {"sessions": [dict(row, can_send=False)], "status": "unavailable"}
+        catalog.reader = lambda: ([], {})
+        catalog.refresh()
+        catalog.refresh()
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.splitlines() == [
+            "relay: codex catalog loading -> ready (1 rows)",
+            "relay: codex catalog ready -> unavailable (1 rows)",
+            "relay: codex catalog unavailable -> ready (0 rows)",
+        ]
+        assert catalog.snapshot() == {"sessions": [], "status": "ready"}
+
+    def test_failed_initial_catalog_read_logs_loading_to_unavailable(self, capsys):
+        import codex_sessions as cx
+        def fail():
+            raise ValueError("private invalid page")
+        catalog = cx.SessionCatalog(fail)
+        catalog.refresh()
+        catalog.refresh()
+        assert capsys.readouterr().err == "relay: codex catalog loading -> unavailable (0 rows)\n"
+
+    def test_closed_catalog_log_does_not_discard_a_healthy_snapshot(self, monkeypatch):
+        import codex_sessions as cx
+        class ClosedLog:
+            def write(self, _text):
+                raise OSError("closed")
+        row = {"session_id": "catalog-0001", "can_send": True}
+        catalog = cx.SessionCatalog(lambda: ([row], {}))
+        monkeypatch.setattr(cx.sys, "stderr", ClosedLog())
+        catalog.refresh()
+        assert catalog.snapshot() == {"sessions": [row], "status": "ready"}
+
+    def test_a_closed_stderr_stream_does_not_break_catalog_recovery(self, monkeypatch):
+        import io
+        import codex_sessions as cx
+        stream = io.StringIO()
+        stream.close()
+        monkeypatch.setattr(cx.sys, "stderr", stream)
+        row = {"session_id": "catalog-0001", "can_send": True}
+        catalog = cx.SessionCatalog(lambda: ([row], {}))
+        catalog.refresh()
+        assert catalog.snapshot() == {"sessions": [row], "status": "ready"}
+        def fail():
+            raise OSError("disconnected")
+        catalog.reader = fail
+        catalog.refresh()
+        assert catalog.snapshot() == {"sessions": [dict(row, can_send=False)], "status": "unavailable"}
+        catalog.reader = lambda: ([], {})
+        catalog.refresh()
+        assert catalog.snapshot() == {"sessions": [], "status": "ready"}
+
+    @pytest.mark.parametrize("broken", [([None], {}), ([], None)])
+    def test_malformed_refresh_keeps_the_last_snapshot_unavailable(self, broken):
+        import codex_sessions as cx
+        row = {"session_id": "catalog-0001", "can_send": True}
+        catalog = cx.SessionCatalog(lambda: ([row], {}))
+        catalog.refresh()
+        catalog.reader = lambda: broken
+        catalog.refresh()
+        assert catalog.snapshot() == {"sessions": [dict(row, can_send=False)], "status": "unavailable"}
+
+    def test_logging_preserves_archive_during_an_inflight_refresh(self, capsys):
+        import threading
+        import codex_sessions as cx
+        row = {"session_id": "catalog-0001", "title": "Private name", "can_send": True}
+        sid = row["session_id"]
+        catalog = cx.SessionCatalog(lambda: ([row], {sid: "/private/transcript"}))
+        catalog.refresh()
+        entered, release = threading.Event(), threading.Event()
+        def delayed():
+            entered.set()
+            assert release.wait(5), "test reader was not released"
+            return [row], {sid: "/private/transcript"}
+        catalog.reader = delayed
+        worker = threading.Thread(target=catalog.refresh)
+        worker.start()
+        try:
+            assert entered.wait(5), "test reader did not start"
+            catalog.forget(sid)
+        finally:
+            release.set()
+            worker.join(5)
+        assert not worker.is_alive()
+        assert catalog.snapshot() == {"sessions": [], "status": "ready"}
+        assert catalog.paths == {}
+        catalog.recall(sid)
+        catalog.refresh()
+        assert catalog.snapshot() == {"sessions": [row], "status": "ready"}
+        assert catalog.paths == {sid: "/private/transcript"}
+        assert capsys.readouterr().err == "relay: codex catalog loading -> ready (1 rows)\n"
+
+    @pytest.mark.private_layout
+    def test_native_comparison_capture_reads_every_page_without_mutations(self):
+        check = self._comparison()
+        capture_native, native_rows = check.capture_native, check.native_rows
+        responses = iter([
+            {"data": [self.row()], "nextCursor": "older"},
+            {"data": [self.row("catalog-0002", name="Older"),
+                      self.row("catalog-0003", source="exec")], "nextCursor": None},
+        ])
+        cursors = []
+        def rpc(method, params):
+            assert method == "thread/list"
+            assert params["archived"] is False and params["useStateDbOnly"] is True
+            cursors.append(params["cursor"])
+            return next(responses)
+        assert native_rows(capture_native(rpc)) == {"catalog-0001": "Phone name", "catalog-0002": "Older"}
+        assert cursors == [None, "older"]
+
+    @pytest.mark.private_layout
+    def test_native_comparison_capture_refuses_cyclic_paging(self):
+        capture_native = self._comparison().capture_native
+        calls = []
+        def rpc(method, params):
+            calls.append(method)
+            return {"data": [], "nextCursor": "same"}
+        with pytest.raises(ValueError):
+            capture_native(rpc)
+        assert calls == ["thread/list", "thread/list"]
+
+    @pytest.mark.private_layout
+    def test_comparison_catches_missing_extra_and_renamed_chats(self):
+        compare = self._comparison().compare
+        native = {"archived": False, "pages": [
+            {"cursor": None, "data": [self.row()], "nextCursor": "older"},
+            {"cursor": "older", "data": [self.row("catalog-0002", name="Older")], "nextCursor": None},
+        ]}
+        helper = {"pages": [{"cursor": None, "next_cursor": None, "codex_status": "ready",
+            "sessions": [{"agent": "claude", "session_id": "cc", "title": "Claude"},
+                         {"agent": "codex", "session_id": "catalog-0001", "title": "Old name"},
+                         {"agent": "codex", "session_id": "catalog-0003", "title": "Archived"}]}]}
+        assert compare(native, helper) == {
+            "match": False, "native_count": 2, "helper_count": 2,
+            "missing": ["catalog-0002"], "extra": ["catalog-0003"],
+            "title_mismatch": ["catalog-0001"],
+        }
+        helper["pages"][0]["sessions"] = [
+            {"agent": "codex", "session_id": "catalog-0002", "title": "Older"}]
+        helper["pages"][0]["next_cursor"] = "rest"
+        helper["pages"].append({"cursor": "rest", "next_cursor": None, "codex_status": "ready",
+            "sessions": [{"agent": "codex", "session_id": "catalog-0001", "title": "Phone name"}]})
+        assert compare(native, helper)["match"] is True
+
+    @pytest.mark.private_layout
+    @pytest.mark.parametrize("source,problem", [
+        ("native", "open"), ("helper", "open"),
+        ("native", "disconnected"), ("helper", "disconnected"),
+        ("native", "cycle"), ("helper", "cycle"),
+        ("native", "missing-terminal"), ("helper", "missing-terminal"),
+        ("native", "after-terminal"), ("helper", "after-terminal"),
+    ])
+    def test_comparison_rejects_incomplete_or_invalid_pagination(self, source, problem):
+        compare = self._comparison().compare
+        native = {"archived": False, "pages": [{"cursor": None, "data": [], "nextCursor": None}]}
+        helper = {"pages": [{"cursor": None, "sessions": [], "next_cursor": None, "codex_status": "ready"}]}
+        capture = native if source == "native" else helper
+        key = "nextCursor" if source == "native" else "next_cursor"
+        page = capture["pages"][0]
+        if problem == "open":
+            page[key] = "more"
+        elif problem == "missing-terminal":
+            del page[key]
+        elif problem == "disconnected":
+            page["cursor"] = "skipped-first-page"
+        elif problem == "cycle":
+            page[key] = "same"
+            capture["pages"].append(dict(page, cursor="same"))
+        else:
+            capture["pages"].append(dict(page))
+        with pytest.raises(ValueError):
+            compare(native, helper)
+
+    @pytest.mark.private_layout
+    @pytest.mark.parametrize("problem", ["loading", "unavailable", "duplicate", "invalid-id", "archived", "unknown-agent"])
+    def test_comparison_never_calls_unavailable_or_malformed_data_a_match(self, problem):
+        compare = self._comparison().compare
+        native = {"archived": False, "pages": [{"cursor": None, "data": [self.row()], "nextCursor": None}]}
+        row = {"agent": "codex", "session_id": "catalog-0001", "title": "Phone name"}
+        page = {"cursor": None, "sessions": [row], "next_cursor": None, "codex_status": "ready"}
+        if problem in ("loading", "unavailable"):
+            page["codex_status"] = problem
+        elif problem == "duplicate":
+            page["sessions"].append(dict(row))
+        elif problem == "invalid-id":
+            row["session_id"] = None
+        elif problem == "unknown-agent":
+            row["agent"] = "unsupported"
+        else:
+            native["pages"][0]["data"][0]["archived"] = True
+        with pytest.raises(ValueError):
+            compare(native, {"pages": [page]})
+
+    @pytest.mark.private_layout
+    def test_comparison_is_offline_and_omits_private_ids_by_default(self, tmp_path, monkeypatch, capsys):
+        check = self._comparison()
+        import codex_sessions as cx
+        def no_discovery(row):
+            assert row["path"] is None
+            return None
+        monkeypatch.setattr(cx, "_catalog_delivery_path", no_discovery)
+        native = {"archived": False, "pages": [{"cursor": None, "data": [self.row(
+            path="/private/transcript")], "nextCursor": None}]}
+        helper = {"pages": [{"cursor": None, "sessions": [], "next_cursor": None, "codex_status": "ready"}]}
+        native_file, helper_file = tmp_path / "native.json", tmp_path / "helper.json"
+        native_file.write_text(json.dumps(native))
+        helper_file.write_text(json.dumps(helper))
+        before = native_file.read_bytes(), helper_file.read_bytes()
+        args = ["--native", str(native_file), "--helper", str(helper_file)]
+        assert check.main(args) == 1
+        out = capsys.readouterr().out
+        assert "catalog-0001" not in out and json.loads(out)["missing"] == 1
+        assert check.main(args + ["--details"]) == 1
+        assert json.loads(capsys.readouterr().out)["missing"] == ["catalog-0001"]
+        assert before == (native_file.read_bytes(), helper_file.read_bytes())
+        helper_file.write_text("invalid JSON containing private text")
+        assert check.main(args) == 2
+        out, err = capsys.readouterr()
+        assert out == "" and "private text" not in err
+
+    @staticmethod
     def database(tmp_path):
         import sqlite3
         path = tmp_path / "state_5.sqlite"

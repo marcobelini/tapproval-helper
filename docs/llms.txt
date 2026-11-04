@@ -53,6 +53,8 @@
 - App Store, outside the EU for now: https://apps.apple.com/app/tapproval/id6805869018
 - TestFlight beta, everywhere: https://testflight.apple.com/join/dW1tYBQG
 - Helper source: https://github.com/marcobelini/tapproval-helper
+- More apps by the same maker, including Tapmerge (GitHub pull requests
+  and issues on the Apple Watch, in development): https://apps.thoughtfulsteward.org
 
 ## Privacy
 Tapproval collects nothing: no accounts, no analytics, no servers of ours.

@@ -1153,7 +1153,7 @@ class TestCodexTalkingBack:
         assert commands == [] and spawned == []
 
     @pytest.mark.parametrize('policy', ['never', 'on-request', 'untrusted'])
-    def test_a_verified_restricted_live_queue_uses_only_its_uuid(self, setup, monkeypatch, policy):
+    def test_recorded_restrictions_cannot_authorize_a_live_queue(self, setup, monkeypatch, policy):
         import subprocess
         _, sessions, sid, path, _, _, spawned, send = setup
         monkeypatch.setattr(sessions.subprocess, 'run', lambda command, **_kwargs:
@@ -1166,11 +1166,29 @@ class TestCodexTalkingBack:
         def run(command, **kwargs):
             commands.append(command)
             return subprocess.CompletedProcess(command, 0, '', '')
-        assert send(runner=run) == 'sent'
-        assert commands[0][:4] == ['/bin/codex', 'queue', '--thread', sid]
-        from tapproval_wire import codex_wrist_words
-        assert codex_wrist_words(commands[0][-1]) == 'check the fix'
+        # A Terminal can change permissions without writing another turn_context.
+        # Even a just-written, restricted context cannot guard queue consumption.
+        assert 'permission limits' in send(runner=run)
+        assert commands == [] and spawned == []
+
+    @pytest.mark.parametrize('tail', [b'\xe2', b'\xf0\x9f', b'\xff\n'])
+    def test_incomplete_utf8_context_is_unavailable_without_crashing_reply(self, setup, tail):
+        talk, _, _, path, _, socket, spawned, send = setup
+        with path.open('ab') as handle:
+            handle.write(b'{"type":"turn_context","payload":{"cwd":"' + tail)
+        assert talk.context(str(path)) is None
+        assert send(connect=lambda: socket) == 'sent'
+        turn = next(m for m in socket.sent if m.get('method') == 'turn/start')
+        assert turn['params']['sandboxPolicy'] == talk.POLICY
+        assert turn['params']['approvalsReviewer'] == 'user'
         assert not spawned
+
+    def test_invalid_utf8_does_not_reuse_an_older_permission_context(self, setup):
+        talk, _, _, path, _, _, _, _ = setup
+        with path.open('ab') as handle:
+            handle.write(json.dumps({'type': 'turn_context', 'payload': {
+                'approvals_reviewer': 'user'}}).encode() + b'\n' + b'\xff')
+        assert talk.context(str(path)) is None
 
     def test_claude_commands_are_not_sent_to_codex(self, setup):
         talk, _, _, _, _, _, spawned, send = setup
@@ -1270,7 +1288,7 @@ class TestCodexTalkingBack:
         warning = ('lsof: WARNING: can\'t stat() devicefs file system %s\n'
                    '      Output information may be incomplete.\n'
                    '      assuming "dev=%x" from mount table\n' % (mount, path.stat().st_dev + 1))
-        monkeypatch.setattr(talk.subprocess, 'run', lambda *a, **k:
+        monkeypatch.setattr(talk.sessions.subprocess, 'run', lambda *a, **k:
                             subprocess.CompletedProcess(a[0], 1, '', warning))
         assert send() == 'sent'
         assert not spawned
@@ -1287,7 +1305,7 @@ class TestCodexTalkingBack:
         warning = ('lsof: WARNING: can\'t stat() devicefs file system %s\n'
                    '      Output information may be incomplete.\n'
                    '      assuming "dev=%x" from mount table\n' % (mount, path.stat().st_dev + 1))
-        monkeypatch.setattr(talk.subprocess, 'run', lambda *a, **k:
+        monkeypatch.setattr(talk.sessions.subprocess, 'run', lambda *a, **k:
                             subprocess.CompletedProcess(a[0], 0, 'n' + str(path) + '\n', warning))
         assert talk.activity(str(path), sid) is True
         assert 'permission limits' in send()
@@ -1320,7 +1338,7 @@ class TestCodexTalkingBack:
         if problem == 'missing-file':
             # Exercise the stat failure without changing rollout discovery.
             monkeypatch.setattr(talk.os, 'stat', lambda *_a, **_k: (_ for _ in ()).throw(OSError()))
-        monkeypatch.setattr(talk.subprocess, 'run', lambda *a, **k:
+        monkeypatch.setattr(talk.sessions.subprocess, 'run', lambda *a, **k:
                             subprocess.CompletedProcess(a[0], 2 if problem == 'bad-exit' else 1,
                                                         '', warning))
         # Calling activity directly also covers a missing target without

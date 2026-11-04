@@ -2,7 +2,8 @@
 
 The shared app-server can apply a sandbox to a new turn. The CLI queue
 cannot: its sandbox flags are ignored for an existing thread (verified on
-0.164.0-alpha.11.1). Never enqueue into an unverified permission context.
+0.164.0-alpha.11.1). Queue delivery stays disabled: a recorded context
+cannot guard the permissions in effect when a message is consumed.
 """
 from __future__ import annotations
 
@@ -137,7 +138,10 @@ def _archive_thread(thread_id, method):
                 raise ValueError("invalid archive receipt")
             return {"ok": True}
         except RpcRefused as error:
-            return {"ok": False, "reason": ("Codex refused: " + error.reason)[:60]}
+            if re.search(r"\balready has an active writer\b", error.reason, re.IGNORECASE):
+                return {"ok": False, "reason": "Codex refused: chat has an active writer"}
+            action = "archive" if method == "thread/archive" else "restore"
+            return {"ok": False, "reason": "Codex refused to %s this chat" % action}
         except (OSError, EOFError, ValueError, TypeError, KeyError, AttributeError):
             # The mutation may have happened. Never fall back or retry it.
             action = "archive" if method == "thread/archive" else "restore"
@@ -167,34 +171,20 @@ def context(path):
                 row = sessions._json_object(line)
                 if row and row.get("type") == sessions.shape("record.context"):
                     found = row.get("payload")
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     return found if isinstance(found, dict) else None
 
 
 def queue_safe(path):
-    """The native queue inherits these limits; it cannot establish them.
+    """No rollout can prove the policy a queued message will inherit.
 
-    Approval requests must already use human review. A queued follow-up
-    cannot change the reviewer or narrow the filesystem or network policy.
+    Terminal permission changes need not write another turn_context. Even
+    a fresh snapshot can change before the queue consumes the message, and
+    the queue has no atomic permission override or precondition (0.166).
+    Keep this predicate for callers checking eligibility, always closed.
     """
-    row = context(path) or {}
-    sandbox = row.get("sandbox_policy")
-    if not isinstance(sandbox, dict):
-        return False
-    cwd = row.get("cwd") or (sessions._rollout_meta(path) or {}).get("cwd")
-    roots = sandbox.get("writable_roots") or []
-    if not isinstance(cwd, str) or not isinstance(roots, list):
-        return False
-    root = os.path.realpath(cwd)
-    if any(not isinstance(p, str) or not os.path.isabs(p)
-           or (os.path.realpath(p) != root and not os.path.realpath(p).startswith(root + os.sep))
-           for p in roots):
-        return False
-    return (row.get("approvals_reviewer") == "user"
-            and row.get("approval_policy") in ("never", "on-request", "untrusted")
-            and sandbox.get("type") in ("workspace-write", "read-only")
-            and sandbox.get("network_access") is False)
+    return False
 
 
 def _lsof_complete_for(path, stderr):
@@ -305,17 +295,9 @@ def send(prefix, text, binary, spawn, log, brief=True, connect=None, runner=None
     if live is None:
         return "Codex activity could not be verified; reopen the session before sending"
     if live:
-        if not queue_safe(path):
-            return ("Open this Codex session through the shared app-server to send from your watch; "
-                    "its current connection cannot enforce the watch's permission limits "
-                    "and human approval review")
-        try:
-            result = (runner or subprocess.run)(
-                [binary, "queue", "--thread", sid, "--message", text],
-                cwd=cwd, capture_output=True, text=True, timeout=3)
-            return "sent" if result.returncode == 0 else "Codex could not queue the message"
-        except (OSError, subprocess.SubprocessError):
-            return "Codex queue did not acknowledge the message; check the session before retrying"
+        return ("Open this Codex session through the shared app-server to send from your watch; "
+                "its current connection cannot enforce the watch's permission limits "
+                "and human approval review")
     # A private exec-resume would take the writer away from the phone and
     # Desktop. Reopen the same UUID on the shared owner instead. Native
     # writer locking still refuses a different process that appeared

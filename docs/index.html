@@ -28,118 +28,90 @@
 <link rel="stylesheet" href="style.css">
 <script type="application/ld+json">{"@context": "https://schema.org", "@type": "VideoObject", "name": "Approve Claude Code from your Apple Watch — Tapproval", "description": "Tapproval's demo: the session list, a CRITICAL command marked by its risk and denied with one tap, a plan and a reply read on the wrist, then one real Claude Code session, the watch beside the terminal or the phone: a question asked on the watch shows in both, and lines typed at the desk or sent from the phone reach the watch. Then what is new in 2.1: the Connection screen showing the road is encrypted, and a command that asks for words before it is sent. Then the quick commands: Recap and What's left? answered in the thread with one tap. And a first look at Codex. No account, no server of ours.", "thumbnailUrl": "https://tapproval.thoughtfulsteward.org/img/demo-poster.jpg", "contentUrl": "https://tapproval.thoughtfulsteward.org/media/tapproval-demo.mp4", "uploadDate": "2026-10-28", "duration": "PT86S"}</script>
 <script type="application/ld+json">{"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "Tapproval", "alternateName": "Tapproval for Apple Watch", "url": "https://tapproval.thoughtfulsteward.org/", "description": "A remote control for Claude Code and Codex on Apple Watch: approve permission prompts, answer questions and follow live sessions from your wrist.", "applicationCategory": "DeveloperApplication", "operatingSystem": "watchOS 10 or later", "softwareRequirements": "Claude Code or Codex on a Mac or Linux computer, or on Windows as a preview, with the free open-source helper Tapproval Base", "offers": [{"@type": "Offer", "name": "Free to start: the first 100 answers, shared by Claude Code and Codex", "price": "0", "priceCurrency": "USD"}, {"@type": "Offer", "name": "Unlock Forever: unlimited Claude Code answers, once", "price": "5.00", "priceCurrency": "USD"}, {"@type": "Offer", "name": "Unlock Codex: unlimited Codex answers, once", "price": "5.00", "priceCurrency": "USD"}], "downloadUrl": "https://apps.apple.com/app/tapproval/id6805869018", "installUrl": "https://apps.apple.com/app/tapproval/id6805869018", "image": "https://tapproval.thoughtfulsteward.org/img/share.png", "screenshot": ["https://tapproval.thoughtfulsteward.org/img/card.png", "https://tapproval.thoughtfulsteward.org/img/sessions.png", "https://tapproval.thoughtfulsteward.org/img/thread.png"], "publisher": {"@type": "Organization", "name": "Tapproval", "email": "tapproval@thoughtfulsteward.org", "url": "https://tapproval.thoughtfulsteward.org/", "logo": "https://tapproval.thoughtfulsteward.org/img/icon.png", "sameAs": ["https://apps.apple.com/app/tapproval/id6805869018", "https://github.com/marcobelini/tapproval-helper"]}, "sameAs": ["https://apps.apple.com/app/tapproval/id6805869018", "https://github.com/marcobelini/tapproval-helper"]}</script>
-<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "The watch can't find my computer", "acceptedAnswer": {"@type": "Answer", "text": "The watch and the computer must be on the same Wi-Fi, and a VPN on your iPhone must be fully connected or fully off. Then open Settings on the watch and tap the status card at the top (it opens Connection): every route gets a tick or a reason."}}, {"@type": "Question", "name": "How do I pair a second watch?", "acceptedAnswer": {"@type": "Answer", "text": "Tell Claude Code on your computer “Open Tapproval pairing”, then open Tapproval on the watch within ten minutes."}}, {"@type": "Question", "name": "How is Tapproval updated?", "acceptedAnswer": {"@type": "Answer", "text": "The helper checks at most once an hour and updates itself, never while a question is waiting on your wrist."}}, {"@type": "Question", "name": "How do I remove it?", "acceptedAnswer": {"@type": "Answer", "text": "Tell Claude Code “Uninstall Tapproval Base”. It restores your settings, keeps a backup and stops the bridge. Delete the app from the watch like any other."}}, {"@type": "Question", "name": "My phone still shows a question I answered", "acceptedAnswer": {"@type": "Answer", "text": "The command ran. The Claude app on a phone or iPad can keep displaying a prompt the watch already answered; it is a known Claude Code bug, and any message sent from the phone clears it."}}]}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "The watch can't find my computer", "acceptedAnswer": {"@type": "Answer", "text": "The watch and the computer must be on the same Wi-Fi, and a VPN on your iPhone must be fully connected or fully off. Then open Settings on the watch and tap the status card at the top (it opens Connection): every route gets a tick or a reason."}}, {"@type": "Question", "name": "How do I pair a second watch?", "acceptedAnswer": {"@type": "Answer", "text": "Tell Claude Code on your computer “Open Tapproval pairing”, then open Tapproval on the watch within ten minutes."}}, {"@type": "Question", "name": "My phone still shows a question I answered", "acceptedAnswer": {"@type": "Answer", "text": "The command ran. The Claude app on a phone or iPad can keep displaying a prompt the watch already answered; it is a known Claude Code bug, and any message sent from the phone clears it."}}]}</script>
 </head>
 <body>
 <div class="wrap">
 <header class="top">
   <img src="img/icon.png" width="36" height="36" alt=""><strong>Tapproval</strong>
-  <nav><a href="#demo">Demo</a><a href="#codex">Codex</a><a href="#how">How it works</a><a href="apple-watch-claude-code.html">Setup guide</a><a href="compare.html">Compare</a><a href="#support">Support</a><a href="https://apps.apple.com/app/tapproval/id6805869018">App Store</a></nav>
+  <nav><a href="#demo">Demo</a><a href="#how">How it works</a><a href="#support">Support</a><a href="https://apps.apple.com/app/tapproval/id6805869018">App Store</a></nav>
 </header>
 
 <section class="hero" style="border:0">
   <div>
     <h1>Your agent asks.<br><em>Your wrist answers.</em></h1>
-    <p class="lede">When the coding agent on your computer asks permission, the question lands on your Apple Watch and one tap answers it. No account, no server.</p>
-    <p class="agents"><span class="pill"><span class="dot on"></span>Claude Code</span><span class="pill"><span class="dot on"></span>Codex</span></p>
+    <p class="lede">When Claude Code or Codex on your computer asks permission, the question lands on your Apple Watch and one tap answers it. No account, no server.</p>
     <div class="ctas"><a class="cta" href="https://apps.apple.com/app/tapproval/id6805869018">Get it on the App Store</a><a class="cta quiet" href="https://testflight.apple.com/join/dW1tYBQG">Or try the beta<span class="spots"><!-- beta-spots -->84 spots left<!-- /beta-spots --></span></a></div>
-    <p class="fine">Your first 100 answers are free, shared by both agents; then $5 once unlocks each agent for good. It needs an Apple Watch and Claude Code or Codex on a Mac or Linux machine; Windows works too, as a preview. Not yet in the EU; the beta works everywhere, and the unlock is free there.</p>
+    <p class="fine">100 answers free, then $5 once. Works with a Mac or Linux computer, and Windows as a preview. Not yet in the EU; the beta works everywhere, and the unlock is free there.</p>
   </div>
   <div class="watch"><img src="img/card.png" width="416" height="496" fetchpriority="high" alt="Apple Watch showing a CRITICAL card: git push --force origin main, with deny and allow buttons"></div>
 </section>
 
 <section id="demo">
   <h2>See it in eighty seconds</h2>
-  <p class="sub">The session list, a CRITICAL command stopped in its session, a plan and a reply read as on the phone, one real session followed on watch, terminal and phone, a new session started, encryption on every road, a command that asks for your words, the quick commands that answer with one tap, and a first look at Codex.</p>
+  <p class="sub">Approve, deny, follow a session and talk back, all from the wrist.</p>
   <video class="demo" controls playsinline preload="none" width="1280" height="720" poster="img/demo-poster.jpg">
     <source src="media/tapproval-demo.mp4" type="video/mp4">
     <a href="media/tapproval-demo.mp4">Watch the demo (MP4, 4.7 MB)</a>
   </video>
 </section>
 
-<section id="codex" class="codex">
-  <div class="codex-text">
-    <p class="eyebrow">New in 3.0</p>
-    <h2>Codex, on the same wrist</h2>
-    <p class="sub">Use Codex as well as Claude Code? Its sessions join the list you already know, and its questions arrive the same way: one card, one tap.</p>
-    <div class="grid two">
-      <div class="card"><h3>One list, two agents</h3><p>Codex sessions sit beside Claude Code's, grouped by what they need, each marked CC or CX.</p></div>
-      <div class="card"><h3>Its questions, your tap</h3><p>When Codex asks before running something, the card is on your wrist, marked with its risk like every other.</p></div>
-      <div class="card"><h3>Follow it live</h3><p>Open a Codex session and read the conversation as it happens.</p></div>
-      <div class="card"><h3>Talk back</h3><p>Reply to a Codex session, or start a new one, from the wrist.</p></div>
-    </div>
-    <p class="note">Nothing more to set up: the helper you install once covers both agents.</p>
-  </div>
-  <div class="wrist" role="img" aria-label="Apple Watch session list: a Codex session marked CX needs a tap, and a Claude Code session marked CC is working">
-    <div class="wrist-top"><span class="dot on"></span><span>Mac</span><b>00.27</b></div>
-    <p class="wrist-head need">Needs you · 1</p>
-    <div class="row need"><div class="tile"><span class="mark full"></span><small>CX</small></div><div><b>Tidy the release notes</b><span>docs</span><em>Needs a tap</em></div></div>
-    <p class="wrist-head">Working · 1</p>
-    <div class="row"><div class="tile"><span class="mark ring"></span><small>CC</small></div><div><b>Fix the flaky checkout test</b><span>platform</span></div></div>
-  </div>
-</section>
-
 <section id="how">
   <h2>How it works</h2>
   <p class="sub">Three steps, and the middle one is a sentence you say to Claude Code.</p>
   <div class="grid three">
-    <div class="card"><span class="n">1</span><h3>Install the watch app</h3><p>From <a href="https://apps.apple.com/app/tapproval/id6805869018">the App Store</a>, on any Apple Watch running watchOS 10 or later. Nothing to sign up for.</p></div>
-    <div class="card"><span class="n">2</span><h3>Tell your computer once</h3><p>On the computer where Claude Code runs, say:</p><pre>Install the Tapproval plugin from marcobelini/<wbr>tapproval-helper</pre><p class="say">Claude installs Tapproval Base, its free, open-source bridge (the <code>tapproval-helper</code> plugin). You approve it like anything else and never touch a terminal. Use Codex too? The same install covers it, ready for 3.0. <a href="apple-watch-claude-code.html">Step by step</a>.</p></div>
-    <div class="card"><span class="n">3</span><h3>Raise your wrist</h3><p>The watch finds your computer by itself: on your Wi-Fi, or away from home through a private travel address.</p></div>
+    <div class="card"><span class="n">1</span><h3>Install the watch app</h3><p>From <a href="https://apps.apple.com/app/tapproval/id6805869018">the App Store</a>, on any Apple Watch with watchOS 10 or later. Nothing to sign up for.</p></div>
+    <div class="card"><span class="n">2</span><h3>Tell your computer once</h3><p>On the computer where Claude Code runs, say:</p><pre>Install the Tapproval plugin from marcobelini/<wbr>tapproval-helper</pre><p class="say">It installs the free, open-source helper. One install covers Codex too. <a href="apple-watch-claude-code.html">Step by step</a>.</p></div>
+    <div class="card"><span class="n">3</span><h3>Raise your wrist</h3><p>The watch finds your computer by itself, at home on your Wi-Fi or away through a private travel address.</p></div>
   </div>
 </section>
 
 <section id="what">
   <h2>What it does</h2>
-  <p class="sub">Everything your agent asks a person for, answered where the person is.</p>
   <div class="shots">
-    <figure><img src="img/card.png" width="416" height="496" loading="lazy" decoding="async" alt="A permission card marked CRITICAL on the watch, with its project and session"><figcaption>Approve or deny with one tap. Your computer obeys instantly.</figcaption></figure>
-    <figure><img src="img/sessions.png" width="416" height="496" loading="lazy" decoding="async" alt="The session list, the first screen: two sessions need you, two are working, each named with its project"><figcaption>The first screen is your sessions, grouped by what they need, each with its project. Background work and sessions that come back by themselves show too.</figcaption></figure>
-    <figure><img src="img/thread.png" width="416" height="496" loading="lazy" decoding="async" alt="A session on the watch with its waiting CRITICAL card as the last thing in the conversation, Deny and Allow right under it"><figcaption>Open a session that needs you and its question is the last thing in the conversation, every word of it, with the answers right under it. Once answered, reply as on your phone: Proceed, What's left?, /code-review, or dictate.</figcaption></figure>
+    <figure><img src="img/card.png" width="416" height="496" loading="lazy" decoding="async" alt="A permission card marked CRITICAL"><figcaption>Approve or deny with one tap.</figcaption></figure>
+    <figure><img src="img/sessions.png" width="416" height="496" loading="lazy" decoding="async" alt="The session list"><figcaption>Your sessions, grouped by what they need.</figcaption></figure>
+    <figure><img src="img/thread.png" width="416" height="496" loading="lazy" decoding="async" alt="A session's conversation on the watch"><figcaption>Read the conversation and reply.</figcaption></figure>
   </div>
   <div class="grid three" style="margin-top:24px">
-    <div class="card"><h3>Know which taps matter</h3><p>Every request is sorted into one of five risk tiers on your computer, and the card says which: a force-push to main arrives marked CRITICAL. Nothing is approved for you unless you ask it to be, and a CRITICAL never is.</p></div>
-    <div class="card"><h3>Real questions, real options</h3><p>Multiple-choice questions arrive with the same choices as on your desktop, several questions one after another, and you can pick more than one answer where the agent allows it.</p></div>
-    <div class="card"><h3>Sessions, live</h3><p>Start a session from the wrist, follow it, send it instructions, and end it when it is done. Sessions are grouped by what they need, and replies and plans read the way they do on your phone.</p></div>
-    <div class="card"><h3>Encrypted, every road</h3><p>Everything between your watch and your computer is encrypted: on your Wi-Fi, through the tunnel when you are away, and in iCloud. The Connection screen says "Encrypted" when it is.</p></div>
-    <div class="card"><h3>A command and your words</h3><p>Pick any of your slash commands from the wrist. One that needs more, like a code review of a particular change, asks for it: say a sentence and both go together.</p></div>
-    <div class="card"><h3>Keeps itself current</h3><p>The computer half updates itself. Installed as a Claude Code plugin, one switch on the watch turns on Claude Code's auto-update, and the watch mentions it quietly if you fall a week behind. Installed from the terminal, there is nothing to switch, and the watch says so.</p></div>
-    <div class="card"><h3>Your day</h3><p>What was handled without you, what you decided, how much you used — and roughly how much time at the desk that saved.</p></div>
-    <div class="card"><h3>The whole story</h3><p>Since you installed: prompts handled, how few needed you, and every CRITICAL that was stopped for a human. No streaks, no badges, nothing to keep up.</p></div>
-    <div class="card"><h3>Your agents</h3><p>Claude Code and Codex, on any Mac or Linux machine, and Windows as a preview. The buzz while the app is closed is Mac-only; elsewhere cards wait until you open it, and nothing is lost.</p></div>
+    <div class="card"><h3>Know which taps matter</h3><p>Each request is marked with its risk, from harmless to CRITICAL. Nothing is approved for you unless you ask, and a CRITICAL never is.</p></div>
+    <div class="card"><h3>Sessions, live</h3><p>Follow a session as it works, send it a reply or a command, or start a new one from the wrist.</p></div>
+    <div class="card"><h3>Claude Code and Codex</h3><p>Both agents in one list, each session marked CC or CX, and their questions answered the same way.</p></div>
   </div>
-</section>
-
-<section id="privacy">
-  <h2>Privacy</h2>
-  <p class="sub">Tapproval collects nothing. There are no accounts, no analytics and no servers of ours. Prompts and conversations travel between your watch and your computer, encrypted on every road: over your own Wi-Fi, through your own iCloud, or through the travel address when you are away, where Cloudflare carries them but cannot read them. The computer half is open source, so you can check.</p>
-  <p><a href="privacy.html">Read the privacy policy</a> · <a href="security.html">Read how it is secured</a> · <a href="https://github.com/marcobelini/tapproval-helper">Read the bridge's source</a></p>
 </section>
 
 <section id="pricing">
-  <h2>Price</h2>
-  <div class="price">
-    <div class="card"><strong>Free to start</strong><p>Every part of it, for your first 100 answers. Reading sessions and the day's overview stays free for good, and a prompt you don't answer from the wrist still appears on your computer. No account.</p><p style="margin-top:10px"><a href="https://apps.apple.com/app/tapproval/id6805869018">Get it on the App Store</a></p></div>
-    <div class="card"><strong>$5, once</strong><p>Unlimited answers, for good, on every watch on your Apple ID. No subscription, ever. An optional $1 coffee for the developer is there too.</p></div>
+  <h2>Price and privacy</h2>
+  <div class="grid two">
+    <div class="card"><h3>$5, once</h3><p>Your first 100 answers are free. Then $5 once unlocks each agent for good, on every watch on your Apple ID. No subscription, ever.</p></div>
+    <div class="card"><h3>Collects nothing</h3><p>No accounts, no analytics, no servers of ours. Everything between watch and computer is encrypted. <a href="privacy.html">Privacy policy</a> · <a href="security.html">How it is secured</a></p></div>
   </div>
 </section>
 
 <section id="support">
   <h2>Support</h2>
-  <p class="sub">The five things people ask, answered here. For anything else there is one address, and a person reads it.</p>
-  <div class="grid">
-    <div class="card"><h3>The watch can't find my computer</h3><p>Two causes cover nearly every case. The watch and the computer must be on the same Wi-Fi, and a VPN on your iPhone must be fully connected or fully off: one that is half up hides your home network from the watch. Then open Settings on the watch and tap the status card at the top (it opens Connection). Every route gets a tick or a reason.</p></div>
-    <div class="card"><h3>Pairing a watch</h3><p>A first install pairs by itself. For a second watch, or after a reset, tell Claude Code on your computer:</p><pre>Open Tapproval pairing</pre><p class="say">Then open Tapproval on the watch within ten minutes.</p></div>
-    <div class="card"><h3>Updating</h3><p>Installed from the terminal, the helper checks at most once an hour and updates itself, never while a question is waiting on your wrist. Installed as a Claude Code plugin, it updates when Claude Code's auto-update is on: turn it on once from the watch (Settings, Auto-update) or in Claude Code (<code>/plugin</code>, Marketplaces, tapproval).</p></div>
-    <div class="card"><h3>Removing it</h3><p>Tell Claude Code:</p><pre>Uninstall Tapproval Base</pre><p class="say">It restores your settings, keeps a backup, stops the bridge and leaves nothing running. Delete the app from the watch like any other.</p></div>
-    <div class="card"><h3>My phone still shows a question I answered</h3><p>The command ran. The Claude app on a phone or iPad can keep displaying a prompt the watch has already answered. It is a known Claude Code bug, not the watch, and any message sent from the phone clears it.</p></div>
-    <div class="card"><h3>Anything else</h3><p>Questions, faults and suggestions alike. Say what Tapproval should do next.</p><p style="margin-top:10px"><a href="mailto:tapproval@thoughtfulsteward.org">tapproval@thoughtfulsteward.org</a></p></div>
+  <div class="grid three">
+    <div class="card"><h3>The watch can't find my computer</h3><p>Put both on the same Wi-Fi, and make sure a VPN on your iPhone is fully on or fully off. Then open Settings on the watch and tap the status card: every route gets a tick or a reason.</p></div>
+    <div class="card"><h3>Pairing another watch</h3><p>Tell Claude Code:</p><pre>Open Tapproval pairing</pre><p class="say">Then open Tapproval on the watch within ten minutes.</p></div>
+    <div class="card"><h3>My phone still shows a question I answered</h3><p>The command ran. It is a known Claude Code bug; any message from the phone clears it.</p></div>
+  </div>
+  <p style="margin-top:16px">Updating, removing and the rest: <a href="apple-watch-claude-code.html">the setup guide</a>. Anything else: <a href="mailto:tapproval@thoughtfulsteward.org">tapproval@thoughtfulsteward.org</a>, read by a person.</p>
+</section>
+
+<section id="more">
+  <h2>More from Thoughtful Steward</h2>
+  <div class="card more">
+    <div>
+      <h3>Tapmerge<span class="soon">Coming soon</span></h3>
+      <p>Your GitHub pull requests and issues on your wrist: see what needs you, and act on it with a tap.</p>
+      <p style="margin-top:10px"><a href="https://apps.thoughtfulsteward.org">See all our apps →</a></p>
+    </div>
   </div>
 </section>
 
 <footer>
-  <p>Tapproval is an independent app and is not affiliated with, endorsed by or sponsored by Anthropic or OpenAI. Claude and Claude Code are trademarks of Anthropic, PBC. Codex is a trademark of OpenAI. Apple Watch and App Store are trademarks of Apple Inc.</p>
-  <p>© 2026 Tapproval · <a href="https://apps.apple.com/app/tapproval/id6805869018">App Store</a> · <a href="apple-watch-claude-code.html">Setup guide</a> · <a href="claude-code-permission-hook.html">How the PermissionRequest hook works</a> · <a href="claude-code-apple-watch-notifications.html">Claude Code notifications on Apple Watch</a> · <a href="compare.html">Compare</a> · <a href="security.html">Security</a> · <a href="changelog.html">Changelog</a> · <a href="privacy.html">Privacy policy</a></p>
+  <p>Tapproval is an independent app and is not affiliated with, endorsed by or sponsored by Anthropic or OpenAI. Claude and Claude Code are trademarks of Anthropic, PBC. Codex is a trademark of OpenAI. GitHub is a trademark of GitHub, Inc. Apple Watch and App Store are trademarks of Apple Inc.</p>
+  <p>© 2026 Tapproval · <a href="https://apps.thoughtfulsteward.org">All our apps</a> · <a href="apple-watch-claude-code.html">Setup guide</a> · <a href="claude-code-permission-hook.html">How the PermissionRequest hook works</a> · <a href="claude-code-apple-watch-notifications.html">Claude Code notifications on Apple Watch</a> · <a href="compare.html">Compare</a> · <a href="security.html">Security</a> · <a href="changelog.html">Changelog</a> · <a href="privacy.html">Privacy policy</a></p>
 </footer>
 </div>
 </body>

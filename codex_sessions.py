@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import stat
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -505,13 +506,24 @@ class SessionCatalog:
                                   if now - at < FORGET_SECONDS}
                 rows = [row for row in rows if row.get("session_id") not in self.forgotten]
                 paths = {sid: path for sid, path in paths.items() if sid not in self.forgotten}
-                self.rows, self.paths, self.status = rows, paths, "ready"
+                self.rows, self.paths = rows, paths
+                self._status("ready")
         except (OSError, EOFError, ValueError, TypeError, KeyError, AttributeError):
             with self.lock:
-                self.status = "unavailable"
+                self._status("unavailable")
         finally:
             with self.lock:
                 self.checked, self.busy = time.monotonic(), False
+
+    def _status(self, status):
+        """Called under the catalog lock; diagnostics never decide readiness."""
+        previous, self.status = self.status, status
+        if previous != status:
+            try:
+                print("relay: codex catalog %s -> %s (%d rows)" % (
+                    previous, status, len(self.rows)), file=sys.stderr)
+            except (OSError, UnicodeError, ValueError):
+                pass  # A closed log must not discard a valid catalog snapshot.
 
     def snapshot(self):
         with self.lock:

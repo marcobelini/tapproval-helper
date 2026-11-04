@@ -781,12 +781,28 @@ def test_lost_mutation_receipt_is_uncertain_and_never_retried(servers, method, f
 
 
 @pytest.mark.parametrize("method", ["archive", "unarchive"])
-@pytest.mark.parametrize("reason", ["active writer", "conflict: thread is busy", "x" * 200])
-def test_rpc_refusal_uses_archive_words_and_preserves_reason(servers, method, reason):
+@pytest.mark.parametrize("reason", ["conflict: thread is busy", "x" * 200,
+                                    "active writer status is unknown"])
+def test_rpc_refusal_uses_fixed_archive_words_without_native_details(servers, method, reason):
     _loaded, opened, faults, _default = servers
     faults[("desktop", "thread/" + method)] = {"error": {"message": reason}}
     result = getattr(talk, method + "_codex_thread")("target")
-    assert result == {"ok": False, "reason": ("Codex refused: " + reason)[:60]}
+    action = "archive" if method == "archive" else "restore"
+    assert result == {"ok": False, "reason": "Codex refused to %s this chat" % action}
+    assert len(mutations(opened)) == 1
+
+
+@pytest.mark.parametrize("method", ["archive", "unarchive"])
+@pytest.mark.parametrize("reason", [
+    "thread a0000000-0000-4000-8000-000000000001 already has an active writer",
+    "Thread a0000000-0000-4000-8000-000000000001 already has an active writer on this server",
+])
+def test_active_writer_refusal_has_its_own_stable_reason(servers, method, reason):
+    _loaded, opened, faults, _default = servers
+    faults[("desktop", "thread/" + method)] = {"error": {"message": reason}}
+    result = getattr(talk, method + "_codex_thread")("target")
+    assert result == {"ok": False, "reason": "Codex refused: chat has an active writer"}
+    assert len(result["reason"]) <= 60
     assert len(mutations(opened)) == 1
 
 
