@@ -10066,13 +10066,29 @@ class TestClaudeCodeSaysWhetherATurnIsRunning:
         # No word from the registry: the old rule.
         (dict(active=90), ("idle", "")),
         (dict(active=3), ("running", "writing")),
+        # Busy after the turn ended: Claude Code counts a background agent
+        # or workflow as busy (2.1.317, `delegatedActive`), and the wrist
+        # showed WORKING for work only running behind a finished turn
+        # (owner, 2026-11-05).
+        (dict(active=300, tasks=1, turn="busy", over=True), ("running", "tasks")),
+        (dict(active=300, turn="busy", over=True), ("running", "tasks")),
+        (dict(active=3, turn="busy", over=True), ("running", "tasks")),
+        (dict(active=300, card=True, turn="busy", over=True), ("asking", "card")),
+        # …and a turn still going stays the turn.
+        (dict(active=300, tasks=1, turn="busy", over=False), ("running", "turn")),
+        (dict(active=300, turn="busy", over=None), ("running", "turn")),
+        # Waiting for the person: never Claude working.
+        (dict(active=300, tool="AskUserQuestion", turn="asking"), ("asking", "terminal")),
+        (dict(active=3, turn="asking"), ("idle", "")),
+        (dict(active=300, tasks=2, turn="asking"), ("running", "tasks")),
     ])
     def test_the_rule(self, args, expected):
         import watch_dashboard as wd
         assert wd.session_state(
             active_seconds_ago=args.get("active"), running_tool=args.get("tool"),
             running_tasks=args.get("tasks", 0), card_waiting=args.get("card", False),
-            waiting_at_mac=args.get("at_mac", False), turn=args.get("turn")) == expected
+            waiting_at_mac=args.get("at_mac", False), turn=args.get("turn"),
+            turn_over=args.get("over")) == expected
 
     @staticmethod
     def _registry(tmp_path, monkeypatch, status):
@@ -10088,8 +10104,8 @@ class TestClaudeCodeSaysWhetherATurnIsRunning:
 
     @pytest.mark.parametrize("status,turn", [
         ("busy", "busy"), ("shell", "busy"), ("idle", "idle"),
-        # Waiting for the person is told apart by the audit log, as before.
-        ("waiting", None), ("something-new", None), (None, None), (3, None),
+        # Waiting for the person: a dialog, a question, a sandbox request.
+        ("waiting", "asking"), ("something-new", None), (None, None), (3, None),
     ])
     def test_the_registry_status_is_read_as_a_turn(self, tmp_path, monkeypatch, status, turn):
         import watch_dashboard as wd
@@ -10145,6 +10161,91 @@ class TestClaudeCodeSaysWhetherATurnIsRunning:
                                    "watch_relay.py"), encoding="utf-8").read()
         call = source[source.index("state, reason = session_state("):]
         assert "turn=registry_turn(session_id)" in call[:400]
+        assert "turn_over=thread_turn_over(path_on_disk)" in call[:400]
+
+    @staticmethod
+    def _lines(*entries):
+        return "".join(json.dumps(e) + "\n" for e in entries)
+
+    @staticmethod
+    def _said(text):
+        return {"type": "user", "message": {"role": "user", "content": text}}
+
+    @staticmethod
+    def _replied(stop, content=None):
+        return {"type": "assistant", "message": {
+            "role": "assistant", "stop_reason": stop,
+            "content": content or [{"type": "text", "text": "Done."}]}}
+
+    def test_the_transcript_says_when_a_turn_is_over(self, tmp_path):
+        import watch_dashboard as wd
+        path = tmp_path / "t.jsonl"
+        wd._THREAD_STATE.clear()
+
+        def over_after(*entries):
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(self._lines(*entries))
+            wd._parse_thread(str(path), wd.THREAD_TURN_LIMIT)
+            return wd.thread_turn_over(str(path))
+
+        assert over_after(self._said("Build it")) is False
+        call = [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "make"}}]
+        assert over_after(self._replied("tool_use", call)) is False
+        assert over_after({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}}) is False
+        assert over_after(self._replied("end_turn")) is True
+        # A slash command the CLI answers itself starts no turn.
+        assert over_after(self._said("<command-name>/config</command-name>"),
+                          self._said("<local-command-stdout>Set</local-command-stdout>")) is True
+        # A task's notification does: Claude reads it and answers.
+        assert over_after(self._said("<task-notification>\n<task-id>a1</task-id>"
+                                     "\n<status>completed</status>")) is False
+        assert over_after(self._replied("stop_sequence")) is True
+        # A prompt, then the person stops Claude: over.
+        assert over_after(self._said("Again"),
+                          self._said("[Request interrupted by user]")) is True
+        assert wd.thread_turn_over(str(tmp_path / "unread.jsonl")) is None
+
+    def _ended_session(self, tmp_path, monkeypatch, *, agent):
+        import watch_dashboard as wd
+        projects = self._quiet_session(tmp_path, monkeypatch, "busy")
+        path = os.path.join(projects, "-Users-x-Developer-Acme", "cccc3333-full.jsonl")
+        launch = [{"type": "tool_use", "id": "a1", "name": "Agent",
+                   "input": {"description": "Review the diff", "run_in_background": True}}]
+        entries = [self._replied("tool_use", launch)]
+        if agent:
+            entries.append({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a1",
+                 "content": "Async agent launched successfully. agentId: 4f2a9c"}]}})
+        else:
+            entries.append({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a1", "content": "started"}]}})
+        entries.append(self._replied("end_turn"))
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(self._lines(*entries))
+        past = time.time() - 90
+        os.utime(path, (past, past))
+        monkeypatch.setattr(wd, "_task_output_files", lambda *a, **k: {
+            "4f2a9c": [os.path.join(str(tmp_path), "4f2a9c.output")]})
+        (tmp_path / "4f2a9c.output").write_text("working")
+        return projects
+
+    def test_a_turn_over_with_an_agent_still_running_is_background(self, tmp_path, monkeypatch):
+        import watch_dashboard as wd
+        row = wd.recent_sessions(projects_dir=self._ended_session(
+            tmp_path, monkeypatch, agent=True))[0]
+        assert (row["state"], row["state_reason"]) == ("running", "tasks")
+        assert row["running_tasks"] == 1
+        assert row["running_label"] == "Review the diff"
+
+    def test_busy_behind_a_finished_turn_counts_at_least_one_task(self, tmp_path, monkeypatch):
+        """Claude Code says delegated work is running even when the
+        transcript gave this helper nothing to count: one, never zero."""
+        import watch_dashboard as wd
+        row = wd.recent_sessions(projects_dir=self._ended_session(
+            tmp_path, monkeypatch, agent=False))[0]
+        assert (row["state"], row["state_reason"]) == ("running", "tasks")
+        assert row["running_tasks"] == 1
 
 
 class TestAScheduledSessionSaysWhenItComesBack:

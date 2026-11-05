@@ -1652,8 +1652,8 @@ try:
         _find_transcript, image_bytes, inbox_ready,
         _message_of, _parse_thread, _read_appended,
         project_root, prompts_at_the_mac, recent_sessions, active_sessions, registry_turn, resolve_session,
-        session_registry, session_state, shape, thread_after, thread_tool_id,
-        thread_wake_at, transcript_origin, transcripts_newest_first,
+        session_registry, session_state, shape, tasks_shown, thread_after, thread_tool_id,
+        thread_turn_over, thread_wake_at, transcript_origin, transcripts_newest_first,
         THREAD_TURN_LIMIT, usage_summary)
 except Exception as _error:  # noqa: BLE001 — any import-time failure, not only ImportError
     _DASHBOARD_ERROR = "%s: %s" % (type(_error).__name__, _error)
@@ -1666,7 +1666,8 @@ except Exception as _error:  # noqa: BLE001 — any import-time failure, not onl
     activity_summary = recap_summary = _find_transcript = image_bytes = \
         _message_of = _parse_thread = _read_appended = project_root = \
         prompts_at_the_mac = recent_sessions = active_sessions = resolve_session = session_state = \
-        shape = thread_after = thread_tool_id = thread_wake_at = transcript_origin = \
+        shape = tasks_shown = thread_after = thread_tool_id = thread_turn_over = \
+        thread_wake_at = transcript_origin = \
         transcripts_newest_first = usage_summary = _dashboard_unavailable
 
     def card_session_title(_session_id):
@@ -4662,7 +4663,9 @@ class RelayHandler(BaseHTTPRequestHandler):
         state, reason = session_state(
             active, tool_now, running, card_waiting,
             bool(path_on_disk) and thread_tool_id(path_on_disk) in prompts_at_the_mac(),
-            wake_at=wake_at, turn=registry_turn(session_id))
+            wake_at=wake_at, turn=registry_turn(session_id),
+            turn_over=thread_turn_over(path_on_disk))
+        running = tasks_shown(reason, running)
         reply = {"turns": turns,
                  "running_tasks": running,
                  "running_tool": tool_now,
