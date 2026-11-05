@@ -587,16 +587,20 @@ def session_registry(sessions_dir=None):
 
 
 def _registry_turn(data):
-    """Claude Code's own word on whether a turn is running: "busy" or
-    "idle", or None where it says nothing this helper reads. "shell" (a
-    command the person runs in the session) is busy; "waiting" (for the
-    person) is left to the audit log, which can tell a prompt at the Mac
-    from a card."""
+    """Claude Code's own word on whether a turn is running: "busy",
+    "idle" or "asking", or None where it says nothing this helper reads.
+    "shell" (a command the person runs in the session) is busy. Its
+    waiting status is "asking": the person's move, a permission dialog, a
+    question, a sandbox request.
+    It used to be left to the audit log, and a question nobody escalated
+    read as Claude working (2026-11-05)."""
     status = data.get(shape("registry.status"))
     if status in (shape("registry.status_busy"), shape("registry.status_shell")):
         return "busy"
     if status == shape("registry.status_idle"):
         return "idle"
+    if status == shape("registry.status_waiting"):
+        return "asking"
     return None
 
 
@@ -901,6 +905,21 @@ UPSTREAM_SHAPES = {
          "leftover, not work.", "2026-10-25"),
     "registry.status_shell":
         ("shell", "A command the person runs in the session.", "2026-10-25"),
+    "registry.status_waiting":
+        ("waiting", "Waiting for the person: a permission dialog, a question "
+         "(\"input needed\"), a sandbox request (Claude Code 2.1.317, "
+         "with waitingFor saying which). Busy, by contrast, also covers a "
+         "background agent or workflow after the turn has ended "
+         "(delegatedActive).", "2026-11-04"),
+    "key.stop_reason":
+        ("stop_reason", "On an assistant line's message: why the model "
+         "stopped. tool_use means the turn goes on.", "2026-11-04"),
+    "stop.end_turn":
+        ("end_turn", "The model finished its turn.", "2026-11-04"),
+    "stop.stop_sequence":
+        ("stop_sequence", "The model stopped on a stop sequence; the turn "
+         "is over too (30 of about 5,000 turn ends on this Mac).",
+         "2026-11-04"),
     "registry.name_source":
         ("nameSource", "How the registry says a session's name came about.",
          "2026-09-03"),
@@ -2073,6 +2092,7 @@ def _thread_lock(path):
 def _fresh_thread_state():
     return {"offset": 0, "turns": [], "launched": set(),
             "finished": set(), "running_tool": None, "running_tool_id": None,
+            "turn_over": None,
             "descriptions": OrderedDict(), "task_labels": {}, "running_label": None,
             "wake_at": None,
             "github": None,
@@ -2359,6 +2379,47 @@ def _keep_what_was_said(turns, said, limit):
     return [said] + turns[-(limit - 1):]
 
 
+def _fold_turn(state, entry, message):
+    """Is Claude's turn over? From the transcript, because the registry's
+    "busy" also covers a background agent or workflow running behind a
+    finished turn, and the wrist showed that as Claude working.
+
+    Over after an assistant line that stopped for good, or after the person
+    stops Claude. A new turn starts with any other user line that is not a
+    tool's answer: a prompt, a task's notification, a Stop hook's feedback,
+    a message from another session. A slash command the CLI answers itself
+    (its echo, then its output) starts none, so the word from before it
+    stands."""
+    if entry.get("type") == "assistant":
+        stop = message.get(shape("key.stop_reason"))
+        if stop in (shape("stop.end_turn"), shape("stop.stop_sequence")):
+            state["turn_over"] = True
+        elif stop:
+            state["turn_over"] = False
+        return
+    if entry.get("type") != "user" or message.get("role") != "user":
+        return
+    content = message.get("content")
+    if isinstance(content, list):
+        parts = [p for p in content if isinstance(p, dict)]
+        if parts and all(p.get("type") == shape("type.tool_result") for p in parts):
+            return
+        lead = next((str(p.get("text") or "") for p in parts if p.get("type") == "text"), "")
+    else:
+        lead = str(content or "")
+    lead = lead.lstrip()
+    if lead.startswith(shape("text.interrupted")):
+        state["turn_over"] = True
+    elif lead.startswith(shape("tag.command_name")):
+        state["turn_over_before_command"] = state.get("turn_over")
+        state["turn_over"] = False
+    elif lead.startswith(shape("tag.local_command_out")):
+        if "turn_over_before_command" in state:
+            state["turn_over"] = state.pop("turn_over_before_command")
+    else:
+        state["turn_over"] = False
+
+
 def _thread_line(state, line, limit):
     """Fold one appended transcript line into the running thread state."""
     entry = _json_object(line)
@@ -2366,6 +2427,7 @@ def _thread_line(state, line, limit):
         return
     message = _message_of(entry)
     role = message.get("role")
+    _fold_turn(state, entry, message)
     # Task launches and receipts arrive as user-role tool results and
     # notifications — never in Claude's own prose. An assistant message
     # QUOTING an id (writing tests, discussing a task) must not count.
@@ -2622,6 +2684,14 @@ def resolve_session(prefix, projects_dir=None, registry=None):
     return session_id, now or began
 
 
+def tasks_shown(reason, running_tasks):
+    """The task count a row carries: at least one when the state says
+    background work, because Claude Code's own "busy" behind a finished
+    turn means some is running even when the transcript gave this helper
+    nothing to count."""
+    return max(1, running_tasks or 0) if reason == "tasks" else running_tasks
+
+
 # A transcript written this recently means Claude is writing now.
 STATE_WRITING_SECONDS = 20
 # A tool call unanswered this long after the transcript last moved is a
@@ -2630,7 +2700,8 @@ STATE_TOOL_SECONDS = 1800
 
 
 def session_state(active_seconds_ago, running_tool, running_tasks,
-                  card_waiting, waiting_at_mac, wake_at=None, turn=None):
+                  card_waiting, waiting_at_mac, wake_at=None, turn=None,
+                  turn_over=None):
     """The one state a session is in, and why: ``(state, reason)``.
 
     ``running`` — Claude writing (``writing``), a tool call in flight
@@ -2652,15 +2723,25 @@ def session_state(active_seconds_ago, running_tool, running_tasks,
     idle, and a turn that ended on an unanswered tool call read running
     (2026-10-25). Background tasks and wake-ups outlive a turn and are
     still read from the transcript.
+
+    "busy" is not always a turn: Claude Code says busy while a background
+    agent or workflow runs, after the turn has ended. ``turn_over`` is the
+    transcript's word on that (True, False or None), and busy behind a
+    finished turn is background work (``tasks``), never Claude working
+    (2026-11-05). "asking" (the registry's waiting) is the person's move:
+    a tool call open then is a prompt at the Mac, and nothing written is
+    Claude writing.
     """
     if card_waiting:
         return "asking", "card"
+    if turn == "busy" and turn_over is True:
+        return "running", "tasks"
     quiet = active_seconds_ago if active_seconds_ago is not None else float("inf")
     tool_live = bool(running_tool) and (
-        turn == "busy" if turn else quiet <= STATE_TOOL_SECONDS)
-    if turn == "idle":
+        turn in ("busy", "asking") if turn else quiet <= STATE_TOOL_SECONDS)
+    if turn in ("idle", "asking"):
         quiet = float("inf")
-    if tool_live and waiting_at_mac:
+    if tool_live and (waiting_at_mac or turn == "asking"):
         return "asking", "terminal"
     if quiet < STATE_WRITING_SECONDS:
         return "running", "writing"
@@ -2708,6 +2789,12 @@ def thread_wake_at(path):
     """When this transcript's session comes back by itself (a wake-up it
     set), epoch seconds, or None. Read from the parse state, never raises."""
     return (_THREAD_STATE.get(path) or {}).get("wake_at") if path else None
+
+
+def thread_turn_over(path):
+    """True once this transcript's turn is over, False while one runs,
+    None before anything was read. From the parse state, never raises."""
+    return (_THREAD_STATE.get(path) or {}).get("turn_over") if path else None
 
 
 def thread_tool_id(path):
@@ -2790,7 +2877,9 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
             max(0, int(time.time() - mtime)), running_tool, running_tasks,
             card_waiting=session_id in waiting,
             waiting_at_mac=thread_tool_id(path) in at_mac,
-            wake_at=wake_at, turn=registry.get(session_id, {}).get("turn"))
+            wake_at=wake_at, turn=registry.get(session_id, {}).get("turn"),
+            turn_over=thread_turn_over(path))
+        running_tasks = tasks_shown(reason, running_tasks)
         repo = repo_slug(cwd)
         # The app's own title wins outright — a /rename, or the title the
         # desktop app gave it, which is what the phone shows too. Otherwise

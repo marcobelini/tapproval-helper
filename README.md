@@ -448,11 +448,12 @@ pytest
 
 ## Known upstream quirks
 
-One Claude Code behavior can look wrong from the outside and isn't — it
-is explained in the watch app the moment it first appears (Settings →
-How it works), and tracked upstream as
-[anthropics/claude-code#32493](https://github.com/anthropics/claude-code/issues/32493)
-and [#89761](https://github.com/anthropics/claude-code/issues/89761).
+Older Claude Code versions kept showing a prompt on the phone after a
+hook had answered it
+([anthropics/claude-code#32493](https://github.com/anthropics/claude-code/issues/32493),
+[#89761](https://github.com/anthropics/claude-code/issues/89761)). It no
+longer does: checked on 2026-11-05 with Claude Code 2.1.317 and Remote
+Control. If you still see one, update Claude Code and the Claude app.
 
 ## The card protocol
 
