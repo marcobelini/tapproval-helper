@@ -232,7 +232,19 @@ def thread_request(message, overrides):
                            if isinstance(result.get(key), dict) and isinstance(value, dict)
                            else copy.deepcopy(value))
         return result
-    return dict(message, params=dict(params, config=merge(overrides, params.get("config") or {})))
+    # Native versions differ on precedence when a dotted explicit key and
+    # a nested startup default address the same setting. Send one nested
+    # representation so an older managed owner cannot keep the default.
+    explicit = {}
+    for key, value in (params.get("config") or {}).items():
+        if not isinstance(key, str):
+            raise ValueError("Invalid Desktop thread configuration key")
+        parts = _config_key(key) if "." in key else [key]
+        entry = copy.deepcopy(value)
+        for part in reversed(parts):
+            entry = {part: entry}
+        explicit = merge(explicit, entry)
+    return dict(message, params=dict(params, config=merge(overrides, explicit)))
 
 
 def proxy_stdio(path, overrides=None):

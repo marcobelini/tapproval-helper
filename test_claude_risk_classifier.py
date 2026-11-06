@@ -1499,6 +1499,34 @@ class TestCardFacts:
         assert ".lineLimit(" not in option and ".truncationMode(" not in option
 
     @pytest.mark.private_layout
+    def test_the_starting_rows_state_line_wraps_rather_than_cuts(self):
+        """#672: a session asked for from the wrist shows "Starting · project",
+        then "Check <computer> · project". One line read "Check Marco's M…"
+        on 40 mm and lost the project on 49 mm; two still cut the project
+        on 40 mm at XXL. It takes the lines it needs."""
+        swift = Path(__file__).with_name("WatchApp").joinpath(
+            "Tapproval", "Sessions.swift").read_text()
+        row = swift[swift.index("struct StartingRow"):swift.index("struct DemoStrip")]
+        note = row[row.index("Text(RelayModel.startingNote("):]
+        note = note[:note.index("\n                }")]
+        assert ".fixedSize(horizontal: false, vertical: true)" in note
+        assert ".lineLimit(" not in note and ".truncationMode(" not in note
+
+    @pytest.mark.private_layout
+    def test_the_starting_rows_title_wraps_like_the_row_it_becomes(self):
+        """#672: a session asked for from the wrist shows the wearer's ask
+        as its title, held to one line: "What folder a…" on 40 mm. The
+        real row it turns into has allowed three lines since 2026-10-12;
+        the starting row allows the same."""
+        swift = Path(__file__).with_name("WatchApp").joinpath(
+            "Tapproval", "Sessions.swift").read_text()
+        row = swift[swift.index("struct StartingRow"):swift.index("struct DemoStrip")]
+        title = row[row.index("Text(starting.text)"):]
+        title = title[:title.index(".frame(maxWidth")]
+        assert ".lineLimit(3)" in title
+        assert ".fixedSize(horizontal: false, vertical: true)" in title
+
+    @pytest.mark.private_layout
     def test_recommended_has_a_line_of_its_own_in_an_answer_row(self):
         """The 2.0 screen test (2026-10-17): on 40 mm at XXL "Keep both
         (Recommended)" broke as "(Recommende / d)", one word wider than its
@@ -4603,6 +4631,36 @@ class TestSignedRequests:
         assert watch_relay.verify_signature(
             header, "GET", "/thread\nid=a", b"", ["k"], now=stamp) == (None, None)
 
+    @pytest.mark.parametrize("path", ["/thread\nid=a", "/thread\rid=a", "/thread\x7fid=a"])
+    def test_the_relay_refuses_a_control_character_in_the_path_on_its_own(self, monkeypatch,
+                                                                          path):
+        """The test above passes on the wire's refusal alone: with the
+        relay's own control-character check removed, it and every other
+        signing test still passed (2026-11-01 review). Here the wire is
+        put back as it was before 2026-10-25, joining whatever it is given,
+        so the captured v2 MAC really does sign the v1 forgery, and only
+        verify_signature's own check stands between them."""
+        def as_before(method, path, stamp, nonce, body=b"", query=None):
+            parts = [str(method).upper(), str(path)]
+            if query is not None:
+                parts.append(str(query))
+            parts += [str(stamp), str(nonce), hashlib.sha256(body or b"").hexdigest()]
+            return "\n".join(parts).encode("utf-8")
+
+        monkeypatch.setattr(tapproval_wire, "signature_message", as_before)
+        stamp, nonce = int(time.time()), uuid.uuid4().hex
+        # The positive control: with this wire, a v1 MAC over `/thread\nid=a`
+        # is the v2 MAC over `/thread` and `id=a`, and a clean path verifies.
+        assert (watch_relay.sign_request("k", "GET", "/thread\nid=a", stamp, nonce, b"")
+                == watch_relay.sign_request("k", "GET", "/thread", stamp, nonce, b"", "id=a"))
+        clean = watch_relay.sign_request("k", "GET", "/thread", stamp, nonce, b"")
+        assert watch_relay.verify_signature("v1 %d %s %s" % (stamp, nonce, clean), "GET",
+                                            "/thread", b"", ["k"], now=stamp) == ("k", nonce)
+        nonce = uuid.uuid4().hex
+        mac = watch_relay.sign_request("k", "GET", path, stamp, nonce, b"")
+        assert watch_relay.verify_signature("v1 %d %s %s" % (stamp, nonce, mac), "GET",
+                                            path, b"", ["k"], now=stamp) == (None, None)
+
     def test_a_signature_that_does_not_verify_proves_nothing(self, relay):
         base, _, device = relay
         body = {"id": "ghost", "decision": "allow"}
@@ -7467,6 +7525,34 @@ class TestPairingIsForAWatch:
         try:
             status, body = relay_call(base + "/pair")
             assert status == 200 and body.get("token")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_pair_refuses_the_tunnel_even_if_its_route_did_not(self, fresh_auth, monkeypatch):
+        """Two walls keep /pair off the travel address: the route's
+        lan_only flag (a 404 at the door, held by
+        test_every_lan_only_route_is_absent_through_the_tunnel) and
+        _handle_pair's own refusal. Nothing had seen the second one fire:
+        with it removed, every pair, tunnel and route test still passed
+        (2026-11-01 review). Here the first wall is taken down on purpose,
+        with a door open and a caller that is not this Mac, which is every
+        other reason to hand over a key; the handler must still say no."""
+        auth = _known_watch(fresh_auth)
+        auth.open_window()
+        monkeypatch.setitem(watch_relay.RelayHandler.ROUTES["GET"], "/pair",
+                            ("_get_pair", dict(auth=False)))
+        watch_relay.LIMITS.reset()
+        server, _queue = watch_relay.serve(port=0, auth=auth, token="s3cret")
+        real = server.get_request
+        server.get_request = lambda: (lambda s, a: (s, ("192.168.1.77", a[1])))(*real())
+        _serve(server)
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        try:
+            status, body = relay_call(base + "/t/s3cret/pair")
+            assert (status, body.get("error")) == (403, "pairing is not available here")
+            assert "token" not in body
+            assert [d["id"] for d in auth.devices] == ["w1"], "no key was issued"
         finally:
             server.shutdown()
             server.server_close()
@@ -17101,7 +17187,7 @@ class TestTheReleaseToolsSayWhenAStepFailed:
         (fake / "xcodebuild").chmod(0o755)
         (tmp_path / "build").mkdir()
         prelude = ('set -euo pipefail\nBUILD_NUMBER=7\nARCHIVE=build/Tapproval-7.xcarchive\n'
-                   'EXTRA_ARGS=(X=1)\nSIGNING_SHA=ABC\n')
+                   'EXTRA_ARGS=(X=1)\nSIGNING_SHA=ABC\nKEYCHAIN=build/k.keychain-db\n')
         run = subprocess.run(["bash", "-c", prelude + block], cwd=tmp_path,
                              env={**os.environ, "PATH": "%s:%s" % (fake, os.environ["PATH"])},
                              capture_output=True, text=True, timeout=30)
@@ -17139,6 +17225,53 @@ class TestTheReleaseToolsSayWhenAStepFailed:
         assert 'CODE_SIGN_IDENTITY="$SIGNING_SHA"' in script
         assert "<string>${SIGNING_SHA}</string>" in script
         assert "<string>Apple Distribution</string>" not in script
+
+    @pytest.mark.private_layout
+    def test_the_signing_keychain_lives_only_as_long_as_the_deploy(self, tmp_path):
+        """A keychain kept between runs was unlocked from a stored
+        passphrase that macOS refused after a restart, twice (2026-11-01,
+        2026-11-05). The deploy now makes its own and must leave nothing:
+        run the real block with a stand-in `security` and a key that will
+        not import, and check the search list is back as it was and the
+        keychain is gone."""
+        script = self._read(os.path.join("WatchApp", "deploy-testflight.sh"))
+        assert "keychain-pass" not in script, "a stored passphrase came back"
+        assert 'OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN"' in script
+        block = script[script.index("SCRATCH=$(mktemp -d)"):
+                       script.index("# Exactly one Apple Distribution identity")]
+        assert block.index("trap drop_signing_keychain EXIT") < block.index("create-keychain")
+        login = tmp_path / "login.keychain-db"
+        login.write_text("")
+        stale = tmp_path / "old" / "tapproval-signing.keychain-db"
+        stale.parent.mkdir()
+        stale.write_text("")
+        state = tmp_path / "list"
+        state.write_text('    "%s"\n    "%s"\n' % (login, stale))
+        fake = tmp_path / "bin"
+        fake.mkdir()
+        (fake / "security").write_text(
+            '#!/bin/bash\nS="%s"\n'
+            'case "$1" in\n'
+            '  list-keychains) if [ "${4:-}" = -s ]; then shift 4; : > "$S";'
+            ' for k in "$@"; do printf \'    "%%s"\\n\' "$k" >> "$S"; done;'
+            ' else cat "$S"; fi ;;\n'
+            '  create-keychain) touch "${@: -1}" ;;\n'
+            '  delete-keychain) rm -f "$2" ;;\n'
+            'esac\n' % state)
+        (fake / "security").chmod(0o755)
+        (tmp_path / "bad.key").write_text("not a key")
+        (tmp_path / "bad.cer").write_text("not a certificate")
+        run = subprocess.run(
+            ["bash", "-c", 'set -euo pipefail\nSIGNING_KEY="%s"\nSIGNING_CERT="%s"\n%s'
+             '\necho "$KEYCHAIN" > "%s/made"\necho REACHED\n'
+             % (tmp_path / "bad.key", tmp_path / "bad.cer", block, tmp_path)],
+            env={**os.environ, "PATH": "%s:%s" % (fake, os.environ["PATH"])},
+            capture_output=True, text=True, timeout=60)
+        assert run.returncode != 0 and "REACHED" not in run.stdout, \
+            "a key that cannot import went on to sign"
+        assert state.read_text() == '    "%s"\n' % login, \
+            "the search list was not put back, or kept a dead run's keychain"
+        assert not list(tmp_path.glob("tmp*/tapproval-signing.keychain-db"))
 
     @pytest.mark.private_layout
     def test_an_unrecorded_build_number_is_said(self):
@@ -17190,6 +17323,66 @@ class TestTheReleaseToolsSayWhenAStepFailed:
             assert other.poll() is None, "a relay that was not this install's was killed"
         finally:
             for proc in (mine, other):
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+
+    @posix_scripts
+    @pytest.mark.parametrize("record", ["data/tunnel.json", "legacy"])
+    def test_uninstall_stops_the_recorded_tunnel_and_no_other(self, tmp_path, record):
+        """`pkill -f "cloudflared tunnel.*127.0.0.1:8978"` stopped every
+        cloudflared this user runs that forwards to the port, an isolated
+        test relay's included (2026-11-01 review). The relay writes its
+        tunnel's pid to tunnel.json; the stop lines run here against three
+        stand-ins: the recorded one goes, an unrecorded one forwarding to
+        the same port stays, and a recorded pid that is no longer a
+        cloudflared (recycled) stays. `pkill` and `killall` on PATH are
+        fakes that only write down that they were called, so this test can
+        never stop a real tunnel on the Mac it runs on. (`kill` is a shell
+        builtin, which no PATH entry can stand in for: the real one runs,
+        and only on the pid the script chose.)"""
+        script = self._read("uninstall.sh")
+        assert not re.search(r"^\s*(pkill|killall)\b", script, re.M)
+        start = script.index("# The travel tunnel outlives")
+        end = script.index("# The Mac bridge (route B")
+        snippet = script[start:end]
+        home = tmp_path / "home"
+        (home / ".tapproval" / "data").mkdir(parents=True)
+        fakes = tmp_path / "bin"
+        fakes.mkdir()
+        calls = tmp_path / "calls"
+        for name in ("pkill", "killall"):
+            fake = fakes / name
+            fake.write_text('#!/bin/sh\necho "%s $*" >> "%s"\n' % (name, calls))
+            fake.chmod(0o755)
+        tunnel = ("import time; time.sleep(60)  "
+                  "# cloudflared tunnel --url http://127.0.0.1:8978")
+        mine = subprocess.Popen([sys.executable, "-c", tunnel])
+        other = subprocess.Popen([sys.executable, "-c", tunnel])
+        recycled = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        where = (home / ".tapproval" / "data" / "tunnel.json" if record != "legacy"
+                 else home / ".tapproval-tunnel.json")
+        env = dict(os.environ, HOME=str(home),
+                   PATH=os.pathsep.join([str(fakes), os.environ.get("PATH", "")]))
+        try:
+            def run(pid):
+                where.write_text(json.dumps({"pid": pid, "url": "https://x.example",
+                                             "port": 8978}))
+                subprocess.run([_BASH, "-c", "set -euo pipefail\n" + snippet],
+                               check=True, timeout=20, env=env)
+
+            run(recycled.pid)
+            time.sleep(0.3)
+            assert recycled.poll() is None, "a recorded pid that is not a tunnel was killed"
+            run(mine.pid)
+            deadline = time.time() + 10
+            while mine.poll() is None and time.time() < deadline:
+                time.sleep(0.05)
+            assert mine.poll() is not None, "the recorded tunnel was not stopped"
+            assert other.poll() is None, "a tunnel the relay did not record was killed"
+            assert not calls.exists(), calls.read_text()
+        finally:
+            for proc in (mine, other, recycled):
                 if proc.poll() is None:
                     proc.kill()
                 proc.wait()
@@ -22176,6 +22369,23 @@ class TestTheFirstAnswerIsFinal:
         out = wpt.decide("ExitPlanMode", {"plan": "x"}, crc=fake)
         assert out["behavior"] == "deny"
 
+    @pytest.mark.parametrize("auto_mode,said", [
+        (False, crc.PLAN_AUTO), (False, crc.PLAN_AUTO_PHONE), (True, crc.PLAN_ACCEPT_EDITS)])
+    def test_a_headless_run_says_why_it_refused_a_row_the_plan_did_not_offer(
+            self, monkeypatch, auto_mode, said):
+        """The test above passes without watch_permission_tool's own
+        refusal: plan_decision's (None, "", None) still fell through to a
+        deny, with an empty message, so the run told Claude nothing about
+        why its plan stopped (2026-11-01 review). Pinned here: the deny,
+        and the sentence that says what happened."""
+        fake = TestTheWristAnswersAHeadlessSend._Fake("answer", answer=said)
+        monkeypatch.setattr(fake, "auto_mode_seen", lambda event: auto_mode)
+        out = wpt.decide("ExitPlanMode", {"plan": "x"}, crc=fake)
+        assert said not in fake.card["options"], "the card must not have offered it"
+        assert out == {"behavior": "deny",
+                       "message": "Your watch answered with a choice this plan did "
+                                  "not offer. Nothing was run."}
+
 
 # ---- Route B: the helper installs the Mac bridge (#378) ---------------------
 
@@ -23654,6 +23864,38 @@ esac
         assert self._take(app, env, holder=gone.pid).returncode == 0
         again = self._take(app, env)
         assert again.returncode == 0 and again.stdout.strip(), again.stderr
+
+    def test_two_flows_never_both_take_over_a_dead_flows_simulator(self, tmp_path):
+        """A lock whose flow is gone used to be cleared check-then-remove:
+        two waiters both saw the dead holder, the first removed it and took
+        the simulator, and the second then removed the first's new lock and
+        took it too, so two flows installed onto one simulator (review of
+        2026-11-01). However many arrive at once, one gets it."""
+        app, env, _ = self._mac(tmp_path)
+        lock = tmp_path / "locks" / "Tapproval-Watch-41mm.lock"
+        holders = [subprocess.Popen(["sleep", "300"]) for _ in range(8)]
+        try:
+            for attempt in range(8):
+                gone = subprocess.Popen(["true"])
+                gone.wait()
+                if lock.exists():
+                    shutil.rmtree(lock)
+                lock.mkdir(parents=True)
+                (lock / "pid").write_text("%d\n" % gone.pid)
+                waiters = [subprocess.Popen(
+                    [str(app / "sim-shared.sh"), "take", "41mm", "se4-41", self.RT,
+                     str(h.pid)], env=dict(env, SIM_LOCK_WAIT="1"),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    for h in holders]
+                won = [w for w in waiters if w.wait(timeout=60) == 0]
+                assert len(won) == 1, "attempt %d: %d flows took the simulator at once" % (
+                    attempt, len(won))
+                kept = (lock / "pid").read_text().strip()
+                assert kept in {str(h.pid) for h in holders}, kept
+                assert not list((tmp_path / "locks").glob("*.reap")), "a reap was left behind"
+        finally:
+            for h in holders:
+                h.kill()
 
     @staticmethod
     def _started(pid):

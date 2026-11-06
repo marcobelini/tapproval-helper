@@ -40,7 +40,20 @@ for PIDFILE in "$HOME/.tapproval/data/relay.pid" "$HOME/.tapproval-relay.pid"; d
 done
 # The travel tunnel outlives a relay on purpose, so a restart keeps its
 # address; an uninstall must stop it, or a public URL would outlive Tapproval.
-pkill -f "cloudflared tunnel.*127.0.0.1:8978" 2>/dev/null || true
+# By the pid the relay wrote down (tunnel.json), never by name: a pattern
+# matched every cloudflared this user runs that forwards to the port, an
+# isolated test relay's included (2026-11-01 review). The pid must still be
+# this user's cloudflared forwarding to 127.0.0.1:8978, the check the relay
+# makes before adopting one: a recycled pid is somebody else's process.
+for TUNNEL_FILE in "$HOME/.tapproval/data/tunnel.json" "$HOME/.tapproval-tunnel.json"; do
+  [ -f "$TUNNEL_FILE" ] || continue
+  TUNNEL_PID=$(sed -n 's/.*"pid": *\([0-9][0-9]*\).*/\1/p' "$TUNNEL_FILE" | head -n 1)
+  [ -n "$TUNNEL_PID" ] && [ "$TUNNEL_PID" -gt 1 ] || continue
+  [ "$(ps -p "$TUNNEL_PID" -o uid= 2>/dev/null | tr -d ' ')" = "$(id -u)" ] || continue
+  case "$(ps -p "$TUNNEL_PID" -o command= 2>/dev/null || true)" in
+    *cloudflared*127.0.0.1:8978*) kill "$TUNNEL_PID" 2>/dev/null || true ;;
+  esac
+done
 # The Mac bridge (route B, #378), here as well as in --uninstall: a plugin
 # install answers --uninstall with "use /plugin uninstall" and removes
 # nothing, and the bridge must not outlive the helper that installed it.

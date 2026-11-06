@@ -60,6 +60,34 @@ def test_shared_desktop_defaults_preserve_explicit_thread_settings(method):
     assert original['params']['config'] == {'features': {'code_mode_host': False}}
 
 
+@pytest.mark.parametrize('method', ['thread/start', 'thread/resume', 'thread/fork'])
+def test_explicit_dotted_binding_replaces_default_without_two_native_representations(method):
+    defaults = {'mcp_servers': {'codex_app': {'enabled': True, 'env': {
+        'CODEX_APP_TOOLS_PIPE_PATH': 'STARTUP', 'CODEX_MCP_NODE_PATH': '/signed/node'}}}}
+    original = {'id': 9, 'method': method, 'params': {'threadId': 'same-id',
+        'config': {'mcp_servers.codex_app.env.CODEX_APP_TOOLS_PIPE_PATH': 'EXPLICIT'}}}
+    updated = desktop.thread_request(original, defaults)
+    assert updated['params']['config'] == {'mcp_servers': {'codex_app': {
+        'enabled': True, 'env': {'CODEX_APP_TOOLS_PIPE_PATH': 'EXPLICIT',
+                                'CODEX_MCP_NODE_PATH': '/signed/node'}}}}
+    assert original['params']['config'] == {
+        'mcp_servers.codex_app.env.CODEX_APP_TOOLS_PIPE_PATH': 'EXPLICIT'}
+    assert defaults['mcp_servers']['codex_app']['env']['CODEX_APP_TOOLS_PIPE_PATH'] == 'STARTUP'
+
+
+def test_dotted_explicit_plugin_key_preserves_quoted_name_and_nested_literal_keys():
+    defaults = {'plugins': {'a.plugin@bundled': {'enabled': True}},
+                'features': {'code_mode_host': True}}
+    request = {'method': 'thread/start', 'params': {'config': {
+        'plugins."a.plugin@bundled".enabled': False,
+        'features.code_mode_host': False,
+        'mcp_servers': {'literal.server': {'enabled': True}}}}}
+    config = desktop.thread_request(request, defaults)['params']['config']
+    assert config == {'plugins': {'a.plugin@bundled': {'enabled': False}},
+                      'features': {'code_mode_host': False},
+                      'mcp_servers': {'literal.server': {'enabled': True}}}
+
+
 @pytest.mark.parametrize('message', [
     {'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'desktop'}}},
     {'id': 2, 'method': 'turn/start', 'params': {'threadId': 'same-id'}},
