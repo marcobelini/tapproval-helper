@@ -1527,6 +1527,18 @@ class TestCardFacts:
         assert ".fixedSize(horizontal: false, vertical: true)" in title
 
     @pytest.mark.private_layout
+    def test_the_activity_row_carries_no_count_beside_its_name(self):
+        """Settings' Activity row read "Acti…" beside today's count on
+        40 mm, at normal text and at XXL (2026-11-06). The count is the
+        first thing on the screen the row opens; the row says only its
+        name."""
+        swift = Path(__file__).with_name("WatchApp").joinpath(
+            "Tapproval", "SettingsScreens.swift").read_text()
+        row = swift[swift.index('navRow("Activity"'):]
+        row = row[:row.index("to: .activity)")]
+        assert "count" not in row and "decisions_needed" not in row
+
+    @pytest.mark.private_layout
     def test_recommended_has_a_line_of_its_own_in_an_answer_row(self):
         """The 2.0 screen test (2026-10-17): on 40 mm at XXL "Keep both
         (Recommended)" broke as "(Recommende / d)", one word wider than its
