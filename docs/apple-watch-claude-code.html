@@ -16,7 +16,7 @@
 <meta name="apple-itunes-app" content="app-id=6805869018">
 <link rel="icon" href="img/icon.png">
 <link rel="stylesheet" href="style.css">
-<script type="application/ld+json">{"@context": "https://schema.org", "@type": "HowTo", "name": "Approve Claude Code prompts from your Apple Watch", "description": "Get Claude Code's permission prompts on an Apple Watch and answer them with one tap.", "totalTime": "PT5M", "tool": [{"@type": "HowToTool", "name": "Apple Watch with watchOS 10 or later"}, {"@type": "HowToTool", "name": "Claude Code on a Mac or Linux computer, or on Windows as a preview"}], "step": [{"@type": "HowToStep", "name": "Install the watch app", "text": "Install Tapproval from the App Store on your Apple Watch. It is free and needs no account. If you downloaded it on your iPhone and it is not on the watch, open the Watch app and tap Install under Available Apps.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html#watch"}, {"@type": "HowToStep", "name": "Add the helper to Claude Code", "text": "In Claude Code, run /plugin marketplace add marcobelini/tapproval-helper and then /plugin install tapproval-helper@tapproval, or ask Claude Code to install the Tapproval plugin from marcobelini/tapproval-helper.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html#helper"}, {"@type": "HowToStep", "name": "Restart Claude Code", "text": "Quit Claude Code and run claude again, so the helper starts with the new session.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html#restart"}, {"@type": "HowToStep", "name": "Open Tapproval on the watch", "text": "Open the app once on the same Wi-Fi as the computer. It finds the computer and pairs by itself.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html#pair"}]}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "HowTo", "name": "Approve Claude Code prompts from your Apple Watch", "description": "Get Claude Code's permission prompts on an Apple Watch and answer them with one tap.", "totalTime": "PT5M", "tool": [{"@type": "HowToTool", "name": "Apple Watch with watchOS 10 or later"}, {"@type": "HowToTool", "name": "Claude Code on a Mac or Linux computer, or on Windows as a preview"}], "step": [{"@type": "HowToStep", "name": "Install the watch app", "text": "Install Tapproval from the App Store on your Apple Watch. It is free and needs no account. If you downloaded it on your iPhone and it is not on the watch, open the Watch app and tap Install under Available Apps.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html#watch"}, {"@type": "HowToStep", "name": "Add the helper to Claude Code", "text": "In Claude Code, run /plugin marketplace add marcobelini/tapproval-helper and then /plugin install tapproval-helper@tapproval, or ask Claude Code to install the Tapproval plugin from marcobelini/tapproval-helper.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html#helper"}, {"@type": "HowToStep", "name": "Restart Claude Code", "text": "Finish your current work, then quit Claude Code normally and run claude again, so the helper starts with the new session.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html#restart"}, {"@type": "HowToStep", "name": "Open Tapproval on the watch", "text": "Open the app once on the same Wi-Fi as the computer. It finds the computer and pairs by itself.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html#pair"}]}</script>
 </head>
 <body>
 <div class="wrap">
@@ -25,22 +25,24 @@
 <main class="policy">
 <h1>Approve Claude Code prompts from your Apple Watch</h1>
 <p>Claude Code stops and asks before it runs a command, edits a file or answers a question for you. If you are away from the keyboard, the session waits. This guide puts those prompts on your Apple Watch, so one tap on the wrist answers them and the session carries on.</p>
-<p>It takes about five minutes. You need an Apple Watch on watchOS 10 or later, and Claude Code on a Mac or a Linux computer. Windows works too, as a preview: it is tested on GitHub's Windows machines but not yet on a real PC, and <a href="https://github.com/marcobelini/tapproval-helper#readme">the helper's README</a> says what it needs there. Everything below is free to set up, there is no account to create, and your first 100 answers cost nothing; after that, $5 once unlocks the app for good.</p>
+<p>It takes about five minutes. You need an Apple Watch on watchOS 10 or later, and Claude Code on a Mac or a Linux computer. Windows works too, as a preview: it is tested on GitHub's Windows machines but not yet on a real PC, and <a href="https://github.com/marcobelini/tapproval-helper#readme">the helper's README</a> says what it needs there. Everything below is free to set up, there is no account to create, and your first 100 answers cost nothing; after that, $5 once unlocks Claude Code for good. In 3.0, the 100 free answers are shared with Codex, which has its own $5 unlock.</p>
+
+<p>Setting up Codex instead? <a href="#codex">Use the Codex beta steps below</a>.</p>
 
 <h2 id="watch">1. Install the watch app</h2>
 <p>Get <a href="https://apps.apple.com/app/tapproval/id6805869018">Tapproval on the App Store</a>. It is not yet available in the EU; the <a href="https://testflight.apple.com/join/dW1tYBQG">TestFlight beta</a> works everywhere, and in the beta the unlock is free.</p>
 <p>Downloaded it on your iPhone and it isn't on the watch? Open the Watch app on the iPhone and tap <b>Install</b> next to Tapproval under <b>Available Apps</b>.</p>
 
 <h2 id="helper">2. Add the helper to Claude Code</h2>
-<p>The watch needs a small bridge on the computer, called Tapproval Base. It is open source and uses only Python's standard library. Type these two lines into Claude Code itself:</p>
-<pre>/plugin marketplace add marcobelini/tapproval-helper
-/plugin install tapproval-helper@tapproval</pre>
+<p>The watch needs a small bridge on the computer, called Tapproval Base. It is open source and uses only Python's standard library. Send these commands in your Claude Code chat, one at a time:</p>
+<pre>/plugin marketplace add marcobelini/tapproval-helper</pre>
+<pre>/plugin install tapproval-helper@tapproval</pre>
 <p>Or just ask Claude Code in plain words:</p>
 <blockquote>Install the Tapproval plugin from marcobelini/tapproval-helper</blockquote>
 <p>The plugin registers a <code>PermissionRequest</code> hook, which is how Claude Code hands a prompt to the watch, and starts the relay with every session. <a href="claude-code-permission-hook.html">How that hook works</a> is explained on its own page.</p>
 
 <h2 id="restart">3. Restart Claude Code</h2>
-<p>Quit Claude Code and run <code>claude</code> again. The helper starts when a session begins, so the session you installed it from cannot start it.</p>
+<p>Finish your current work, then quit Claude Code normally and run <code>claude</code> again. The helper starts when a session begins, so the session you installed it from cannot start it.</p>
 <p>On a Mac, the helper also adds a small iCloud bridge, so your watch can buzz while Tapproval is closed. macOS shows an “App Background Activity” notice naming Tapproval’s developer: that is the bridge, and it is listed under System Settings → General → Login Items &amp; Extensions. Linux and Windows have no bridge: cards wait until you open Tapproval on the watch, and nothing is lost.</p>
 <p>Claude Code leaves automatic updates off for plugins outside Anthropic’s own marketplaces, so turn them on once: type <code>/plugin</code>, open <strong>Marketplaces</strong>, choose <strong>tapproval</strong> and pick <strong>Enable auto-update</strong>. With watch app 2.1 you can also turn it on from the watch: Settings, <strong>Auto-update</strong>. Until you do, the watch mentions it once a newer helper has been out a week.</p>
 
@@ -56,7 +58,15 @@
 </ul>
 <p><strong>Nothing is approved for you.</strong> By default every prompt waits for a person. If you do not answer on the watch, the ordinary prompt is still there in Claude Code, exactly as it would be without Tapproval.</p>
 
-<h2>If the watch cannot find the computer</h2>
+<h2 id="codex">Codex in the 3.0 beta</h2>
+<p>Use the matching <a href="https://testflight.apple.com/join/dW1tYBQG">3.0 watch beta</a> and the current helper. If you installed the helper above, you do not need a second copy. For a Codex-only computer, follow the <a href="https://github.com/marcobelini/tapproval-helper#install--no-terminal-no-downloads">terminal installation instructions</a> instead. Review any new Codex hook yourself; installing the helper does not grant hook trust.</p>
+<p>For a Codex Desktop chat on a Mac, the optional Desktop connection also needs to be prepared. In a coding-agent chat on that computer, ask:</p>
+<blockquote>Prepare Tapproval’s Codex Desktop launcher for the installed app. Do not change approval settings or stop any sessions.</blockquote>
+<p>The <a href="https://github.com/marcobelini/tapproval-helper#codex-desktop-transport--internal-30-beta">helper’s Desktop instructions</a> explain how to select the installed application and its bundled executable. Preparation does not open or stop the app. When your active work is finished, quit Desktop normally, then open the prepared launcher from Terminal:</p>
+<pre>open "$HOME/.tapproval/data/codex-desktop-launcher/Launch Codex.command"</pre>
+<p>Use that launcher when you want the Desktop connection. An ordinary app launch uses the ordinary transport again. Open Tapproval on the watch and look for the chat marked <strong>CX</strong>. Send words such as “Summarise progress”; Claude Code commands such as <code>/compact</code> are not Codex wrist messages. Codex’s own approval settings still decide which actions ask you: an automatic reviewer can approve an action without producing a card.</p>
+
+<h2 id="connection">If the watch cannot find the computer</h2>
 <p>Open <strong>Settings</strong> on the watch and tap the status card at the top, which opens <strong>Connection</strong>: every route gets a tick or a reason. On the computer, one command says what the helper sees and the one next step:</p>
 <pre>python3 ~/.tapproval/ClaudeRiskClassifier.py --status</pre>
 <p>Its <em>Connection</em> block names the relay, the iCloud route, whether the away address answers from the internet, anything the helper has noticed, and where its log is (<code>~/.tapproval/logs/relay.log</code>). The same notices appear on the watch's Connection screen.</p>
@@ -67,7 +77,7 @@
 <tr><td><strong>Computer</strong> red at home, or <strong>Found it, no answer</strong></td><td>Watch and computer on different networks, or a VPN on the iPhone that is half connected.</td><td>Join the same Wi-Fi, or turn the iPhone's VPN off or fully on.</td></tr>
 <tr><td><strong>Tailscale: No answer</strong></td><td>A watch app usually cannot use the iPhone's Tailscale connection.</td><td>Nothing; the other routes carry the cards.</td></tr>
 <tr><td><strong>Away address: No answer</strong> or <strong>Old address</strong></td><td>The address changed (the computer restarted) or its connection dropped. The helper notices within five minutes and opens a new one.</td><td>Wait a minute or two: the new address reaches the watch through your iCloud. If it stays red, run <code>--status</code>.</td></tr>
-<tr><td><strong>Approvals only</strong></td><td>Cards arrive through iCloud, but sessions need a direct link.</td><td>Join the computer's Wi-Fi, or turn off the iPhone's VPN.</td></tr>
+<tr><td><strong>Approvals only</strong></td><td>Cards arrive through iCloud, but sessions need a direct link.</td><td>Join the computer’s Wi-Fi, or check that the away address answers in Connection.</td></tr>
 <tr><td><strong>Helper: older than the version this app expects</strong></td><td>The helper on the computer has not updated yet.</td><td>Start Claude Code once; it updates itself.</td></tr>
 <tr><td>A red notice from <strong>Your computer</strong>, such as <em>The iCloud route is off</em></td><td>The helper found something wrong and says what, in its own words.</td><td>Follow the sentence; <code>--status</code> repeats it as the next step.</td></tr>
 </tbody></table></div>
