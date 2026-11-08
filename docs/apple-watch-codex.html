@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Approve Codex from your Apple Watch: setup guide</title>
+<meta name="description" content="Get Codex's permission prompts on your Apple Watch, each marked with its risk, and answer with one tap. Follow and reply to Codex chats from the wrist. Setup in five minutes.">
+<link rel="canonical" href="https://tapproval.thoughtfulsteward.org/apple-watch-codex.html">
+<meta property="og:site_name" content="Tapproval">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Approve Codex prompts from your Apple Watch">
+<meta property="og:description" content="Setup guide: Codex's permission prompts on your wrist, each marked with its risk, one tap to answer.">
+<meta property="og:url" content="https://tapproval.thoughtfulsteward.org/apple-watch-codex.html">
+<meta property="og:image" content="https://tapproval.thoughtfulsteward.org/img/share.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="apple-itunes-app" content="app-id=6805869018">
+<link rel="icon" href="img/icon.png">
+<link rel="stylesheet" href="style.css">
+<script src="copy.js" defer></script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "HowTo", "name": "Approve Codex prompts from your Apple Watch", "description": "Get Codex's permission prompts on an Apple Watch and answer them with one tap.", "totalTime": "PT5M", "tool": [{"@type": "HowToTool", "name": "Apple Watch with watchOS 10 or later"}, {"@type": "HowToTool", "name": "Codex on a Mac or Linux computer, or on Windows as a preview"}], "step": [{"@type": "HowToStep", "name": "Install the watch app", "text": "Install Tapproval 3.0 or later from the App Store on your Apple Watch. It is free to start and needs no account.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-codex.html#watch"}, {"@type": "HowToStep", "name": "Install the helper", "text": "Run the one-line installer in a terminal. It finds Codex's folder and adds Tapproval's hook to Codex's hooks.json; if Claude Code is on the same computer, the same install covers it.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-codex.html#helper"}, {"@type": "HowToStep", "name": "Trust the hook in Codex", "text": "Open codex in a terminal once and choose Trust all and continue. Codex runs a hook only after you have approved it.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-codex.html#trust"}, {"@type": "HowToStep", "name": "Open Tapproval on the watch", "text": "Open the app once on the same Wi-Fi as the computer. It finds the computer and pairs by itself.", "url": "https://tapproval.thoughtfulsteward.org/apple-watch-codex.html#pair"}]}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<div class="wrap">
+<header class="top"><a href="./" style="display:flex;align-items:center;gap:12px;color:inherit"><img src="img/icon.png" alt=""><strong>Tapproval</strong></a>
+  <nav><a href="./">Home</a><a href="apple-watch-claude-code.html">Claude Code guide</a><a href="compare.html">Compare</a><a href="https://apps.apple.com/app/tapproval/id6805869018">App Store</a></nav></header>
+<main class="policy" id="main" tabindex="-1">
+<h1>Approve Codex prompts from your Apple Watch</h1>
+<p>Codex stops and asks before it runs a command or changes a file, unless you have told it not to. If you are away from the keyboard, the work waits. Tapproval puts those questions on your Apple Watch, each marked with how risky it is, so one tap on the wrist answers it and Codex carries on.</p>
+<p>It works from watch app 3.0. You need an Apple Watch on watchOS 10 or later, and Codex on a Mac or a Linux computer; Windows works too, as a preview. There is no account to create. Your first 100 answers are free, shared by Codex and Claude Code; after that, $5 once unlocks Codex for good. Claude Code has its own $5 unlock.</p>
+<p>Using Claude Code as well? One install covers both, and both show in one list on the watch. <a href="apple-watch-claude-code.html">The Claude Code guide</a> has its own steps.</p>
+
+<h2 id="watch">1. Install the watch app</h2>
+<p>Get <a href="https://apps.apple.com/app/tapproval/id6805869018">Tapproval on the App Store</a>. Downloaded it on your iPhone and it isn't on the watch? Open the Watch app on the iPhone and tap <b>Install</b> next to Tapproval under <b>Available Apps</b>.</p>
+
+<h2 id="helper">2. Install the helper</h2>
+<p>The watch needs a small bridge on the computer, called Tapproval Base. It is open source and uses only Python's standard library. In a terminal, one command:</p>
+<pre data-copy-label="helper install command">curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash</pre>
+<p>On Windows, <a href="https://github.com/marcobelini/tapproval-helper#readme">the helper's README</a> has the PowerShell line. The installer finds Codex's folder (<code>~/.codex</code>, or wherever <code>CODEX_HOME</code> points) and adds Tapproval's hook to Codex's <code>hooks.json</code>. It changes nothing else of Codex's. If you use Claude Code too, it wires that in the same run.</p>
+
+<h2 id="trust">3. Trust the hook in Codex</h2>
+<p>Codex runs a hook only after you have approved it, and the helper never approves it for you. Open <code>codex</code> in a terminal once and choose <strong>Trust all and continue</strong>. The installer reminds you until Codex says it is trusted.</p>
+
+<h2 id="pair">4. Open Tapproval on the watch</h2>
+<p>Open the app once while the watch and the computer are on the same Wi-Fi. It finds the computer by itself and pairs automatically. From then on it also reaches the computer when you are away, through a private travel address. On a Mac, a small iCloud bridge lets the watch buzz while Tapproval is closed; elsewhere, cards wait until you open the app.</p>
+
+<h2>What arrives on the wrist</h2>
+<ul>
+<li><strong>Codex's permission questions</strong>, for commands, file changes and terminal input, each marked with one of five risk tiers worked out on your computer. Tap Allow or Deny. When the same session is open in Codex on your iPhone, the question shows there too, and answering either clears the other.</li>
+<li><strong>Your Codex chats</strong>, marked <strong>CX</strong>, in the same list as Claude Code's sessions (marked <strong>CC</strong>): the chats Codex itself lists for this computer, idle ones included, with older ones as you scroll.</li>
+<li><strong>A live thread</strong> for each chat. Follow it as it works and send it words, such as “Summarise progress”. Claude Code's slash commands, such as <code>/compact</code>, are not Codex messages.</li>
+<li><strong>New session</strong>: start Codex from the wrist. The <strong>Use</strong> row picks Codex or Claude Code, and remembers the choice for each project.</li>
+</ul>
+<p><strong>Nothing is approved for you.</strong> Codex's own approval settings still decide which actions ask at all: if you have set an automatic reviewer, it can approve an action without a card ever appearing. Every question that does reach the watch waits for a person.</p>
+
+<h2 id="desktop">Codex Desktop on a Mac</h2>
+<p>For chats in the Codex Desktop app, an optional Desktop connection needs preparing once. In a coding-agent chat on that computer, ask:</p>
+<blockquote data-copy-label="Desktop launcher preparation request">Prepare Tapproval’s Codex Desktop launcher for the installed app. Do not change approval settings or stop any sessions.</blockquote>
+<p>Preparation does not open or stop the app. When your active work is finished, quit Desktop normally, then open it through the prepared launcher:</p>
+<pre data-copy-label="Desktop launcher command">open "$HOME/.tapproval/data/codex-desktop-launcher/Launch Codex.command"</pre>
+<p>An ordinary launch of the app uses the ordinary connection again. <a href="https://github.com/marcobelini/tapproval-helper#readme">The helper's README</a> has the details.</p>
+
+<h2>If the watch cannot find the computer</h2>
+<p>Open <strong>Settings</strong> on the watch and tap the status card at the top: every route gets a tick or a reason. “Codex chats unavailable” means the helper cannot reach Codex on the computer; the last list stays visible, and sending waits until it can. More in <a href="apple-watch-claude-code.html#connection">the troubleshooting table</a>.</p>
+
+<h2>Removing it</h2>
+<p>Run <code>python3 ~/.tapproval/ClaudeRiskClassifier.py --uninstall</code>. It takes its hook back out of Codex's <code>hooks.json</code>, keeps a backup, and leaves nothing running. Delete the app from the watch like any other.</p>
+
+<p style="margin-top:36px"><a class="cta" href="https://apps.apple.com/app/tapproval/id6805869018">Get Tapproval on the App Store</a></p>
+</main>
+<footer>
+  <p>Tapproval is an independent app and is not affiliated with, endorsed by or sponsored by Anthropic or OpenAI. Claude and Claude Code are trademarks of Anthropic, PBC. Codex is a trademark of OpenAI. Apple Watch and App Store are trademarks of Apple Inc.</p>
+  <p>© 2026 Tapproval · <a href="./">Home</a> · <a href="apple-watch-claude-code.html">Claude Code guide</a> · <a href="security.html">Security</a> · <a href="privacy.html">Privacy policy</a> · <a href="mailto:tapproval@thoughtfulsteward.org">tapproval@thoughtfulsteward.org</a></p>
+</footer>
+</div>
+</body>
+</html>

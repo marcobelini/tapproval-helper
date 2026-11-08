@@ -10,7 +10,7 @@
 > tool by another developer.
 
 ## What it does
-- Approve or deny Claude Code permission prompts with one tap on the watch.
+- Approve or deny Claude Code and Codex permission prompts with one tap on the watch.
 - Sorts every request into one of five risk tiers on the computer; the card
   shows the tier. Nothing is approved automatically unless the user turns
   that on, and a CRITICAL request never is.
@@ -68,6 +68,7 @@ read them).
 ## Key pages
 - Home: https://tapproval.thoughtfulsteward.org/
 - Setup guide: https://tapproval.thoughtfulsteward.org/apple-watch-claude-code.html
+- Codex setup guide: https://tapproval.thoughtfulsteward.org/apple-watch-codex.html
 - The PermissionRequest hook's decision shape: https://tapproval.thoughtfulsteward.org/claude-code-permission-hook.html
 - Ways to approve Claude Code away from the desk, compared: https://tapproval.thoughtfulsteward.org/compare.html
 - Claude Code notifications on Apple Watch, the three ways: https://tapproval.thoughtfulsteward.org/claude-code-apple-watch-notifications.html
