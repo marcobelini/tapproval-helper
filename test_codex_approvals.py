@@ -10,7 +10,7 @@ import time
 import pytest
 
 import ClaudeRiskClassifier as classifier
-from codex_approvals import ApprovalSync, LocalWebSocket, MAX_MESSAGE, approval_card
+from codex_approvals import ApprovalSync, LocalWebSocket, MAX_MESSAGE, approval_card, native_consent
 from watch_relay import CardQueue
 
 
@@ -260,9 +260,9 @@ def test_codex_hook_never_overrides_native_policy(monkeypatch, tool, attached, p
     ("mcpServer/elicitation/request", {"serverName": "example", "mode": "url",
                                     "url": "https://example.invalid/private-token"}),
     ("mcpServer/elicitation/request", {"mode": "openai/userVerification", "challenge": "secret"}),
-    ("item/permissions/requestApproval", {"permissions": {"network": {"enabled": True}}}),
+    ("item/permissions/requestApproval", {"permissions": {"unknown": True}}),
     ("item/commandExecution/requestApproval", {"networkApprovalContext": {"host": "example.invalid"}}),
-    ("item/commandExecution/requestApproval", {"additionalPermissions": {"network": {"enabled": True}}}),
+    ("item/commandExecution/requestApproval", {"additionalPermissions": {"unknown": True}}),
     ("item/commandExecution/requestApproval", {"availableDecisions": ["acceptForSession", "cancel"]}),
     ("item/future/requestApproval", {}),
 ])
@@ -290,6 +290,274 @@ def test_standalone_mcp_request_needs_no_turn_or_item_id(sync):
     until(lambda: len(cards.pending()) == 1)
     resolved(wire, "consent")
     until(lambda: not cards.pending())
+
+
+def consent_request(mode="form", schema=None):
+    return {"id": "consent", "method": "mcpServer/elicitation/request", "params": {
+        "threadId": "thread-1", "serverName": "test-tool", "mode": mode,
+        "message": "Allow this tool action?", "requestedSchema": schema if schema is not None else {
+            "type": "object", "properties": {}}}}
+
+
+@pytest.mark.parametrize("decision,expected", [
+    ("allow", {"action": "accept", "content": {}}),
+    ("deny", {"action": "decline"}),
+])
+def test_empty_tool_consent_answers_native_action_once(sync, decision, expected):
+    _adapter, wire, cards = sync
+    wire.incoming.put(consent_request())
+    until(lambda: len(cards.pending()) == 1)
+    card = cards.pending()[0]
+    assert card.get("kind") != "handoff" and not card["can_always"]
+    assert "test-tool" in card["detail"]
+    assert cards.decide(card["id"], decision)
+    until(lambda: any(m.get("id") == "consent" and "result" in m for m in wire.sent))
+    assert [m["result"] for m in wire.sent if m.get("id") == "consent" and "result" in m] == [expected]
+
+
+@pytest.mark.parametrize("decision,permissions", [("allow", {"network": {"enabled": True}}), ("deny", {})])
+def test_permission_consent_grants_only_the_requested_turn(sync, decision, permissions):
+    _adapter, wire, cards = sync
+    event = request()
+    event["method"] = "item/permissions/requestApproval"
+    event["params"]["permissions"] = {"network": {"enabled": True}}
+    wire.incoming.put(event)
+    until(lambda: len(cards.pending()) == 1)
+    card = cards.pending()[0]
+    assert card.get("kind") != "handoff"
+    assert "turn" in card["allow_label"]
+    assert cards.decide(card["id"], decision)
+    until(lambda: any(m.get("id") == 10 and "result" in m for m in wire.sent))
+    assert [m["result"] for m in wire.sent if m.get("id") == 10 and "result" in m] == [
+        {"permissions": permissions, "scope": "turn"}]
+
+
+def test_managed_network_consent_uses_offered_one_shot_decisions(sync):
+    _adapter, wire, cards = sync
+    event = request()
+    event["params"].update(networkApprovalContext={"host": "example.test", "protocol": "https"},
+                           availableDecisions=["accept", "cancel"])
+    wire.incoming.put(event)
+    until(lambda: len(cards.pending()) == 1)
+    card = cards.pending()[0]
+    assert card.get("kind") != "handoff" and "https" in card["detail"]
+    assert "example.test" in card["detail"] and card["deny_label"] == "No, stop this turn"
+    assert cards.decide(card["id"], "deny")
+    until(lambda: any(m.get("id") == 10 and "result" in m for m in wire.sent))
+    assert next(m["result"] for m in wire.sent if m.get("id") == 10 and "result" in m) == {"decision": "cancel"}
+
+
+@pytest.mark.parametrize("mode", ["form", "openai/form", "openaiForm"])
+@pytest.mark.parametrize("label,value", [("Yes", True), ("No", False), ("Decline request", None)])
+def test_tool_boolean_form_preserves_the_selected_value(sync, mode, label, value):
+    _adapter, wire, cards = sync
+    wire.incoming.put(consent_request(mode, {"type": "object", "properties": {
+        "confirmed": {"type": "boolean", "title": "Proceed?", "default": True}}, "required": ["confirmed"]}))
+    until(lambda: len(cards.pending()) == 1)
+    card = cards.pending()[0]
+    assert card["kind"] == "question" and card["options"] == ["Yes", "No", "Decline request"]
+    assert not any("result" in m for m in wire.sent), "a default must never answer a prompt"
+    assert cards.decide(card["id"], "answer", label)
+    until(lambda: any(m.get("id") == "consent" and "result" in m for m in wire.sent))
+    expected = {"action": "decline"} if value is None else {"action": "accept", "content": {"confirmed": value}}
+    assert next(m["result"] for m in wire.sent if m.get("id") == "consent" and "result" in m) == expected
+
+
+def test_tool_enum_labels_map_to_the_native_values(sync):
+    _adapter, wire, cards = sync
+    wire.incoming.put(consent_request(schema={"type": "object", "properties": {
+        "scope": {"type": "string", "enum": ["once", "read"], "enumNames": ["This action", "Read only"]}}}))
+    until(lambda: len(cards.pending()) == 1)
+    card = cards.pending()[0]
+    assert cards.decide(card["id"], "answer", "Read only")
+    until(lambda: any(m.get("id") == "consent" and "result" in m for m in wire.sent))
+    assert next(m["result"] for m in wire.sent if m.get("id") == "consent" and "result" in m) == {
+        "action": "accept", "content": {"scope": "read"}}
+
+
+def test_titled_enum_preserves_its_const_values():
+    card, answers = native_consent(consent_request(schema={"type": "object", "properties": {
+        "scope": {"type": "string", "oneOf": [
+            {"const": "r", "title": "Read"}, {"const": "w", "title": "Write"}]}}}))
+    assert card["options"] == ["Read", "Write", "Decline request"]
+    assert answers[("answer", "Write")] == {"action": "accept", "content": {"scope": "w"}}
+
+
+def test_device_verification_explains_why_without_disclosing_the_challenge():
+    from codex_approvals import handoff_card
+    event = consent_request("openai/userVerification")
+    event["params"]["challenge"] = "private-device-challenge"
+    card = handoff_card(event)
+    assert card["headline"] == "Device verification required"
+    assert "device authentication" in card["detail"]
+    assert "private-device-challenge" not in json.dumps(card)
+
+
+def test_invalid_tool_choice_cannot_send_an_arbitrary_native_value(sync):
+    _adapter, wire, cards = sync
+    wire.incoming.put(consent_request(schema={"type": "object", "properties": {
+        "confirmed": {"type": "boolean"}}}))
+    until(lambda: len(cards.pending()) == 1)
+    assert cards.decide(cards.pending()[0]["id"], "answer", "arbitrary input")
+    until(lambda: not cards.pending())
+    assert not any(m.get("id") == "consent" and "result" in m for m in wire.sent)
+
+
+@pytest.mark.parametrize("schema", [
+    {"type": "object", "properties": {"password": {"type": "string"}}},
+    {"type": "object", "properties": {}, "required": ["missing"]},
+    {"type": "object", "properties": {}, "required": ""},
+    {"type": "object", "properties": {}, "additionalProperties": True},
+    {"type": "object", "properties": {}, "anyOf": []},
+    {"type": "object", "properties": {"a": {"type": "boolean"}, "b": {"type": "boolean"}}},
+    {"type": "object", "properties": {"x": {"type": "string", "enum": ["a", "b"], "enumNames": ["Same", "Same"]}}},
+    {"type": "object", "properties": {"x": {"type": "string", "enum": ["a\nb"]}}},
+    {"type": "object", "properties": {"x": {"type": "string", "enum": ["Decline request"]}}},
+    {"type": "object", "properties": {"x": {"type": "boolean", "secretExtension": True}}},
+])
+def test_unrepresentable_tool_forms_remain_handoffs(schema):
+    assert native_consent(consent_request(schema=schema)) is None
+
+
+@pytest.mark.parametrize("mode", ["url", "openai/userVerification", "future"])
+def test_no_tool_authentication_proof_is_invented(mode):
+    assert native_consent(consent_request(mode)) is None
+
+
+@pytest.mark.parametrize("permissions", [
+    {"fileSystem": {"read": ["/repo/input"], "write": ["/repo/output"]}},
+    {"fileSystem": {"entries": [{"access": "write", "path": {"type": "path", "path": "/repo"}}]}},
+    {"fileSystem": {"entries": [{"access": "read", "path": {"type": "glob_pattern", "pattern": "/repo/**"}}], "globScanMaxDepth": 2}},
+    {"fileSystem": {"entries": [{"access": "read", "path": {"type": "special", "value": {"kind": "project_roots"}}}]}},
+    {"network": {"enabled": True}},
+])
+def test_permissions_show_the_complete_scope_and_freeze_the_response(permissions):
+    event = request()
+    event["method"] = "item/permissions/requestApproval"
+    event["params"]["permissions"] = permissions
+    original = json.loads(json.dumps(permissions))
+    card, answers = native_consent(event)
+    assert json.dumps(original, ensure_ascii=False, sort_keys=True, indent=2) in card["detail"]
+    permissions.clear()
+    assert answers[("allow", None)] == {"permissions": original, "scope": "turn"}
+    assert answers[("deny", None)] == {"permissions": {}, "scope": "turn"}
+
+
+@pytest.mark.parametrize("permissions", [
+    {"futurePermission": True}, {"network": {"enabled": "yes"}},
+    {"network": {"enabled": True, "future": True}},
+    {"fileSystem": {"read": "all"}}, {"fileSystem": {"globScanMaxDepth": True}},
+    {"fileSystem": {"entries": [{"access": "write", "path": {"type": []}}]}},
+    {"fileSystem": {"entries": [{"access": "execute", "path": {"type": "path", "path": "/repo"}}]}},
+    {"fileSystem": {"write": ["/" + "x" * 2000]}},
+])
+def test_unrecognized_or_truncated_permissions_never_become_answerable(permissions):
+    event = request()
+    event["method"] = "item/permissions/requestApproval"
+    event["params"]["permissions"] = permissions
+    assert native_consent(event) is None
+
+
+def test_native_consent_refuses_a_missing_one_shot_choice():
+    event = request()
+    event["params"].update(networkApprovalContext={"host": "example.test", "protocol": "https"},
+                           availableDecisions=["acceptForSession", "cancel"])
+    assert native_consent(event) is None
+
+
+@pytest.mark.parametrize("decision,expected", [("allow", "accept"), ("deny", "decline")])
+def test_additional_command_permissions_keep_the_command_decision(sync, decision, expected):
+    _adapter, wire, cards = sync
+    event = request(command="read input")
+    event["params"]["additionalPermissions"] = {"fileSystem": {"read": ["/repo/input"]}}
+    wire.incoming.put(event)
+    until(lambda: len(cards.pending()) == 1)
+    card = cards.pending()[0]
+    assert "read input" in card["detail"] and "/repo/input" in card["detail"]
+    assert cards.decide(card["id"], decision)
+    until(lambda: any(m.get("id") == 10 and "result" in m for m in wire.sent))
+    assert next(m["result"] for m in wire.sent if m.get("id") == 10 and "result" in m) == {"decision": expected}
+
+
+def test_additional_permissions_without_the_working_directory_are_not_guessed():
+    event = request()
+    event["params"].pop("cwd")
+    event["params"]["additionalPermissions"] = {"fileSystem": {"write": ["relative/path"]}}
+    assert native_consent(event) is None
+
+
+def test_oversized_tool_consent_is_not_silently_truncated():
+    event = consent_request()
+    event["params"]["message"] = "x" * 2001
+    assert native_consent(event) is None
+
+
+def test_tool_form_terms_are_shown_before_consent():
+    event = consent_request(schema={"type": "object", "properties": {},
+        "title": "One action", "description": "Creates a record in the connected service."})
+    card, _answers = native_consent(event)
+    assert "One action" in card["detail"]
+    assert "Creates a record in the connected service." in card["detail"]
+    event["params"]["requestedSchema"]["description"] = "x" * 2001
+    assert native_consent(event) is None
+
+
+def test_concurrent_native_requests_keep_their_distinct_response_shapes(sync):
+    _adapter, wire, cards = sync
+    wire.incoming.put(consent_request())
+    event = request(request_id=77)
+    event["method"] = "item/permissions/requestApproval"
+    event["params"]["permissions"] = {"network": {"enabled": True}}
+    wire.incoming.put(event)
+    until(lambda: len(cards.pending()) == 2)
+    for card in cards.pending():
+        assert cards.decide(card["id"], "allow")
+    until(lambda: len([m for m in wire.sent if "result" in m]) == 2)
+    results = {m["id"]: m["result"] for m in wire.sent if "result" in m}
+    assert results == {"consent": {"action": "accept", "content": {}},
+                       77: {"permissions": {"network": {"enabled": True}}, "scope": "turn"}}
+
+
+def test_tool_consent_still_requires_current_single_ownership(sync):
+    adapter, wire, cards = sync
+    adapter.ownership_guard = lambda _sid: False
+    wire.incoming.put(consent_request())
+    until(lambda: len(cards.pending()) == 1)
+    assert cards.decide(cards.pending()[0]["id"], "allow")
+    until(lambda: not adapter._pending)
+    assert not any(m.get("id") == "consent" and "result" in m for m in wire.sent)
+
+
+def test_phone_resolution_retracts_tool_consent_and_replay_never_answers(sync):
+    _adapter, wire, cards = sync
+    event = consent_request()
+    wire.incoming.put(event)
+    until(lambda: len(cards.pending()) == 1)
+    old = cards.pending()[0]["id"]
+    resolved(wire, "consent")
+    until(lambda: not cards.pending())
+    assert not cards.decide(old, "allow")
+    wire.incoming.put(event)
+    wire.incoming.put(request(request_id=99))
+    until(lambda: len(cards.pending()) == 1)
+    assert not any(m.get("id") == "consent" and "result" in m for m in wire.sent)
+
+
+def test_lost_tool_answer_is_never_retried(sync):
+    _adapter, wire, cards = sync
+    original = wire.send
+    attempted = []
+    def send(message):
+        if message.get("id") == "consent" and "result" in message:
+            attempted.append(message)
+            raise OSError("receipt lost")
+        original(message)
+    wire.send = send
+    wire.incoming.put(consent_request())
+    until(lambda: len(cards.pending()) == 1)
+    assert cards.decide(cards.pending()[0]["id"], "allow")
+    until(lambda: wire.closed)
+    assert len(attempted) == 1
 
 
 def test_agent_question_is_not_an_approval_but_mcp_consent_is(sync):

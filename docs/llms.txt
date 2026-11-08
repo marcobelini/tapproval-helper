@@ -50,7 +50,7 @@
 - Reading sessions and the day's overview stays free.
 
 ## Where to get it
-- App Store, outside the EU for now: https://apps.apple.com/app/tapproval/id6805869018
+- App Store: https://apps.apple.com/app/tapproval/id6805869018
 - TestFlight beta, everywhere: https://testflight.apple.com/join/dW1tYBQG
 - Helper source: https://github.com/marcobelini/tapproval-helper
 - More apps by the same maker, including Tapmerge (GitHub pull requests

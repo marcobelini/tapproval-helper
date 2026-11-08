@@ -297,6 +297,182 @@ def approval_card(message, item=None, hook_event=None):
     return card
 
 
+def _permission_summary(profile):
+    """Accept only permission fields whose entire scope we can show."""
+    if not isinstance(profile, dict) or not profile or set(profile) - {"network", "fileSystem"}:
+        return None
+    network = profile.get("network")
+    if network is not None and (not isinstance(network, dict) or set(network) != {"enabled"}
+                                or type(network["enabled"]) is not bool):
+        return None
+    files = profile.get("fileSystem")
+    if files is not None:
+        if not isinstance(files, dict) or set(files) - {"read", "write", "entries", "globScanMaxDepth"}:
+            return None
+        for access in ("read", "write"):
+            paths = files.get(access)
+            if paths is not None and (not isinstance(paths, list) or not all(
+                    isinstance(p, str) and p for p in paths)):
+                return None
+        depth = files.get("globScanMaxDepth")
+        if depth is not None and (type(depth) is not int or depth < 1):
+            return None
+        entries = files.get("entries")
+        if entries is not None:
+            if not isinstance(entries, list):
+                return None
+            for entry in entries:
+                if (not isinstance(entry, dict) or set(entry) != {"access", "path"}
+                        or entry["access"] not in ("read", "write", "deny")):
+                    return None
+                path = entry["path"]
+                if not isinstance(path, dict):
+                    return None
+                kind = path.get("type")
+                if not isinstance(kind, str):
+                    return None
+                field = {"path": "path", "glob_pattern": "pattern", "special": "value"}.get(kind)
+                if field is None or set(path) != {"type", field}:
+                    return None
+                value = path[field]
+                if kind == "special":
+                    if (not isinstance(value, dict) or value.get("kind") not in (
+                            "root", "minimal", "project_roots", "tmpdir", "slash_tmp")
+                            or set(value) - {"kind", "subpath"}
+                            or (value.get("subpath") is not None and not isinstance(value["subpath"], str))):
+                        return None
+                elif not isinstance(value, str) or not value:
+                    return None
+    text = json.dumps(profile, ensure_ascii=False, sort_keys=True, indent=2)
+    return text if len(text) <= 1400 else None
+
+
+def native_consent(message):
+    """A displayed native scope and its exact, server-side answer payloads.
+
+    Response data never travels on the card. No session/persistent grants,
+    implicit form defaults, browser tokens or device-verification proofs.
+    """
+    method, params = message.get("method"), message.get("params")
+    if not isinstance(params, dict) or not isinstance(params.get("threadId"), str):
+        return None
+    card = {"agent": "codex", "tier": "HIGH", "can_always": False,
+            "session_id": params["threadId"], "project": "Codex",
+            "allow_label": "Allow once", "deny_label": "Deny"}
+    reason = params.get("message") or params.get("reason") or ""
+    if not isinstance(reason, str):
+        return None
+    detail = reason
+    answers = None
+    if method == "mcpServer/elicitation/request":
+        if params.get("mode") not in ("form", "openai/form", "openaiForm"):
+            return None
+        if not isinstance(params.get("message"), str) or not params["message"]:
+            return None
+        server, schema = params.get("serverName"), params.get("requestedSchema")
+        if (not isinstance(server, str) or not server or not isinstance(schema, dict)
+                or schema.get("type") != "object"
+                or set(schema) - {"type", "properties", "required", "$schema", "additionalProperties", "title", "description"}
+                or (schema.get("additionalProperties") is not None and schema["additionalProperties"] is not False)):
+            return None
+        properties, required = schema.get("properties"), schema.get("required")
+        if required is None:
+            required = []
+        if (not isinstance(properties, dict) or not isinstance(required, list)
+                or not all(isinstance(k, str) and k in properties for k in required)):
+            return None
+        card["headline"] = "Approve connected tool?"
+        detail = server + "\n" + reason
+        for annotation in ("title", "description"):
+            value = schema.get(annotation)
+            if value is not None:
+                if not isinstance(value, str):
+                    return None
+                detail += "\n" + value
+        answers = {("deny", None): {"action": "decline"}}
+        if not properties:
+            answers[("allow", None)] = {"action": "accept", "content": {}}
+        elif len(properties) == 1:
+            name, field = next(iter(properties.items()))
+            if not isinstance(name, str) or not name or not isinstance(field, dict):
+                return None
+            labels = values = None
+            if field.get("type") == "boolean" and not set(field) - {"type", "title", "description", "default"}:
+                labels, values = ["Yes", "No"], [True, False]
+            elif field.get("type") == "string" and not set(field) - {"type", "title", "description", "default", "enum", "enumNames"}:
+                values = field.get("enum")
+                labels = field.get("enumNames") or values
+            elif field.get("type") == "string" and not set(field) - {"type", "title", "description", "default", "oneOf"}:
+                options = field.get("oneOf")
+                if isinstance(options, list) and all(isinstance(option, dict)
+                        and set(option) == {"const", "title"} for option in options):
+                    labels = [option["title"] for option in options]
+                    values = [option["const"] for option in options]
+            if (not isinstance(labels, list) or not isinstance(values, list)
+                    or not 1 <= len(labels) == len(values) <= 8
+                    or not all(isinstance(label, str) and label.strip() == label and label
+                               and len(label) <= 160 and "\n" not in label for label in labels)
+                    or len(set(labels)) != len(labels) or "Decline request" in labels
+                    or (field["type"] == "string" and not all(isinstance(v, str) for v in values))):
+                return None
+            title, description = field.get("title") or name, field.get("description") or ""
+            if not isinstance(title, str) or not isinstance(description, str):
+                return None
+            detail += "\n" + name + ": " + title + "\n" + description
+            card.update(kind="question", options=labels + ["Decline request"], question_header=title)
+            for index, label in enumerate(labels):
+                value = values[index]
+                answers[("answer", label)] = {"action": "accept", "content": {name: value}}
+            answers[("answer", "Decline request")] = {"action": "decline"}
+        else:
+            return None
+    elif method == "item/permissions/requestApproval":
+        summary = _permission_summary(params.get("permissions"))
+        if summary is None or not all(isinstance(params.get(k), str) and params[k]
+                                     for k in ("turnId", "itemId", "cwd")):
+            return None
+        card.update(headline="Allow extra permissions?", allow_label="Allow for this turn")
+        detail += "\nFor this turn only\n" + params["cwd"] + "\n" + summary
+        answers = {("allow", None): {"permissions": params["permissions"], "scope": "turn"},
+                   ("deny", None): {"permissions": {}, "scope": "turn"}}
+    elif method == "item/commandExecution/requestApproval":
+        network, extra = params.get("networkApprovalContext"), params.get("additionalPermissions")
+        refusal = denial_action(params)
+        if (not (network or extra) or refusal is None or params.get("kind", "command") not in ("command", "writeStdin")
+                or not all(isinstance(params.get(k), str) and params[k] for k in ("turnId", "itemId"))):
+            return None
+        command = params.get("command")
+        if ((command is not None and not isinstance(command, str))
+                or (params.get("cwd") is not None and not isinstance(params["cwd"], str))):
+            return None
+        if not command and not network:
+            return None
+        if extra and not params.get("cwd"):
+            return None
+        card["headline"] = "Allow network access?" if network else "Allow command permissions?"
+        detail += "\n" + (command or "") + "\n" + (params.get("cwd") or "")
+        if network:
+            if (not isinstance(network, dict) or set(network) != {"host", "protocol"}
+                    or not isinstance(network["host"], str) or not network["host"]
+                    or network["protocol"] not in ("http", "https", "socks5Tcp", "socks5Udp")):
+                return None
+            detail += "\n" + network["protocol"] + ": " + network["host"]
+        if extra:
+            summary = _permission_summary(extra)
+            if summary is None:
+                return None
+            detail += "\nAdditional permissions for this command:\n" + summary
+        if refusal == "cancel":
+            card["deny_label"] = "No, stop this turn"
+        answers = {("allow", None): {"decision": "accept"}, ("deny", None): {"decision": refusal}}
+    else:
+        return None
+    if len(detail) > 2000:
+        return None  # Never grant a scope that was truncated on its way to the wrist.
+    card["detail"] = detail.strip()
+    return card, {key: json.loads(json.dumps(value)) for key, value in answers.items()}
+
+
 def handoff_card(message):
     """Keep native consent visible without inventing a compatible answer."""
     params = message["params"]
@@ -315,6 +491,14 @@ def handoff_card(message):
         detail = params["command"]
     if not detail and isinstance(params.get("serverName"), str):
         detail = params["serverName"]
+    if method == "mcpServer/elicitation/request":
+        if params.get("mode") == "openai/userVerification":
+            title = "Device verification required"
+            detail += "\nThis approval needs device authentication on your computer or phone."
+        elif params.get("mode") == "url":
+            detail += "\nComplete the browser step on your computer or phone."
+        else:
+            detail += "\nThis form needs fields the Watch cannot collect yet."
     return {"agent": "codex", "kind": "handoff", "tier": "MEDIUM",
             "headline": title, "detail": detail[:2000], "can_always": False,
             "session_id": params["threadId"], "project": "Codex"}
@@ -718,14 +902,16 @@ class ApprovalSync:
                     threading.Thread(target=self._fetch_file, args=(key, message, done, sock),
                                      name="codex-file-card", daemon=True).start()
                     return
-                card = approval_card(message, self._items.get((thread_id, params.get("itemId"))))
+                consent = native_consent(message)
+                card = consent[0] if consent else approval_card(message, self._items.get((thread_id, params.get("itemId"))))
                 if card is None:
                     card = handoff_card(message)
                 done = threading.Event()
                 self._pending[key] = (done, params.get("turnId"))
                 self._request_items[key] = params.get("itemId")
                 self._trace("received", key, method)
-                threading.Thread(target=self._mirror, args=(key, card, done, sock, denial_action(params)),
+                threading.Thread(target=self._mirror, args=(key, card, done, sock, denial_action(params),
+                                                          consent[1] if consent else None),
                                  name="codex-card", daemon=True).start()
 
     def _fetch_file(self, key, message, done, sock):
@@ -790,27 +976,30 @@ class ApprovalSync:
                 # shared socket after its last active turn still detaches all.
                 pass
 
-    def _mirror(self, key, card, done, sock, refusal="decline"):
+    def _mirror(self, key, card, done, sock, refusal="decline", native_answers=None):
         try:
             if done.is_set():
                 return
             card = dict(self.card_title(card), post_id=self._card_id(key))
             _card_id, decision, _answer = self.queue.submit(
                 card, float("inf"), resolved_elsewhere=done.is_set, admission_lock=self._lock)
+            result = (native_answers.get((decision, _answer if decision == "answer" else None))
+                      if native_answers is not None else
+                      {"decision": "accept" if decision == "allow" else refusal}
+                      if decision in ("allow", "deny") else None)
             # Ownership checks may query other servers. Never perform them
             # under this server's lock, and recheck the native lease below.
-            if (decision in ("allow", "deny") and not done.is_set()
+            if (result is not None and not done.is_set()
                     and card.get("kind") != "handoff" and self.ownership_guard
                     and not self.ownership_guard(key[0])):
                 self._suspend_thread(key[0])
                 return
             with self._lock:
-                if (decision in ("allow", "deny") and not done.is_set()
+                if (result is not None and not done.is_set()
                         and card.get("kind") != "handoff"
                         and self._socket is sock
                         and self._pending.get(key, (None, None))[0] is done):
-                    sock.send({"id": key[1], "result": {
-                        "decision": "accept" if decision == "allow" else refusal}})
+                    sock.send({"id": key[1], "result": result})
                     self._audit_answer(card, decision)
         except (OSError, ValueError, EOFError):
             self.close()
