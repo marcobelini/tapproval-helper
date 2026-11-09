@@ -12738,6 +12738,88 @@ class TestASignedOutMacSaysSo:
         assert "signed out" in turns[0]["text"] and "Sign in" in turns[0]["text"]
 
 
+class TestALoginAboutToEndSaysSoFirst:
+    """2026-11-08: Claude Code's claude.ai login reached its hard end, which
+    renewing does not move, and every New session from the wrist was then
+    refused as "signed out" until someone sat at the Mac. Claude Code had
+    said when, in `claude auth status`'s `loginExpiresAt` and six warnings
+    in say.log, and nothing carried it to the wrist."""
+
+    ENDS = "2026-12-08T14:57:00.011Z"          # the real shape, seen 2026-11-09
+    ENDS_AT = 1796741820.011                    # the same instant, as a time stamp
+
+    @pytest.fixture(autouse=True)
+    def _fresh(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "signed_in", _REAL_SIGNED_IN)
+        monkeypatch.setattr(watch_relay, "_SIGNIN", {"at": 0.0, "in": None})
+        for key in ("signin", "signin_expiring"):
+            watch_relay.clear_condition(key)
+        yield
+        for key in ("signin", "signin_expiring"):
+            watch_relay.clear_condition(key)
+
+    @staticmethod
+    def _status(logged_in, ends):
+        import subprocess as sp
+        said = {"loggedIn": logged_in, "authMethod": "claude.ai", "loginExpiresAt": ends}
+        return lambda: sp.CompletedProcess(["claude"], 0 if logged_in else 1,
+                                           json.dumps(said), "")
+
+    def _said(self):
+        return {c["key"]: c["detail"] for c in watch_relay.conditions()}
+
+    def test_the_real_date_is_read(self):
+        assert watch_relay.login_ends({"loginExpiresAt": self.ENDS}) == pytest.approx(self.ENDS_AT)
+
+    @pytest.mark.parametrize("value", [
+        None, "", "soon", 1796741820, "2026-12-08", "2026-12-08T14:57:00",  # no zone: whose day?
+    ])
+    def test_a_date_that_cannot_be_read_is_none(self, value):
+        assert watch_relay.login_ends({"loginExpiresAt": value}) is None
+
+    def test_two_days_before_the_wrist_hears_of_it(self):
+        now = self.ENDS_AT - 2 * 86400
+        assert watch_relay.signed_in(runner=self._status(True, self.ENDS), now=now) is True
+        said = self._said()
+        assert "signin_expiring" in said and "signin" not in said
+        day = time.localtime(self.ENDS_AT)
+        assert "%d December" % day.tm_mday in said["signin_expiring"]
+        # The wrist's words, not the log's: no Terminal command to type.
+        assert "Sign in again" in said["signin_expiring"]
+        assert "claude auth" not in said["signin_expiring"]
+
+    def test_a_month_before_it_stays_quiet(self):
+        now = self.ENDS_AT - 30 * 86400
+        watch_relay.signed_in(runner=self._status(True, self.ENDS), now=now)
+        assert "signin_expiring" not in self._said()
+
+    def test_signing_in_again_withdraws_it(self):
+        watch_relay.note_condition("signin_expiring", "stale")
+        now = self.ENDS_AT - 2 * 86400
+        later = "2027-01-08T14:57:00.000Z"
+        watch_relay.signed_in(runner=self._status(True, later), now=now)
+        assert "signin_expiring" not in self._said()
+
+    def test_once_it_has_ended_the_signed_out_row_takes_over(self):
+        watch_relay.note_condition("signin_expiring", "stale")
+        watch_relay.signed_in(runner=self._status(False, None), now=self.ENDS_AT + 60)
+        said = self._said()
+        assert "signin" in said and "signin_expiring" not in said
+
+    def test_a_login_with_no_end_says_nothing(self):
+        """An API key or a long-lived token reports no end; nothing to warn of."""
+        watch_relay.signed_in(runner=self._status(True, None), now=self.ENDS_AT)
+        assert "signin_expiring" not in self._said()
+
+    def test_cannot_tell_leaves_what_was_said(self):
+        """An unreadable answer is not news either way."""
+        import subprocess as sp
+        watch_relay.note_condition("signin_expiring", "kept")
+        watch_relay.signed_in(runner=lambda: sp.CompletedProcess(["claude"], 1, "", ""),
+                              now=self.ENDS_AT)
+        assert self._said().get("signin_expiring") == "kept"
+
+
 class TestSigningInFromTheWrist:
     """The owner's photo of 2026-11-09: New session failed with "Open a
     terminal there and run: claude auth login", a day after the Mac's
@@ -19580,7 +19662,7 @@ class TestTheReportingItselfIsChecked:
     # exercised by a test that fires them, not merely declared.
     VOCABULARY = {"bonjour", "bridge", "bridge_install", "bridge_saves", "claude", "codex", "codex_sync", "codex_sessions", "codex_shared_service", "crash",
                   "dashboard", "helper", "icloud_off", "login_item_off", "no_tls", "outdated", "pairing",
-                  "port", "signin", "signin_codex", "stuck", "tunnel", "update"}
+                  "port", "signin", "signin_codex", "signin_expiring", "stuck", "tunnel", "update"}
 
     @staticmethod
     def _module_source(name):

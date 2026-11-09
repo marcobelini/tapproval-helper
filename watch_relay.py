@@ -1967,7 +1967,51 @@ def _ask_signed_in(runner, stamp):
     with _SIGNIN_LOCK:
         _SIGNIN.update(at=stamp, asked=True, **{"in": answer})
     _say_signed_in("claude", answer)
+    _say_login_ends(answer, said if answer is True else None, stamp)
     return answer
+
+
+# How long before Claude Code's own login runs out the wrist hears of it.
+# A claude.ai login has a hard end that renewing does not move
+# (`loginExpiresAt` in `claude auth status`, seen 2026-11-09 with 2.1.318).
+# On 2026-11-08 one passed unnoticed: every New session from the wrist was
+# refused as "signed out" until someone sat at the Mac, while Claude
+# Code's own six warnings went only into say.log.
+SIGNIN_WARN_SECONDS = 3 * 86400
+_MONTHS = ("January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December")
+
+
+def login_ends(said):
+    """When Claude Code says its login ends, as a time stamp; None when it
+    names no end, or one this cannot read for certain. A time with no zone
+    is not read: whose day it falls on would be a guess."""
+    import datetime
+    value = said.get("loginExpiresAt") if isinstance(said, dict) else None
+    if not isinstance(value, str):
+        return None
+    # Python 3.9 reads only 3- or 6-digit fractions; a second is plenty here.
+    text = re.sub(r"(T\d\d:\d\d:\d\d)\.\d+", r"\1", value.strip()).replace("Z", "+00:00")
+    try:
+        ends = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if ends.tzinfo is None:
+        return None
+    return ends.timestamp()
+
+
+def _say_login_ends(answer, said, now):
+    # Signed out, the "signin" row says it all; cannot tell, nothing changed.
+    ends = login_ends(said) if answer is True else None
+    if ends is not None and ends - now <= SIGNIN_WARN_SECONDS:
+        day = time.localtime(ends)
+        note_condition("signin_expiring", (
+            "Claude Code's sign-in on your computer ends on %d %s. After that "
+            "the watch can't start or reply to its sessions. Sign in again on "
+            "the computer before then." % (day.tm_mday, _MONTHS[day.tm_mon - 1])))
+    elif answer is not None:
+        clear_condition("signin_expiring")
 
 
 # The sign-in a wrist's tap starts, one per agent at a time. Claude Code's
