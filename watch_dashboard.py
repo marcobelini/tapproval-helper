@@ -1153,8 +1153,10 @@ def _findings_as_lines(text):
     return _JSON_FENCE.sub(lines, text)
 
 
-SIGNED_OUT_NOTICE = ("Claude Code on this computer is signed out — run: "
-                     "claude auth login")
+# No command in it (2026-11-09): the watch draws a Sign in button beside
+# a "signin" notice, and the wearer cannot run anything from the wrist.
+SIGNED_OUT_NOTICE = ("Claude Code on this computer is signed out. Sign in "
+                     "again on the computer.")
 # What the terminal shows in place of /compact's summary and of a stop.
 COMPACTED_NOTICE = "Conversation compacted"
 INTERRUPTED_NOTICE = "Interrupted"
