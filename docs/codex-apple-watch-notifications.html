@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex notifications on Apple Watch: what works</title>
+<meta name="description" content="Four ways to hear from Codex on an Apple Watch: its own alerts, a notify script, the ChatGPT app, or a watch app that answers. What each does without an iPhone.">
+<link rel="canonical" href="https://tapproval.thoughtfulsteward.org/codex-apple-watch-notifications.html">
+<meta property="og:site_name" content="Tapproval">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Codex notifications on Apple Watch: what works">
+<meta property="og:description" content="Codex's own alerts, a notify script, the ChatGPT app, or a watch app that answers: what each reaches, and what happens without your iPhone.">
+<meta property="og:url" content="https://tapproval.thoughtfulsteward.org/codex-apple-watch-notifications.html">
+<meta property="og:image" content="https://tapproval.thoughtfulsteward.org/img/share.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="apple-itunes-app" content="app-id=6805869018">
+<link rel="icon" href="img/icon.png">
+<link rel="stylesheet" href="style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@graph": [{"@type": "Article", "headline": "Codex notifications on Apple Watch: what works", "datePublished": "2026-11-09", "dateModified": "2026-11-09", "author": {"@type": "Organization", "name": "Tapproval", "url": "https://tapproval.thoughtfulsteward.org/"}, "mainEntityOfPage": "https://tapproval.thoughtfulsteward.org/codex-apple-watch-notifications.html"}, {"@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can Codex send notifications to an Apple Watch?", "acceptedAnswer": {"@type": "Answer", "text": "Not by itself. Codex's own alerts are terminal notifications on the computer. A notify script can forward a finished turn to a phone push service, and the ChatGPT app on an iPhone can notify you when Codex needs attention; the watch shows those phone notifications while the iPhone is locked or asleep."}}, {"@type": "Question", "name": "Can I approve a Codex command on my Apple Watch?", "acceptedAnswer": {"@type": "Answer", "text": "Only with a watch app built for it, which receives the question from a hook in Codex on your computer and sends the answer back. Codex's notify setting cannot do this: it fires only when a turn completes, not when an approval is requested. Tapproval is one such app; the comparison page lists others."}}, {"@type": "Question", "name": "Do Codex notifications reach the watch when my iPhone is not with me?", "acceptedAnswer": {"@type": "Answer", "text": "Not an iPhone app's notifications: Apple sends them to the iPhone when the watch and the iPhone are disconnected. Only a watch app that reaches your computer over the internet itself keeps working then."}}]}]}</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<div class="wrap">
+<header class="top"><a href="./" style="display:flex;align-items:center;gap:12px;color:inherit"><img src="img/icon.png" alt=""><strong>Tapproval</strong></a>
+  <nav><a href="./">Home</a><a href="apple-watch-codex.html">Codex guide</a><a href="apple-watch-claude-code.html">Claude Code guide</a><a href="compare.html">Compare</a><a href="https://apps.apple.com/app/tapproval/id6805869018">App Store</a></nav></header>
+<main class="policy" id="main" tabindex="-1">
+<h1>Codex notifications on your Apple Watch</h1>
+<p><em>Written by the maker of Tapproval, one of the options below, so read it with that in mind. Every claim about another product links to its source; facts as of 9 November 2026.</em></p>
+<p>Codex stops when it needs you: a command to allow, a file change to approve. If you have stepped away, the work waits. There are four ways to have your Apple Watch tell you, and they differ in one thing that matters more than it sounds: whether the watch can only <em>tell</em> you, or can also <em>answer</em>.</p>
+
+<h2 id="built-in">1. Codex's own alerts, on the computer</h2>
+<p>The Codex CLI can raise a terminal notification when it needs approval or finishes a turn. In <code>~/.codex/config.toml</code>, the <code>[tui]</code> table's <code>notifications</code> setting turns them on and can limit them to events such as <code>approval-requested</code> and <code>agent-turn-complete</code> (<a href="https://learn.chatgpt.com/docs/config-file/config-advanced">Codex's configuration guide</a>). They appear on the computer, through your terminal, so they reach the wrist only if you are near enough to see the screen.</p>
+<p><strong>Good fit</strong> if you stay in the room and only need a nudge. Nothing to install.</p>
+
+<h2 id="notify">2. A notify script that pings your phone</h2>
+<p>Codex can also run a program of your choice, set with <code>notify</code> in the same file. It passes the program one JSON argument describing the turn, and it fires "whenever Codex emits supported events (currently only <code>agent-turn-complete</code>)" (<a href="https://learn.chatgpt.com/docs/config-file/config-advanced">the same guide</a>). A short script there can send a push through ntfy or Pushover, which your watch shows like any other phone notification.</p>
+<p>The limit is in that quote: it tells you a turn is done, not that Codex is waiting for permission. For approvals, a script has to sit in a Codex hook instead.</p>
+
+<h2 id="chatgpt">3. The ChatGPT app on your iPhone</h2>
+<p>OpenAI's <a href="https://learn.chatgpt.com/docs/remote-connections">remote connections</a> let the ChatGPT app on a phone follow Codex on a computer: it lists "Approve commands and other actions" among what you can do remotely, and you can "get notified when ChatGPT completes a task or needs your attention". The computer runs the ChatGPT desktop app on macOS or Windows, signed in to the same account and workspace as the phone.</p>
+<p>The page does not mention the Apple Watch. Your watch shows the phone's notification the way it shows any iPhone app's, <a href="https://support.apple.com/en-us/108369">while the iPhone is locked or asleep</a>, and the approval itself is made on the phone.</p>
+<p><strong>Good fit</strong> if you use Codex through the ChatGPT desktop app and carry your phone.</p>
+
+<h2 id="watch-app">4. A watch app that answers</h2>
+<p>The fourth kind puts the question itself on the watch and sends your answer back. On the computer, a hook in Codex's <code>hooks.json</code> hands each permission question to a small relay; the watch app shows it, and one tap answers. Tapproval works this way, from watch app 3.0: each question arrives marked with one of five risk tiers, worked out on your computer, so a force-push to main shows as CRITICAL before you tap. You can also follow a Codex chat live and reply to it from the wrist. The first 100 answers are free, shared with Claude Code, then $5 once unlocks Codex. The <a href="apple-watch-codex.html">Codex setup guide</a> takes five minutes.</p>
+<p>Others exist. <a href="https://apps.apple.com/us/app/agent-approve/id6756645367">Agent Approve</a> has a watch app and lists Codex among its agents, at $14.99 a month after a trial. <a href="compare.html">The comparison page</a> sets the rest side by side, with price, account and server for each.</p>
+<p>Codex's own approval settings still decide which actions ask at all: if you have set an automatic reviewer, it can approve an action before any card appears. Tapproval approves nothing on its own; every card that reaches the watch waits for your tap.</p>
+
+<h2 id="no-phone">When your iPhone is not with you</h2>
+<p>This is where the four part ways. Apple routes an iPhone app's notifications to the watch only while the two are connected: <a href="https://support.apple.com/en-us/108369">"when your devices are disconnected, your notifications will appear on your iPhone instead of your Apple Watch."</a> Leave the phone at home and options 2 and 3 go quiet on the wrist; option 1 never left the computer.</p>
+<p>A watch app can reach your computer on its own over the internet, on Wi-Fi or cellular. Tapproval does that through a private travel address and, on a Mac, through your own iCloud, so questions still arrive and answers still land with the phone switched off.</p>
+
+<h2>Side by side</h2>
+<div class="scroll"><table>
+<thead><tr><th></th><th>Codex alerts</th><th>Notify script</th><th>ChatGPT app</th><th>Watch app (Tapproval)</th></tr></thead>
+<tbody>
+<tr><td>Tells you it needs approval</td><td>Yes, on the computer</td><td>No, turn finished only</td><td>Yes, on the phone</td><td>Yes, on the watch</td></tr>
+<tr><td>Answer on the watch</td><td>No</td><td>No</td><td>No, on the phone</td><td>Yes, one tap</td></tr>
+<tr><td>Works with the iPhone away</td><td>On the computer only</td><td>No</td><td>No</td><td>Yes</td></tr>
+<tr><td>Needs</td><td>Nothing</td><td>A script and a push service</td><td>ChatGPT desktop app, same account on the phone</td><td>The app and its open-source helper</td></tr>
+<tr><td>Risk shown on the prompt</td><td>No</td><td>No</td><td>Not stated</td><td>Yes, five tiers</td></tr>
+</tbody></table></div>
+
+<p>Using Claude Code too? <a href="claude-code-apple-watch-notifications.html">Claude Code notifications on Apple Watch</a> covers its three ways, and one Tapproval install answers both.</p>
+
+<p style="margin-top:36px"><a class="cta" href="https://apps.apple.com/app/tapproval/id6805869018">Get Tapproval on the App Store</a> <a class="cta quiet" href="apple-watch-codex.html">Codex setup guide</a></p>
+</main>
+<footer>
+  <p>Tapproval is an independent app and is not affiliated with, endorsed by or sponsored by Anthropic or OpenAI. Claude and Claude Code are trademarks of Anthropic, PBC. Codex and ChatGPT are trademarks of OpenAI. Apple Watch and App Store are trademarks of Apple Inc.</p>
+  <p>© 2026 Tapproval · <a href="./">Home</a> · <a href="security.html">Security</a> · <a href="privacy.html">Privacy policy</a> · <a href="mailto:tapproval@thoughtfulsteward.org">tapproval@thoughtfulsteward.org</a></p>
+</footer>
+</div>
+</body>
+</html>

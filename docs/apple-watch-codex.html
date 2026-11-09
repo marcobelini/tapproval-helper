@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Approve Codex from your Apple Watch: setup guide</title>
-<meta name="description" content="Get Codex's permission prompts on your Apple Watch, each marked with its risk, and answer with one tap. Follow and reply to Codex chats from the wrist. Setup in five minutes.">
+<meta name="description" content="Get Codex's permission prompts on your Apple Watch, each marked with its risk, and answer with one tap. Follow and reply to Codex chats too. Five-minute setup.">
 <link rel="canonical" href="https://tapproval.thoughtfulsteward.org/apple-watch-codex.html">
 <meta property="og:site_name" content="Tapproval">
 <meta property="og:type" content="article">
@@ -27,7 +27,7 @@
 <main class="policy" id="main" tabindex="-1">
 <h1>Approve Codex prompts from your Apple Watch</h1>
 <p>Codex stops and asks before it runs a command or changes a file, unless you have told it not to. If you are away from the keyboard, the work waits. Tapproval puts those questions on your Apple Watch, each marked with how risky it is, so one tap on the wrist answers it and Codex carries on.</p>
-<p>It works from watch app 3.0. You need an Apple Watch on watchOS 10 or later, and Codex on a Mac or a Linux computer; Windows works too, as a preview. There is no account to create. Your first 100 answers are free, shared by Codex and Claude Code; after that, $5 once unlocks Codex for good. Claude Code has its own $5 unlock.</p>
+<p>It works from watch app 3.0. You need an Apple Watch on watchOS 10 or later, and Codex on a Mac or a Linux computer; Windows works too, as a preview. There is no account to create. Your first 100 answers are free, shared by Codex and Claude Code; after that, $5 once unlocks Codex for good, with no subscription. Claude Code has its own $5 unlock, so if you only use Codex, one unlock is all you need.</p>
 <p>Using Claude Code as well? One install covers both, and both show in one list on the watch. <a href="apple-watch-claude-code.html">The Claude Code guide</a> has its own steps.</p>
 
 <h2 id="watch">1. Install the watch app</h2>
@@ -62,6 +62,7 @@
 
 <h2>If the watch cannot find the computer</h2>
 <p>Open <strong>Settings</strong> on the watch and tap the status card at the top: every route gets a tick or a reason. “Codex chats unavailable” means the helper cannot reach Codex on the computer; the last list stays visible, and sending waits until it can. More in <a href="apple-watch-claude-code.html#connection">the troubleshooting table</a>.</p>
+<p>Weighing other ways to hear from Codex on the wrist? <a href="codex-apple-watch-notifications.html">Codex notifications on Apple Watch</a> sets them side by side.</p>
 
 <h2>Removing it</h2>
 <p>Run <code>python3 ~/.tapproval/ClaudeRiskClassifier.py --uninstall</code>. It takes its hook back out of Codex's <code>hooks.json</code>, keeps a backup, and leaves nothing running. Delete the app from the watch like any other.</p>

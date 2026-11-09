@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Approve Claude Code and Codex remotely: the options compared (November 2026)</title>
-<meta name="description" content="Remote Control, Happy, Omnara, claude-watch, Chums, Taphaptic, ntfy scripts, Pushary and Tapproval compared for approving Claude Code and Codex away from the desk: price, Apple Watch, Codex support, accounts, servers, and who Remote Control leaves out.">
+<title>Approve Claude Code and Codex remotely: options compared</title>
+<meta name="description" content="Remote Control, Happy, Omnara, claude-watch, AgentWatch, Tapproval and more, compared for approving Claude Code and Codex away from the desk, Apple Watch too.">
 <link rel="canonical" href="https://tapproval.thoughtfulsteward.org/compare.html">
 <meta property="og:site_name" content="Tapproval">
 <meta property="og:type" content="article">
@@ -23,13 +23,14 @@
   <nav><a href="./">Home</a><a href="apple-watch-claude-code.html">Claude Code guide</a><a href="apple-watch-codex.html">Codex guide</a><a href="claude-code-permission-hook.html">How the hook works</a><a href="https://apps.apple.com/app/tapproval/id6805869018">App Store</a></nav></header>
 <main class="policy">
 <h1>Approving Claude Code and Codex away from your desk: the options compared</h1>
-<p><em>Written by the maker of Tapproval, so read it with that in mind. Every claim about another product links to its source; facts as of 24 October 2026, 29 October for AgentWatch and tapproval, and 8 November for which tools work with Codex.</em></p>
+<p><em>Written by the maker of Tapproval, so read it with that in mind. Every claim about another product links to its source; facts as of 24 October 2026, 29 October for AgentWatch and tapproval, 8 November for which tools work with Codex, and 9 November for Agent Approve.</em></p>
 <p>Claude Code and Codex stop and wait whenever they need permission. Several tools now let you answer from somewhere other than the terminal. They differ more than their descriptions suggest: some need an account and a server in the middle, some need a particular plan, and only a few reach the Apple Watch.</p>
 
 <h2>Side by side</h2>
 <div class="scroll"><table>
 <tr><th></th><th>Tapproval</th><th>Claude Remote Control</th><th>Happy</th><th>Omnara</th><th>claude-watch</th><th>Chums</th></tr>
-<tr><td>Price</td><td>100 answers free, then $5 once</td><td>Free app; needs a Pro, Max, Team or Enterprise plan</td><td>Free; long voice sessions paid</td><td>No platform fee; managed compute paid</td><td>Free</td><td>Free, open source</td></tr>
+<tr><td>Price</td><td>100 answers free, then $5 once per agent</td><td>Free app; needs a Pro, Max, Team or Enterprise plan</td><td>Free; long voice sessions paid</td><td>No platform fee; managed compute paid</td><td>Free</td><td>Free, open source</td></tr>
+<tr><td>Subscription</td><td>None</td><td>A Claude plan</td><td>Not checked</td><td>Not checked</td><td>None</td><td>None</td></tr>
 <tr><td>Apple Watch</td><td>Watch app, built for the wrist</td><td>No watch app; the iPhone notification is mirrored</td><td>No</td><td>Yes, in the iOS app</td><td>Watch and iPhone app</td><td>Watch and iPhone app</td></tr>
 <tr><td>Works with Codex</td><td>Yes, from watch app 3.0</td><td>No, Claude Code only</td><td>Yes</td><td>Through its MCP server</td><td>No, Claude Code only</td><td>Yes</td></tr>
 <tr><td>iPhone / Android / web</td><td>Watch only</td><td>iOS, Android, web</td><td>iOS, Android, web, Mac</td><td>iOS; others not checked</td><td>iPhone</td><td>iPhone</td></tr>
@@ -45,8 +46,8 @@
 <li><strong>You already pay for Claude Pro or Max and mostly carry your phone:</strong> start with Anthropic's <a href="https://code.claude.com/docs/en/remote-control">Remote Control</a>. It is built in and needs nothing installed.</li>
 <li><strong>You want Android, the web or a desktop client:</strong> <a href="https://happy.engineering/">Happy</a> or <a href="https://github.com/omnara-ai/omnara">Omnara</a>. Happy is the most widely used. Omnara has moved towards managed agents in its own cloud.</li>
 <li><strong>You want to build your own:</strong> <a href="https://github.com/shobhit99/claude-watch">claude-watch</a> (watch and Mac on the same Wi-Fi) or <a href="https://github.com/lcoutodemos/chums">Chums</a> (Claude Code and Codex, a hub on your own Mac) are good open-source starts. Both are source code you sign and build yourself.</li>
-<li><strong>You want a push on your phone and nothing on your wrist:</strong> <a href="https://github.com/yuuichieguchi/claude-remote-approver">claude-remote-approver</a> turns each prompt into an ntfy notification with Approve and Deny buttons, free and open source; <a href="https://pushary.com/claude-code-notifications">Pushary</a> does the same as a hosted service at $9.99 a month. <a href="claude-code-apple-watch-notifications.html">What reaches the watch, and what doesn't</a>, has its own page.</li>
-<li><strong>You want the watch to be the whole interface</strong>, with no account, no server of ours in the middle, and each prompt marked with how risky it is: that is what <a href="./">Tapproval</a> is for. By default it approves nothing on its own; every card waits for your tap.</li>
+<li><strong>You want a push on your phone and nothing on your wrist:</strong> <a href="https://github.com/yuuichieguchi/claude-remote-approver">claude-remote-approver</a> turns each prompt into an ntfy notification with Approve and Deny buttons, free and open source; <a href="https://pushary.com/claude-code-notifications">Pushary</a> does the same as a hosted service at $9.99 a month. What reaches the watch, and what doesn't, has its own page for <a href="claude-code-apple-watch-notifications.html">Claude Code</a> and for <a href="codex-apple-watch-notifications.html">Codex</a>.</li>
+<li><strong>You want the watch to be the whole interface</strong>, with no account, no subscription, no server of ours in the middle, and each prompt marked with how risky it is: that is what <a href="./">Tapproval</a> is for. By default it approves nothing on its own; every card waits for your tap.</li>
 </ul>
 
 <h2>Also seen</h2>
@@ -54,6 +55,7 @@
 <li><a href="https://github.com/dzzzgnr/taphaptic">Taphaptic</a>: lifecycle notifications from Claude Code and Codex to a watch app, through a relay and Apple's push service. Its README says prompts, transcripts and tool arguments are not sent, only a minimal event. MIT. Whether it is on the App Store is not stated on the page.</li>
 <li><a href="https://github.com/yuuichieguchi/claude-remote-approver">claude-remote-approver</a>: a hook that pushes each permission prompt to the ntfy app on iOS or Android, with Approve, Always Approve and Deny buttons; falls back to the terminal after 120 seconds. No account; Node.js. MIT.</li>
 <li><a href="https://apps.apple.com/app/id6761702872">AgentWatch</a> (JoCoding, Inc.): an iPhone, iPad and Apple Watch companion for Claude Code and Codex on a Mac, with session alerts and Live Activities. Monitoring and alerts are free; approvals, prompts and interrupts from the phone are AgentWatch Plus, $3.99 a month or $34.99 a year. Its App Store privacy label lists e-mail address, user ID and device ID as data linked to you.</li>
+<li><a href="https://apps.apple.com/us/app/agent-approve/id6756645367">Agent Approve</a> (Agent Approve LLC): approvals for 14 coding agents, Codex among them, from an iPhone, iPad or Apple Watch app; a computer side set up with <code>npx agentapprove</code>. $14.99 a month after a seven-day trial.</li>
 <li><a href="https://tapproval.vercel.app/">tapproval</a> (lowercase, <a href="https://github.com/dikshantrajput/tapproval">dikshantrajput/tapproval</a>): a different project from this one, despite the name. It sends Claude Code's permission prompts to a phone as a web push, encrypted on your computer first: one tap on the lock screen on Android and desktop Chrome, while on an iPhone you open the Home Screen web app and answer there. No watch. No account; MIT, and self-hostable.</li>
 <li><a href="https://pushary.com/claude-code-notifications">Pushary</a>: a hosted service that installs Claude Code hooks and pushes the question to your phone, "Tap yes or no from your lock screen". iPhone, Android and Mac; $9.99 a month after a three-day trial. No watch mentioned.</li>
 </ul>

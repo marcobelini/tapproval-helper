@@ -72,6 +72,7 @@ read them).
 - The PermissionRequest hook's decision shape: https://tapproval.thoughtfulsteward.org/claude-code-permission-hook.html
 - Ways to approve Claude Code away from the desk, compared: https://tapproval.thoughtfulsteward.org/compare.html
 - Claude Code notifications on Apple Watch, the three ways: https://tapproval.thoughtfulsteward.org/claude-code-apple-watch-notifications.html
+- Codex notifications on Apple Watch, the four ways: https://tapproval.thoughtfulsteward.org/codex-apple-watch-notifications.html
 - Security: https://tapproval.thoughtfulsteward.org/security.html
 - Changelog: https://tapproval.thoughtfulsteward.org/changelog.html
 - Privacy policy: https://tapproval.thoughtfulsteward.org/privacy.html

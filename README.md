@@ -1,12 +1,13 @@
 # Tapproval Base
 
-**Approve Claude Code permission prompts from your Apple Watch, each one
-marked with its risk.** This is the computer half of Tapproval.
+**Approve Claude Code and Codex permission prompts from your Apple Watch,
+each one marked with its risk.** This is the computer half of Tapproval.
 
 [![Get it on the App Store](https://img.shields.io/badge/App%20Store-Get%20Tapproval-d97757?logo=apple&logoColor=white&style=for-the-badge)](https://apps.apple.com/app/tapproval/id6805869018)
 [![Or try the beta on TestFlight](https://img.shields.io/badge/TestFlight-Beta-555555?logo=apple&logoColor=white&style=for-the-badge)](https://testflight.apple.com/join/dW1tYBQG)
 [![Website](https://img.shields.io/badge/Website-tapproval.thoughtfulsteward.org-2f7f56?style=for-the-badge)](https://tapproval.thoughtfulsteward.org)
 
+On the App Store: 100 answers free, then $5 once per agent (Claude Code, Codex). No subscription.
 In the TestFlight beta the unlock is free.
 
 Privacy policy: https://tapproval.thoughtfulsteward.org/privacy.html · Support: tapproval@thoughtfulsteward.org

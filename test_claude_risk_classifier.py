@@ -26924,3 +26924,38 @@ class TestEveryHostHasItsOwnWindows:
     def test_cloudflared_is_installed_the_hosts_way(self, monkeypatch, platform, words):
         monkeypatch.setattr(tapproval_host.sys, "platform", platform)
         assert tapproval_host.cloudflared_install() == words
+
+
+@pytest.mark.private_layout
+class TestArchiveE2EReadsEachFacesOwnRelayLines:
+    """archive-e2e.sh runs one relay for every face, and greped its whole
+    log after each: a later face whose watch never reached /archive still
+    printed every "PASS relay said" from the first face's lines (2026-11-09
+    review). Each face now reads only what the relay logged after its test
+    began."""
+
+    def script(self):
+        return open(os.path.join(_ROOT, "WatchApp", "archive-e2e.sh"), encoding="utf-8").read()
+
+    def test_every_relay_line_check_reads_the_faces_own_slice(self):
+        body = self.script()
+        loop = body[body.index('for i in "${!E2E_UDIDS[@]}"'):]
+        checks = [line for line in loop.splitlines() if 'grep -q "relay:' in line]
+        assert checks, "the relay-line checks moved; re-read this test"
+        for line in checks:
+            assert '"$face_log"' in line and "relay.log" not in line, line
+
+    def test_the_slice_starts_before_the_faces_test_runs(self):
+        loop = self.script()[self.script().index('for i in "${!E2E_UDIDS[@]}"'):]
+        mark = loop.index('mark=$(wc -c < "$TMP/relay.log")')
+        assert mark < loop.index("e2e_test_without_building")
+        assert loop.index('tail -c +"$((mark + 1))" "$TMP/relay.log" > "$face_log"') \
+            < loop.index('grep -q "relay:')
+
+    def test_the_slice_is_what_came_after_the_mark(self, tmp_path):
+        log = tmp_path / "relay.log"
+        log.write_text("relay: archive claude aaaaaaaa archived\n")
+        script = ('mark=$(wc -c < "%s"); printf "relay: face two\\n" >> "%s"; '
+                  'tail -c +"$((mark + 1))" "%s"' % (log, log, log))
+        out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+        assert out.stdout == "relay: face two\n"
