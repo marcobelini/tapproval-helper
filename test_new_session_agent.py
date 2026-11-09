@@ -12,7 +12,7 @@ def test_explicit_agent_controls_the_launched_command(monkeypatch, chosen, recen
         {'path': '/project', 'agent': recent}])
     monkeypatch.setattr(classifier, 'ensure_codex_on_path', lambda: '/bin/codex')
     monkeypatch.setattr(relay, 'ensure_claude_on_path', lambda: True)
-    monkeypatch.setattr(relay, 'signed_in', lambda: True)
+    monkeypatch.setattr(relay, 'signed_in', lambda **_: True)
     monkeypatch.setattr(relay, 'trust_folder', lambda _: True)
     commands = []
     monkeypatch.setattr(relay._host, 'is_windows', lambda: False)
@@ -256,7 +256,7 @@ def _claude_on_a_mac(monkeypatch):
     import subprocess
     monkeypatch.setattr(relay, 'known_projects', lambda *_: [{'path': '/project'}])
     monkeypatch.setattr(relay, 'ensure_claude_on_path', lambda: True)
-    monkeypatch.setattr(relay, 'signed_in', lambda: True)
+    monkeypatch.setattr(relay, 'signed_in', lambda **_: True)
     monkeypatch.setattr(relay, 'trust_folder', lambda _: True)
     opened = []
 

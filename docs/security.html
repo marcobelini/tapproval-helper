@@ -20,13 +20,13 @@
 <body>
 <div class="wrap">
 <header class="top"><a href="./" style="display:flex;align-items:center;gap:12px;color:inherit"><img src="img/icon.png" alt=""><strong>Tapproval</strong></a>
-  <nav><a href="./">Home</a><a href="apple-watch-claude-code.html">Setup guide</a><a href="changelog.html">Changelog</a><a href="https://github.com/marcobelini/tapproval-helper">Source</a></nav></header>
+  <nav><a href="./">Home</a><a href="apple-watch-claude-code.html">Claude Code guide</a><a href="apple-watch-codex.html">Codex guide</a><a href="changelog.html">Changelog</a><a href="https://github.com/marcobelini/tapproval-helper">Source</a></nav></header>
 <main class="policy">
 <h1>Security: what Tapproval can see, and what was fixed</h1>
 <p><em>Tapproval answers permission prompts, so a bug in it is a bug in somebody's permission boundary. This page says what it can see, what it promises, what it does not protect against, and every security fix so far. The computer half is open source, so each claim here can be checked in <a href="https://github.com/marcobelini/tapproval-helper">the code</a>.</em></p>
 
 <h2>What Tapproval can see, and where it goes</h2>
-<p>A small helper on your computer, Tapproval Base, sees what Claude Code asks permission for: the command, or the file and what would be written to it. For the session list it also reads Claude Code's transcripts on that computer. It sends a short card to your watch and prints your answer back to Claude Code. There is no server of ours, no account and no telemetry. Cards take one of three routes, each encrypted from watch app 2.1 (on the App Store since 24 October 2026; earlier versions are signed but not encrypted):</p>
+<p>A small helper on your computer, Tapproval Base, sees what Claude Code or Codex asks permission for: the command, or the file and what would be written to it. For the session list it also reads Claude Code's transcripts and Codex's chat list on that computer. It sends a short card to your watch and hands your answer back to the agent that asked. There is no server of ours, no account and no telemetry. Cards take one of three routes, each encrypted from watch app 2.1 (on the App Store since 24 October 2026; earlier versions are signed but not encrypted):</p>
 <ul>
 <li><strong>Your own network.</strong> Watch and computer talk directly, encrypted. The watch accepts only your computer's own certificate, which it learns from an answer that proves your computer's key, so a stranger on the same Wi-Fi can neither read what passes nor pretend to be your computer. Every request and every answer is also signed, so nobody can fake or change one.</li>
 <li><strong>Your own iCloud, on a Mac.</strong> The helper installs a small bridge there, and cards pass through CloudKit's private database, which belongs to your Apple ID. We cannot read it. A card's details, its plan and the pairing key are stored encrypted, so Apple cannot read them either; only a card's headline and risk level stay readable to Apple, because it needs them to buzz your watch. Installing with <code>--no-bridge</code> leaves it out.</li>
@@ -40,6 +40,7 @@
 <li><strong>It fails closed.</strong> Anything it cannot parse, reach or judge ends with the ordinary prompt in your terminal, exactly as if Tapproval were not installed.</li>
 <li><strong>Nothing gets in without a key</strong> except the "are you there?" check. A program on your own computer shows the helper's key file, which only your own user account can read, and even then it can never answer a card, so a command Claude runs cannot approve its own prompt. Posting a card takes the helper's key file, and the hook believes only an answer that proves the same key, so a program that grabs the helper's port while it restarts cannot answer for it. Being on the same Wi-Fi counts for nothing: on a café network, that is a room full of strangers.</li>
 <li><strong>A current watch never sends its key.</strong> Every App Store version from 1.4 signs each request. Each signature can be used once. The helper proves itself in its answer, and the watch keeps an address only from an answer carrying that proof.</li>
+<li><strong>Codex decides whether the hook runs.</strong> Codex runs a hook only after you have trusted it in Codex, and the helper never trusts it for you. Codex's own approval settings still decide which actions ask at all, and every Codex question that reaches the watch waits for a person, under the same rules as Claude Code's.</li>
 <li><strong>Standard-library Python only.</strong> The helper installs no third-party packages, so there is no dependency tree to trust.</li>
 </ul>
 

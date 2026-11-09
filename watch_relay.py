@@ -1825,10 +1825,32 @@ SIGNIN_WAIT_SECONDS = 2.0
 # /health uses the answer only to say so on the Connection screen.
 HEALTH_SIGNIN_WAIT = 0.5
 _SIGNIN = {"at": 0.0, "in": None, "asked": False}
+# Codex's own, beside Claude Code's: the two sign in separately and lapse
+# separately (owner, 2026-11-09: "both for Claude Code and Codex").
+_SIGNIN_CODEX = {"at": 0.0, "in": None, "asked": False}
 _SIGNIN_LOCK = threading.Lock()
 
+# What the wrist is told, per agent: the condition's key and its sentence.
+# No command in it (2026-11-09): a watch from 3.0.1 on draws a Sign in
+# button for these keys, and one that predates it still says the problem
+# plainly. "Open a Terminal and run …" is the thing a wearer cannot do from
+# the wrist, and the rule is never to surface the terminal.
+SIGNIN_SAYS = {
+    "claude": ("signin", "Claude Code on your computer is signed out, so the "
+                         "watch can't start or reply to its sessions. Sign in "
+                         "again on the computer."),
+    "codex": ("signin_codex", "Codex on your computer is signed out, so the "
+                              "watch can't start or reply to its chats. Sign "
+                              "in again on the computer."),
+}
 
-def signed_in(runner=None, now=None, wait=None):
+
+def _signin_state(agent):
+    # Read at call time: tests put a fresh dict in place of either.
+    return _SIGNIN_CODEX if agent == "codex" else _SIGNIN
+
+
+def signed_in(runner=None, now=None, wait=None, agent="claude"):
     """True, False, or None when it cannot be told.
 
     `claude auth status` prints JSON with `loggedIn`. None — an old CLI
@@ -1843,34 +1865,86 @@ def signed_in(runner=None, now=None, wait=None):
     say it on the Connection screen where every other fault is reported.
     """
     stamp = time.time() if now is None else now
+    state = _signin_state(agent)
     # One question at a time, asked off the caller's thread and never under
     # the lock: callers that arrive meanwhile share it, and none waits
     # longer than SIGNIN_WAIT_SECONDS — after that, the last answer.
     with _SIGNIN_LOCK:
-        if _SIGNIN.get("asked"):
-            trusted = (SIGNIN_CACHE_SECONDS if _SIGNIN["in"] is not None
+        if state.get("asked"):
+            trusted = (SIGNIN_CACHE_SECONDS if state["in"] is not None
                        else SIGNIN_UNKNOWN_CACHE_SECONDS)
-            if stamp - _SIGNIN["at"] < trusted:
-                return _SIGNIN["in"]
-        answered = _SIGNIN.get("asking")
+            if stamp - state["at"] < trusted:
+                return state["in"]
+        answered = state.get("asking")
         if answered is None:
-            answered = _SIGNIN["asking"] = threading.Event()
-            threading.Thread(target=_refresh_signed_in, args=(runner, stamp, answered),
-                             daemon=True, name="signin").start()
-        last = _SIGNIN["in"]
+            answered = state["asking"] = threading.Event()
+            threading.Thread(target=_refresh_signed_in,
+                             args=(runner, stamp, answered, agent),
+                             daemon=True, name="signin-" + agent).start()
+        last = state["in"]
     if answered.wait(SIGNIN_WAIT_SECONDS if wait is None else wait):
         with _SIGNIN_LOCK:
-            return _SIGNIN["in"]
+            return state["in"]
     return last
 
 
-def _refresh_signed_in(runner, stamp, answered):
+def forget_signed_in(agent):
+    """Ask afresh next time: a sign-in just finished or failed."""
+    with _SIGNIN_LOCK:
+        _signin_state(agent).update(asked=False)
+
+
+def _refresh_signed_in(runner, stamp, answered, agent="claude"):
     try:
-        _ask_signed_in(runner, stamp)
+        if agent == "codex":
+            _ask_codex_signed_in(runner, stamp)
+        else:
+            _ask_signed_in(runner, stamp)
     finally:
         with _SIGNIN_LOCK:
-            _SIGNIN.pop("asking", None)
+            _signin_state(agent).pop("asking", None)
         answered.set()
+
+
+def _say_signed_in(agent, answer):
+    # Literal keys, so the reporting test can see both of them.
+    if agent == "codex":
+        if answer is False:
+            note_condition("signin_codex", SIGNIN_SAYS["codex"][1])
+        elif answer is True:
+            clear_condition("signin_codex")
+    elif answer is False:
+        note_condition("signin", SIGNIN_SAYS["claude"][1])
+    elif answer is True:
+        clear_condition("signin")
+
+
+def _ask_codex_signed_in(runner, stamp):
+    """`codex login status`: "Logged in using …" with exit 0, "Not logged
+    in" with exit 1 (Codex 0.167, seen 2026-11-09). Anything else, an
+    absent binary included, is None: cannot tell, never a refusal."""
+    answer = None
+    try:
+        if runner is None:
+            from ClaudeRiskClassifier import ensure_codex_on_path
+            binary = ensure_codex_on_path()
+            if not binary:
+                raise LookupError("no codex")
+            done = subprocess.run([binary, "login", "status"], capture_output=True,
+                                  text=True, timeout=15)
+        else:
+            done = runner()
+        said = " ".join(((done.stdout or "") + " " + (done.stderr or "")).split()).lower()
+        if done.returncode == 0 and said.startswith("logged in"):
+            answer = True
+        elif said.startswith("not logged in"):
+            answer = False
+    except Exception:
+        answer = None
+    with _SIGNIN_LOCK:
+        _SIGNIN_CODEX.update(at=stamp, asked=True, **{"in": answer})
+    _say_signed_in("codex", answer)
+    return answer
 
 
 def _ask_signed_in(runner, stamp):
@@ -1892,12 +1966,109 @@ def _ask_signed_in(runner, stamp):
         answer = None
     with _SIGNIN_LOCK:
         _SIGNIN.update(at=stamp, asked=True, **{"in": answer})
-    if answer is False:
-        note_condition("signin", "Claude Code on your computer is signed out. "
-                                 "Open a Terminal there and run: claude auth login")
-    elif answer is True:
-        clear_condition("signin")
+    _say_signed_in("claude", answer)
     return answer
+
+
+# The sign-in a wrist's tap starts, one per agent at a time. Claude Code's
+# opens the computer's browser and listens on localhost for the approval
+# (seen 2026-11-09, 2.1.318), so nothing is typed anywhere. Codex's is its
+# device code: a link and a short code, for any phone, which is what lets
+# a wearer away from the computer sign it back in.
+SIGNIN_RUN_SECONDS = 15 * 60
+SIGNIN_CODE_WAIT = 10.0
+_SIGNIN_RUNS = {}
+_SIGNIN_RUNS_LOCK = threading.Lock()
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_DEVICE_URL = re.compile(r"https://\S+")
+_DEVICE_CODE = re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4,6}\b")
+
+
+def start_signin(agent, popen=None):
+    """Start the agent's own sign-in on this computer. Returns a dict for
+    the watch: {"ok": True, "status": "opened"} (Claude Code: approve in
+    the computer's browser), {"ok": True, "status": "code", "url", "code"}
+    (Codex: enter the code on any device), or {"ok": False, "status":
+    words}. Never raises; never says signed in — /health does, once the
+    agent itself says so."""
+    if agent not in SIGNIN_SAYS:
+        return {"ok": False, "status": "unknown agent"}
+    with _SIGNIN_RUNS_LOCK:
+        run = _SIGNIN_RUNS.get(agent)
+        if run and run["proc"].poll() is None and time.time() - run["at"] < SIGNIN_RUN_SECONDS:
+            # A second tap shows what the first started, never a second
+            # sign-in racing it.
+            return dict(run["answer"])
+    if agent == "codex":
+        from ClaudeRiskClassifier import ensure_codex_on_path
+        binary = ensure_codex_on_path()
+        if not binary:
+            return {"ok": False, "status": "Codex is not installed on your computer"}
+        command = [binary, "login", "--device-auth"]
+    else:
+        if not ensure_claude_on_path():
+            return {"ok": False, "status": "claude not on PATH"}
+        command = ["claude", "auth", "login"]
+    try:
+        proc = (popen or subprocess.Popen)(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    except OSError:
+        return {"ok": False, "status": "The sign-in could not start on your computer"}
+    seen = {"url": None, "code": None}
+    found = threading.Event()
+
+    def read():
+        # Drains the output so the CLI never blocks on a full pipe; reads
+        # the device code out of it for Codex. Neither is ever logged.
+        try:
+            for line in proc.stdout:
+                plain = _ANSI.sub("", line)
+                if agent == "codex":
+                    url = _DEVICE_URL.search(plain)
+                    code = _DEVICE_CODE.search(plain)
+                    if url and not seen["url"]:
+                        seen["url"] = url.group(0).rstrip(".,)")
+                    if code and not seen["code"]:
+                        seen["code"] = code.group(0)
+                    if seen["url"] and seen["code"]:
+                        found.set()
+        except (OSError, ValueError):
+            pass
+        finally:
+            found.set()
+
+    def finish():
+        try:
+            proc.wait(timeout=SIGNIN_RUN_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        except Exception:
+            pass
+        # Whatever happened, the next question is asked afresh: a success
+        # clears the condition, a failure keeps it.
+        forget_signed_in(agent)
+        signed_in(agent=agent, wait=0)
+        print("relay: sign-in for %s ended" % agent, file=sys.stderr)
+
+    threading.Thread(target=read, daemon=True, name="signin-read").start()
+    threading.Thread(target=finish, daemon=True, name="signin-wait").start()
+    if agent == "codex":
+        found.wait(SIGNIN_CODE_WAIT)
+        if not (seen["url"] and seen["code"]):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return {"ok": False, "status": "Codex did not give a sign-in code"}
+        answer = {"ok": True, "status": "code", "url": seen["url"],
+                  "code": seen["code"], "expires_in": 900}
+    else:
+        answer = {"ok": True, "status": "opened"}
+    with _SIGNIN_RUNS_LOCK:
+        _SIGNIN_RUNS[agent] = {"proc": proc, "at": time.time(), "answer": answer}
+    print("relay: sign-in for %s started" % agent, file=sys.stderr)
+    return dict(answer)
 
 
 def say_guard(session_id, force=False, live=None):
@@ -3076,6 +3247,8 @@ def start_session(path, text, projects_dir=None, platform=None, agent=None,
         binary = ensure_codex_on_path()
         if not binary:
             return "Codex is not installed on your computer"
+        if signed_in(agent="codex") is False:
+            return "codex signed out"
         started = "started"
     else:
         if not ensure_claude_on_path():
@@ -4332,6 +4505,10 @@ class RelayHandler(BaseHTTPRequestHandler):
             "/archive": ("_post_archive", dict(token=True, no_simulator=True)),
             "/restore": ("_post_restore", dict(token=True, no_simulator=True)),
             "/auto-update": ("_post_auto_update", dict(token=True, no_simulator=True)),
+            # The wrist's Sign in button. token, like /new: a local process
+            # must not open sign-in pages on this computer in the watch's
+            # name, and no_simulator, so a test tap never reaches a real one.
+            "/signin": ("_post_signin", dict(token=True, no_simulator=True)),
             # The watch reporting its own trouble. A device token, like
             # /say: a local process must not be able to file a fault in
             # the watch's name.
@@ -4502,6 +4679,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             # subprocess about twice a minute at worst — and it waits half
             # a second at most: a slow answer lands on the next poll.
             signed_in(wait=HEALTH_SIGNIN_WAIT)
+            if "codex" in wired_agents():
+                signed_in(wait=HEALTH_SIGNIN_WAIT, agent="codex")
             check_login_item()
             # Only a plugin install has the switch to show. A terminal
             # install updates itself and says so, or Settings had no
@@ -4865,7 +5044,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     # after Terminal accepted the command. Keep new and
                     # unclassified outcomes conservative by default.
                     answer["retry_safe"] = status in {
-                        "empty", "unknown project", "unknown agent", "claude not on PATH", "signed out",
+                        "empty", "unknown project", "unknown agent", "claude not on PATH", "signed out", "codex signed out",
                         "Codex is not installed on your computer",
                         "a first message cannot start with ! or #",
                         "new sessions need Codex's own installer on Windows",
@@ -4972,6 +5151,12 @@ class RelayHandler(BaseHTTPRequestHandler):
         self._serialised_send(lambda body: (
             restore_session(str(body.get("session_id", ""))[:64], agent=body.get("agent")),
             "restored"), path)
+
+    def _post_signin(self, path, query):
+        """{"agent": "claude" | "codex"} → what start_signin says."""
+        agent = (self._read_json() or {}).get("agent")
+        answer = start_signin(agent)
+        self._send_json(answer, 200 if answer.get("ok") or agent in SIGNIN_SAYS else 400)
 
     def _post_auto_update(self, path, query):
         """The watch's "Keep the helper up to date" switch: {"on": bool}.

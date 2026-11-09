@@ -8352,7 +8352,7 @@ class TestAWristMessageGoesIntoTheInbox:
         monkeypatch.setattr(watch_relay, "_spawn_detached",
                             lambda *a, **k: spawned.append(a) or None)
         monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
-        monkeypatch.setattr(watch_relay, "signed_in", lambda: True)
+        monkeypatch.setattr(watch_relay, "signed_in", lambda **_: True)
         return spawned
 
     def test_an_open_session_gets_it_in_its_inbox(self, monkeypatch, capsys):
@@ -8863,7 +8863,7 @@ class TestNoticesCarryATone:
     "Failed to authenticate…" in red: the existing rewrite only looked
     at assistant prose, and this time the line was a local_command."""
 
-    SIGNED_OUT = "Claude Code on this computer is signed out — run: claude auth login"
+    SIGNED_OUT = watch_dashboard.SIGNED_OUT_NOTICE
 
     def _notices(self, tmp_path, name, lines):
         _write_transcript(tmp_path, "-p", name + ".jsonl",
@@ -12623,7 +12623,9 @@ class TestASignedOutMacSaysSo:
         assert watch_relay.signed_in(runner=self._answer(0, '{"loggedIn": false}')) is False
         said = [c for c in watch_relay.conditions() if c["key"] == "signin"]
         assert said, "the wrist learns of this on the Connection screen or not at all"
-        assert "claude auth login" in said[0]["detail"], "say the fix, not the fault"
+        # The wrist draws a Sign in button for this key; the sentence never
+        # asks for a Terminal command the wearer cannot run (2026-11-09).
+        assert "Sign in" in said[0]["detail"] and "claude auth" not in said[0]["detail"]
 
     def test_signed_out_is_read_although_the_cli_exits_1(self):
         """The real shape, seen 2026-10-11 with Claude Code 2.1.288: signed
@@ -12634,7 +12636,7 @@ class TestASignedOutMacSaysSo:
         out = '{"loggedIn": false, "authMethod": "none", "apiProvider": "firstParty"}'
         assert watch_relay.signed_in(runner=self._answer(1, out)) is False
         said = [c for c in watch_relay.conditions() if c["key"] == "signin"]
-        assert said and "claude auth login" in said[0]["detail"]
+        assert said and "signed out" in said[0]["detail"]
 
     @pytest.mark.parametrize("code,out", [
         (1, ""), (0, "not json at all"),
@@ -12733,7 +12735,146 @@ class TestASignedOutMacSaysSo:
         turns, _, _ = watch_dashboard._parse_thread(str(path), watch_dashboard.THREAD_TURN_LIMIT)
         assert len(turns) == 1
         assert turns[0]["role"] == "system" and turns[0]["kind"] == "notice"
-        assert "signed out" in turns[0]["text"] and "claude auth login" in turns[0]["text"]
+        assert "signed out" in turns[0]["text"] and "Sign in" in turns[0]["text"]
+
+
+class TestSigningInFromTheWrist:
+    """The owner's photo of 2026-11-09: New session failed with "Open a
+    terminal there and run: claude auth login", a day after the Mac's
+    Claude Code had signed out. Codex lapses too, and nothing noticed it.
+    Now each agent is asked on its own, the wrist is told in words with no
+    command, and a Sign in tap starts the agent's own sign-in: Claude
+    Code's in the computer's browser, Codex's as a device code."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "signed_in", _REAL_SIGNED_IN)
+        monkeypatch.setattr(watch_relay, "_SIGNIN", {"at": 0.0, "in": None})
+        monkeypatch.setattr(watch_relay, "_SIGNIN_CODEX", {"at": 0.0, "in": None})
+        monkeypatch.setattr(watch_relay, "_SIGNIN_RUNS", {})
+        for key in ("signin", "signin_codex"):
+            watch_relay.clear_condition(key)
+        yield
+        for key in ("signin", "signin_codex"):
+            watch_relay.clear_condition(key)
+
+    @staticmethod
+    def _codex(code, out):
+        import subprocess as sp
+        return lambda: sp.CompletedProcess(["codex"], code, out, "")
+
+    def test_codex_signed_out_is_reported_on_its_own(self):
+        assert watch_relay.signed_in(runner=self._codex(1, "Not logged in\n"),
+                                     agent="codex") is False
+        said = {c["key"]: c["detail"] for c in watch_relay.conditions()}
+        assert "signin_codex" in said and "signin" not in said
+        assert "Codex" in said["signin_codex"] and "codex login" not in said["signin_codex"]
+
+    def test_codex_signed_in_clears_it(self):
+        watch_relay.note_condition("signin_codex", "stale")
+        assert watch_relay.signed_in(runner=self._codex(0, "Logged in using ChatGPT\n"),
+                                     agent="codex") is True
+        assert "signin_codex" not in [c["key"] for c in watch_relay.conditions()]
+
+    @pytest.mark.parametrize("code,out", [(0, ""), (2, "error: unknown subcommand"),
+                                          (0, "Not sure")])
+    def test_a_codex_answer_that_cannot_be_read_is_not_a_refusal(self, code, out):
+        assert watch_relay.signed_in(runner=self._codex(code, out), agent="codex") is None
+        assert "signin_codex" not in [c["key"] for c in watch_relay.conditions()]
+
+    def test_the_two_agents_keep_separate_answers(self):
+        import subprocess as sp
+        watch_relay.signed_in(runner=lambda: sp.CompletedProcess(
+            ["claude"], 0, '{"loggedIn": true}', ""))
+        watch_relay.signed_in(runner=self._codex(1, "Not logged in"), agent="codex")
+        keys = [c["key"] for c in watch_relay.conditions()]
+        assert "signin_codex" in keys and "signin" not in keys
+
+    class _Proc:
+        """A stand-in sign-in process: its output, and whether it ran on."""
+        def __init__(self, lines, code=None):
+            import io
+            self.stdout = io.StringIO("".join(lines))
+            self.code, self.killed = code, False
+            self.done = threading.Event()
+        def poll(self):
+            return None if not self.done.is_set() else (self.code or 0)
+        def wait(self, timeout=None):
+            self.done.wait(timeout)
+            return self.code or 0
+        def kill(self):
+            self.killed = True
+            self.done.set()
+
+    def test_claude_code_opens_its_sign_in_in_the_browser(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
+        started = []
+        proc = self._Proc(["Opening browser to sign in…\n"])
+        answer = watch_relay.start_signin(
+            "claude", popen=lambda cmd, **k: started.append(cmd) or proc)
+        assert answer == {"ok": True, "status": "opened"}
+        assert started == [["claude", "auth", "login"]]
+        proc.done.set()
+
+    def test_a_second_tap_shows_the_first_sign_in(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
+        started = []
+        proc = self._Proc([])
+        def popen(cmd, **k):
+            started.append(cmd)
+            return proc
+        watch_relay.start_signin("claude", popen=popen)
+        assert watch_relay.start_signin("claude", popen=popen)["status"] == "opened"
+        assert len(started) == 1, "never two sign-ins racing"
+        proc.done.set()
+
+    def test_codex_gives_a_code_for_any_phone(self, monkeypatch):
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
+        lines = ["Follow these steps to sign in with ChatGPT using device code\n",
+                 "   \x1b[94mhttps://auth.example.test/codex/device\x1b[0m\n",
+                 "2. Enter this one-time code \x1b[90m(expires in 15 minutes)\x1b[0m\n",
+                 "   \x1b[94mABCD-EF123\x1b[0m\n"]
+        proc = self._Proc(lines)
+        answer = watch_relay.start_signin("codex", popen=lambda cmd, **k: proc)
+        assert answer["ok"] and answer["status"] == "code"
+        assert answer["url"] == "https://auth.example.test/codex/device"
+        assert answer["code"] == "ABCD-EF123"
+        proc.done.set()
+
+    def test_codex_without_a_code_fails_in_words_and_stops(self, monkeypatch):
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
+        monkeypatch.setattr(watch_relay, "SIGNIN_CODE_WAIT", 0.2)
+        proc = self._Proc(["something else entirely\n"])
+        answer = watch_relay.start_signin("codex", popen=lambda cmd, **k: proc)
+        assert answer["ok"] is False and "code" in answer["status"]
+
+    def test_nothing_to_sign_in_with_is_said(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: False)
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: None)
+        assert watch_relay.start_signin("claude")["ok"] is False
+        assert "not installed" in watch_relay.start_signin("codex")["status"]
+        assert watch_relay.start_signin("gpt")["status"] == "unknown agent"
+
+    def test_a_finished_sign_in_asks_again(self, monkeypatch):
+        """Success clears the condition only when the agent itself says so."""
+        monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
+        asked = []
+        monkeypatch.setattr(watch_relay, "signed_in",
+                            lambda **k: asked.append(k.get("agent")))
+        watch_relay._SIGNIN.update(asked=True, at=time.time(), **{"in": False})
+        proc = self._Proc([])
+        watch_relay.start_signin("claude", popen=lambda cmd, **k: proc)
+        proc.done.set()
+        _wait_until(lambda: asked, what="the sign-in to be checked again")
+        assert asked == ["claude"] and watch_relay._SIGNIN["asked"] is False
+
+    def test_a_codex_start_refuses_while_codex_is_signed_out(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
+        monkeypatch.setattr(watch_relay, "known_projects",
+                            lambda *a, **k: [{"path": str(tmp_path), "agent": "codex"}])
+        monkeypatch.setattr(watch_relay, "signed_in",
+                            lambda **k: False if k.get("agent") == "codex" else True)
+        assert watch_relay.start_session(str(tmp_path), "hi", agent="codex") == "codex signed out"
 
 
 class TestPicturesReachTheWrist:
@@ -14894,7 +15035,7 @@ class TestNewSessionFromTheWatch:
         monkeypatch.setattr(watch_relay._host, "is_windows", lambda: False)    # Linux
         monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
-        monkeypatch.setattr(watch_relay, "signed_in", lambda: True)
+        monkeypatch.setattr(watch_relay, "signed_in", lambda **_: True)
         monkeypatch.setattr(watch_relay, "trust_folder", lambda _p: True)
         opened = []
         monkeypatch.setattr(watch_relay._host, "open_terminal",
@@ -15659,6 +15800,8 @@ class TestTheRelayRefusesASimulator:
         ("/restore", {"session_id": "x", "agent": "codex"}),
         # A simulator's tap must not change the owner's Claude Code settings.
         ("/auto-update", {"on": True}),
+        # Nor open a sign-in page on the owner's computer.
+        ("/signin", {"agent": "claude"}),
     ]
 
     @pytest.fixture
@@ -15678,6 +15821,8 @@ class TestTheRelayRefusesASimulator:
         monkeypatch.setattr(watch_relay, "_plugin_install", lambda here=None: True)
         monkeypatch.setattr(watch_relay, "set_auto_update",
                             lambda on: ran.append("auto-update") or (on, None))
+        monkeypatch.setattr(watch_relay, "start_signin",
+                            lambda agent: ran.append("signin") or {"ok": True, "status": "opened"})
         allow = getattr(request, "param", False)
         server, _ = watch_relay.serve(port=0, auth=_known_watch(fresh_auth),
                                       allow_simulator=allow)
@@ -15708,7 +15853,7 @@ class TestTheRelayRefusesASimulator:
         post = watch_relay.RelayHandler.ROUTES["POST"]
         guarded = {p for p, (_, rules) in post.items() if rules.get("no_simulator")}
         assert guarded == {"/decision", "/say", "/new", "/new-agent", "/end", "/archive",
-                           "/restore", "/auto-update"}
+                           "/restore", "/auto-update", "/signin"}
 
     @pytest.mark.parametrize("tag", ["1", "yes"])
     @pytest.mark.parametrize("path,body", GUARDED)
@@ -19308,7 +19453,8 @@ class TestClaudeIsFoundWhoeverStartedTheRelay:
         source = open(os.path.join(_ROOT, "watch_relay.py"), encoding="utf-8").read()
         assert 'if not shutil.which("claude")' not in source, \
             "a bare which() is the check that failed under launchd"
-        assert source.count("if not ensure_claude_on_path():") == 2
+        # A message, a new session, and the wrist's Sign in (2026-11-09).
+        assert source.count("if not ensure_claude_on_path():") == 3
 
 
 class TestANewerHelperIsSaid:
@@ -19434,7 +19580,7 @@ class TestTheReportingItselfIsChecked:
     # exercised by a test that fires them, not merely declared.
     VOCABULARY = {"bonjour", "bridge", "bridge_install", "bridge_saves", "claude", "codex", "codex_sync", "codex_sessions", "codex_shared_service", "crash",
                   "dashboard", "helper", "icloud_off", "login_item_off", "no_tls", "outdated", "pairing",
-                  "port", "signin", "stuck", "tunnel", "update"}
+                  "port", "signin", "signin_codex", "stuck", "tunnel", "update"}
 
     @staticmethod
     def _module_source(name):
@@ -26625,7 +26771,7 @@ class TestEveryHostHasItsOwnWindows:
     def _session(self, tmp_path, monkeypatch, claude):
         monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
         monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: claude)
-        monkeypatch.setattr(watch_relay, "signed_in", lambda: True)
+        monkeypatch.setattr(watch_relay, "signed_in", lambda **_: True)
         monkeypatch.setattr(watch_relay, "trust_folder", lambda _p: True)
         monkeypatch.setattr(watch_relay._host, "is_windows", lambda: True)
         opened = []

@@ -1510,7 +1510,7 @@ class TestCodexTalkingBack:
             'path': str(workspace), 'name': 'workspace', 'minutes_ago': 0, 'agent': 'codex'}])
         monkeypatch.setattr(classifier, 'ensure_codex_on_path', lambda: '/opt/a path/codex')
         monkeypatch.setattr(relay, 'trust_folder', lambda _: pytest.fail('Claude trust reached'))
-        monkeypatch.setattr(relay, 'signed_in', lambda: pytest.fail('Claude auth reached'))
+        monkeypatch.setattr(relay, 'signed_in', lambda **k: None if k.get('agent') == 'codex' else pytest.fail('Claude auth reached'))
         scripts = []
         def opened(command, **kwargs):
             assert command[0] == 'open'
