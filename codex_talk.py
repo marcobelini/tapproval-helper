@@ -328,11 +328,15 @@ def shared_socket():
     return sessions.control_socket()
 
 
-def _start_shared_service(binary):
+def _start_shared_service(binary, env=None):
     """Idempotent native start, never restart/update or a private fallback."""
     try:
+        # The caller's own environment unless it names one: Desktop's
+        # adapter does, so the service never keeps its bindings.
+        extra = {} if env is None else {"env": env}
         result = subprocess.run([binary, "app-server", "daemon", "start"],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=START_TIMEOUT)
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=START_TIMEOUT,
+            **extra)
     except (OSError, subprocess.SubprocessError) as error:
         raise ValueError("Codex's background service start could not be confirmed; "
                          "check Codex on your computer before trying again") from error
@@ -341,7 +345,7 @@ def _start_shared_service(binary):
                          "open Codex on your computer before trying again")
 
 
-def _shared_client(binary=None, connect=None):
+def _shared_client(binary=None, connect=None, env=None):
     """Reach the common owner; only proven absence permits an idempotent start.
 
     No thread mutation has happened yet, so retrying an absent socket is
@@ -360,7 +364,10 @@ def _shared_client(binary=None, connect=None):
     if not binary:
         raise ValueError("Codex's background service is unavailable; "
                          "Codex is not installed on your computer")
-    _start_shared_service(binary)
+    if env is None:
+        _start_shared_service(binary)
+    else:
+        _start_shared_service(binary, env=env)
     deadline = time.monotonic() + START_TIMEOUT
     while True:
         try:

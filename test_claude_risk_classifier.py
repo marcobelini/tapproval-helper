@@ -17637,6 +17637,68 @@ class TestTheReleaseToolsSayWhenAStepFailed:
         assert not list(tmp_path.glob("tmp*/tapproval-signing.keychain-db"))
 
     @pytest.mark.private_layout
+    def test_another_keychain_with_the_signing_certificate_is_set_aside(self, tmp_path):
+        """The archive signs from the run's own keychain by name, but the
+        export searches the whole list. On 2026-11-09 it found the same
+        certificate first in a leftover keychain that had locked at the
+        restart, and two build numbers were burned. Run the script's own
+        functions with a stand-in `security`: the leftover is off the list
+        for the run and back on it afterwards, a keychain with another
+        certificate is never touched, and the login keychain is never set
+        aside whatever it holds."""
+        script = self._read(os.path.join("WatchApp", "deploy-testflight.sh"))
+        assert script.index('set_aside_other_copies "$CERT_SHA"') \
+            < script.index("BUILD_NUMBER=$(("), "asked only after a number is taken"
+        block = script[script.index("others_on_search_list() {"):
+                       script.index("trap drop_signing_keychain EXIT")]
+        sha = "0123456789ABCDEF0123456789ABCDEF01234567"
+        login = tmp_path / "login.keychain-db"
+        leftover = tmp_path / "claudewatch-signing.keychain-db"
+        foreign = tmp_path / "another-project.keychain-db"
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        ours = scratch / "tapproval-signing.keychain-db"
+        for keychain in (login, leftover, foreign, ours):
+            keychain.write_text("")
+        identity = '  1) %s "Apple Distribution: Somebody (TEAM)"\n'
+        (tmp_path / "claudewatch-signing.keychain-db.ids").write_text(identity % sha)
+        (tmp_path / "login.keychain-db.ids").write_text(identity % sha)
+        (tmp_path / "another-project.keychain-db.ids").write_text(identity % ("F" * 40))
+        state = tmp_path / "list"
+        state.write_text("".join('    "%s"\n' % k for k in (login, leftover, foreign, ours)))
+        fake = tmp_path / "bin"
+        fake.mkdir()
+        (fake / "security").write_text(
+            '#!/bin/bash\nS="%s"\n'
+            'case "$1" in\n'
+            '  list-keychains) if [ "${4:-}" = -s ]; then shift 4; : > "$S";'
+            ' for k in "$@"; do printf \'    "%%s"\\n\' "$k" >> "$S"; done;'
+            ' else cat "$S"; fi ;;\n'
+            '  find-identity) cat "${@: -1}.ids" 2>/dev/null ;;\n'
+            '  delete-keychain) rm -f "$2" ;;\n'
+            'esac\n' % state)
+        (fake / "security").chmod(0o755)
+        run = subprocess.run(
+            ["bash", "-c", 'set -euo pipefail\nSCRATCH="%s"\nKEYCHAIN="%s"\n%s\n'
+             'trap drop_signing_keychain EXIT\n'
+             'set_aside_other_copies "%s"\ncp "%s" "%s/during"\n'
+             % (scratch, ours, block, sha.lower(), state, tmp_path)],
+            env={**os.environ, "PATH": "%s:%s" % (fake, os.environ["PATH"])},
+            capture_output=True, text=True, timeout=60)
+        assert run.returncode == 0, run.stderr
+
+        def listed(*keychains):
+            return "".join('    "%s"\n' % k for k in keychains)
+
+        assert (tmp_path / "during").read_text() == listed(login, foreign, ours), \
+            "the leftover with our certificate stayed on the list for the run"
+        assert str(leftover) in run.stdout, "set aside without a word"
+        assert "login" in run.stderr, "the login keychain holding it went unsaid"
+        assert state.read_text() == listed(login, foreign, leftover), \
+            "the list was not put back as it was, less the run's own keychain"
+        assert leftover.exists() and foreign.exists(), "a keychain file was touched"
+
+    @pytest.mark.private_layout
     def test_an_unrecorded_build_number_is_said(self):
         script = self._read(os.path.join("WatchApp", "deploy-testflight.sh"))
         record = script[script.index('commit -q -m "Ship build'):]

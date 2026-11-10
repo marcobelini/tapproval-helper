@@ -138,6 +138,9 @@ def _config_key(key):
     return parts
 
 
+_BARE_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_.:/@+-]*\Z")
+
+
 def _config_value(text):
     # Desktop currently supplies booleans. Also retain ordinary JSON/TOML
     # scalar/array overrides; refuse richer TOML instead of silently losing
@@ -147,6 +150,12 @@ def _config_value(text):
     try:
         value = json.loads(text)
     except ValueError as error:
+        # Codex's own `-c` takes a value TOML cannot read as a plain
+        # string (`-c model=o3`); refusing it ended the whole Desktop
+        # connection (2026-11-09 review). Only a bare word, and never one
+        # TOML reads as a number: anything richer is still refused.
+        if _BARE_WORD.match(text) and text.lower().lstrip("+-") not in ("inf", "nan"):
+            return text
         raise ValueError("Codex shared connection cannot translate a Desktop config value") from error
     def valid(item):
         if isinstance(item, list):
@@ -156,6 +165,12 @@ def _config_value(text):
     if not valid(value):
         raise ValueError("Codex shared connection cannot translate a Desktop config value")
     return value
+
+
+# What Desktop hands its own server for app tools; carried per thread, never
+# into the long-lived shared service.
+DESKTOP_BINDINGS = ("CODEX_APP_TOOLS_PIPE_PATH", "CODEX_MCP_NODE_PATH",
+                    "CODEX_BROWSER_USE_NODE_PATH", "CODEX_ELECTRON_RESOURCES_PATH")
 
 
 def shared_overrides(args, env):
@@ -198,9 +213,8 @@ def shared_overrides(args, env):
             if not isinstance(current, dict):
                 raise ValueError("Codex shared connection has conflicting Desktop config keys")
         current[parts[-1]] = _config_value(value.strip())
-    bindings = {key: env[key] for key in (
-        "CODEX_APP_TOOLS_PIPE_PATH", "CODEX_MCP_NODE_PATH", "CODEX_BROWSER_USE_NODE_PATH",
-        "CODEX_ELECTRON_RESOURCES_PATH", "CODEX_CLI_PATH") if env.get(key)}
+    bindings = {key: env[key] for key in DESKTOP_BINDINGS + ("CODEX_CLI_PATH",)
+                if env.get(key)}
     plugins = config.get("plugins", {})
     if not isinstance(plugins, dict):
         raise ValueError("Codex shared connection has invalid Desktop plugin defaults")
@@ -254,16 +268,28 @@ def proxy_stdio(path, overrides=None):
     wire = LocalWebSocket(path, max_message=limit)
     done = threading.Event()
     failed = threading.Event()
+    written = threading.Lock()
     def read():
         try:
             while not done.is_set():
                 message = wire.receive()
-                sys.stdout.buffer.write(json.dumps(message, ensure_ascii=False).encode() + b"\n")
-                sys.stdout.buffer.flush()
+                with written:
+                    sys.stdout.buffer.write(json.dumps(message, ensure_ascii=False).encode() + b"\n")
+                    sys.stdout.buffer.flush()
         except (OSError, EOFError, ValueError):
             if not done.is_set():
                 failed.set()
             done.set()
+    def refuse(message, error):
+        # One request Desktop sent that cannot be carried is refused alone;
+        # raising here ended the whole Desktop connection (2026-11-09
+        # review). A notification has no id and nobody to tell.
+        if "id" not in message:
+            return
+        answer = {"id": message["id"], "error": {"code": -32602, "message": str(error)}}
+        with written:
+            sys.stdout.buffer.write(json.dumps(answer, ensure_ascii=False).encode() + b"\n")
+            sys.stdout.buffer.flush()
     reader = threading.Thread(target=read, name="desktop-stdio", daemon=True)
     reader.start()
     buffered = b""
@@ -283,7 +309,12 @@ def proxy_stdio(path, overrides=None):
                     message = json.loads(line)
                     if not isinstance(message, dict):
                         raise ValueError("expected Desktop JSON-RPC object")
-                    wire.send(thread_request(message, overrides))
+                    try:
+                        outgoing = thread_request(message, overrides)
+                    except ValueError as error:
+                        refuse(message, error)
+                        continue
+                    wire.send(outgoing)
             if len(buffered) > limit:
                 raise ValueError("oversized Desktop message")
         return 1 if failed.is_set() else 0
@@ -307,7 +338,12 @@ def run(cli, args):
         raise ValueError("The Desktop socket adapter currently requires a POSIX host")
     overrides = shared_overrides(args, env)
     from codex_talk import _shared_client, shared_socket
-    client = _shared_client(binary=cli)
+    # Should this start the shared service, the service outlives this
+    # Desktop and serves the phone and the watch: it gets the real CLI and
+    # none of this connection's own bindings, which go per thread above
+    # and go stale once Desktop quits (2026-11-09 review).
+    service_env = {key: value for key, value in env.items() if key not in DESKTOP_BINDINGS}
+    client = _shared_client(binary=cli, env=service_env)
     client.close()
     # Disconnecting the Desktop closes only its client, never the shared
     # server or a phone/watch turn. No writer ownership needs transferring.
