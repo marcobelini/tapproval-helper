@@ -4,6 +4,7 @@ import os
 import plistlib
 import stat
 import socket
+import threading
 import time
 
 import pytest
@@ -904,3 +905,86 @@ def test_rpc_deadline_bounds_silent_partial_and_ping_only_transport(monkeypatch,
         assert wire._receive_deadline is None
     finally:
         wire.close()
+
+
+# --- 2026-11-09 review ---------------------------------------------------
+
+def test_a_service_this_desktop_starts_gets_none_of_its_bindings(tmp_path, monkeypatch):
+    """The shared service outlives Desktop and serves the phone and the
+    watch; it inherited the adapter's CODEX_CLI_PATH and Desktop's pipe
+    paths, which go stale once Desktop quits."""
+    monkeypatch.setattr(desktop.host, 'native_windows', lambda: False)
+    real = tmp_path / 'codex'
+    real.touch()
+    seen = {}
+    class Shared:
+        def close(self):
+            pass
+    monkeypatch.setattr(talk, '_shared_client',
+                        lambda **kwargs: seen.update(kwargs) or Shared())
+    monkeypatch.setattr(desktop, 'proxy_stdio', lambda path, **kwargs: 0)
+    monkeypatch.setenv('CODEX_CLI_PATH', '/the/adapter/wrapper')
+    monkeypatch.setenv('CODEX_APP_TOOLS_PIPE_PATH', '/tmp/desktop.pipe')
+    monkeypatch.setenv('CODEX_ELECTRON_RESOURCES_PATH', '/Applications/Codex.app/Resources')
+    assert desktop.run(str(real), ['app-server']) == 0
+    env = seen['env']
+    assert env['CODEX_CLI_PATH'] == str(real.resolve())
+    assert not set(desktop.DESKTOP_BINDINGS) & set(env)
+
+
+def test_the_service_start_passes_the_environment_it_is_given(monkeypatch):
+    ran = {}
+    monkeypatch.setattr(talk.subprocess, 'run', lambda cmd, **kwargs: ran.update(kwargs) or
+                        talk.subprocess.CompletedProcess(cmd, 0, '', ''))
+    talk._start_shared_service('/bin/codex', env={'CODEX_CLI_PATH': '/bin/codex'})
+    assert ran['env'] == {'CODEX_CLI_PATH': '/bin/codex'}
+
+
+@pytest.mark.parametrize('value, expected', [
+    ('o3', 'o3'), ('gpt-5.1-codex', 'gpt-5.1-codex'), ('on-request', 'on-request'),
+])
+def test_a_bare_word_codex_takes_as_a_string_is_a_string(value, expected):
+    """Codex's own -c reads `model=o3` as the string "o3"; refusing it ended
+    the whole Desktop connection."""
+    assert desktop.shared_overrides(['app-server', '-c', 'model=' + value], {}) == {'model': expected}
+
+
+@pytest.mark.parametrize('value', ['inf', '-nan', '{a=1}', 'two words', '1979-05-27T07:32:00'])
+def test_anything_richer_than_a_bare_word_is_still_refused(value):
+    with pytest.raises(ValueError, match='shared'):
+        desktop.shared_overrides(['app-server', '-c', 'model=' + value], {})
+
+
+def test_one_untranslatable_request_is_refused_alone(monkeypatch):
+    """A thread/start with a config key that cannot be split ended
+    proxy_stdio, and with it every Desktop thread."""
+    import io
+    sent, out = [], io.BytesIO()
+    class FakeWire:
+        def __init__(self, *a, **k):
+            self.closed = threading.Event()
+        def receive(self):
+            self.closed.wait(5)
+            raise EOFError
+        def send(self, message):
+            sent.append(message)
+        def close(self):
+            self.closed.set()
+    import codex_approvals
+    monkeypatch.setattr(codex_approvals, 'LocalWebSocket', FakeWire)
+    bad = {'id': 7, 'method': 'thread/start', 'params': {'config': {'a."b': 1}}}
+    good = {'id': 8, 'method': 'thread/list', 'params': {}}
+    r, w = os.pipe()
+    os.write(w, (json.dumps(bad) + '\n' + json.dumps(good) + '\n').encode())
+    os.close(w)
+    stdin = os.fdopen(r, 'rb')
+    monkeypatch.setattr(desktop.sys, 'stdin', stdin)
+    monkeypatch.setattr(desktop.sys, 'stdout', type('Out', (), {'buffer': out})())
+    # The wait for input stands in as "ready": on Windows select() takes
+    # sockets only, and this test ran the real wait on a pipe there
+    # (1.1.117's three-host run). What is tested is the refusal, on every host.
+    monkeypatch.setattr(desktop.select, 'select', lambda r, w, x, timeout=None: (r, [], []))
+    assert desktop.proxy_stdio('/unused', overrides={'features': {'x': True}}) == 0
+    assert sent == [good], "the connection ended at the bad request"
+    answer = json.loads(out.getvalue().decode().splitlines()[0])
+    assert answer['id'] == 7 and answer['error']['code'] == -32602
