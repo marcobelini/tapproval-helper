@@ -27013,12 +27013,13 @@ class TestEveryHostHasItsOwnWindows:
 
     def test_linux_wakes_at_login_by_autostart_and_uninstall_takes_it(
             self, linux, monkeypatch, tmp_path):
-        target = tmp_path / "autostart" / "tapproval-relay.desktop"
+        target = tmp_path / "autostart" / "tapproval-base.desktop"
         monkeypatch.setenv("CLAUDE_LAUNCH_AGENT_PATH", str(target))
         monkeypatch.setattr(crc.sys, "executable", "/usr/bin/python3")
         assert crc.install_launch_agent() is True
         text = target.read_text(encoding="utf-8")
         assert text.startswith("[Desktop Entry]\n")
+        assert "Name=Tapproval Base\n" in text and "relay\n" not in text.split("Exec=")[0]
         assert text == tapproval_host.login_file_text("/usr/bin/python3", crc._relay_path())
         assert 'Exec="/usr/bin/python3" "' in text and '--ensure\n' in text
         assert crc.remove_launch_agent() is True and not target.exists()
@@ -27031,7 +27032,7 @@ class TestEveryHostHasItsOwnWindows:
         monkeypatch.setenv("APPDATA", str(tmp_path))
         assert tapproval_host.login_file_path() == os.path.join(
             str(tmp_path), "Microsoft", "Windows", "Start Menu", "Programs", "Startup",
-            "Tapproval relay.cmd")
+            "Tapproval Base.cmd")
         python = tmp_path / "python.exe"
         (tmp_path / "pythonw.exe").write_text("")
         text = tapproval_host.login_file_text(str(python), r"C:\h\watch_relay.py")
@@ -27041,6 +27042,73 @@ class TestEveryHostHasItsOwnWindows:
     def test_a_mac_keeps_launchd(self, monkeypatch):
         monkeypatch.setattr(tapproval_host.sys, "platform", "darwin")
         assert tapproval_host.login_file_path() is None
+        assert tapproval_host.old_login_file_paths("/x/y.plist") == []
+
+    # The login file is the one name of ours a person meets on the computer
+    # itself (Windows lists it under Startup apps), and until 2026-11 it was
+    # named after a part: "Tapproval relay".
+
+    def _an_old_login_file(self, tmp_path, monkeypatch, name, new):
+        folder = tmp_path / "startup"
+        folder.mkdir()
+        old = folder / name
+        old.write_text("old")
+        monkeypatch.setenv("CLAUDE_LAUNCH_AGENT_PATH", str(folder / new))
+        monkeypatch.setattr(crc.sys, "executable", "/usr/bin/python3")
+        return old, folder / new
+
+    def test_an_install_takes_the_old_name_away_on_linux(self, linux, monkeypatch, tmp_path):
+        old, new = self._an_old_login_file(tmp_path, monkeypatch,
+                                           "tapproval-relay.desktop", "tapproval-base.desktop")
+        assert crc.install_launch_agent() is True
+        assert new.exists() and not old.exists()
+
+    def test_an_install_takes_the_old_name_away_on_windows(self, windows, monkeypatch, tmp_path):
+        old, new = self._an_old_login_file(tmp_path, monkeypatch,
+                                           "Tapproval relay.cmd", "Tapproval Base.cmd")
+        assert crc.install_launch_agent() is True
+        assert new.exists() and not old.exists()
+
+    def test_the_old_name_stays_when_the_new_one_cannot_be_written(
+            self, linux, monkeypatch, tmp_path):
+        old, new = self._an_old_login_file(tmp_path, monkeypatch,
+                                           "tapproval-relay.desktop", "tapproval-base.desktop")
+        new.mkdir()                               # a folder where the file should go
+        assert crc.install_launch_agent() is False
+        assert old.exists()                       # still one entry, never none
+
+    def test_an_uninstall_takes_the_old_name_too(self, linux, monkeypatch, tmp_path):
+        old, new = self._an_old_login_file(tmp_path, monkeypatch,
+                                           "tapproval-relay.desktop", "tapproval-base.desktop")
+        crc.remove_launch_agent()
+        assert not old.exists() and not new.exists()
+
+    def test_an_update_renames_the_old_one_without_an_installer(
+            self, linux, monkeypatch, tmp_path):
+        old, new = self._an_old_login_file(tmp_path, monkeypatch,
+                                           "tapproval-relay.desktop", "tapproval-base.desktop")
+        monkeypatch.setattr(watch_relay._host, "is_mac", lambda: False)
+        assert watch_relay._rename_old_login_file() is True
+        assert "Name=Tapproval Base\n" in new.read_text(encoding="utf-8") and not old.exists()
+
+    def test_an_update_gives_no_login_file_to_an_install_that_had_none(
+            self, linux, monkeypatch, tmp_path):
+        new = tmp_path / "startup" / "tapproval-base.desktop"
+        monkeypatch.setenv("CLAUDE_LAUNCH_AGENT_PATH", str(new))
+        monkeypatch.setattr(watch_relay._host, "is_mac", lambda: False)
+        assert watch_relay._rename_old_login_file() is False
+        assert not new.exists()                   # a plugin install starts nothing at login
+
+    def test_a_mac_renames_nothing(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(watch_relay._host, "is_mac", lambda: True)
+        monkeypatch.setattr(crc, "rename_old_login_file",
+                            lambda: pytest.fail("the Mac's login item is the bridge's"))
+        assert watch_relay._rename_old_login_file() is False
+
+    def test_every_start_looks_for_the_old_name(self):
+        import inspect
+        body = inspect.getsource(watch_relay._ensure_running)
+        assert "_rename_old_login_file()" in body
 
     def _session(self, tmp_path, monkeypatch, claude):
         monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})

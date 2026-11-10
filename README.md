@@ -302,8 +302,8 @@ reaches a server of ours; there is none.
 - Bonjour (`dns-sd`), so your watch finds this computer on your own Wi-Fi
   without being told an address. Tailscale is used only if you already run
   it.
-- On a Mac, the signed and notarized bridge (`TapprovalBridge`, a login
-  item), which puts a waiting card into your own private iCloud database so
+- On a Mac, the signed and notarized bridge (a login item, listed as
+  Tapproval), which puts a waiting card into your own private iCloud database so
   a closed watch still buzzes. It ships inside this repository; Base
   downloads no other program.
 - `cloudflared`, only if you installed it yourself: it opens the travel
@@ -340,8 +340,8 @@ reaches a server of ours; there is none.
 - Writes the audit log `~/.claude/risk-audit.jsonl`, its own files under
   `~/.tapproval`, the hook entry in your Claude Code settings, and a login
   wake-up: on a Mac a login job in `~/Library/LaunchAgents` and the
-  bridge's login item, on Linux `~/.config/autostart/tapproval-relay.desktop`,
-  and on Windows `Tapproval relay.cmd` in your Startup folder.
+  bridge's login item, on Linux `~/.config/autostart/tapproval-base.desktop`,
+  and on Windows `Tapproval Base.cmd` in your Startup folder.
   "Uninstall Tapproval Base" removes all of it except the audit log, which
   stays yours.
 

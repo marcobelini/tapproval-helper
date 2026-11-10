@@ -658,6 +658,15 @@ def ask_person(title, text, allow, deny, seconds):
 
 # ---- signing in at login -----------------------------------------------------
 
+#: The login file's name on Windows and on Linux. Windows lists the first
+#: under Startup apps by exactly this name, so it is the product's name,
+#: not the name of a part.
+LOGIN_FILE_NAMES = ("Tapproval Base.cmd", "tapproval-base.desktop")
+#: What the same files were called until 2026-11: "relay" is our word for a
+#: part, and nobody at the computer knows it. An install takes these away.
+OLD_LOGIN_FILE_NAMES = ("Tapproval relay.cmd", "tapproval-relay.desktop")
+
+
 def login_file_path():
     """Where a file that wakes the relay at every login lives, on hosts
     that have no launchd: XDG autostart on Linux, the Startup folder on
@@ -669,10 +678,20 @@ def login_file_path():
         base = os.environ.get("APPDATA") or os.path.join(
             os.path.expanduser("~"), "AppData", "Roaming")
         return os.path.join(base, "Microsoft", "Windows", "Start Menu", "Programs",
-                            "Startup", "Tapproval relay.cmd")
+                            "Startup", LOGIN_FILE_NAMES[0])
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
         os.path.expanduser("~"), ".config")
-    return os.path.join(base, "autostart", "tapproval-relay.desktop")
+    return os.path.join(base, "autostart", LOGIN_FILE_NAMES[1])
+
+
+def old_login_file_paths(beside):
+    """The login files an earlier helper wrote under their old names, in the
+    folder of ``beside`` (today's login file). Empty on macOS."""
+    if is_mac() or not beside:
+        return []
+    folder = os.path.dirname(beside)
+    return [os.path.join(folder, name) for name in OLD_LOGIN_FILE_NAMES
+            if os.path.basename(beside) != name]
 
 
 def login_file_text(python, relay):
@@ -688,7 +707,7 @@ def login_file_text(python, relay):
         for char in '\\"`$':
             word = word.replace(char, "\\" + char)
         return '"%s"' % word
-    return ("[Desktop Entry]\nType=Application\nName=Tapproval relay\n"
+    return ("[Desktop Entry]\nType=Application\nName=Tapproval Base\n"
             "Comment=Lets your watch reach this computer after a restart\n"
             "Exec=%s %s --ensure\nTerminal=false\nNoDisplay=true\n"
             "X-GNOME-Autostart-enabled=true\n" % (quoted(python), quoted(relay)))

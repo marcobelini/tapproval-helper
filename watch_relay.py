@@ -1013,6 +1013,20 @@ def _self_update():
 _BRIDGE_RETRY_EVERY = 3600.0
 
 
+def _rename_old_login_file():
+    """On Linux and Windows, give a login file from before 2026-11 the
+    product's name ("Tapproval Base", not "Tapproval relay"): an update
+    arrives by itself and runs no installer. Never raises, never blocks a
+    session."""
+    try:
+        if _host.is_mac():
+            return False
+        import ClaudeRiskClassifier as classifier
+        return classifier.rename_old_login_file()
+    except Exception:
+        return False
+
+
 def _maybe_update_bridge():
     """Start a detached ``--bridge-update`` when this helper pins a bridge
     version this Mac does not have (route B, #378). Never raises, never
@@ -1196,6 +1210,7 @@ def _ensure_running(updated=False):
     if not updated:
         _self_update()
     _maybe_update_bridge()
+    _rename_old_login_file()
     running = _probe_relay()
     if running is None and _port_in_use(DEFAULT_PORT):
         # Held but silent: a busy relay, most likely (its /health can wait

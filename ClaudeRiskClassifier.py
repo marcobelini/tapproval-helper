@@ -3992,9 +3992,35 @@ def _install_login_file():
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8", newline="") as handle:
             handle.write(_host.login_file_text(sys.executable, relay))
-        return True
     except OSError:
         return False
+    # Only once the new one is written: an old name left beside it would
+    # show the computer two startup entries, and removed first, none.
+    _remove_old_login_files(target)
+    return True
+
+
+def rename_old_login_file():
+    """A helper before 2026-11 named its Linux or Windows login file after
+    one of its parts ("Tapproval relay"). Write it again under the
+    product's name, and only where an old one is: an install that never
+    had a login file gains none. True when one was rewritten."""
+    if _host.is_mac():
+        return False
+    target = _login_file()
+    if not any(os.path.exists(old) for old in _host.old_login_file_paths(target)):
+        return False
+    return _install_login_file()
+
+
+def _remove_old_login_files(target):
+    """Take away the login files written under their old names ("Tapproval
+    relay"), beside today's. Never raises."""
+    for old in _host.old_login_file_paths(target):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
 
 
 def wake_relay_at_login():
@@ -4018,6 +4044,7 @@ def remove_launch_agent():
     """Take the login wake-up out again — part of a clean exit."""
     if not _host.is_mac():
         target = _login_file()
+        _remove_old_login_files(target)
         try:
             os.remove(target)
             return True
