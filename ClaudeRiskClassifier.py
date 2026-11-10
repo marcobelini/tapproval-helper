@@ -4466,6 +4466,146 @@ def uninstall_codex():
     return True
 
 
+# ---- the short command --------------------------------------------------------
+#
+# ``tapproval status`` instead of ``python3 ~/.tapproval/ClaudeRiskClassifier.py
+# --status``: one short front for what Base already does, on every host
+# (design/tapproval-base-on-the-computer.md, stage 0). It adds no ability.
+
+#: The words ``tapproval`` understands.
+COMMAND_WORDS = ("status", "pair", "update", "uninstall", "help")
+#: How the launcher calls this file. Never bare: with no arguments this file
+#: is the hook, and would sit waiting for an event on stdin.
+COMMAND_FLAG = "--tapproval"
+_COMMAND_MARK = "Tapproval Base: the short command"
+COMMAND_HELP = """tapproval: the computer half of Tapproval (Tapproval Base)
+
+  tapproval status      what Base sees, and the one next step
+  tapproval pair        let a new watch pair, for ten minutes
+  tapproval update      fetch the latest Base now
+  tapproval uninstall   remove Base from this computer"""
+
+
+def searched_bin(home=None, path=None):
+    """``~/.local/bin`` when it exists and the terminal already searches
+    it, else None. Base never edits shell settings to make room for a
+    command, and never makes the folder."""
+    home = os.path.expanduser("~") if home is None else home
+    path = os.environ.get("PATH", "") if path is None else path
+    folder = os.path.join(home, ".local", "bin")
+    if not os.path.isdir(folder):
+        return None
+    real = os.path.realpath(folder)
+    for entry in path.split(os.pathsep):
+        if entry and os.path.realpath(os.path.expanduser(entry)) == real:
+            return folder
+    return None
+
+
+def _command_path():
+    """Where the launcher goes, or None when there is nowhere the terminal
+    already looks. ``TAPPROVAL_COMMAND_DIR`` is the tests' override; set
+    empty, it means nowhere. Without it, an install whose settings path is
+    overridden gets no command either."""
+    folder = os.environ.get("TAPPROVAL_COMMAND_DIR")
+    if folder is None:
+        # An install pointed at settings of its own is a test's or a trial,
+        # not this person's: it puts nothing on their PATH.
+        if os.environ.get("CLAUDE_SETTINGS_PATH"):
+            return None
+        folder = searched_bin()
+    if not folder:
+        return None
+    return os.path.join(folder, "tapproval.cmd" if _host.is_windows() else "tapproval")
+
+
+def command_text(python, script):
+    """The launcher: two lines that hand every word to this file."""
+    if _host.is_windows():
+        # One line, so cmd has read all of it before ``uninstall`` deletes
+        # the file it is reading.
+        return ('@echo off\r\nrem %s. Its installer wrote this file; '
+                'its uninstall removes it.\r\n"%s" "%s" %s %%* & exit /b\r\n'
+                % (_COMMAND_MARK, python, script, COMMAND_FLAG))
+    def quoted(word):
+        return "'%s'" % word.replace("'", "'\\''")
+    return ("#!/bin/sh\n# %s. Its installer wrote this file; its uninstall "
+            "removes it.\nexec %s %s %s \"$@\"\n"
+            % (_COMMAND_MARK, quoted(python), quoted(script), COMMAND_FLAG))
+
+
+def _is_our_command(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return _COMMAND_MARK in handle.read(600)
+    except OSError:
+        return False
+
+
+def install_command():
+    """Put ``tapproval`` where the terminal already finds commands. True
+    when it is there. A ``tapproval`` that is somebody else's stays theirs.
+    Never raises."""
+    target = _command_path()
+    if not target:
+        return False
+    if os.path.lexists(target) and not _is_our_command(target):
+        return False
+    try:
+        fresh = target + ".new"
+        with open(fresh, "w", encoding="utf-8", newline="") as handle:
+            handle.write(command_text(sys.executable, os.path.abspath(__file__)))
+        os.chmod(fresh, 0o755)
+        os.replace(fresh, target)
+        return True
+    except OSError:
+        return False
+
+
+def remove_command():
+    """Take the launcher away again, and only one this installer wrote."""
+    target = _command_path()
+    if not target or not _is_our_command(target):
+        return False
+    try:
+        os.remove(target)
+        return True
+    except OSError:
+        return False
+
+
+def run_command(words):
+    """``tapproval <word>``. 0 when the word's own work says so; 2 for a
+    word it does not know."""
+    word = words[0] if words else "help"
+    if word not in COMMAND_WORDS or len(words) > 1:
+        print(COMMAND_HELP, file=sys.stderr)
+        return 2
+    if word == "help":
+        print(COMMAND_HELP)
+        return 0
+    if word == "status":
+        return run_status()
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    if word in ("pair", "update"):
+        return subprocess.call([sys.executable, _relay_path(), "--" + word])
+    if _host.is_windows():
+        script = os.path.join(here, "uninstall.ps1")
+        call = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", script]
+    else:
+        script = os.path.join(here, "uninstall.sh")
+        call = ["bash", script]
+    if not os.path.exists(script):
+        print("Tapproval: the uninstaller is not beside this helper (%s). "
+              "A plugin install is removed with /plugin uninstall %s; the "
+              "README says how to clear what that leaves."
+              % (script, PLUGIN_NAME), file=sys.stderr)
+        return 1
+    return subprocess.call(call)
+
+
 def run_install(then_watch=False, bridge=None):
     """Register this script as a PermissionRequest hook. Safe to re-run.
 
@@ -4501,6 +4641,7 @@ def run_install(then_watch=False, bridge=None):
     # before it existed get it the next time anything runs --install.
     # After the bridge, which may take the wake-up over.
     agent = bool(relay_command) and wake_relay_at_login()
+    short = install_command()
 
     if not changed:
         print("Already installed, and the paths are correct.")
@@ -4511,6 +4652,7 @@ def run_install(then_watch=False, bridge=None):
         if closed:
             print(closed)
         _say_codex(codex)
+        _say_command(short)
         print("  Nothing to do.")
         return 0
 
@@ -4529,6 +4671,7 @@ def run_install(then_watch=False, bridge=None):
     if closed:
         print(closed)
     _say_codex(codex)
+    _say_command(short)
     if then_watch:
         return 0
     print("")
@@ -4594,6 +4737,12 @@ def _bridge_step(choice=None):
     return said
 
 
+def _say_command(short):
+    if short:
+        print("  Shortcut : type \"tapproval status\" in a terminal "
+              "(also pair, update, uninstall)")
+
+
 def _say_codex(codex):
     if codex == "installed":
         print("  Codex    : wired too; open codex in Terminal once and choose "
@@ -4649,6 +4798,7 @@ def run_uninstall():
         # The login job is ours whatever settings say: a hand edit or an
         # earlier --uninstall took the hooks and left it pointing at a
         # script the uninstaller then deletes (2026-09-30 review).
+        remove_command()
         if remove_launch_agent():
             print("Not in settings; the login job was removed.")
         else:
@@ -4665,6 +4815,7 @@ def run_uninstall():
     backup = _backup(path)
     _write_settings(path, data)
     remove_launch_agent()
+    remove_command()
     bridge_gone = _remove_bridge()
 
     print("Removed. Your other settings were left untouched.")
@@ -5087,6 +5238,12 @@ def main(argv=None):
     if not argv or (len(argv) == 2 and argv[0] == "--agent"
                     and argv[1] in ("claude", "codex")):
         return _guarded(run_hook, agent=argv[1] if argv else None)
+    # ``tapproval <word>`` through its launcher, or the word typed after
+    # this file's own name.
+    if argv[0] == COMMAND_FLAG:
+        return _guarded(run_command, argv[1:])
+    if argv[0] in COMMAND_WORDS:
+        return _guarded(run_command, argv)
     import argparse
     parser = argparse.ArgumentParser(
         description="Risk triage for Claude Code permission prompts.",

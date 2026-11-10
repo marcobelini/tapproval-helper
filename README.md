@@ -196,7 +196,7 @@ watch restored from backup): run
 
     python3 ~/.tapproval/watch_relay.py --pair
 
-or, on a plugin install, the same file under Claude Code's plugin cache
+(`tapproval pair` where the short command is installed) or, on a plugin install, the same file under Claude Code's plugin cache
 (`~/.claude/plugins/cache/tapproval/tapproval-helper/*/watch_relay.py`).
 That opens a ten-minute window on the local network. Tell your user to
 open Tapproval on the watch now. (A computer that has never paired opens
@@ -278,7 +278,8 @@ log was deliberately left in place.
 - **Leaving is one sentence.** Tell Claude Code: "Uninstall Tapproval
   Base" — or run
   `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/uninstall.sh | bash`
-  yourself (`uninstall.ps1` on Windows). It restores your settings (backup kept), removes the login
+  yourself (`uninstall.ps1` on Windows; `tapproval uninstall` runs the
+  same script from your own copy). It restores your settings (backup kept), removes the login
   wake-up, stops the relay, forgets the paired watch, removes the Mac
   bridge and its login job, and deletes `~/.tapproval` — as if Base was
   never here. Your audit log stays yours.
@@ -344,6 +345,9 @@ reaches a server of ours; there is none.
   and on Windows `Tapproval relay.cmd` in your Startup folder.
   "Uninstall Tapproval Base" removes all of it except the audit log, which
   stays yours.
+- Writes one more file where `~/.local/bin` is already on your PATH: a
+  two-line `tapproval` launcher there (`tapproval.cmd` on Windows), never
+  over a `tapproval` that is not ours. The uninstall removes it.
 
 ## What Base is
 
@@ -428,6 +432,16 @@ before replacing the helper; a new helper does not answer them for you.
 ### Connection and helper status
 
 One command says what the helper sees and the one next step:
+
+```bash
+tapproval status
+```
+
+`tapproval` is a two-line launcher the installer puts in `~/.local/bin`,
+and only when that folder exists and your terminal already searches it:
+Base never edits your shell settings to make room. It also knows `pair`,
+`update` and `uninstall`. Where it is not there (a plugin install, or no
+such folder), the long form does the same:
 
 ```bash
 python3 ~/.tapproval/ClaudeRiskClassifier.py --status

@@ -575,6 +575,13 @@ def _no_real_launch_agent(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_short_command(monkeypatch):
+    """No test may put a ``tapproval`` command on this machine's PATH: empty
+    means nowhere. A test that wants one names a folder of its own."""
+    monkeypatch.setenv("TAPPROVAL_COMMAND_DIR", "")
+
+
+@pytest.fixture(autouse=True)
 def _temporary_projects_count(monkeypatch):
     """The suite's projects live in a temporary folder, which on Linux is
     under /tmp — the very place the projects picker leaves out. Tests that
@@ -2028,6 +2035,126 @@ class TestShareFooter:
         monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
         assert crc.run_report() == 0
         assert crc.PROJECT_SITE not in capsys.readouterr().out
+
+
+class TestTheShortCommand:
+    """``tapproval status`` in front of what Base already does (stage 0 of
+    design/tapproval-base-on-the-computer.md). It adds no ability, never
+    edits shell settings, and never takes over somebody else's command."""
+
+    @pytest.fixture
+    def calls(self, monkeypatch):
+        made = []
+        monkeypatch.setattr(subprocess, "call", lambda argv: made.append(argv) or 0)
+        monkeypatch.setattr(crc, "run_hook",
+                            lambda **k: pytest.fail("a word is never the hook"))
+        return made
+
+    @pytest.fixture
+    def bin_dir(self, tmp_path, monkeypatch):
+        folder = tmp_path / "bin"
+        folder.mkdir()
+        monkeypatch.setenv("TAPPROVAL_COMMAND_DIR", str(folder))
+        monkeypatch.setattr(crc._host, "is_windows", lambda: False)
+        return folder
+
+    def test_status_is_the_report_the_flag_gives(self, calls, monkeypatch):
+        monkeypatch.setattr(crc, "run_status", lambda: 7)
+        assert crc.main(["status"]) == 7
+        assert crc.main([crc.COMMAND_FLAG, "status"]) == 7
+        assert crc.main(["--status"]) == 7 and calls == []
+
+    @pytest.mark.parametrize("word", ["pair", "update"])
+    def test_pair_and_update_are_the_relays_own(self, calls, word):
+        assert crc.main([crc.COMMAND_FLAG, word]) == 0
+        assert calls == [[sys.executable, crc._relay_path(), "--" + word]]
+
+    def test_uninstall_runs_the_uninstaller_beside_the_helper(self, calls, monkeypatch):
+        monkeypatch.setattr(crc._host, "is_windows", lambda: False)
+        assert crc.main(["uninstall"]) == 0
+        here = os.path.dirname(os.path.abspath(crc.__file__))
+        assert calls == [["bash", os.path.join(here, "uninstall.sh")]]
+
+    def test_uninstall_on_windows_is_the_powershell_one(self, calls, monkeypatch):
+        monkeypatch.setattr(crc._host, "is_windows", lambda: True)
+        assert crc.main(["uninstall"]) == 0
+        assert calls[0][0] == "powershell.exe" and calls[0][-1].endswith("uninstall.ps1")
+
+    def test_with_no_uninstaller_beside_it_nothing_runs(self, calls, monkeypatch, capsys):
+        monkeypatch.setattr(crc.os.path, "exists", lambda path: False)
+        assert crc.main(["uninstall"]) == 1
+        assert calls == [] and "/plugin uninstall" in capsys.readouterr().err
+
+    def test_the_launcher_alone_is_help_and_never_the_hook(self, calls, capsys):
+        assert crc.main([crc.COMMAND_FLAG]) == 0
+        assert "tapproval status" in capsys.readouterr().out and calls == []
+
+    @pytest.mark.parametrize("words", [["nonsense"], ["status", "extra"]])
+    def test_a_word_it_does_not_know_does_nothing(self, calls, monkeypatch, capsys, words):
+        monkeypatch.setattr(crc, "run_status", lambda: pytest.fail("not asked for"))
+        assert crc.main([crc.COMMAND_FLAG] + words) == 2
+        assert calls == [] and "tapproval status" in capsys.readouterr().err
+
+    def test_the_folder_must_exist_and_already_be_searched(self, tmp_path):
+        home = tmp_path / "home"
+        folder = home / ".local" / "bin"
+        on_path = os.pathsep.join(["/usr/bin", str(folder)])
+        assert crc.searched_bin(str(home), on_path) is None       # no such folder
+        assert not folder.exists()                                # and none is made
+        folder.mkdir(parents=True)
+        assert crc.searched_bin(str(home), "/usr/bin") is None    # not searched
+        assert crc.searched_bin(str(home), on_path) == str(folder)
+
+    def test_an_install_with_settings_of_its_own_gets_no_command(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("TAPPROVAL_COMMAND_DIR")
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+        monkeypatch.setattr(crc, "searched_bin",
+                            lambda *a: pytest.fail("a trial install looks nowhere"))
+        assert crc._command_path() is None and crc.install_command() is False
+
+    def test_install_writes_it_and_uninstall_takes_it(self, settings, bin_dir, capsys):
+        assert crc.run_install() == 0
+        launcher = bin_dir / "tapproval"
+        text = launcher.read_text(encoding="utf-8")
+        assert text.startswith("#!/bin/sh\n") and text.rstrip().endswith(
+            crc.COMMAND_FLAG + ' "$@"')
+        assert "ClaudeRiskClassifier.py" in text and os.access(str(launcher), os.X_OK)
+        assert 'Shortcut : type "tapproval status"' in capsys.readouterr().out
+        assert crc.run_install() == 0                             # and again: still ours
+        assert "Shortcut" in capsys.readouterr().out
+        assert crc.run_uninstall() == 0
+        assert not launcher.exists()
+
+    def test_with_nowhere_to_put_it_the_install_says_nothing(self, settings, capsys):
+        assert crc.run_install() == 0                             # the autouse: nowhere
+        assert "Shortcut" not in capsys.readouterr().out
+
+    def test_somebody_elses_tapproval_stays_theirs(self, settings, bin_dir, capsys):
+        theirs = bin_dir / "tapproval"
+        theirs.write_text("#!/bin/sh\necho another product\n")
+        assert crc.run_install() == 0
+        assert "Shortcut" not in capsys.readouterr().out
+        assert crc.run_uninstall() == 0
+        assert theirs.read_text() == "#!/bin/sh\necho another product\n"
+
+    def test_the_windows_launcher_is_one_line_cmd_has_read_whole(self, monkeypatch):
+        monkeypatch.setattr(crc._host, "is_windows", lambda: True)
+        text = crc.command_text(r"C:\py\python.exe", r"C:\h\ClaudeRiskClassifier.py")
+        assert text.endswith('"C:\\py\\python.exe" "C:\\h\\ClaudeRiskClassifier.py" '
+                             '--tapproval %* & exit /b\r\n')
+        monkeypatch.setenv("TAPPROVAL_COMMAND_DIR", "bin")
+        assert crc._command_path() == os.path.join("bin", "tapproval.cmd")
+
+    def test_the_launcher_runs_as_written(self, bin_dir, tmp_path):
+        if os.name == "nt" or not shutil.which("sh"):
+            pytest.skip("a /bin/sh launcher")
+        assert crc.install_command() is True
+        env = dict(os.environ, CLAUDE_SETTINGS_PATH=str(tmp_path / "settings.json"))
+        for name in ("CLAUDE_RISK_MODE", "CLAUDE_RISK_RELAY", "CLAUDE_RISK_RELAY_WAIT"):
+            env.pop(name, None)
+        done = subprocess.run([str(bin_dir / "tapproval"), "help"], capture_output=True,
+                              text=True, env=env, timeout=30)
+        assert done.returncode == 0 and "tapproval uninstall" in done.stdout
 
 
 class TestInstallerCLI:
