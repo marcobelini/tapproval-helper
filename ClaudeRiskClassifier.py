@@ -111,7 +111,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.115"
+__version__ = "1.1.116"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -1706,9 +1706,17 @@ def _names_a_secret_path(value):
 def _path_like(value):
     """A tool input that is a path rather than prose: one line, short, and
     shaped like a path. An MCP message about "the credentials doc" is not a
-    read of one."""
-    return ("\n" not in value and len(value) < 1024 and " " not in value.strip()
-            and (value.startswith(("/", "~", ".", "$HOME")) or "/" in value or "\\" in value))
+    read of one. A space is prose only when the value does not start where
+    a path does: "~/Library/Application Support/…/Login Data" is a path,
+    and dropping it hid every secret under a folder with a space in its
+    name (2026-11-09 review)."""
+    text = value.strip()
+    if "\n" in value or len(value) >= 1024:
+        return False
+    if text.startswith(("/", "~/", "$HOME/")) or re.match(r"[A-Za-z]:[\\/]", text):
+        return True
+    return " " not in text and (text.startswith((".", "~", "$HOME")) or "/" in text
+                                or "\\" in text)
 
 
 READ_ONLY_TOOLS = frozenset(

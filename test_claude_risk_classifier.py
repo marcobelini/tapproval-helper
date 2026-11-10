@@ -12937,18 +12937,124 @@ class TestSigningInFromTheWrist:
         assert "not installed" in watch_relay.start_signin("codex")["status"]
         assert watch_relay.start_signin("gpt")["status"] == "unknown agent"
 
+    def test_a_check_begun_before_a_sign_in_is_not_kept(self):
+        """2026-11-09 review: a check that read "signed out" a moment
+        before the sign-in landed was joined after it and cached as fresh
+        for two minutes; New session kept refusing as signed out."""
+        import subprocess as sp
+        gate = threading.Event()
+        def stale():
+            gate.wait(5)
+            return sp.CompletedProcess(["claude"], 1, '{"loggedIn": false}', "")
+        watch_relay.signed_in(runner=stale, wait=0)          # in flight
+        watch_relay.forget_signed_in("claude")               # the sign-in landed
+        def fresh():
+            return sp.CompletedProcess(["claude"], 0, '{"loggedIn": true}', "")
+        assert watch_relay.signed_in(runner=fresh, wait=10) is True
+        gate.set()
+        for thread in threading.enumerate():                 # the stale one answers,
+            if thread.name == "signin-claude":               # inside this test, not
+                thread.join(5)                               # in the next one's state
+        assert "signin" not in [c["key"] for c in watch_relay.conditions()]
+        assert watch_relay.signed_in(runner=fresh, wait=10) is True
+
+    def test_an_answer_begun_on_state_since_replaced_is_not_kept(self):
+        """A check still running when its state was replaced (a test's
+        fresh state, CI 2026-11-10) wrote "signed out" into the new one:
+        a count of generations restarted at zero and matched it."""
+        import subprocess as sp
+        gate = threading.Event()
+        def stale():
+            gate.wait(5)
+            return sp.CompletedProcess(["claude"], 1, '{"loggedIn": false}', "")
+        watch_relay.signed_in(runner=stale, wait=0)
+        watch_relay._SIGNIN = {"at": 0.0, "in": None}         # replaced, as a fixture does
+        gate.set()
+        for thread in threading.enumerate():
+            if thread.name == "signin-claude":
+                thread.join(5)
+        assert watch_relay._SIGNIN == {"at": 0.0, "in": None}
+        assert "signin" not in [c["key"] for c in watch_relay.conditions()]
+
+    def test_a_codex_that_is_gone_takes_its_signed_out_row_with_it(self, monkeypatch):
+        """2026-11-09 review: uninstalled, Codex answered "cannot tell",
+        which cleared nothing; the row and its Sign in stayed until a
+        restart, and the button said Codex was not installed."""
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: None)
+        watch_relay.note_condition("signin_codex", "stale")
+        assert watch_relay.signed_in(agent="codex", wait=2) is None
+        assert "signin_codex" not in [c["key"] for c in watch_relay.conditions()]
+
+    def test_health_clears_the_row_of_a_codex_no_longer_wired(self):
+        import inspect
+        body = inspect.getsource(watch_relay.RelayHandler._get_health)
+        wired = body.index('if "codex" in wired_agents():')
+        assert body.index('clear_condition("signin_codex")') > wired
+
+    def test_an_agent_that_is_not_a_name_is_refused_not_raised(self):
+        """2026-11-09 review: {"agent": []} raised TypeError (unhashable)
+        out of start_signin and dropped the connection with no answer."""
+        for odd in ([], {}, 3, None):
+            assert watch_relay.start_signin(odd) == {"ok": False, "status": "unknown agent"}
+
+    def test_a_tap_while_codex_is_still_starting_waits_for_it(self, monkeypatch):
+        """2026-11-09 review: Codex takes seconds to print its code, the
+        watch gives up after five and taps again, and the second tap found
+        nothing recorded yet: a second `codex login` beside the first."""
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
+        started = []
+
+        class Slow(self._Proc):
+            def __init__(self):
+                super().__init__([])
+                def lines():
+                    time.sleep(0.5)
+                    yield "   https://auth.example.test/codex/device\n"
+                    yield "   ABCD-EF123\n"
+                self.stdout = lines()
+
+        procs = []
+        def popen(cmd, **k):
+            started.append(cmd)
+            procs.append(Slow())
+            return procs[-1]
+        answers = []
+        taps = [threading.Thread(target=lambda: answers.append(
+            watch_relay.start_signin("codex", popen=popen))) for _ in range(2)]
+        for tap in taps:
+            tap.start()
+            time.sleep(0.05)
+        for tap in taps:
+            tap.join(5)
+        assert len(started) == 1, "two taps started two sign-ins"
+        assert [a.get("code") for a in answers] == ["ABCD-EF123", "ABCD-EF123"]
+        for proc in procs:
+            proc.done.set()
+
+    def test_a_failed_start_frees_the_slot_for_the_next_tap(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
+        def broken(cmd, **k):
+            raise OSError("no")
+        assert watch_relay.start_signin("claude", popen=broken)["ok"] is False
+        proc = self._Proc([])
+        assert watch_relay.start_signin("claude", popen=lambda cmd, **k: proc)["ok"] is True
+        proc.done.set()
+
     def test_a_finished_sign_in_asks_again(self, monkeypatch):
         """Success clears the condition only when the agent itself says so."""
         monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
         asked = []
+        # Record the state at the moment of asking: read afterwards, a
+        # thread another test left running could have written it again.
         monkeypatch.setattr(watch_relay, "signed_in",
-                            lambda **k: asked.append(k.get("agent")))
+                            lambda **k: asked.append(
+                                (k.get("agent"), watch_relay._SIGNIN["asked"])))
         watch_relay._SIGNIN.update(asked=True, at=time.time(), **{"in": False})
         proc = self._Proc([])
         watch_relay.start_signin("claude", popen=lambda cmd, **k: proc)
         proc.done.set()
         _wait_until(lambda: asked, what="the sign-in to be checked again")
-        assert asked == ["claude"] and watch_relay._SIGNIN["asked"] is False
+        assert asked == [("claude", False)]
 
     def test_a_codex_start_refuses_while_codex_is_signed_out(self, monkeypatch, tmp_path):
         monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
@@ -15930,6 +16036,24 @@ class TestTheRelayRefusesASimulator:
                 return reply.status, json.loads(reply.read() or b"{}")
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read() or b"{}")
+
+    @pytest.mark.parametrize("body", [{"agent": []}, {"agent": {"a": 1}}, []])
+    def test_a_sign_in_for_no_named_agent_is_answered_400(self, relay, monkeypatch, body):
+        """2026-11-09 review: an unhashable agent raised out of /signin and
+        the connection dropped with no answer at all."""
+        monkeypatch.setattr(watch_relay, "start_signin", self._real_start_signin)
+        base, ran = relay
+        request = urllib.request.Request(
+            base + "/signin", data=json.dumps(body).encode(), method="POST",
+            headers={"Content-Type": "application/json", "X-Tapproval-Token": "devicetoken"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as reply:
+                status, answer = reply.status, json.loads(reply.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            status, answer = error.code, json.loads(error.read() or b"{}")
+        assert status == 400 and answer == {"ok": False, "status": "unknown agent"}
+
+    _real_start_signin = staticmethod(watch_relay.start_signin)
 
     def test_the_answering_routes_carry_the_rule(self):
         post = watch_relay.RelayHandler.ROUTES["POST"]
@@ -26083,6 +26207,10 @@ class TestWhatTheShellUnquotes:
         ("Grep", {"pattern": "x", "glob": "**/.ss?/*"}),
         ("mcp__fs__read_file", {"path": "/Users/u/.ssh/id_rsa"}),
         ("mcp__fs__read_text_file", {"path": "~/.aws"}),
+        # 2026-11-09 review: a space in the path hid it from the check.
+        ("mcp__fs__read_file",
+         {"path": "~/Library/Application Support/Google/Chrome/Default/Login Data"}),
+        ("mcp__fs__read_file", {"path": "/Users/u/My Keys/.ssh/id_rsa"}),
     ])
     def test_a_secret_named_any_other_way_is_a_secret_read(self, tool, tool_input):
         result = crc.classify({"tool_name": tool, "tool_input": tool_input})
@@ -26092,6 +26220,8 @@ class TestWhatTheShellUnquotes:
         ("Grep", {"pattern": "x", "glob": "*.py"}),
         ("mcp__slack__send_message", {"text": "the credentials doc is ready"}),
         ("mcp__fs__read_file", {"path": "/Users/u/proj/README.md"}),
+        ("mcp__slack__send_message", {"text": "copy the Login Data file over ~/.ssh later"}),
+        ("mcp__fs__read_file", {"path": "/Users/u/My Notes/ssh tips.md"}),
     ])
     def test_and_no_further(self, tool, tool_input):
         result = crc.classify({"tool_name": tool, "tool_input": tool_input})

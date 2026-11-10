@@ -1879,7 +1879,8 @@ def signed_in(runner=None, now=None, wait=None, agent="claude"):
         if answered is None:
             answered = state["asking"] = threading.Event()
             threading.Thread(target=_refresh_signed_in,
-                             args=(runner, stamp, answered, agent),
+                             args=(runner, stamp, answered, agent,
+                                   state.setdefault("gen", object())),
                              daemon=True, name="signin-" + agent).start()
         last = state["in"]
     if answered.wait(SIGNIN_WAIT_SECONDS if wait is None else wait):
@@ -1889,20 +1890,35 @@ def signed_in(runner=None, now=None, wait=None, agent="claude"):
 
 
 def forget_signed_in(agent):
-    """Ask afresh next time: a sign-in just finished or failed."""
+    """Ask afresh next time: a sign-in just finished or failed. A question
+    already on its way began before that, so its answer is not kept, and
+    the next caller asks a new one rather than joining it: a check that
+    read "signed out" a moment before the sign-in landed was cached as
+    fresh for two minutes (2026-11-09 review)."""
     with _SIGNIN_LOCK:
-        _signin_state(agent).update(asked=False)
+        state = _signin_state(agent)
+        # A new token, not a count: a count restarts at nothing, and an
+        # answer begun before would match it again.
+        state.update(asked=False, gen=object())
+        state.pop("asking", None)
 
 
-def _refresh_signed_in(runner, stamp, answered, agent="claude"):
+def _current(state, gen):
+    """Whether an answer begun at ``gen`` is still the one to keep."""
+    return gen is None or state.get("gen") is gen
+
+
+def _refresh_signed_in(runner, stamp, answered, agent="claude", gen=None):
     try:
         if agent == "codex":
-            _ask_codex_signed_in(runner, stamp)
+            _ask_codex_signed_in(runner, stamp, gen)
         else:
-            _ask_signed_in(runner, stamp)
+            _ask_signed_in(runner, stamp, gen)
     finally:
         with _SIGNIN_LOCK:
-            _signin_state(agent).pop("asking", None)
+            state = _signin_state(agent)
+            if state.get("asking") is answered:
+                state.pop("asking", None)
         answered.set()
 
 
@@ -1919,16 +1935,17 @@ def _say_signed_in(agent, answer):
         clear_condition("signin")
 
 
-def _ask_codex_signed_in(runner, stamp):
+def _ask_codex_signed_in(runner, stamp, gen=None):
     """`codex login status`: "Logged in using …" with exit 0, "Not logged
     in" with exit 1 (Codex 0.167, seen 2026-11-09). Anything else, an
     absent binary included, is None: cannot tell, never a refusal."""
-    answer = None
+    answer, absent = None, False
     try:
         if runner is None:
             from ClaudeRiskClassifier import ensure_codex_on_path
             binary = ensure_codex_on_path()
             if not binary:
+                absent = True
                 raise LookupError("no codex")
             done = subprocess.run([binary, "login", "status"], capture_output=True,
                                   text=True, timeout=15)
@@ -1942,12 +1959,18 @@ def _ask_codex_signed_in(runner, stamp):
     except Exception:
         answer = None
     with _SIGNIN_LOCK:
+        if not _current(_SIGNIN_CODEX, gen):
+            return answer          # begun before a sign-in: not news
         _SIGNIN_CODEX.update(at=stamp, asked=True, **{"in": answer})
+    if absent:
+        # No Codex at all: a "signed out" row from before it went has no
+        # Sign in that could work (2026-11-09 review).
+        clear_condition("signin_codex")
     _say_signed_in("codex", answer)
     return answer
 
 
-def _ask_signed_in(runner, stamp):
+def _ask_signed_in(runner, stamp, gen=None):
     answer = None
     try:
         run = runner or (lambda: subprocess.run(
@@ -1965,6 +1988,8 @@ def _ask_signed_in(runner, stamp):
     except Exception:
         answer = None
     with _SIGNIN_LOCK:
+        if not _current(_SIGNIN, gen):
+            return answer          # begun before a sign-in: not news
         _SIGNIN.update(at=stamp, asked=True, **{"in": answer})
     _say_signed_in("claude", answer)
     _say_login_ends(answer, said if answer is True else None, stamp)
@@ -2035,30 +2060,64 @@ def start_signin(agent, popen=None):
     (Codex: enter the code on any device), or {"ok": False, "status":
     words}. Never raises; never says signed in — /health does, once the
     agent itself says so."""
-    if agent not in SIGNIN_SAYS:
+    if not isinstance(agent, str) or agent not in SIGNIN_SAYS:
         return {"ok": False, "status": "unknown agent"}
     with _SIGNIN_RUNS_LOCK:
         run = _SIGNIN_RUNS.get(agent)
-        if run and run["proc"].poll() is None and time.time() - run["at"] < SIGNIN_RUN_SECONDS:
+        if run and run["proc"] is None:
+            # Another tap's sign-in is still starting (Codex takes up to
+            # SIGNIN_CODE_WAIT to print its code, the watch gives up after
+            # five seconds and taps again): wait for it, never a second.
+            starting = run
+        elif run and run["proc"].poll() is None and time.time() - run["at"] < SIGNIN_RUN_SECONDS:
             # A second tap shows what the first started, never a second
             # sign-in racing it.
             return dict(run["answer"])
+        else:
+            starting = None
+            mine = {"proc": None, "at": time.time(), "ready": threading.Event()}
+            _SIGNIN_RUNS[agent] = mine
+    if starting is not None:
+        starting["ready"].wait(SIGNIN_CODE_WAIT + 5)
+        with _SIGNIN_RUNS_LOCK:
+            run = _SIGNIN_RUNS.get(agent)
+            if run and run.get("answer"):
+                return dict(run["answer"])
+        return {"ok": False, "status": "The sign-in could not start on your computer"}
+    answer, proc = None, None
+    try:
+        answer, proc = _launch_signin(agent, popen)
+    finally:
+        with _SIGNIN_RUNS_LOCK:
+            if proc is not None and answer and answer.get("ok"):
+                _SIGNIN_RUNS[agent] = {"proc": proc, "at": time.time(), "answer": answer}
+            elif _SIGNIN_RUNS.get(agent) is mine:
+                del _SIGNIN_RUNS[agent]
+        mine["ready"].set()
+    if proc is not None:
+        print("relay: sign-in for %s started" % agent, file=sys.stderr)
+    return dict(answer)
+
+
+def _launch_signin(agent, popen):
+    """start_signin's work once it holds the agent's one slot: (answer for
+    the watch, the running process or None when nothing runs on)."""
     if agent == "codex":
         from ClaudeRiskClassifier import ensure_codex_on_path
         binary = ensure_codex_on_path()
         if not binary:
-            return {"ok": False, "status": "Codex is not installed on your computer"}
+            return {"ok": False, "status": "Codex is not installed on your computer"}, None
         command = [binary, "login", "--device-auth"]
     else:
         if not ensure_claude_on_path():
-            return {"ok": False, "status": "claude not on PATH"}
+            return {"ok": False, "status": "claude not on PATH"}, None
         command = ["claude", "auth", "login"]
     try:
         proc = (popen or subprocess.Popen)(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, start_new_session=True)
     except OSError:
-        return {"ok": False, "status": "The sign-in could not start on your computer"}
+        return {"ok": False, "status": "The sign-in could not start on your computer"}, None
     seen = {"url": None, "code": None}
     found = threading.Event()
 
@@ -2104,15 +2163,12 @@ def start_signin(agent, popen=None):
                 proc.kill()
             except Exception:
                 pass
-            return {"ok": False, "status": "Codex did not give a sign-in code"}
+            return {"ok": False, "status": "Codex did not give a sign-in code"}, None
         answer = {"ok": True, "status": "code", "url": seen["url"],
                   "code": seen["code"], "expires_in": 900}
     else:
         answer = {"ok": True, "status": "opened"}
-    with _SIGNIN_RUNS_LOCK:
-        _SIGNIN_RUNS[agent] = {"proc": proc, "at": time.time(), "answer": answer}
-    print("relay: sign-in for %s started" % agent, file=sys.stderr)
-    return dict(answer)
+    return answer, proc
 
 
 def say_guard(session_id, force=False, live=None):
@@ -4725,6 +4781,10 @@ class RelayHandler(BaseHTTPRequestHandler):
             signed_in(wait=HEALTH_SIGNIN_WAIT)
             if "codex" in wired_agents():
                 signed_in(wait=HEALTH_SIGNIN_WAIT, agent="codex")
+            else:
+                # Nobody asks about a Codex that is not wired, so a row
+                # from before stayed until a restart (2026-11-09 review).
+                clear_condition("signin_codex")
             check_login_item()
             # Only a plugin install has the switch to show. A terminal
             # install updates itself and says so, or Settings had no
@@ -5198,9 +5258,11 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def _post_signin(self, path, query):
         """{"agent": "claude" | "codex"} → what start_signin says."""
-        agent = (self._read_json() or {}).get("agent")
+        body = self._read_json()
+        agent = body.get("agent") if isinstance(body, dict) else None
         answer = start_signin(agent)
-        self._send_json(answer, 200 if answer.get("ok") or agent in SIGNIN_SAYS else 400)
+        known = isinstance(agent, str) and agent in SIGNIN_SAYS
+        self._send_json(answer, 200 if answer.get("ok") or known else 400)
 
     def _post_auto_update(self, path, query):
         """The watch's "Keep the helper up to date" switch: {"on": bool}.

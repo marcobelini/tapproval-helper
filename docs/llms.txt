@@ -3,8 +3,8 @@
 > Approve Claude Code's and Codex's permission prompts from an Apple Watch. When the
 > agent on your computer asks permission, the question appears on the
 > watch, marked with one of five risk tiers, and one tap answers it.
-> No account and no server of ours. Independent; not affiliated with Anthropic.
-> Made for Claude Code users and vibe coders who step away while Claude works.
+> No account and no server of ours. Independent; not affiliated with Anthropic or OpenAI.
+> Made for people who run Claude Code or Codex and step away while it works.
 > Claude Code and Codex, side by side, since version 3.0.
 > Not to be confused with tapproval.vercel.app, a separate phone-notification
 > tool by another developer.
@@ -29,13 +29,17 @@
 
 ## What it needs
 - An Apple Watch running watchOS 10 or later.
-- Claude Code on a Mac or a Linux machine, or on Windows as a preview
+- Claude Code or Codex on a Mac or a Linux machine, or on Windows as a preview
   (tested on GitHub's Windows machines, not yet on a real PC). The buzz
   while the app is closed is Mac-only; elsewhere cards wait until the app
   is opened.
 - Tapproval Base, the free, open-source helper (MIT licence; the
   tapproval-helper plugin and repository), which Claude Code installs
   when told: "Install the Tapproval plugin from marcobelini/tapproval-helper".
+  For Codex, one command installs it:
+  curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash
+  then open codex once and choose "Trust all and continue", because Codex
+  runs a hook only after the user approves it.
 - Works on the same Wi-Fi, or away from home through a private travel address.
 
 ## Codex (since 3.0)
@@ -48,6 +52,19 @@
 - The first 100 answers are free, shared by Claude Code and Codex; then
   $5 once unlocks unlimited answers for each agent, for good. No subscription. An optional $1 tip is offered too.
 - Reading sessions and the day's overview stays free.
+
+## Common questions
+- Is there a subscription? No. 100 answers free, shared by Claude Code and
+  Codex, then $5 once per agent.
+- Does it work with Codex? Yes, since version 3.0; one helper install covers
+  both agents.
+- Does it work without the iPhone? Yes. The watch reaches the computer over
+  the internet on its own, through a private travel address, and on a Mac
+  through the user's own iCloud.
+- Does it approve anything on its own? No, unless the user turns that on
+  for the harmless tiers; a CRITICAL request never.
+- Is it the same as tapproval.vercel.app? No; that is a separate
+  phone-notification tool by another developer, with no watch app.
 
 ## Where to get it
 - App Store: https://apps.apple.com/app/tapproval/id6805869018
