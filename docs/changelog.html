@@ -23,6 +23,10 @@
 <main class="policy">
 <h1>Changelog</h1>
 <p><em>Every release of Tapproval Base, the helper on your computer, newest first. Starting Claude Code once updates it. Generated from <a href="https://github.com/marcobelini/tapproval-helper/releases">the releases on GitHub</a>, which may already hold a newer one. Security fixes are also explained on <a href="security.html">the security page</a>.</em></p>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.117">1.1.117</a></h2>
+<p><em>2026-11-10</em></p>
+<p><strong>Codex Desktop through Tapproval, steadier.</strong> If Desktop was the one that started Codex's shared background service, that service now starts clean instead of keeping Desktop's temporary connection, which broke once Desktop quit. A plain setting such as <code>-c model=o3</code> no longer ends the Desktop connection, and one request that cannot be carried over is refused on its own while every other thread carries on (#1276). This matters only if you use Codex Desktop through Tapproval, which is opt-in.</p>
+<p>Updates itself within the hour on every computer; nothing to do.</p>
 <h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.116">1.1.116</a></h2>
 <p><em>2026-11-10</em></p>
 <p><strong>Signing in from the wrist, made stricter.</strong> The watch shows a sign-in code only when the answer provably came from your own computer, and the computer runs one sign-in at a time, so a second tap cannot start a competing one (#1269).</p>
