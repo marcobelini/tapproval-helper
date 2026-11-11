@@ -652,13 +652,27 @@ def permission_mode(path, tail=_MODE_TAIL_BYTES):
         return ""
 
 
+def side_reason(entry, transcript):
+    """Why a wrist message cannot go into this live session's own inbox,
+    or "" when it can: "no_inbox" (it has none), or "plan" or "bypass", the
+    modes in which Claude Code would hold a message from outside for a
+    click (#246, 2026-10-22). The watch words its line from this, so a
+    new reason is a new word here and a general line there."""
+    if not (entry or {}).get("socket"):
+        return "no_inbox"
+    mode = permission_mode(transcript)
+    if mode == shape("mode.plan"):
+        return "plan"
+    if mode == shape("mode.bypass"):
+        return "bypass"
+    return ""
+
+
 def inbox_ready(entry, transcript):
     """Whether a wrist message can go into this live session's own inbox:
-    it has one, and its mode is not one in which Claude Code would hold a
-    message from outside for a click (#246, 2026-10-22)."""
-    if not (entry or {}).get("socket"):
-        return False
-    return permission_mode(transcript) not in (shape("mode.bypass"), shape("mode.plan"))
+    side_reason has nothing against it. One decision, so the row the watch
+    reads and the route the relay takes cannot disagree."""
+    return not side_reason(entry, transcript)
 
 
 _REPO_SLUG_CACHE = OrderedDict()
@@ -2890,6 +2904,8 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
         # different name for the same session — which read as a different
         # session.
         named = registry.get(session_id, {}).get("name", "")
+        beside = (side_reason(registry.get(session_id), path)
+                  if session_id in live else "")
         sessions.append({
             "title": named or derive_title(opening) or name,
             "project": name,
@@ -2901,8 +2917,10 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
             # open session does not read. Said per row, by the side that
             # knows, so a route that does reach a live session can turn it
             # off without a new watch build.
-            "side_thread": (session_id in live
-                            and not inbox_ready(registry.get(session_id), path)),
+            "side_thread": bool(beside),
+            # And why, so the watch can say what to do about it: "plan",
+            # "bypass" or "no_inbox"; "" when the message reaches it.
+            "side_reason": beside,
             "path": cwd or "",
             "session_id": session_id[:12],
             "opening": opening or "",

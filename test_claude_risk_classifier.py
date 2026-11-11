@@ -8464,6 +8464,25 @@ class TestAWristMessageGoesIntoTheInbox:
         assert watch_dashboard.inbox_ready({}, transcript("auto")) is False
         assert watch_dashboard.inbox_ready(None, transcript("auto")) is False
 
+    def test_the_row_says_why_a_message_runs_beside(self, tmp_path):
+        """The watch words its line from the reason, so the helper names it:
+        the same three cases inbox_ready turns away, and nothing else."""
+        def transcript(mode):
+            return str(_write_transcript(tmp_path, "-m", "%s.jsonl" % mode, [
+                {"type": "user", "permissionMode": mode,
+                 "message": {"role": "user", "content": "b"}}]))
+        entry = {"socket": "/tmp/cc-socks/1.sock"}
+        cases = [(entry, transcript("auto"), ""),
+                 (entry, None, ""),
+                 (entry, transcript("plan"), "plan"),
+                 (entry, transcript("bypassPermissions"), "bypass"),
+                 ({}, transcript("auto"), "no_inbox"),
+                 (None, transcript("plan"), "no_inbox")]
+        for who, path, reason in cases:
+            assert watch_dashboard.side_reason(who, path) == reason
+            # One decision, said two ways: they can never disagree.
+            assert watch_dashboard.inbox_ready(who, path) is (reason == "")
+
     def _stage(self, monkeypatch, posted):
         monkeypatch.setattr(watch_relay, "session_registry",
                             lambda *a, **k: {"abcdef12-3": {"pid": 7, "socket": "/tmp/cc-socks/7.sock"}})
@@ -8557,6 +8576,26 @@ class TestAWristMessageGoesIntoTheInbox:
                 "side1": {"socket": _s, "bridged": False, "cwd": "/x", "name": ""}})
             rows = watch_dashboard.recent_sessions(projects_dir=str(tmp_path))
             assert [r["side_thread"] for r in rows if r["session_id"] == "side1"] == [side]
+            assert [r["side_reason"] for r in rows
+                    if r["session_id"] == "side1"] == ["no_inbox" if side else ""]
+
+    def test_a_planning_session_says_it_is_planning(self, tmp_path, monkeypatch):
+        """A session in plan mode has an inbox and still takes no wrist
+        message; its row says "plan", and a closed one says nothing."""
+        for sid, mode in (("plan1", "plan"), ("byp1", "bypassPermissions"), ("shut1", "plan")):
+            _write_transcript(tmp_path, "-p", sid + ".jsonl", [
+                {"cwd": "/x", "entrypoint": "cli", "permissionMode": mode,
+                 "message": {"role": "user", "content": "hello " + sid}}])
+        monkeypatch.setattr(watch_dashboard, "live_sessions",
+                            lambda *a, **k: {"plan1": "Terminal", "byp1": "Terminal"})
+        monkeypatch.setattr(watch_dashboard, "session_registry", lambda *a, **k: {
+            sid: {"socket": "/tmp/cc-socks/1.sock", "bridged": False, "cwd": "/x", "name": ""}
+            for sid in ("plan1", "byp1")})
+        rows = {r["session_id"]: r for r in watch_dashboard.recent_sessions(
+            projects_dir=str(tmp_path), include_idle=True)}
+        assert (rows["plan1"]["side_thread"], rows["plan1"]["side_reason"]) == (True, "plan")
+        assert (rows["byp1"]["side_thread"], rows["byp1"]["side_reason"]) == (True, "bypass")
+        assert (rows["shut1"]["side_thread"], rows["shut1"]["side_reason"]) == (False, "")
 
 
 class TestCodeBlocksForTheWatch:
@@ -16890,6 +16929,8 @@ class TestSessionRegistry:
         rows = {s["session_id"]: s for s in watch_relay.recent_sessions(projects_dir=str(tmp_path), include_idle=True)}
         assert rows["a-1"]["side_thread"] is True
         assert rows["b-1"]["side_thread"] is False
+        assert rows["a-1"]["side_reason"] == "no_inbox"
+        assert rows["b-1"]["side_reason"] == ""
 
     def test_without_remote_control_every_live_session_shows(self, tmp_path, monkeypatch):
         import watch_dashboard
