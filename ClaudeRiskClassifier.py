@@ -5068,6 +5068,38 @@ def check_command(command):
     return problems
 
 
+def session_env(data, env=None):
+    """The environment a session's hook runs in: this shell's, with what
+    settings.json exports for the hook on top. --status is typed in a plain
+    terminal, where none of that is set, and read "shadow" from it while
+    every session was in enforce (2026-11-10)."""
+    merged = dict(os.environ if env is None else env)
+    exported = data.get("env") if isinstance(data, dict) else None
+    if isinstance(exported, dict):
+        for name, value in exported.items():
+            if isinstance(name, str) and name.startswith("CLAUDE_RISK_") \
+                    and isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                merged[name] = str(value)
+    return merged
+
+
+def wakes_at_login():
+    """Is something in place that wakes the relay at login? On Linux and
+    Windows the login file; on a Mac the relay's own job, or the bridge
+    that took the wake-up over from it (1.1.0 and later), which leaves no
+    job file to find. Never raises."""
+    if not _host.is_mac():
+        target = _login_file()
+        return bool(target) and os.path.exists(target)
+    if os.path.exists(_launch_agent_path()):
+        return True
+    try:
+        import bridge_install
+        return bool(bridge_install.mac_supported() and bridge_install.wakes_relay())
+    except Exception:
+        return False
+
+
 def status_facts():
     """Everything --status reports, as facts rather than lines, so a test
     can hold one of them without parsing a printout."""
@@ -5080,7 +5112,7 @@ def status_facts():
     handlers = _settings_handlers(data)
     plugin = _plugin_install()
     plugin_only = bool(plugin) and not handlers
-    policy = load_policy()
+    policy = load_policy(session_env(data))
     entries = read_audit(policy)
     mode = str(policy.get("mode", "shadow")).lower()
     if plugin_only:
@@ -5091,7 +5123,7 @@ def status_facts():
     return {
         "settings_path": path, "readable": readable, "handlers": handlers,
         "plugin": plugin, "plugin_only": plugin_only, "mode": mode,
-        "relay_wired": relay_wired, "login_item": os.path.exists(_launch_agent_path()),
+        "relay_wired": relay_wired, "login_item": wakes_at_login(),
         "relay_health": _relay_health(), "audit_path": _audit_path(policy),
         "entries": entries,
     }

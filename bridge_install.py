@@ -648,6 +648,18 @@ def wake_relay(python, relay):
     return True
 
 
+def wakes_relay():
+    """Read only: does the bridge installed here wake the relay at login?
+    The file it reads at start-up is there, it is a bridge that registers
+    itself, and its login item is on. Never raises."""
+    try:
+        return bool(os.path.exists(relay_start_path()) and os.path.isdir(app_path())
+                    and registers_itself(app_path())
+                    and login_item("login-status", app_path()) in LOGIN_ON)
+    except Exception:
+        return False
+
+
 # Where the bridge agrees to start a relay from (Bridge/main.swift, wakeRelay):
 # a terminal install and a plugin install, under the user's home.
 RELAY_HOMES = ("~/.tapproval/", "~/.claude/plugins/")

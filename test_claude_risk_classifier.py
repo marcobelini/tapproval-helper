@@ -16538,6 +16538,104 @@ class TestStatusFacts:
         assert facts["relay_wired"] is True
         assert facts["relay_health"]["watch_seen_seconds_ago"] == 4
 
+    # --status is typed in a plain terminal, and `tapproval status` made that
+    # the usual way to ask. Two of its lines were read from the wrong place
+    # (found on the owner's Mac, 2026-11-10): the mode from this shell, and
+    # the login wake-up from a job file the bridge has since replaced.
+
+    def _quiet(self, monkeypatch, tmp_path, env=None):
+        path = tmp_path / "settings.json"
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(path))
+        if env is not None:
+            path.write_text(json.dumps({"env": env}), encoding="utf-8")
+        monkeypatch.setattr(crc, "_plugin_install", lambda: None)
+        monkeypatch.setattr(crc, "_relay_health", lambda: None)
+        monkeypatch.setattr(crc, "read_audit", lambda policy: [])
+        monkeypatch.delenv("CLAUDE_RISK_MODE", raising=False)
+
+    def test_a_plain_terminal_reads_the_mode_sessions_run_in(self, tmp_path, monkeypatch):
+        self._quiet(monkeypatch, tmp_path, env={"CLAUDE_RISK_MODE": "enforce"})
+        assert crc.status_facts()["mode"] == "enforce"      # not this shell's "shadow"
+
+    def test_settings_win_over_what_this_shell_exports(self, tmp_path, monkeypatch):
+        self._quiet(monkeypatch, tmp_path, env={"CLAUDE_RISK_MODE": "shadow"})
+        monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
+        assert crc.status_facts()["mode"] == "shadow"
+
+    def test_with_nothing_in_settings_the_shell_still_counts(self, tmp_path, monkeypatch):
+        self._quiet(monkeypatch, tmp_path)
+        assert crc.status_facts()["mode"] == "shadow"
+        monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
+        assert crc.status_facts()["mode"] == "enforce"
+
+    def test_only_the_hooks_own_settings_are_carried_over(self):
+        merged = crc.session_env({"env": {"CLAUDE_RISK_MODE": "enforce",
+                                          "CLAUDE_RISK_RELAY_WAIT": 86400,
+                                          "CLAUDE_RISK_RELAY": ["not", "a", "word"],
+                                          "CLAUDE_RISK_AUTO_ALLOW": True,
+                                          "PATH": "/elsewhere"}}, env={"PATH": "/bin"})
+        assert merged == {"PATH": "/bin", "CLAUDE_RISK_MODE": "enforce",
+                          "CLAUDE_RISK_RELAY_WAIT": "86400"}
+        assert crc.session_env({"env": "nonsense"}, env={}) == {}
+        assert crc.session_env([], env={"A": "b"}) == {"A": "b"}
+
+    def _a_mac(self, monkeypatch, wakes):
+        monkeypatch.setattr(crc._host, "is_mac", lambda: True)
+        monkeypatch.setattr(bridge_install, "mac_supported", lambda *a: True)
+        monkeypatch.setattr(bridge_install, "wakes_relay", lambda: wakes)
+        assert not os.path.exists(crc._launch_agent_path())    # the old job is gone
+
+    def test_a_mac_whose_bridge_wakes_the_relay_says_so(self, tmp_path, monkeypatch, capsys):
+        self._quiet(monkeypatch, tmp_path)
+        self._a_mac(monkeypatch, True)
+        assert crc.status_facts()["login_item"] is True
+        monkeypatch.setattr(crc, "_bridge_status_line", lambda health: None)
+        assert crc.run_status() == 0
+        out = capsys.readouterr().out
+        assert "Reboot        : the relay wakes again at login" in out
+        assert "no login wake-up" not in out
+
+    def test_a_mac_with_neither_still_says_there_is_none(self, tmp_path, monkeypatch):
+        self._quiet(monkeypatch, tmp_path)
+        self._a_mac(monkeypatch, False)
+        assert crc.status_facts()["login_item"] is False
+
+    def test_a_mac_with_the_relays_own_job_never_asks_the_bridge(self, monkeypatch):
+        monkeypatch.setattr(crc._host, "is_mac", lambda: True)
+        monkeypatch.setattr(bridge_install, "wakes_relay",
+                            lambda: pytest.fail("the job file already answers"))
+        with open(crc._launch_agent_path(), "w") as handle:
+            handle.write("job")
+        assert crc.wakes_at_login() is True
+
+    def test_linux_and_windows_look_for_their_login_file(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(crc._host, "is_mac", lambda: False)
+        monkeypatch.setattr(bridge_install, "wakes_relay",
+                            lambda: pytest.fail("the bridge is the Mac's"))
+        target = tmp_path / "tapproval-base.desktop"
+        monkeypatch.setenv("CLAUDE_LAUNCH_AGENT_PATH", str(target))
+        assert crc.wakes_at_login() is False
+        target.write_text("[Desktop Entry]\n")
+        assert crc.wakes_at_login() is True
+
+    def test_the_bridge_wakes_the_relay_only_with_all_three_in_place(self, monkeypatch):
+        answers = []
+        monkeypatch.setattr(bridge_install, "registers_itself", lambda app=None: True)
+        monkeypatch.setattr(bridge_install, "login_item",
+                            lambda action, app=None: answers.append(action) or "enabled")
+        assert bridge_install.wakes_relay() is False and answers == []    # nothing here yet
+        os.makedirs(bridge_install.app_path())
+        assert bridge_install.wakes_relay() is False and answers == []    # no file to read
+        with open(bridge_install.relay_start_path(), "w") as handle:
+            handle.write("{}")
+        assert bridge_install.wakes_relay() is True and answers == ["login-status"]
+        monkeypatch.setattr(bridge_install, "login_item",
+                            lambda action, app=None: "not-registered")
+        assert bridge_install.wakes_relay() is False                      # switched off
+        monkeypatch.setattr(bridge_install, "login_item",
+                            lambda action, app=None: 1 / 0)
+        assert bridge_install.wakes_relay() is False                      # never raises
+
 
 class TestInstallerHelpers:
     """The installer's three moves, each on its own: point our hook at a
