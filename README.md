@@ -1,7 +1,9 @@
 # Tapproval Base
 
-**Approve Claude Code and Codex permission prompts from your Apple Watch,
-each one marked with its risk.** This is the computer half of Tapproval.
+**Tapproval is a remote control for Claude Code and Codex on your Apple
+Watch.** Approve what your agent asks, answer its questions, follow it live
+and send it on, from your wrist. Every permission prompt is marked with its
+risk. This is the computer half of Tapproval.
 
 [![Get it on the App Store](https://img.shields.io/badge/App%20Store-Get%20Tapproval-d97757?logo=apple&logoColor=white&style=for-the-badge)](https://apps.apple.com/app/tapproval/id6805869018)
 [![Or try the beta on TestFlight](https://img.shields.io/badge/TestFlight-Beta-555555?logo=apple&logoColor=white&style=for-the-badge)](https://testflight.apple.com/join/dW1tYBQG)

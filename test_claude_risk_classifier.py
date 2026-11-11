@@ -16577,6 +16577,104 @@ class TestStatusFacts:
         assert facts["relay_wired"] is True
         assert facts["relay_health"]["watch_seen_seconds_ago"] == 4
 
+    # --status is typed in a plain terminal, and `tapproval status` made that
+    # the usual way to ask. Two of its lines were read from the wrong place
+    # (found on the owner's Mac, 2026-11-10): the mode from this shell, and
+    # the login wake-up from a job file the bridge has since replaced.
+
+    def _quiet(self, monkeypatch, tmp_path, env=None):
+        path = tmp_path / "settings.json"
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(path))
+        if env is not None:
+            path.write_text(json.dumps({"env": env}), encoding="utf-8")
+        monkeypatch.setattr(crc, "_plugin_install", lambda: None)
+        monkeypatch.setattr(crc, "_relay_health", lambda: None)
+        monkeypatch.setattr(crc, "read_audit", lambda policy: [])
+        monkeypatch.delenv("CLAUDE_RISK_MODE", raising=False)
+
+    def test_a_plain_terminal_reads_the_mode_sessions_run_in(self, tmp_path, monkeypatch):
+        self._quiet(monkeypatch, tmp_path, env={"CLAUDE_RISK_MODE": "enforce"})
+        assert crc.status_facts()["mode"] == "enforce"      # not this shell's "shadow"
+
+    def test_settings_win_over_what_this_shell_exports(self, tmp_path, monkeypatch):
+        self._quiet(monkeypatch, tmp_path, env={"CLAUDE_RISK_MODE": "shadow"})
+        monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
+        assert crc.status_facts()["mode"] == "shadow"
+
+    def test_with_nothing_in_settings_the_shell_still_counts(self, tmp_path, monkeypatch):
+        self._quiet(monkeypatch, tmp_path)
+        assert crc.status_facts()["mode"] == "shadow"
+        monkeypatch.setenv("CLAUDE_RISK_MODE", "enforce")
+        assert crc.status_facts()["mode"] == "enforce"
+
+    def test_only_the_hooks_own_settings_are_carried_over(self):
+        merged = crc.session_env({"env": {"CLAUDE_RISK_MODE": "enforce",
+                                          "CLAUDE_RISK_RELAY_WAIT": 86400,
+                                          "CLAUDE_RISK_RELAY": ["not", "a", "word"],
+                                          "CLAUDE_RISK_AUTO_ALLOW": True,
+                                          "PATH": "/elsewhere"}}, env={"PATH": "/bin"})
+        assert merged == {"PATH": "/bin", "CLAUDE_RISK_MODE": "enforce",
+                          "CLAUDE_RISK_RELAY_WAIT": "86400"}
+        assert crc.session_env({"env": "nonsense"}, env={}) == {}
+        assert crc.session_env([], env={"A": "b"}) == {"A": "b"}
+
+    def _a_mac(self, monkeypatch, wakes):
+        monkeypatch.setattr(crc._host, "is_mac", lambda: True)
+        monkeypatch.setattr(bridge_install, "mac_supported", lambda *a: True)
+        monkeypatch.setattr(bridge_install, "wakes_relay", lambda: wakes)
+        assert not os.path.exists(crc._launch_agent_path())    # the old job is gone
+
+    def test_a_mac_whose_bridge_wakes_the_relay_says_so(self, tmp_path, monkeypatch, capsys):
+        self._quiet(monkeypatch, tmp_path)
+        self._a_mac(monkeypatch, True)
+        assert crc.status_facts()["login_item"] is True
+        monkeypatch.setattr(crc, "_bridge_status_line", lambda health: None)
+        assert crc.run_status() == 0
+        out = capsys.readouterr().out
+        assert "Reboot        : the relay wakes again at login" in out
+        assert "no login wake-up" not in out
+
+    def test_a_mac_with_neither_still_says_there_is_none(self, tmp_path, monkeypatch):
+        self._quiet(monkeypatch, tmp_path)
+        self._a_mac(monkeypatch, False)
+        assert crc.status_facts()["login_item"] is False
+
+    def test_a_mac_with_the_relays_own_job_never_asks_the_bridge(self, monkeypatch):
+        monkeypatch.setattr(crc._host, "is_mac", lambda: True)
+        monkeypatch.setattr(bridge_install, "wakes_relay",
+                            lambda: pytest.fail("the job file already answers"))
+        with open(crc._launch_agent_path(), "w") as handle:
+            handle.write("job")
+        assert crc.wakes_at_login() is True
+
+    def test_linux_and_windows_look_for_their_login_file(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(crc._host, "is_mac", lambda: False)
+        monkeypatch.setattr(bridge_install, "wakes_relay",
+                            lambda: pytest.fail("the bridge is the Mac's"))
+        target = tmp_path / "tapproval-base.desktop"
+        monkeypatch.setenv("CLAUDE_LAUNCH_AGENT_PATH", str(target))
+        assert crc.wakes_at_login() is False
+        target.write_text("[Desktop Entry]\n")
+        assert crc.wakes_at_login() is True
+
+    def test_the_bridge_wakes_the_relay_only_with_all_three_in_place(self, monkeypatch):
+        answers = []
+        monkeypatch.setattr(bridge_install, "registers_itself", lambda app=None: True)
+        monkeypatch.setattr(bridge_install, "login_item",
+                            lambda action, app=None: answers.append(action) or "enabled")
+        assert bridge_install.wakes_relay() is False and answers == []    # nothing here yet
+        os.makedirs(bridge_install.app_path())
+        assert bridge_install.wakes_relay() is False and answers == []    # no file to read
+        with open(bridge_install.relay_start_path(), "w") as handle:
+            handle.write("{}")
+        assert bridge_install.wakes_relay() is True and answers == ["login-status"]
+        monkeypatch.setattr(bridge_install, "login_item",
+                            lambda action, app=None: "not-registered")
+        assert bridge_install.wakes_relay() is False                      # switched off
+        monkeypatch.setattr(bridge_install, "login_item",
+                            lambda action, app=None: 1 / 0)
+        assert bridge_install.wakes_relay() is False                      # never raises
+
 
 class TestInstallerHelpers:
     """The installer's three moves, each on its own: point our hook at a
@@ -17136,6 +17234,47 @@ class TestTheUpdateLeavesTheBlockingPath:
         monkeypatch.setattr(watch_relay, "_pull_update", lambda: True)
         assert watch_relay.main(["--update"]) == 0
         assert ensured == [True]
+
+
+@pytest.mark.private_layout   # reads README.md and WatchApp/, which the public helper repo does not have
+class TestTapprovalIsDescribedOneWay:
+    """The owner, 2026-11-11: the store, the site and the documents each
+    described Tapproval differently ("approve prompts", "a remote
+    control", "answer Claude Code"). One sentence says what it is, and
+    every front door carries it."""
+
+    IDENTITY = "a remote control for Claude Code and Codex on your Apple Watch"
+    DOES = "Approve what your agent asks, answer its questions, follow it live and send it on, from your wrist"
+
+    def _read(self, *parts):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), *parts), encoding="utf-8") as handle:
+            return handle.read()
+
+    @pytest.mark.parametrize("parts", [("helper", "docs", "index.html"), ("helper", "docs", "llms.txt"),
+                                       ("helper", "README.md"), ("README.md",),
+                                       ("WatchApp", "asc", "asc_write_meta.py")])
+    def test_every_front_door_says_what_it_is(self, parts):
+        text = " ".join(self._read(*parts).replace(">", " ").split())
+        assert self.IDENTITY.lower() in text.lower(), parts
+
+    @pytest.mark.parametrize("parts", [("helper", "docs", "index.html"), ("helper", "docs", "llms.txt"),
+                                       ("helper", "README.md"), ("README.md",),
+                                       ("WatchApp", "asc", "asc_write_meta.py")])
+    def test_and_what_it_does_in_the_same_words(self, parts):
+        text = " ".join(self._read(*parts).replace(">", " ").split())
+        assert self.DOES.lower() in text.lower(), parts
+
+    def test_the_home_page_title_and_description_fit_a_search_result(self):
+        page = self._read("helper", "docs", "index.html")
+        title = re.search(r"<title>(.*?)</title>", page).group(1)
+        description = re.search(r'<meta name="description" content="(.*?)">', page).group(1)
+        assert title == "Tapproval — Remote control for Claude Code and Codex"
+        assert len(title) <= 60 and len(description) <= 160, (len(title), len(description))
+        assert "remote control" in description.lower() and "No subscription" in description
+
+    def test_the_old_one_job_lines_are_gone(self):
+        assert "Answer Claude Code from your Apple Watch — one tap" not in self._read("README.md")
+        assert "Tapproval — Approve Claude Code and Codex on Apple Watch" not in self._read("helper", "docs", "index.html")
 
 
 class TestTheSiteMapMatchesTheSite:

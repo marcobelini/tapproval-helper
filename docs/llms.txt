@@ -1,8 +1,10 @@
 # Tapproval
 
-> Approve Claude Code's and Codex's permission prompts from an Apple Watch. When the
-> agent on your computer asks permission, the question appears on the
-> watch, marked with one of five risk tiers, and one tap answers it.
+> Tapproval is a remote control for Claude Code and Codex on your Apple Watch.
+> Approve what your agent asks, answer its questions, follow it live and
+> send it on, from your wrist. When the agent on your computer asks
+> permission, the question appears on the watch, marked with one of five
+> risk tiers, and one tap answers it.
 > No account and no server of ours. Independent; not affiliated with Anthropic or OpenAI.
 > Made for people who run Claude Code or Codex and step away while it works.
 > Claude Code and Codex, side by side, since version 3.0.
