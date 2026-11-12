@@ -95,6 +95,15 @@ def _no_crash_hooks_left_at_the_end():
 
 
 @pytest.fixture(autouse=True)
+def _no_real_simulator_turn(tmp_path, monkeypatch):
+    """The turn on this Mac's simulators (WatchApp/sim-turn.sh) is one lock
+    for every run on the Mac, CI's and Tapmerge's included. A test that runs
+    a script which takes it gets a folder of its own, or the suite would
+    wait behind a real run, and a real run behind the suite."""
+    monkeypatch.setenv("SIM_TURN_DIR", str(tmp_path / "sim-turn"))
+
+
+@pytest.fixture(autouse=True)
 def _no_leftover_conditions():
     """The relay's condition registry is module-wide, like SITE_RULES: a
     condition left behind by one test would make the next pass for the
@@ -17268,13 +17277,36 @@ class TestTapprovalIsDescribedOneWay:
         page = self._read("helper", "docs", "index.html")
         title = re.search(r"<title>(.*?)</title>", page).group(1)
         description = re.search(r'<meta name="description" content="(.*?)">', page).group(1)
-        assert title == "Tapproval — Remote control for Claude Code and Codex"
+        assert title == "Tapproval: Apple Watch remote for Claude Code and Codex"
         assert len(title) <= 60 and len(description) <= 160, (len(title), len(description))
         assert "remote control" in description.lower() and "No subscription" in description
 
     def test_the_old_one_job_lines_are_gone(self):
         assert "Answer Claude Code from your Apple Watch — one tap" not in self._read("README.md")
         assert "Tapproval — Approve Claude Code and Codex on Apple Watch" not in self._read("helper", "docs", "index.html")
+
+
+class TestTheSharePictureSaysWhatTheHomePageSays:
+    """The picture a shared link shows (og:image) said "Claude Code asks"
+    and "Free beta on TestFlight" until 2026-11-12, months after the home
+    page had moved on, because it had no source: nobody could see its
+    words change. Its source is design/exposure/share-card.html, and its
+    words are the home page's."""
+
+    def _read(self, *parts):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), *parts), encoding="utf-8") as handle:
+            return handle.read()
+
+    @pytest.mark.private_layout
+    def test_the_headline_is_the_home_pages(self):
+        home = re.search(r"<h1>(.*?)</h1>", self._read("helper", "docs", "index.html")).group(1)
+        assert home in self._read("design", "exposure", "share-card.html")
+
+    @pytest.mark.private_layout
+    def test_it_names_both_agents_and_no_beta(self):
+        card = self._read("design", "exposure", "share-card.html")
+        assert "Claude Code and Codex" in card
+        assert "TestFlight" not in card and "beta" not in card.lower()
 
 
 class TestTheSiteMapMatchesTheSite:
@@ -19508,7 +19540,8 @@ class TestWatchSimulatorsAreChosenBySize:
         app = tmp_path / "WatchApp"
         app.mkdir()
         for name in ("watch-flows.sh", "sim-devtype.sh", "sim-udid.sh", "sim-retire.sh",
-                     "sim-runtime.sh", "sim-tidy.sh", "sim-own.sh", "sim-shared.sh"):
+                     "sim-runtime.sh", "sim-tidy.sh", "sim-own.sh", "sim-shared.sh",
+                     "sim-turn.sh"):
             shutil.copy(os.path.join(_ROOT, "WatchApp", name), app / name)
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
@@ -19783,7 +19816,7 @@ class TestScreenshotsBuildOnceAndShootTwoFacesAtATime:
         import shutil
         app = tmp_path / "WatchApp"
         app.mkdir()
-        for name in ("watch-shots.sh", "sim-udid.sh", "sim-devtype.sh"):
+        for name in ("watch-shots.sh", "sim-udid.sh", "sim-devtype.sh", "sim-turn.sh"):
             shutil.copy(os.path.join(_ROOT, "WatchApp", name), app / name)
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
@@ -24371,7 +24404,8 @@ class TestFlowsShareOneSimulatorPerKind:
 
     RT = "com.apple.CoreSimulator.SimRuntime.watchOS-27-0"
     SCRIPTS = ("watch-flows.sh", "e2e-lib.sh", "sim-shared.sh", "sim-own.sh", "sim-udid.sh",
-               "sim-retire.sh", "sim-runtime.sh", "sim-devtype.sh", "sim-tidy.sh", "stop-tree.sh")
+               "sim-retire.sh", "sim-runtime.sh", "sim-devtype.sh", "sim-tidy.sh", "stop-tree.sh",
+               "sim-turn.sh")
     E2E = ("pill-e2e.sh", "place-e2e.sh", "tap-e2e.sh", "mark-e2e.sh", "codex-e2e.sh",
            "archive-e2e.sh")
 
@@ -24733,6 +24767,209 @@ esac
             assert not re.search(r"sim-own\.sh \"Tapproval", text), name
             if name != "watch-flows.sh":   # CI's own prefix, honoured only with "CI" in it
                 assert "_SIM_PREFIX" not in text, name
+
+
+@pytest.mark.private_layout
+class TestOneSimulatorRunAtATimeOnThisMac:
+    """Each project took turns with itself; nothing made Tapproval's CI,
+    Tapmerge's CI and the runs sessions start by hand wait for one another.
+    On 2026-11-12 three ran at once: six simulators on a 24 GB Mac, runs of
+    twenty minutes that took two hours, and a pull request failed twice by
+    a test that only ran out of time. Now every run that uses a simulator
+    waits for one turn, the Mac's (WatchApp/sim-turn.sh), and a simulator
+    left on by a run that was killed is switched off by the next to take
+    it. Against stand-in Xcode tools; never the real turn."""
+
+    TURN = os.path.join(_ROOT, "WatchApp", "sim-turn.sh")
+
+    def _turn(self, tmp_path, *args, wait=None, **popen):
+        env = dict(os.environ, SIM_TURN_DIR=str(tmp_path / "turn"), SIM_TURN_POLL="1")
+        if wait is not None:
+            env["SIM_TURN_WAIT"] = str(wait)
+        if popen:
+            return subprocess.Popen(["bash", self.TURN, *map(str, args)], env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return subprocess.run(["bash", self.TURN, *map(str, args)], env=env,
+                              capture_output=True, text=True, timeout=60)
+
+    def test_a_second_run_waits_for_the_first_and_says_for_whom(self, tmp_path):
+        first = subprocess.Popen(["sleep", "300"])
+        second = subprocess.Popen(["sleep", "300"])
+        try:
+            assert self._turn(tmp_path, "take", first.pid, "Tapmerge's CI").returncode == 0
+            assert self._turn(tmp_path, "who").stdout.strip() == \
+                "Tapmerge's CI (pid %d)" % first.pid
+            waiting = self._turn(tmp_path, "take", second.pid, "the flows", wait=30, background=True)
+            time.sleep(3)
+            assert waiting.poll() is None, "it did not wait: %s" % (waiting.communicate(),)
+            # Giving back is the holder's alone.
+            self._turn(tmp_path, "give", second.pid)
+            assert self._turn(tmp_path, "who").stdout.strip().startswith("Tapmerge's CI")
+            self._turn(tmp_path, "give", first.pid)
+            _, err = waiting.communicate(timeout=30)
+            assert waiting.returncode == 0, err
+            assert "waiting for a turn" in err and "Tapmerge's CI has it" in err, err
+            assert self._turn(tmp_path, "who").stdout.strip() == "the flows (pid %d)" % second.pid
+        finally:
+            first.kill()
+            second.kill()
+
+    def test_a_turn_still_taken_is_refused_and_left_alone(self, tmp_path):
+        holder = subprocess.Popen(["sleep", "300"])
+        try:
+            assert self._turn(tmp_path, "take", holder.pid, "a long run").returncode == 0
+            late = self._turn(tmp_path, "take", os.getpid(), "me", wait=2)
+            assert late.returncode == 3 and "still in use by a long run" in late.stderr, late.stderr
+            assert self._turn(tmp_path, "who").stdout.strip().startswith("a long run")
+        finally:
+            holder.kill()
+
+    def test_a_turn_whose_run_is_gone_is_taken_over(self, tmp_path):
+        gone = subprocess.Popen(["sleep", "300"])
+        assert self._turn(tmp_path, "take", gone.pid, "a killed run").returncode == 0
+        gone.kill()
+        gone.wait()
+        assert self._turn(tmp_path, "who").stdout == "", "a dead run still has the turn"
+        again = self._turn(tmp_path, "take", os.getpid(), "the next run", wait=10)
+        assert again.returncode == 0, again.stderr
+        assert self._turn(tmp_path, "who").stdout.strip() == "the next run (pid %d)" % os.getpid()
+
+    def test_however_many_arrive_at_a_dead_runs_turn_one_gets_it(self, tmp_path):
+        gone = subprocess.Popen(["true"])
+        holders = [subprocess.Popen(["sleep", "300"]) for _ in range(6)]
+        try:
+            assert self._turn(tmp_path, "take", os.getpid(), "x").returncode == 0
+            self._turn(tmp_path, "give", os.getpid())
+            gone.wait()
+            # A lock left by a process that is gone, as a kill -9 leaves it.
+            os.symlink("%d@Thu Jan  1 00:00:00 1970|a dead run" % gone.pid,
+                       tmp_path / "turn" / "turn")
+            takers = [self._turn(tmp_path, "take", h.pid, "run %d" % n, wait=2, background=True)
+                      for n, h in enumerate(holders)]
+            codes = [t.wait(timeout=30) for t in takers]
+            assert sorted(codes) == [0, 3, 3, 3, 3, 3], codes
+        finally:
+            for h in holders:
+                h.kill()
+
+    def test_a_script_the_holder_started_is_part_of_its_run(self, tmp_path):
+        """ci-local.sh takes the turn and starts watch-flows.sh, which asks
+        for it too: it passes at once, and its giving back leaves the turn
+        with the run that has it."""
+        script = (
+            'set -u\n"$T" take $$ "the parent" || exit 9\n'
+            'bash -c \'"$T" take $$ "the child" || exit 8; "$T" give $$\' || exit $?\n'
+            '"$T" who\n')
+        run = subprocess.run(["bash", "-c", script],
+                             env=dict(os.environ, T=self.TURN, SIM_TURN_DIR=str(tmp_path / "turn"),
+                                      SIM_TURN_WAIT="2", SIM_TURN_POLL="1"),
+                             capture_output=True, text=True, timeout=60)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert run.stdout.startswith("the parent (pid "), run.stdout
+
+    def test_every_script_that_uses_a_simulator_takes_the_turn(self):
+        """Read from the scripts, so one added later cannot go round it."""
+        app = os.path.join(_ROOT, "WatchApp")
+        takers = {"watch-flows.sh": "./sim-turn.sh take $$",
+                  "watch-shots.sh": "./sim-turn.sh take $$",
+                  "auto-update-e2e.sh": "e2e_take_turn"}
+        for name, call in takers.items():
+            text = open(os.path.join(app, name), encoding="utf-8").read()
+            assert call in text, name
+            first_sim = min(i for i in (text.find("sim-shared.sh take"), text.find("sim-udid.sh "),
+                                        text.find("sim-own.sh ")) if i >= 0)
+            first_sim = text.find("sim-shared.sh take") if name == "auto-update-e2e.sh" else first_sim
+            code = "\n".join(line for line in text[:first_sim].splitlines()
+                              if not line.lstrip().startswith("#"))
+            assert call in code, "%s reaches for a simulator before its turn" % name
+        lib = open(os.path.join(app, "e2e-lib.sh"), encoding="utf-8").read()
+        pick = lib[lib.index("e2e_pick_faces() {"):]
+        assert pick.index("e2e_take_turn") < pick.index("sim-shared.sh"), "e2e-lib.sh"
+        assert '"$E2E_WATCHAPP/sim-turn.sh" give $$' in lib
+        (ci,) = _ci_files("ci-local.sh")
+        assert ci.index("WatchApp/sim-turn.sh take $$") < ci.index("Compile the watch app")
+        assert "trap 'WatchApp/sim-turn.sh give $$' EXIT" in ci
+        # Every script that boots a simulator is one of those, or theirs.
+        for name in sorted(os.listdir(app)):
+            if not name.endswith(".sh"):
+                continue
+            text = open(os.path.join(app, name), encoding="utf-8").read()
+            if "simctl boot" in text or "e2e_boot" in text:
+                assert ("sim-turn.sh take" in text or "e2e_take_turn" in text
+                        or "e2e_pick_faces" in text or name in self.NOT_QUEUED), name
+
+    # demo-film.sh records the owner's film on a simulator he chose, by hand.
+    NOT_QUEUED = ("demo-film.sh", "e2e-lib.sh")
+
+    def test_the_flows_wait_their_turn_and_give_it_back(self, tmp_path):
+        mac = TestFlowsShareOneSimulatorPerKind()
+        app, env, events = mac._mac(tmp_path)
+        holder = subprocess.Popen(["sleep", "300"])
+        turn = dict(env, SIM_TURN_POLL="1")
+        try:
+            assert subprocess.run(["bash", str(app / "sim-turn.sh"), "take", str(holder.pid),
+                                   "another project"], env=turn).returncode == 0
+            busy = subprocess.run(["bash", str(app / "watch-flows.sh")],
+                                  env=dict(turn, SIM_TURN_WAIT="2"),
+                                  capture_output=True, text=True, timeout=60)
+            assert busy.returncode != 0 and "still in use by another project" in busy.stderr, \
+                busy.stdout + busy.stderr
+            assert events.read_text() == "", "it touched a simulator without its turn"
+            subprocess.run(["bash", str(app / "sim-turn.sh"), "give", str(holder.pid)], env=turn)
+            run = subprocess.run(["bash", str(app / "watch-flows.sh")], env=turn,
+                                 capture_output=True, text=True, timeout=60)
+            assert run.returncode == 0, run.stdout + run.stderr
+            assert not (tmp_path / "locks" / "turn").is_symlink(), "the flows kept the turn"
+        finally:
+            holder.kill()
+
+    def test_a_simulator_left_on_by_a_killed_run_is_switched_off_by_the_next(self, tmp_path):
+        mac = TestFlowsShareOneSimulatorPerKind()
+        app, env, events = mac._mac(tmp_path)
+        took = mac._take(app, env)
+        udid = took.stdout.strip()
+        assert took.returncode == 0 and udid
+        # The same flow asking again keeps its simulator as it is.
+        subprocess.run(["xcrun", "simctl", "boot", udid], env=env, check=True)
+        events.write_text("")
+        again = mac._take(app, env)
+        assert again.stdout.strip() == udid and events.read_text() == "", events.read_text()
+        # Killed: its lock stays, and so does the simulator, still on.
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        (tmp_path / "locks" / "Tapproval-Watch-41mm.lock" / "pid").write_text(str(dead.pid))
+        (tmp_path / "locks" / "Tapproval-Watch-41mm.lock" / "start").write_text("")
+        nxt = mac._take(app, env)
+        assert nxt.returncode == 0 and nxt.stdout.strip() == udid, nxt.stderr
+        assert events.read_text().splitlines() == ["shutdown " + udid]
+        assert "left on by a run that is gone" in nxt.stderr
+
+    def test_a_cancelled_ci_run_switches_its_simulators_off_and_lets_go(self):
+        (ci,) = _ci_files("ci-local.sh")
+        stop = ci[ci.index("stop() {"):ci.index("trap stop TERM INT HUP")]
+        assert 'WatchApp/sim-tidy.sh "$CI_OWN"' in stop and 'WatchApp/sim-tidy.sh "$IOS_UDID"' in stop
+        assert "sim-shared.sh give 46mm $$" in stop and "sim-shared.sh give iPhone $$" in stop
+        # A simulator given back is no longer this run's to switch off.
+        assert 'give_sim 46mm\n    CI_OWN=""' in ci and 'give_sim iPhone\n      IOS_UDID=""' in ci
+
+    def test_the_ci_job_outlasts_its_wait_for_a_turn(self):
+        """The wait counts against the job's clock: at 45 minutes a run that
+        waited behind another was cancelled, which read as a failure."""
+        (workflow,) = _ci_files(".github/workflows/tests.yml")
+        mini = workflow[workflow.index("runs-on: [self-hosted, macOS, tapproval-mini]"):]
+        minutes = int(re.search(r"timeout-minutes: (\d+)", mini).group(1))
+        turn = open(self.TURN, encoding="utf-8").read()
+        wait = int(re.search(r"limit=\$\{SIM_TURN_WAIT:-(\d+)\}", turn).group(1))
+        assert minutes * 60 >= wait + 25 * 60, "the job is cancelled while it waits its turn"
+
+    def test_tapmerge_and_tapproval_wait_at_the_same_door(self):
+        """Tapmerge carries the same script. Two keys to the same room are
+        no lock: the folder, the name and the holder's form are fixed here."""
+        turn = open(self.TURN, encoding="utf-8").read()
+        assert 'dir="${SIM_TURN_DIR:-${SIM_LOCK_DIR:-/tmp/mac-simulator-turn}}"' in turn
+        assert 'lock="$dir/turn"' in turn
+        assert 'ln -sn "$me|$what" "$lock"' in turn
+        assert "printf '%s@%s' \"$1\" \"$(ps -p \"$1\" -o lstart=" in turn
 
 
 class TestTheWatchUsesFourTextSizes:
@@ -25100,6 +25337,8 @@ class TestASessionCanBeArchivedFromTheWrist:
         import codex_talk
         acted = []
         catalog = {"status": "ready", "sessions": [{"session_id": self.THREAD}]}
+        # Every test shares one session id: no ask is carried into the next.
+        monkeypatch.setattr(watch_dashboard, "_ARCHIVE_ASKED", {})
 
         def arrange(entry=None, codex=False, archived=None, inbox=True, posted=True,
                     codex_answer=None, end_word="ended"):
@@ -25146,6 +25385,92 @@ class TestASessionCanBeArchivedFromTheWrist:
         assert watch_relay.archive_session(self.SID) == "asked"
         assert acted == [("inbox", watch_relay.ARCHIVE_ASK)]
         assert watch_relay.ARCHIVE_ASK == "Archive this session with your session tool."
+
+    def test_a_second_tap_asks_the_app_nothing_new(self, stage, capsys):
+        """The row came back while the app's Claude was still busy, so the
+        wearer tapped again: one session was sent eight asks (relay log,
+        2026-11-12). The answer is the same word, and the inbox is left alone."""
+        arrange, acted, _ = stage
+        arrange({"status": "Desktop", "pid": 1}, archived=False)
+        for _ in range(3):
+            assert watch_relay.archive_session(self.SID) == "asked"
+        assert acted == [("inbox", watch_relay.ARCHIVE_ASK)]
+        assert "already asked" in capsys.readouterr().err
+
+    def test_an_ask_nothing_came_of_can_be_made_again(self, stage, monkeypatch):
+        """Said no to the app's card, or its Claude never got to it: after a
+        while a tap asks afresh."""
+        arrange, acted, _ = stage
+        arrange({"status": "Desktop", "pid": 1}, archived=False)
+        assert watch_relay.archive_session(self.SID) == "asked"
+        monkeypatch.setattr(watch_dashboard, "ARCHIVE_ASK_HOLD", 0)
+        assert watch_relay.archive_session(self.SID) == "asked"
+        assert acted == [("inbox", watch_relay.ARCHIVE_ASK)] * 2
+
+    def test_an_ask_that_never_reached_the_inbox_is_not_remembered(self, stage):
+        arrange, acted, _ = stage
+        arrange({"status": "Desktop", "pid": 1}, archived=False, posted=False)
+        assert watch_relay.archive_session(self.SID) == "open it in the Claude app"
+        arrange({"status": "Desktop", "pid": 1}, archived=False)
+        assert watch_relay.archive_session(self.SID) == "asked"
+        assert acted == [("inbox", watch_relay.ARCHIVE_ASK)] * 2
+
+    def test_an_asked_session_says_so_on_its_row_and_leaves_when_the_app_archives(
+            self, tmp_path, monkeypatch):
+        """The list is where the wearer learns what became of the ask: the
+        row is marked while the app's Claude gets to it, and gone once the
+        app's own file says archived, though its process may live on."""
+        monkeypatch.setattr(watch_dashboard, "_ARCHIVE_ASKED", {})
+        monkeypatch.setattr(watch_dashboard, "ARCHIVE_CHECK_EVERY", 0)
+        monkeypatch.setattr(watch_dashboard, "ARCHIVE_RECHECK_EVERY", 0)
+        app = {"archived": False}
+        monkeypatch.setattr(watch_dashboard, "claude_app_archived",
+                            lambda sid, root=None: app["archived"])
+        for sid in ("arch1", "other1"):
+            _write_transcript(tmp_path, "-p", sid + ".jsonl", [
+                {"cwd": "/x", "entrypoint": "claude-desktop",
+                 "message": {"role": "user", "content": "hello " + sid}}])
+        live = {"arch1": "Desktop", "other1": "Desktop"}
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda *a, **k: dict(live))
+        monkeypatch.setattr(watch_dashboard, "session_registry", lambda *a, **k: {
+            sid: {"socket": "/tmp/cc-socks/1.sock", "bridged": False, "cwd": "/x", "name": ""}
+            for sid in live})
+
+        def rows(**kwargs):
+            return {r["session_id"]: r.get("archiving") for r in watch_dashboard.recent_sessions(
+                projects_dir=str(tmp_path), **kwargs)}
+
+        assert rows() == {"arch1": False, "other1": False}
+        watch_dashboard.note_archive_asked("arch1")
+        assert rows() == {"arch1": True, "other1": False}
+        app["archived"] = True
+        assert rows() == {"other1": False}
+        # A card must still have somewhere to be.
+        assert set(rows(waiting=["arch1"])) == {"arch1", "other1"}
+        # Restored at the computer: it is a session again, and not on its way out.
+        app["archived"] = False
+        monkeypatch.setattr(watch_dashboard, "ARCHIVE_ASK_HOLD", 0)
+        assert rows() == {"arch1": False, "other1": False}
+        # Its process gone, the ask is forgotten with it.
+        del live["arch1"]
+        assert rows() == {"other1": False}
+        assert watch_dashboard._ARCHIVE_ASKED == {}
+
+    def test_the_apps_file_is_not_read_on_every_list(self, monkeypatch):
+        monkeypatch.setattr(watch_dashboard, "_ARCHIVE_ASKED", {})
+        reads = []
+        monkeypatch.setattr(watch_dashboard, "claude_app_archived",
+                            lambda sid, root=None: reads.append(sid) or False)
+        watch_dashboard.note_archive_asked("arch1", now=1000)
+        assert watch_dashboard.archive_progress("nobody", now=1000) == ""
+        for second in (1000, 1001, 1002):
+            assert watch_dashboard.archive_progress("arch1", now=second) == "archiving"
+        # Read a moment ago, by the archive itself.
+        assert reads == []
+        later = 1000 + watch_dashboard.ARCHIVE_CHECK_EVERY
+        for second in (later, later + 1):
+            assert watch_dashboard.archive_progress("arch1", now=second) == "archiving"
+        assert reads == ["arch1"]
 
     def test_a_claude_app_session_is_never_archived_headless(self, stage):
         """`claude --resume -p` is another process; it cannot archive the
