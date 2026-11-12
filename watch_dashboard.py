@@ -533,6 +533,67 @@ def claude_app_archived(session_id, root=None):
     return None
 
 
+# A Claude app session the wrist asked to archive itself, by id: when it
+# was asked, and what the app's file last said. The app's Claude gets to
+# the ask only when its turn ends, so the session stays live meanwhile and
+# the watch put the row straight back: one session was asked eight times
+# (relay log, 2026-11-12). Kept here, in memory, because the list is where
+# the wearer learns what became of the ask; a restart forgets, and the
+# worst of that is one ask more.
+ARCHIVE_ASK_HOLD = 300          # a tap inside this asks nothing new
+ARCHIVE_CHECK_EVERY = 3         # the app's file is read no oftener, per session
+ARCHIVE_RECHECK_EVERY = 30      # ...and once it says archived, this seldom
+_ARCHIVE_ASKED = {}
+_ARCHIVE_LOCK = threading.Lock()
+
+
+def note_archive_asked(session_id, now=None):
+    """The ask reached the session's inbox."""
+    now = time.time() if now is None else now
+    with _ARCHIVE_LOCK:
+        _ARCHIVE_ASKED[session_id] = {"asked": now, "checked": now, "archived": False}
+
+
+def archive_asked(session_id, now=None):
+    """True while an ask is recent enough that another would only repeat it."""
+    now = time.time() if now is None else now
+    with _ARCHIVE_LOCK:
+        entry = _ARCHIVE_ASKED.get(session_id)
+        return bool(entry) and now - entry["asked"] < ARCHIVE_ASK_HOLD
+
+
+def archive_progress(session_id, now=None):
+    """What became of an ask: "archived" once the app's own file says so,
+    "archiving" while the ask is still fresh, "" otherwise or when nobody
+    asked. The file is read at most every few seconds. Never raises."""
+    now = time.time() if now is None else now
+    with _ARCHIVE_LOCK:
+        entry = _ARCHIVE_ASKED.get(session_id)
+        if entry is None:
+            return ""
+        every = ARCHIVE_RECHECK_EVERY if entry["archived"] else ARCHIVE_CHECK_EVERY
+        due = now - entry["checked"] >= every
+        if due:
+            entry["checked"] = now
+    if due:
+        try:
+            archived = claude_app_archived(session_id) is True
+        except Exception:  # noqa: BLE001 — a list must not fail over a mark
+            archived = entry["archived"]
+        entry["archived"] = archived
+    if entry["archived"]:
+        return "archived"
+    return "archiving" if now - entry["asked"] < ARCHIVE_ASK_HOLD else ""
+
+
+def _forget_archive_asks(alive):
+    """An ask is about a live session; with its process gone there is
+    nothing left to mark or to hide."""
+    with _ARCHIVE_LOCK:
+        for session_id in [s for s in _ARCHIVE_ASKED if s not in alive]:
+            del _ARCHIVE_ASKED[session_id]
+
+
 def session_registry(sessions_dir=None):
     """What Claude Code records about each live session, by id: where it
     runs, whether the phone can see it (Remote Control gave it a bridge
@@ -2860,6 +2921,13 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
             found = [f for f in found
                      if f[3] not in registry or registry[f[3]]["bridged"]
                      or f[3] in waiting]
+    # A Claude app session the wrist asked to archive itself: gone from the
+    # list once the app's own file says archived, though its process may
+    # live on; marked while its Claude gets to the ask. A card still keeps
+    # its row.
+    _forget_archive_asks(registry)
+    leaving = {f[3]: archive_progress(f[3]) for f in found} if _ARCHIVE_ASKED else {}
+    found = [f for f in found if leaving.get(f[3]) != "archived" or f[3] in waiting]
     # One row per session. A session that left its worktree writes on in
     # the repository's folder, and the worktree's copy of its transcript
     # stays: the list sent both under one id, the watch drew one row per id
@@ -2921,6 +2989,9 @@ def recent_sessions(limit=12, projects_dir=None, include_idle=False,
             # And why, so the watch can say what to do about it: "plan",
             # "bypass" or "no_inbox"; "" when the message reaches it.
             "side_reason": beside,
+            # Asked from the wrist to archive itself, and not there yet:
+            # the watch shows the row on its way out, not as it was.
+            "archiving": leaving.get(session_id) == "archiving",
             "path": cwd or "",
             "session_id": session_id[:12],
             "opening": opening or "",

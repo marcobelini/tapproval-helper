@@ -1663,7 +1663,8 @@ class DashboardUnavailable(OSError):
 _DASHBOARD_ERROR = None
 try:
     from watch_dashboard import (  # noqa: E402
-        activity_summary, card_session_title, claude_app_archived, recap_summary,
+        activity_summary, archive_asked, card_session_title, claude_app_archived,
+        note_archive_asked, recap_summary,
         _find_transcript, image_bytes, inbox_ready,
         _message_of, _parse_thread, _read_appended,
         project_root, prompts_at_the_mac, recent_sessions, active_sessions, registry_turn, resolve_session,
@@ -1699,6 +1700,12 @@ except Exception as _error:  # noqa: BLE001 — any import-time failure, not onl
 
     def claude_app_archived(*_args, **_kwargs):
         return None             # no word from the app: an archive stays asked
+
+    def archive_asked(*_args, **_kwargs):
+        return False            # nothing remembered: every tap asks
+
+    def note_archive_asked(*_args, **_kwargs):
+        return None
 
     THREAD_TURN_LIMIT = 14      # watch_dashboard's own value
 
@@ -2745,10 +2752,17 @@ def _archive_claude(prefix, waiting, projects_dir=None):
     if origin == "Desktop":
         if claude_app_archived(session_id):
             return session_id, "archived"
+        # Asked a moment ago, and its Claude has not got to it: the same
+        # answer, and no second note in its inbox (one session got eight).
+        if archive_asked(session_id):
+            print("relay: archive claude %s already asked, nothing new sent"
+                  % session_id[:8], file=sys.stderr)
+            return session_id, "asked"
         # Its inbox or nothing. The headless route is another process: it
         # cannot archive the app's session, and would only add a turn.
         if (inbox_ready(entry, _find_transcript(session_id, projects_dir))
                 and post_to_inbox(entry, ARCHIVE_ASK, brief=True)):
+            note_archive_asked(session_id)
             return session_id, "asked"
         return session_id, "open it in the Claude app"
     return session_id, "can't archive here"

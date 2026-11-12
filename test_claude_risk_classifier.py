@@ -17268,13 +17268,36 @@ class TestTapprovalIsDescribedOneWay:
         page = self._read("helper", "docs", "index.html")
         title = re.search(r"<title>(.*?)</title>", page).group(1)
         description = re.search(r'<meta name="description" content="(.*?)">', page).group(1)
-        assert title == "Tapproval — Remote control for Claude Code and Codex"
+        assert title == "Tapproval: Apple Watch remote for Claude Code and Codex"
         assert len(title) <= 60 and len(description) <= 160, (len(title), len(description))
         assert "remote control" in description.lower() and "No subscription" in description
 
     def test_the_old_one_job_lines_are_gone(self):
         assert "Answer Claude Code from your Apple Watch — one tap" not in self._read("README.md")
         assert "Tapproval — Approve Claude Code and Codex on Apple Watch" not in self._read("helper", "docs", "index.html")
+
+
+class TestTheSharePictureSaysWhatTheHomePageSays:
+    """The picture a shared link shows (og:image) said "Claude Code asks"
+    and "Free beta on TestFlight" until 2026-11-12, months after the home
+    page had moved on, because it had no source: nobody could see its
+    words change. Its source is design/exposure/share-card.html, and its
+    words are the home page's."""
+
+    def _read(self, *parts):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), *parts), encoding="utf-8") as handle:
+            return handle.read()
+
+    @pytest.mark.private_layout
+    def test_the_headline_is_the_home_pages(self):
+        home = re.search(r"<h1>(.*?)</h1>", self._read("helper", "docs", "index.html")).group(1)
+        assert home in self._read("design", "exposure", "share-card.html")
+
+    @pytest.mark.private_layout
+    def test_it_names_both_agents_and_no_beta(self):
+        card = self._read("design", "exposure", "share-card.html")
+        assert "Claude Code and Codex" in card
+        assert "TestFlight" not in card and "beta" not in card.lower()
 
 
 class TestTheSiteMapMatchesTheSite:
@@ -25100,6 +25123,8 @@ class TestASessionCanBeArchivedFromTheWrist:
         import codex_talk
         acted = []
         catalog = {"status": "ready", "sessions": [{"session_id": self.THREAD}]}
+        # Every test shares one session id: no ask is carried into the next.
+        monkeypatch.setattr(watch_dashboard, "_ARCHIVE_ASKED", {})
 
         def arrange(entry=None, codex=False, archived=None, inbox=True, posted=True,
                     codex_answer=None, end_word="ended"):
@@ -25146,6 +25171,92 @@ class TestASessionCanBeArchivedFromTheWrist:
         assert watch_relay.archive_session(self.SID) == "asked"
         assert acted == [("inbox", watch_relay.ARCHIVE_ASK)]
         assert watch_relay.ARCHIVE_ASK == "Archive this session with your session tool."
+
+    def test_a_second_tap_asks_the_app_nothing_new(self, stage, capsys):
+        """The row came back while the app's Claude was still busy, so the
+        wearer tapped again: one session was sent eight asks (relay log,
+        2026-11-12). The answer is the same word, and the inbox is left alone."""
+        arrange, acted, _ = stage
+        arrange({"status": "Desktop", "pid": 1}, archived=False)
+        for _ in range(3):
+            assert watch_relay.archive_session(self.SID) == "asked"
+        assert acted == [("inbox", watch_relay.ARCHIVE_ASK)]
+        assert "already asked" in capsys.readouterr().err
+
+    def test_an_ask_nothing_came_of_can_be_made_again(self, stage, monkeypatch):
+        """Said no to the app's card, or its Claude never got to it: after a
+        while a tap asks afresh."""
+        arrange, acted, _ = stage
+        arrange({"status": "Desktop", "pid": 1}, archived=False)
+        assert watch_relay.archive_session(self.SID) == "asked"
+        monkeypatch.setattr(watch_dashboard, "ARCHIVE_ASK_HOLD", 0)
+        assert watch_relay.archive_session(self.SID) == "asked"
+        assert acted == [("inbox", watch_relay.ARCHIVE_ASK)] * 2
+
+    def test_an_ask_that_never_reached_the_inbox_is_not_remembered(self, stage):
+        arrange, acted, _ = stage
+        arrange({"status": "Desktop", "pid": 1}, archived=False, posted=False)
+        assert watch_relay.archive_session(self.SID) == "open it in the Claude app"
+        arrange({"status": "Desktop", "pid": 1}, archived=False)
+        assert watch_relay.archive_session(self.SID) == "asked"
+        assert acted == [("inbox", watch_relay.ARCHIVE_ASK)] * 2
+
+    def test_an_asked_session_says_so_on_its_row_and_leaves_when_the_app_archives(
+            self, tmp_path, monkeypatch):
+        """The list is where the wearer learns what became of the ask: the
+        row is marked while the app's Claude gets to it, and gone once the
+        app's own file says archived, though its process may live on."""
+        monkeypatch.setattr(watch_dashboard, "_ARCHIVE_ASKED", {})
+        monkeypatch.setattr(watch_dashboard, "ARCHIVE_CHECK_EVERY", 0)
+        monkeypatch.setattr(watch_dashboard, "ARCHIVE_RECHECK_EVERY", 0)
+        app = {"archived": False}
+        monkeypatch.setattr(watch_dashboard, "claude_app_archived",
+                            lambda sid, root=None: app["archived"])
+        for sid in ("arch1", "other1"):
+            _write_transcript(tmp_path, "-p", sid + ".jsonl", [
+                {"cwd": "/x", "entrypoint": "claude-desktop",
+                 "message": {"role": "user", "content": "hello " + sid}}])
+        live = {"arch1": "Desktop", "other1": "Desktop"}
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda *a, **k: dict(live))
+        monkeypatch.setattr(watch_dashboard, "session_registry", lambda *a, **k: {
+            sid: {"socket": "/tmp/cc-socks/1.sock", "bridged": False, "cwd": "/x", "name": ""}
+            for sid in live})
+
+        def rows(**kwargs):
+            return {r["session_id"]: r.get("archiving") for r in watch_dashboard.recent_sessions(
+                projects_dir=str(tmp_path), **kwargs)}
+
+        assert rows() == {"arch1": False, "other1": False}
+        watch_dashboard.note_archive_asked("arch1")
+        assert rows() == {"arch1": True, "other1": False}
+        app["archived"] = True
+        assert rows() == {"other1": False}
+        # A card must still have somewhere to be.
+        assert set(rows(waiting=["arch1"])) == {"arch1", "other1"}
+        # Restored at the computer: it is a session again, and not on its way out.
+        app["archived"] = False
+        monkeypatch.setattr(watch_dashboard, "ARCHIVE_ASK_HOLD", 0)
+        assert rows() == {"arch1": False, "other1": False}
+        # Its process gone, the ask is forgotten with it.
+        del live["arch1"]
+        assert rows() == {"other1": False}
+        assert watch_dashboard._ARCHIVE_ASKED == {}
+
+    def test_the_apps_file_is_not_read_on_every_list(self, monkeypatch):
+        monkeypatch.setattr(watch_dashboard, "_ARCHIVE_ASKED", {})
+        reads = []
+        monkeypatch.setattr(watch_dashboard, "claude_app_archived",
+                            lambda sid, root=None: reads.append(sid) or False)
+        watch_dashboard.note_archive_asked("arch1", now=1000)
+        assert watch_dashboard.archive_progress("nobody", now=1000) == ""
+        for second in (1000, 1001, 1002):
+            assert watch_dashboard.archive_progress("arch1", now=second) == "archiving"
+        # Read a moment ago, by the archive itself.
+        assert reads == []
+        later = 1000 + watch_dashboard.ARCHIVE_CHECK_EVERY
+        for second in (later, later + 1):
+            assert watch_dashboard.archive_progress("arch1", now=second) == "archiving"
+        assert reads == ["arch1"]
 
     def test_a_claude_app_session_is_never_archived_headless(self, stage):
         """`claude --resume -p` is another process; it cannot archive the
