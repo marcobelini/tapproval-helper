@@ -23,6 +23,16 @@
 <main class="policy">
 <h1>Changelog</h1>
 <p><em>Every release of Tapproval Base, the helper on your computer, newest first. Starting Claude Code once updates it. Generated from <a href="https://github.com/marcobelini/tapproval-helper/releases">the releases on GitHub</a>, which may already hold a newer one. Security fixes are also explained on <a href="security.html">the security page</a>.</em></p>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.122">1.1.122</a></h2>
+<p><em>2026-11-14</em></p>
+<p><strong>Fixes from a review of the whole project.</strong> Nothing changes in everyday use; these close gaps.</p>
+<ul>
+<li><strong>The risk mark is harder to fool.</strong> With auto-allow switched on, a few commands that run or write things were marked SAFE: an <code>awk</code> program piping through a variable, <code>flake8 --output-file</code>, <code>bat --pager</code>, some <code>mypy</code> flags. So were secret files reached by another spelling: after a <code>cd</code> into their folder, with a doubled slash, with quotes inside a word, in braces, or as <code>kubectl get secret/name</code>. They are marked as what they are now. Tiers were compared on about 98,900 real commands, and none of them changed (#1333, #1334).</li>
+<li><strong>One <code>git</code> command could keep a session waiting.</strong> A long row of <code>-c</code> options made the hook think for minutes. It answers at once now (#1338).</li>
+<li><strong>Pairing a watch on the network is for one watch.</strong> After <code>tapproval pair</code>, the first watch to ask gets the key and may ask again if its answer was lost; no other device on the network is served, and the window shuts once that watch is paired. To pair another, run <code>tapproval pair</code> again (#1335).</li>
+<li><strong>Smaller things:</strong> a session id that matches two sessions matches neither; <code>--status</code> no longer stops on an odd answer; <code>--uninstall</code> always removes the <code>tapproval</code> command and the startup entry; a settings backup is as private as the settings; a repeated Codex sign-in tap says how long its code really has left (#1339).</li>
+</ul>
+<p>Updates itself within the hour on every computer; nothing to do.</p>
 <h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.121">1.1.121</a></h2>
 <p><em>2026-11-12</em></p>
 <p><strong>Archiving a Claude desktop app session from the watch asks it once.</strong> A session in the Claude app cannot be archived from outside: Base leaves it a note, and its Claude archives the session when its current step ends. Until then the session is still running, so the watch showed it again as if nothing had happened, and every further tap left another note; one session was asked eight times. Base now remembers the ask for five minutes and answers a repeat without sending anything new, marks the session's row as on its way out, and takes the row off the list as soon as the app has archived it. Terminal sessions and Codex chats archive as before (#1307).</p>
