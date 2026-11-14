@@ -13352,6 +13352,12 @@ class TestSigningInFromTheWrist:
     def test_a_finished_sign_in_asks_again(self, monkeypatch):
         """Success clears the condition only when the agent itself says so."""
         monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
+        # An earlier test's sign-in ends in a thread of its own, which asks
+        # too: let it finish first, or its question is counted here (main
+        # was red for it on 2026-11-14).
+        _wait_until(lambda: not [t for t in threading.enumerate()
+                                 if t.name == "signin-wait"],
+                    what="earlier sign-ins to end")
         asked = []
         # Record the state at the moment of asking: read afterwards, a
         # thread another test left running could have written it again.
