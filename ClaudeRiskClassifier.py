@@ -111,7 +111,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.121"
+__version__ = "1.1.122"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -576,7 +576,10 @@ def _names_a_secret(word):
     return _words_name_a_secret([p for p in _SECRET_JOINERS.split(bare.lower()) if p])
 
 
-_HOME_ITSELF = re.compile(r"^(~|\$\{?HOME\}?)/?\*?$")
+# `${HOME:?}` and `${HOME?words}` are $HOME with a guard against an unset
+# value: the same folder when the command runs (2026-11-14 review).
+_HOME_VARIABLE = r"\$(?:HOME|\{HOME(?::?\?[^}]*)?\})"
+_HOME_ITSELF = re.compile(r"^(~|%s)/?\*?$" % _HOME_VARIABLE)
 
 
 def _is_home(word):
@@ -591,7 +594,7 @@ def _is_home(word):
     if len(home) < 2:
         return False
     # `~/.` is the home folder too (2026-10-26 review).
-    path = re.sub(r"^(?:~|\$\{?HOME\}?)(?=/|$)", lambda _: home, path)
+    path = re.sub(r"^(?:~|%s)(?=/|$)" % _HOME_VARIABLE, lambda _: home, path)
     return os.path.normpath(path.rstrip("*") or "/") == home
 # The machine's own folders: one list for every tool. find and rm kept two
 # that disagreed — `find /Users -delete` read HIGH beside `rm -rf /Users`'s
@@ -966,13 +969,20 @@ RM_RECURSIVE = re.compile(r"-[A-Za-z]*[rR]")
 # <name>=<val> push …`). The old `(?:-\S+\s+)*` swallowed only the flag,
 # so `-C /repo` left `/repo` looking like the subcommand and a protected
 # force-push slipped from CRITICAL down to an unknown-command MEDIUM.
-_GIT_VALUE_GLOBALS = r"-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix"
+# `-[Cc]`, not `-C|-c`: the pattern ignores case, so the two spellings were
+# two readings of the same word, and the fix of 2026-11-14 only made the
+# blow-up smaller (40 options a third of a second, 50 ten seconds).
+_GIT_VALUE_GLOBALS = r"-[Cc]|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix"
+# Each option has ONE reading: a value-taking global is never also a bare
+# flag. With two, `git -c -c -c … 1` was tried every way before the match
+# failed, twice as long for each `-c` or so, and 30 of them held the hook
+# for good (2026-11-14 review).
 GIT_RE = re.compile(
     r"\bgit\s+"
-    r"(?:(?:%s)\s+\S+\s+"   # value-taking global + its separate-word value
-    r"|--\S+\s+"             # --long or --long=value (value attached)
-    r"|-\w+\s+)*"           # bare short flag(s)
-    r"([a-z][a-z-]*)\b(.*)" % _GIT_VALUE_GLOBALS, re.I)
+    r"(?:(?:%(v)s)\s+\S+\s+"            # value-taking global + its separate-word value
+    r"|(?!(?:%(v)s)\s)--\S+\s+"         # --long or --long=value (value attached)
+    r"|(?!(?:%(v)s)\s)-\w+\s+)*"        # bare short flag(s)
+    r"([a-z][a-z-]*)\b(.*)" % {"v": _GIT_VALUE_GLOBALS}, re.I)
 
 # Targets that mean "wipe the machine" or "wipe my home directory". The
 # current folder and its parent by any spelling: `./` and `../` read HIGH
@@ -1356,7 +1366,10 @@ def _unwrapped(segment):
 # would have allowed them.
 READ_TOOL_ESCAPES = {
     "awk": re.compile(r"system\s*\(|\|\s*[\"']|\|&|>{1,2}\s*[\"']|getline\s*<"
-                      r"|(^|\s)(-[fi]\s*\S|--file\b|--include\b)|@include\b").search,
+                      # A program or an extension from a file, unseen: gawk's
+                      # -E/--exec and -l/--load as much as -f and -i.
+                      r"|(^|\s)(-[fiEl]\s*\S|--file\b|--include\b|--exec\b|--load\b)"
+                      r"|@include\b|@load\b").search,
     "rg": re.compile(r"(^|\s)--pre(=|\s)").search,
     "find": re.compile(r"(^|\s)-(fprint0?|fprintf|fls)(\s|$)").search,
     "tree": re.compile(r"(^|\s)(-o|--output)(\s|=)").search,
@@ -1370,8 +1383,13 @@ READ_TOOL_ESCAPES = {
                       # A script file holds the same commands, unseen.
                       r"|(^|\s)(-[A-Za-z]*f|--file\b)").search,
     # A config file names plugins, and both import them.
-    "mypy": re.compile(r"(^|\s)--config-file\b").search,
-    "flake8": re.compile(r"(^|\s)--(config|append-config)\b").search,
+    # mypy also writes reports, installs packages and runs an interpreter;
+    # flake8 appends whatever --format says to --output-file, and bat runs
+    # its pager (2026-11-14 review: each read SAFE).
+    "mypy": re.compile(r"(^|\s)--(config-file|junit-xml|install-types|python-executable"
+                       r"|[a-z-]+-report)\b").search,
+    "flake8": re.compile(r"(^|\s)--(config|append-config|output-file)\b").search,
+    "bat": re.compile(r"(^|\s)--pager(=|\s)").search,
     # Setting the clock or the machine's name, not reading them.
     "date": re.compile(r"(^|\s)(-s|--set)\b|(^|\s)\d{6,}(\s|$)").search,
     "hostname": lambda segment: any(not w.startswith("-") for w in _tokens(segment)[1:]),
@@ -1383,6 +1401,117 @@ READ_TOOL_ESCAPES = {
 }
 for _awk in ("gawk", "nawk", "mawk"):
     READ_TOOL_ESCAPES[_awk] = READ_TOOL_ESCAPES["awk"]
+
+
+# The same file by another spelling. The shell drops quotes and backslashes
+# inside a word, writes out each choice in braces, and the disk takes `//`,
+# `/./` and `x/../` for nothing at all; and a `cd` puts the folder in one
+# command and the file in the next. Each of these named a secret store and
+# read SAFE (2026-11-14 review): `cd ~/.tapproval && cat data/auth.json`,
+# `cat ~/.codex//auth.json`, `cat ~/.a''ws/cre''dentials`,
+# `cat ~/{.a,}ws/cre{d,}entials`. Read here over the whole command, and
+# only ever to find a secret path: nothing else is judged by this reading.
+_SLASH_RUN = re.compile(r"/(?:\.?/)+")
+_UP_STEP = re.compile(r"(?:(?<=^)|(?<=[/\s=]))(?!\.\.?/)[^/\s=]+/\.\./")
+_BRACES = re.compile(r"\{([^{}\s]*,[^{}\s]*)\}")
+_BRACE_SPELLINGS = 32
+_CHANGES_FOLDER = frozenset(("cd", "pushd"))
+_RELATIVE_NAME = re.compile(r"[\w.][\w.@%+/-]*")
+_KUBE_SECRET = re.compile(r"(?:^|[\s,])secrets?(?:\.[\w.-]*)?(?:/|,)|,secrets?(?=\s|$)", re.I)
+
+
+def _plain_path(text):
+    """``text`` with the path steps that change nothing taken out."""
+    text = _SLASH_RUN.sub("/", text)
+    for _ in range(8):
+        shorter = _UP_STEP.sub("", text)
+        if shorter == text:
+            break
+        text = _SLASH_RUN.sub("/", shorter)
+    return text
+
+
+def _brace_spellings(word):
+    """Every word the shell writes for ``word``'s braces; None for more
+    than anyone would read."""
+    parts = _BRACES.split(word)
+    spellings = [""]
+    for index, part in enumerate(parts):
+        choices = part.split(",") if index % 2 else [part]
+        if len(spellings) * len(choices) > _BRACE_SPELLINGS:
+            return None
+        spellings = [left + right for left in spellings for right in choices]
+    return spellings
+
+
+def _secret_by_another_spelling(command):
+    """Does the command name a secret store once it is read as the shell
+    and the disk read it?"""
+    # A heredoc's body is a program's input, not this shell's file names.
+    command = _without_heredoc_bodies(command)
+    bare = _QUOTING.sub("", command)
+    plain = _plain_path(bare)
+    if plain != command and SECRET_PATH.search(plain):
+        return True
+    for word in plain.split():
+        if "{" in word and "," in word:
+            spellings = _brace_spellings(word)
+            if spellings is None:
+                # Too many to read, in a hidden or a home path: unread.
+                if word.startswith((".", "~", "$HOME", "${HOME}")) or "/." in word:
+                    return True
+            elif any(SECRET_PATH.search(_plain_path(s) + "/") for s in spellings):
+                return True
+    folder = None
+    for segment in _segments(command):
+        words = [_QUOTING.sub("", w).rstrip(")}") for w in _tokens(segment.lstrip("({ "))]
+        if not words:
+            continue
+        if os.path.basename(words[0]).lower() in _CHANGES_FOLDER:
+            target = next((w for w in words[1:] if not w.startswith("-")), "")
+            if not target or target == "-":
+                folder = None
+            elif folder and not target.startswith(("/", "~", "$")):
+                folder = folder.rstrip("/") + "/" + target
+            else:
+                folder = target
+            continue
+        if folder is None:
+            continue
+        for word in words[1:]:
+            # A file's name, as a word on its own: `await cookies()` in a
+            # message after a `cd` is not the browser's Cookies file.
+            if not _RELATIVE_NAME.fullmatch(word):
+                continue
+            if SECRET_PATH.search(_plain_path(folder.rstrip("/") + "/" + word)):
+                return True
+    return False
+
+
+# An awk program that runs a command or writes a file through a NAME, read
+# over the whole command, where the program's quotes are whole. The segment
+# splitter knows no quotes: it cut `awk 'BEGIN { cat = "sh"; printf "rm -rf
+# ~" | cat }'` at the `;` and the `|`, each piece began with a read-only
+# word, and the line read SAFE (2026-11-14 review). A `|` or `>` after
+# print is output; in a pattern (`/a|b/`, `$3 > 100`) it is not.
+_AWK_WORD = re.compile(r"\b[gnm]?awk\b")
+_AWK_STRING = re.compile(r'\\?"(?:\\.|[^"\\])*?\\?"')
+_AWK_RUNS = re.compile(r"system\s*\(|\b(?:print|printf)\b[^;}\n]*[|>]"
+                       r"|\|\s*getline|getline\s*<|\|&|@load\b|@include\b")
+
+
+def _awk_program_runs(command):
+    """Does an awk program on this line run a command or write a file?"""
+    found = _AWK_WORD.search(command)
+    if not found:
+        return False
+    for quoted in _QUOTED.finditer(command, found.end()):
+        program = quoted.group(1) if quoted.group(1) is not None else quoted.group(2)
+        if "{" not in program and "@" not in program:
+            continue  # a separator or a variable's value, not a program
+        if _AWK_RUNS.search(_AWK_STRING.sub('""', program)):
+            return True
+    return False
 
 
 # Reads that put a live credential into the transcript, by a spelling the
@@ -1454,6 +1583,10 @@ def _classify_bash(command, _depth, fragment=False):
     hidden_glob = not fragment and bool(SECRET_GLOB.search(command))
     if hidden_glob:
         bump("secret-glob", Risk.HIGH)
+    if not fragment and _secret_by_another_spelling(command):
+        bump("secret-access", Risk.HIGH)
+    if not fragment and _awk_program_runs(command):
+        bump("read-tool-writes-or-runs", Risk.MEDIUM)
     if SQL_EXEC.search(command) and any(
             os.path.basename(_first_token(segment)).lower() in SQL_CLIENTS
             for segment in _segments(command)):
@@ -1536,6 +1669,10 @@ def _classify_bash(command, _depth, fragment=False):
 
         if CREDENTIAL_READS.search(segment):
             bump("credential-read", Risk.HIGH)
+        # kubectl's `kind/name` and `kind,kind`: the word `secret` joined to
+        # a neighbour the word list never splits on.
+        if token in ("kubectl", "oc") and _KUBE_SECRET.search(segment):
+            bump("secret-access", Risk.HIGH)
 
         # The effect the words name, before any table gets to recognise the
         # binary. bump() takes the maximum, so a recognition table below can
@@ -1607,8 +1744,8 @@ SCRATCH_PATH = re.compile(r"([/\\](tmp|scratchpad|\.cache)[/\\])", re.I)
 # What every later session reads as its instructions, or runs as a command,
 # agent or skill: not documentation, whatever the extension (2026-09-30).
 INSTRUCTION_PATH = re.compile(
-    r"(^|[/\\])(CLAUDE(\.local)?\.md|AGENTS\.md)$"
-    r"|(^|[/\\])\.claude[/\\](commands|agents|skills|hooks)[/\\]", re.I)
+    r"(^|[/\\])(CLAUDE(\.local)?\.md|AGENTS(\.override)?\.md)$"
+    r"|(^|[/\\])\.claude[/\\](commands|agents|skills|hooks|rules)[/\\]", re.I)
 
 
 TEMP_ROOT = re.compile(r"(/private)?/tmp/", re.I)
@@ -1699,7 +1836,7 @@ def _names_a_secret_path(value):
     A folder named on its own (`~/.aws`) is the folder's contents, and a
     wildcard inside a hidden folder (`**/.ss?/*`) is read as the shell's
     rule reads it."""
-    value = value.replace("\\", "/")
+    value = _plain_path(value.replace("\\", "/"))
     return bool(SECRET_PATH.search(value + "/") or SECRET_GLOB.search(" " + value))
 
 
@@ -4244,6 +4381,15 @@ def _backup(path):
     with open(path, "r", encoding="utf-8") as src:
         content = src.read()
     with open(backup, "w", encoding="utf-8") as dst:
+        # As private as the original: settings.json can hold keys, and a
+        # 0600 file's copy was readable by every account. Before the
+        # content, so it is never there to read. Windows keeps no such
+        # bits, and a filesystem that refuses is no reason to stop.
+        try:
+            import stat
+            os.chmod(backup, stat.S_IMODE(os.stat(path).st_mode))
+        except OSError:
+            pass
         dst.write(content)
     return backup
 
@@ -4802,6 +4948,11 @@ def _settings_or_explain():
 
 def run_uninstall():
     """Remove our hook entry, leaving everything else in settings untouched."""
+    # The short command and the login entry are ours whatever settings.json
+    # says, so they go first: an unreadable file or a plugin install ended
+    # the uninstall before either was looked for (2026-11-14 review).
+    remove_command()
+    login_removed = remove_launch_agent()
     found = _settings_or_explain()
     if found is None:
         return 1
@@ -4825,8 +4976,7 @@ def run_uninstall():
         # The login job is ours whatever settings say: a hand edit or an
         # earlier --uninstall took the hooks and left it pointing at a
         # script the uninstaller then deletes (2026-09-30 review).
-        remove_command()
-        if remove_launch_agent():
+        if login_removed:
             print("Not in settings; the login job was removed.")
         else:
             print("Not installed — nothing to remove.")
@@ -4841,8 +4991,6 @@ def run_uninstall():
     # to undo a write, and a run that changes nothing must leave nothing.
     backup = _backup(path)
     _write_settings(path, data)
-    remove_launch_agent()
-    remove_command()
     bridge_gone = _remove_bridge()
 
     print("Removed. Your other settings were left untouched.")
@@ -5149,7 +5297,10 @@ def _relay_json(path, timeout=1):
                 key, "GET", urllib.parse.unquote(split.path), b"", split.query)
         request = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(request, timeout=timeout) as reply:
-            return json.loads(reply.read())
+            answer = json.loads(reply.read())
+        # The relay answers these in objects; a list or a number is some
+        # other program on the port, and --status read it as a relay's.
+        return answer if isinstance(answer, dict) else None
     except Exception:
         return None
 
@@ -5193,9 +5344,12 @@ def connection_lines(health, tunnel, away_ok):
         lines.append("Away address  : %s" % url.split("/t/")[0])
     lines.append("Tailscale     : %s" % ((tunnel or {}).get("tailscale") or "not on Tailscale"))
     seen = health.get("watch_seen_seconds_ago")
-    lines.append("Watch         : %s" % ("seen %ds ago" % seen if seen is not None
+    known = isinstance(seen, (int, float)) and not isinstance(seen, bool)
+    lines.append("Watch         : %s" % ("seen %ds ago" % seen if known
                                          else "not seen recently"))
-    problems = [c.get("detail") for c in health.get("conditions") or [] if c.get("detail")]
+    conditions = health.get("conditions")
+    problems = [c["detail"] for c in (conditions if isinstance(conditions, list) else [])
+                if isinstance(c, dict) and isinstance(c.get("detail"), str) and c["detail"]]
     for detail in problems:
         lines.append("Problem       : %s" % detail)
     if problems:

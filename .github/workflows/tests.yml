@@ -25,8 +25,19 @@ jobs:
       fail-fast: false
       matrix:
         # Every host the helper promises (2026-10-28): free on a public repo.
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-24.04, windows-latest, macos-latest]
         python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        # hosts only: begin (the private workflow has one host, and no such lines)
+        # GitHub's newest Linux image (26.04) has no Python 3.9, and the
+        # job stopped before a single test ran (2026-11-15). 3.9 on Linux
+        # runs on the image before it, which still has it.
+        exclude:
+          - os: ubuntu-latest
+            python: "3.9"
+        include:
+          - os: ubuntu-24.04
+            python: "3.9"
+        # hosts only: end
     defaults:
       run:
         shell: bash

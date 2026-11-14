@@ -864,6 +864,10 @@ class TestClassifyBashDestructive:
         "rm -rf ./", "rm -rf ../", "rm -rf ./*", "rm -rf ../*",
         # 2026-10-26 review: the home folder spelled with a trailing `/.`.
         "rm -rf ~/.", "rm -rf $HOME/.", "rm -rf ~/./",
+        # 2026-11-14 review: `${HOME:?}` is $HOME with a guard against
+        # an empty value, and the guard does not make the target smaller.
+        'rm -rf "${HOME:?}"', "rm -rf ${HOME:?}/", "rm -rf ${HOME:?}/*",
+        'rm -rf "${HOME:?unset}"', "rm -rf ${HOME?}",
         "find " + os.path.expanduser("~") + " -delete",
     ])
     def test_the_home_folder_by_any_spelling_is_catastrophic(self, command):
@@ -1904,6 +1908,25 @@ class TestInstaller:
         assert len(backups) == 1
         assert json.loads(backups[0].read_text(encoding="utf-8")) == {"model": "keep-me"}
 
+    def test_a_backup_is_as_private_as_the_settings_were(self, settings, tmp_path):
+        """settings.json can hold keys in its env block; a 0600 file's copy
+        was written with the default mode, readable by every account
+        (2026-11-14 review). Compared with the original rather than with
+        0600, because Windows keeps no such bits."""
+        settings.write_text(json.dumps({"env": {"KEY": "synthetic"}}), encoding="utf-8")
+        os.chmod(str(settings), 0o600)
+        backup = crc._backup(str(settings))
+        assert os.stat(backup).st_mode & 0o777 == os.stat(str(settings)).st_mode & 0o777
+        assert json.loads(open(backup, encoding="utf-8").read()) == {"env": {"KEY": "synthetic"}}
+
+    def test_a_backup_whose_mode_cannot_be_set_is_still_a_backup(self, settings, monkeypatch):
+        settings.write_text("{}", encoding="utf-8")
+        def refuse(*_a, **_k):
+            raise OSError("no modes here")
+        monkeypatch.setattr(crc.os, "chmod", refuse)
+        backup = crc._backup(str(settings))
+        assert backup and os.path.exists(backup)
+
     def test_uninstall_removes_only_our_entry(self, settings, capsys):
         settings.write_text(json.dumps({"hooks": {"PermissionRequest": [
             {"matcher": "Bash", "hooks": [{"type": "command", "command": "/other/guard.sh"}]}
@@ -2133,6 +2156,35 @@ class TestTheShortCommand:
         assert "Shortcut" in capsys.readouterr().out
         assert crc.run_uninstall() == 0
         assert not launcher.exists()
+
+    def _leftovers(self, bin_dir):
+        """The short command and the login entry an earlier --install left."""
+        launcher = bin_dir / "tapproval"
+        launcher.write_text(crc.command_text(sys.executable, crc.__file__), encoding="utf-8")
+        assert crc._is_our_command(str(launcher))
+        login = os.environ["CLAUDE_LAUNCH_AGENT_PATH"]
+        os.makedirs(os.path.dirname(login), exist_ok=True)
+        with open(login, "w", encoding="utf-8") as handle:
+            handle.write("synthetic login entry\n")
+        return launcher, login
+
+    def test_uninstall_takes_them_when_the_settings_cannot_be_read(self, settings, bin_dir, capsys):
+        """The two leftovers are ours whatever settings.json says; an
+        unreadable file used to end the uninstall before either was
+        looked for (2026-11-14 review)."""
+        launcher, login = self._leftovers(bin_dir)
+        settings.write_text("{ this is not json", encoding="utf-8")
+        assert crc.run_uninstall() == 1
+        assert not launcher.exists() and not os.path.exists(login)
+        assert settings.read_text(encoding="utf-8") == "{ this is not json"
+
+    def test_uninstall_takes_them_from_a_plugin_install_too(self, settings, bin_dir,
+                                                           monkeypatch, capsys):
+        launcher, login = self._leftovers(bin_dir)
+        monkeypatch.setattr(crc, "_plugin_only_install", lambda: {"root": "/synthetic/plugin"})
+        assert crc.run_uninstall() == 1
+        assert "/plugin uninstall" in capsys.readouterr().out
+        assert not launcher.exists() and not os.path.exists(login)
 
     def test_with_nowhere_to_put_it_the_install_says_nothing(self, settings, capsys):
         assert crc.run_install() == 0                             # the autouse: nowhere
@@ -6167,6 +6219,40 @@ class TestStatusTroubleshoots:
     def _lines(self, health, tunnel=None, answers=None):
         return crc.connection_lines(health, tunnel or {}, answers)
 
+    @pytest.mark.parametrize("health", [
+        dict(HEALTH, conditions=["words", 3, None, {"detail": "The real one"}]),
+        dict(HEALTH, conditions={"detail": "not a list"}),
+        dict(HEALTH, conditions="words", watch_seen_seconds_ago="soon"),
+    ])
+    def test_conditions_of_any_shape_are_read_not_crashed_on(self, health):
+        """Whatever answers on the relay's port is another program's JSON
+        until proven otherwise (2026-11-14 review)."""
+        text = "\n".join(self._lines(health))
+        assert "Relay         : running" in text and "Next step" in text
+        if isinstance(health["conditions"], list):
+            assert "Problem       : The real one" in text
+
+    @pytest.mark.parametrize("answer", ["[]", '["ok"]', "3", '"words"', "null"])
+    def test_an_answer_that_is_not_an_object_is_no_relay(self, monkeypatch, answer, capsys,
+                                                         tmp_path):
+        import io
+        import urllib.request
+        monkeypatch.setattr(crc, "_relay_key", lambda _env: "")
+        class Reply(io.BytesIO):
+            def __enter__(self):
+                return self
+            def __exit__(self, *_a):
+                return False
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            lambda *_a, **_k: Reply(answer.encode()))
+        assert crc._relay_health() is None
+        monkeypatch.setenv("CLAUDE_PLUGINS_DIR", str(tmp_path / "empty"))
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "settings.json"))
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
+        monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
+        assert crc.run_status() == 0
+        assert "Relay         : not running" in capsys.readouterr().out
+
     def test_all_well_says_so(self):
         lines = self._lines(self.HEALTH, {"url": "https://a.trycloudflare.com/t/x",
                                           "tailscale": "http://100.1.2.3:8977"}, True)
@@ -7909,6 +7995,21 @@ class TestLanSourceIsNotTrusted:
         assert body["reported"] in ("mail_not_configured",
                                     "not_sent_in_tests"), body["reported"]
 
+    def test_a_watch_reporting_in_a_loop_is_stopped(self, lan, monkeypatch):
+        """Every report is a line in the crash log, which rolls over once
+        at 512 KB: a key holder looping this pushed the helper's own
+        crashes out of it (2026-11-14 review)."""
+        import crash_report
+        base, _, _ = lan
+        written = []
+        monkeypatch.setattr(crash_report, "report",
+                            lambda *a, **k: written.append(a) or ("not_sent_in_tests", {}))
+        statuses = [self._call(base + "/diagnostic", token="devicetoken", method="POST",
+                               body={"kind": "caught", "message": "synthetic %d" % n})[0]
+                    for n in range(40)]
+        assert statuses[0] == 200 and statuses[-1] == 429
+        assert len(written) == statuses.count(200) < 40
+
     def test_a_report_with_nothing_in_it_is_refused(self, lan):
         base, _, _ = lan
         status, body = self._call(base + "/diagnostic", token="devicetoken",
@@ -7949,7 +8050,7 @@ class TestLanSourceIsNotTrusted:
         status, body = self._call(base + "/pair")
         assert status == 403 and body.get("error") == "already paired"
 
-    def test_an_open_window_hands_over_a_key_of_its_own_once_per_address(self, lan):
+    def test_an_open_window_hands_over_a_key_of_its_own(self, lan):
         """A device key, never the bootstrap: the bootstrap is the machine's
         own secret, and whoever claimed it held every future key too
         (2026-09-25 review). A device key can be counted and revoked."""
@@ -7959,7 +8060,12 @@ class TestLanSourceIsNotTrusted:
         assert status == 200 and body["token"] and body["token"] != "bootstraptoken"
         assert auth.matches(body["token"])
         assert any(d.get("source") == "lan-window" for d in auth.devices)
-        assert self._call(base + "/pair")[0] == 403   # same address, again
+        # The same address again is the watch whose answer was lost: a
+        # new key, and the one that never arrived is gone (2026-11-14).
+        status, again = self._call(base + "/pair")
+        assert status == 200 and again["token"] != body["token"]
+        assert auth.matches(again["token"]) and not auth.matches(body["token"])
+        assert sum(d.get("source") == "lan-window" for d in auth.devices) == 1
 
     def test_a_burst_shuts_the_window(self, lan):
         """A flood is an attack, not a retry."""
@@ -13206,6 +13312,34 @@ class TestSigningInFromTheWrist:
         for proc in procs:
             proc.done.set()
 
+    def test_a_second_tap_says_how_long_the_code_still_lives(self, monkeypatch):
+        """The first answer was handed back whole, so a tap ten minutes in
+        still promised the full fifteen (2026-11-14 review)."""
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
+        proc = self._Proc(["https://auth.example.test/codex/device\n", "ABCD-EF123\n"])
+        first = watch_relay.start_signin("codex", popen=lambda cmd, **k: proc)
+        assert first["expires_in"] == 900
+        with watch_relay._SIGNIN_RUNS_LOCK:
+            watch_relay._SIGNIN_RUNS["codex"]["at"] -= 600
+        again = watch_relay.start_signin(
+            "codex", popen=lambda cmd, **k: pytest.fail("a second sign-in"))
+        assert again["code"] == "ABCD-EF123"
+        assert 295 <= again["expires_in"] <= 300
+        proc.done.set()
+
+    def test_a_start_that_raises_anything_is_still_an_answer(self, monkeypatch):
+        """"Never raises", says start_signin; only OSError was caught, and
+        anything else dropped the connection with no answer."""
+        monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
+        def broken(cmd, **k):
+            raise ValueError("bad arguments")
+        answer = watch_relay.start_signin("claude", popen=broken)
+        assert answer == {"ok": False,
+                          "status": "The sign-in could not start on your computer"}
+        proc = self._Proc([])
+        assert watch_relay.start_signin("claude", popen=lambda cmd, **k: proc)["ok"] is True
+        proc.done.set()
+
     def test_a_failed_start_frees_the_slot_for_the_next_tap(self, monkeypatch):
         monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
         def broken(cmd, **k):
@@ -14567,6 +14701,20 @@ class TestTheWristAnswersAHeadlessSend:
         assert replies[0]["error"]["code"] == -32700 and "error" in replies[1]
         assert replies[2]["result"]["protocolVersion"] == wpt.PROTOCOL
 
+    def test_a_message_nested_too_deep_to_parse_does_not_end_the_server(self):
+        """json.loads raises RecursionError, not ValueError, on a message
+        nested deeper than the interpreter will follow; it ended the tool,
+        and with it every answer the run still needed (2026-11-14 review)."""
+        import io
+        deep = "[" * 200000 + "]" * 200000
+        stdin = io.StringIO(deep + "\n" + json.dumps(
+            {"jsonrpc": "2.0", "id": 3, "method": "initialize"}) + "\n")
+        stdout = io.StringIO()
+        wpt.serve(stdin=stdin, stdout=stdout, crc=self._Fake("allow"))
+        replies = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        assert [r.get("id") for r in replies] == [None, 3]
+        assert replies[0]["error"]["code"] == -32700
+
     def test_the_threshold_the_hook_obeys_is_obeyed_here_too(self):
         """A wrist asked about every `ls` stops reading the cards. With a
         raised threshold the harmless ones are answered here, exactly as
@@ -15447,6 +15595,36 @@ class TestNewSessionFromTheWatch:
         assert status.startswith("could not open Terminal: ")
         assert "Not authorized" in status
         assert ".command" in status, "the fallback must say it was tried too"
+
+    @pytest.mark.parametrize("failure", ["refused", "raised"])
+    def test_a_command_file_nothing_opened_is_not_left_behind(self, tmp_path, monkeypatch,
+                                                              failure):
+        """The file holds the wearer's words and removes itself only when
+        it runs; when `open` failed it stayed in the temp folder for good
+        (2026-11-14 review)."""
+        import subprocess as sp
+        monkeypatch.setattr(watch_dashboard, "live_sessions", lambda: {})
+        monkeypatch.setattr(watch_relay.shutil, "which", lambda _n: "/usr/local/bin/claude")
+        made = tmp_path / "made"
+        made.mkdir()
+        real = watch_relay.tempfile.mkstemp
+        monkeypatch.setattr(watch_relay.tempfile, "mkstemp",
+                            lambda **k: real(**dict({"dir": str(made)}, **k)))
+        seen = []
+        def fake_run(cmd, **kw):
+            if cmd[0] == "open":
+                seen.append(os.path.exists(cmd[-1]))
+                if failure == "raised":
+                    raise OSError("no open here")
+                return sp.CompletedProcess(cmd, 1, "", "LSOpenURLsWithRole() failed")
+            return sp.CompletedProcess(cmd, 1, "", "execution error")
+        monkeypatch.setattr(watch_relay.subprocess, "run", fake_run)
+        status = watch_relay.start_session(str(tmp_path / "acme"), "synthetic words",
+                                           projects_dir=self._projects(tmp_path),
+                                           platform="darwin")
+        assert status.startswith("could not open Terminal: ")
+        assert seen == [True], "the file was there for `open` to read"
+        assert list(made.iterdir()) == []
 
     def _start(self, tmp_path, monkeypatch, text="Fix CI; it's red",
                open_ok=True, osascript=None, open_error=None):
@@ -16486,6 +16664,19 @@ class TestLocalMeansLocal:
                           method="POST")[0] == 200
         assert auth.window_open() and not auth.needs_consent("192.168.1.77")
 
+    def test_asking_at_the_mac_in_a_loop_is_stopped(self, relay):
+        """Without the key file each call puts the question on the Mac's
+        screen again; any local process could keep it there
+        (2026-11-14 review). The key file's holder is not counted."""
+        _server, base, auth = relay
+        statuses = [relay_call(base + "/admin/pair-open", method="POST")[0]
+                    for _ in range(8)]
+        assert statuses[0] == 200 and statuses[-1] == 429
+        assert statuses.count(200) == 5
+        for _ in range(8):
+            assert relay_call(base + "/admin/pair-open", token="bootstraptoken",
+                              method="POST")[0] == 200
+
     def test_the_pair_command_signs_with_the_key_file(self, relay, tmp_path, monkeypatch):
         server, _base, auth = relay
         key_file = tmp_path / "auth.json"
@@ -17134,6 +17325,55 @@ class TestFirstPairingIsAWindow:
         assert not auth.begin_asking("192.168.1.50"), "still one question up"
         auth.finish_asking("192.168.1.9", True, ticket)
         assert auth.claim_window("192.168.1.9")
+
+    def test_the_watch_whose_answer_was_lost_may_ask_again(self, fresh_auth):
+        """The watch gives up on a request after 5 s. Its second ask comes
+        from the same address, and was refused: "one retry" could only
+        ever be another device's (2026-11-14 review)."""
+        auth = _known_watch(fresh_auth)
+        auth.open_window()
+        first = auth.claim_window("192.168.1.9")
+        again = auth.claim_window("192.168.1.9")
+        assert first and again and again != first
+        assert not auth.matches(first), "the key that never arrived is gone"
+        assert auth.matches(again)
+
+    def test_a_window_is_for_one_address(self, fresh_auth):
+        """On a Mac that has paired before, the owner's `tapproval pair`
+        window asks nothing and did not shut behind the watch: for the
+        rest of its ten minutes any other device on the network got a key
+        (2026-11-14 review)."""
+        auth = _known_watch(fresh_auth)
+        auth.open_window()
+        assert auth.claim_window("192.168.1.9")
+        assert auth.claim_window("192.168.1.66") is None
+        assert auth.claim_window("192.168.1.9"), "the watch itself still may"
+
+    def test_asking_again_has_an_end(self, fresh_auth):
+        auth = _known_watch(fresh_auth)
+        auth.open_window()
+        for _ in range(watch_relay.PAIR_WINDOW_CLAIMS):
+            assert auth.claim_window("192.168.1.9")
+        assert auth.claim_window("192.168.1.9") is None
+
+    def test_the_window_shuts_once_the_watch_has_enrolled(self, fresh_auth):
+        """The key from the window is traded for the watch's own: pairing
+        is done, and the door has nobody left to wait for."""
+        auth = _known_watch(fresh_auth)
+        auth.open_window()
+        key = auth.claim_window("192.168.1.9")
+        handler = watch_relay.RelayHandler.__new__(watch_relay.RelayHandler)
+        handler.required_token, handler.auth = None, auth
+        handler.client_address = ("192.168.1.9", 50000)
+        handler._over_limit = lambda *a, **k: False
+        handler._presented = lambda: key
+        handler._signed_nonce = None
+        sent = []
+        handler._send_json = lambda payload, status=200, headers=None: sent.append((status, payload))
+        handler._handle_enroll({"device_id": "w1"})
+        assert sent and sent[0][0] == 200, sent
+        assert not auth.window_open()
+        assert auth.claim_window("192.168.1.66") is None
 
     @pytest.mark.parametrize("ok, said, allowed", [
         (True, "button returned:Allow, gave up:false", True),
@@ -18652,7 +18892,40 @@ class TestCiRunsWhatTheChangeCanBreak:
         (local,) = _ci_files("ci-local.sh")
         ask = local.index('./ci-tree-cache.sh check "$SCOPE"')
         assert ask < local.index("uvx --quiet --python"), "asked before any work"
-        assert '[ "$WHICH" = all ] && ./ci-tree-cache.sh record "$SCOPE"' in local
+        assert ('[ "$WHICH" = all ] && [ "${#SKIPPED[@]}" -eq 0 ] '
+                '&& ./ci-tree-cache.sh record "$SCOPE"') in local
+
+    def _ci_local_ends(self, tmp_path, skipped):
+        """ci-local.sh from its summary on, after a run of everything in
+        which nothing failed, beside a stand-in ci-tree-cache.sh."""
+        import subprocess
+        (local,) = _ci_files("ci-local.sh")
+        wants = next(line for line in local.splitlines() if line.startswith("wants() {"))
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "ci-tree-cache.sh").write_text('#!/bin/bash\necho "$@" >> recorded\n')
+        os.chmod(tmp_path / "ci-tree-cache.sh", 0o755)
+        script = ('set -uo pipefail\nsay() { echo "$@"; }\n%s\n'
+                  'WHICH=all SCOPE=full PURCHASES_PROVEN=0\n'
+                  'PASSED=(pytest) FAILED=() NOT_NEEDED=() SKIPPED=(%s)\n%s'
+                  % (wants, skipped, local[local.index('say "Summary'):]))
+        run = subprocess.run(["bash", "-c", script], cwd=tmp_path, capture_output=True,
+                             text=True, timeout=30)
+        recorded = tmp_path / "recorded"
+        return run, recorded.read_text() if recorded.exists() else ""
+
+    def test_a_run_with_a_part_that_could_not_run_is_not_recorded(self, tmp_path):
+        """2026-11-14 review: "no iPhone simulator could be made" is a SKIP,
+        not a failure, and the tree was still written down as passed, so
+        its merge to main was left untested as "already passed"."""
+        run, recorded = self._ci_local_ends(
+            tmp_path / "skip", '"purchase tests: no iPhone simulator could be made"')
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert "SKIP purchase tests: no iPhone simulator could be made" in run.stdout
+        assert recorded == "", "a tree with a part that never ran was recorded as passed"
+        # The same ending with nothing skipped does record: the stand-in works.
+        run, recorded = self._ci_local_ends(tmp_path / "whole", "")
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert recorded == "record full\n", recorded
 
     # -- a cancelled run leaves nothing behind ---------------------------------
 
@@ -20862,8 +21135,19 @@ def test_the_two_ci_workflows_share_their_test_steps():
         end = next((i for i, line in enumerate(rest)
                     if line.startswith("  ") and not line.startswith("   ")), len(rest))
         # The public matrix also names its hosts (Linux, Windows, macOS);
-        # the private fallback runs on one, as the runner is private.
-        return [line for line in rest[:end]
+        # the private fallback runs on one, as the runner is private. So
+        # is a span marked "hosts only": which image a host's job runs on
+        # (Linux 3.9 on the image that still has it, 2026-11-15).
+        kept, hosts_only = [], False
+        for line in rest[:end]:
+            if "# hosts only: begin" in line:
+                hosts_only = True
+            elif "# hosts only: end" in line:
+                hosts_only = False
+            elif not hosts_only:
+                kept.append(line)
+        assert not hosts_only, "a hosts-only span that never ends hides the rest"
+        return [line for line in kept
                 if "vars.CI_RUNNER" not in line and "runs-on:" not in line
                 and not line.strip().startswith("needs:")
                 and not line.strip().startswith("os: [")
@@ -21578,6 +21862,46 @@ class TestATranscriptIsFoundByAnyPrefix:
         monkeypatch.setattr(wd.os, "listdir", lambda *a: pytest.fail("walked the folders"))
         assert wd._find_transcript(sid[:12]) == found
         assert wd._find_transcript(sid[:8]) == found
+
+
+    def _two(self, tmp_path, monkeypatch):
+        import watch_dashboard as wd
+        ids = ("abcdef123456-7890-aaaa-bbbb-ccccdddd0000",
+               "abcdef999999-7890-aaaa-bbbb-ccccdddd0000")
+        for number, sid in enumerate(ids):
+            project = tmp_path / ("proj%d" % number)
+            project.mkdir()
+            (project / (sid + ".jsonl")).write_text("{}\n")
+        monkeypatch.setattr(wd, "CLAUDE_PROJECTS", str(tmp_path))
+        monkeypatch.setattr(wd, "_TRANSCRIPT_PATHS", {})
+        return wd, ids
+
+    def test_a_prefix_two_sessions_share_names_neither(self, tmp_path, monkeypatch):
+        """A short prefix resolved to whichever transcript the folder
+        listed first, and /end, /say and /archive then acted on it
+        (2026-11-14 review). Codex's find_rollout already refuses."""
+        wd, ids = self._two(tmp_path, monkeypatch)
+        assert wd._find_transcript("abcdef") is None
+        assert wd._find_transcript("a") is None
+        assert wd.resolve_session("abcdef") == (None, None)
+        for sid in ids:
+            assert wd._find_transcript(sid[:12]).endswith(sid + ".jsonl")
+            assert wd._find_transcript(sid).endswith(sid + ".jsonl")
+        # ...and the memo, which now holds both, refuses as the folders do.
+        assert set(wd._TRANSCRIPT_PATHS) == set(ids)
+        monkeypatch.setattr(wd.os, "listdir", lambda *a: pytest.fail("walked the folders"))
+        assert wd._find_transcript("abcdef") is None
+
+    def test_an_id_that_begins_another_is_still_itself(self, tmp_path, monkeypatch):
+        import watch_dashboard as wd
+        project = tmp_path / "proj"
+        project.mkdir()
+        for sid in ("moved-1", "moved-10"):
+            (project / (sid + ".jsonl")).write_text("{}\n")
+        monkeypatch.setattr(wd, "_TRANSCRIPT_PATHS", {})
+        found = wd._find_transcript("moved-1", projects_dir=str(tmp_path))
+        assert found and found.endswith("moved-1.jsonl")
+        assert wd._find_transcript("moved", projects_dir=str(tmp_path)) is None
 
 
 class TestAnEmptyPrefixFindsNothing:
@@ -24834,6 +25158,47 @@ class TestOneSimulatorRunAtATimeOnThisMac:
         assert again.returncode == 0, again.stderr
         assert self._turn(tmp_path, "who").stdout.strip() == "the next run (pid %d)" % os.getpid()
 
+    def _ps_that_cannot_read(self, tmp_path, pid):
+        """A PATH whose ps fails for ``pid`` alone, as ps does for a moment
+        on a Mac under load, and is the real one for every other."""
+        bin_ = tmp_path / "bin"
+        bin_.mkdir()
+        (bin_ / "ps").write_text(
+            '#!/bin/bash\nfor a in "$@"; do [ "$a" = "%d" ] && exit 1; done\n'
+            'exec /bin/ps "$@"\n' % pid)
+        os.chmod(bin_ / "ps", 0o755)
+        return "%s%s%s" % (bin_, os.pathsep, os.environ["PATH"])
+
+    def test_a_holder_ps_cannot_read_for_a_moment_keeps_its_turn(self, tmp_path, monkeypatch):
+        """2026-11-14 review: a ps that failed once read as "the holder is
+        gone", and the next run took the turn from a run still going.
+        Only a process that is gone, or one started at another time, has
+        lost it (as sim-shared.sh's holding() already had it)."""
+        holder = subprocess.Popen(["sleep", "300"])
+        try:
+            assert self._turn(tmp_path, "take", holder.pid, "a run still going").returncode == 0
+            monkeypatch.setenv("PATH", self._ps_that_cannot_read(tmp_path, holder.pid))
+            late = self._turn(tmp_path, "take", os.getpid(), "me", wait=2)
+            assert late.returncode == 3, "took a live run's turn: %s" % late.stderr
+            assert "still in use by a run still going" in late.stderr, late.stderr
+            assert self._turn(tmp_path, "who").stdout.strip() == \
+                "a run still going (pid %d)" % holder.pid
+        finally:
+            holder.kill()
+
+    def test_a_process_number_given_to_a_later_process_is_not_the_holder(self, tmp_path):
+        """macOS hands a dead run's number on: alive, but started at another time."""
+        later = subprocess.Popen(["sleep", "300"])
+        try:
+            (tmp_path / "turn").mkdir()
+            os.symlink("%d@Thu Jan  1 00:00:00 1970|a dead run" % later.pid,
+                       tmp_path / "turn" / "turn")
+            assert self._turn(tmp_path, "who").stdout == ""
+            again = self._turn(tmp_path, "take", os.getpid(), "the next run", wait=10)
+            assert again.returncode == 0, again.stderr
+        finally:
+            later.kill()
+
     def test_however_many_arrive_at_a_dead_runs_turn_one_gets_it(self, tmp_path):
         gone = subprocess.Popen(["true"])
         holders = [subprocess.Popen(["sleep", "300"]) for _ in range(6)]
@@ -25611,6 +25976,22 @@ class TestASessionCanBeArchivedFromTheWrist:
         assert watch_dashboard.claude_app_archived(self.SID, root=str(tmp_path / "none")) is None
         assert watch_dashboard.claude_app_archived("", root=str(tmp_path)) is None
 
+    def test_a_file_that_vanishes_while_sorting_does_not_undo_the_order(self, tmp_path, monkeypatch):
+        """Newest first is what makes the bounded read find the right
+        file; one file deleted mid-sort raised OSError and left the list
+        as the folder gave it (2026-11-14 review)."""
+        import glob
+        self._app_file(tmp_path, "local_old.json", self.SID, False)
+        self._app_file(tmp_path, "local_new.json", self.SID, True)
+        folder = tmp_path / "acct" / "org"
+        old, new, gone = (str(folder / name) for name in
+                          ("local_old.json", "local_new.json", "local_gone.json"))
+        os.utime(old, (1000, 1000))
+        os.utime(new, (2000, 2000))
+        monkeypatch.setattr(glob, "glob", lambda _pattern: [old, new, gone])
+        monkeypatch.setattr(watch_dashboard, "CLAUDE_APP_FILES_READ", 1)
+        assert watch_dashboard.claude_app_archived(self.SID, root=str(tmp_path)) is True
+
     def test_an_unreadable_app_file_is_not_an_answer(self, tmp_path):
         folder = tmp_path / "acct" / "org"
         folder.mkdir(parents=True)
@@ -25666,6 +26047,26 @@ class TestASessionCanBeArchivedFromTheWrist:
         assert relay_call(base + "/archive", token="devicetoken", method="POST",
                           body=body)[1] == {"ok": True, "status": "archived"}
         assert len(ran) == 1, "the app is asked once, never again"
+
+    def test_a_retried_ask_does_not_read_the_apps_files_each_time(self, relay, monkeypatch):
+        """The replay answers before any budget is spent, and it read up
+        to 400 of the app's files on every retry (2026-11-14 review)."""
+        base, ran, words = relay
+        words["archive"] = "asked"
+        reads = []
+        monkeypatch.setattr(watch_relay, "claude_app_archived",
+                            lambda sid, root=None: reads.append(sid) or words.get("app"))
+        body = {"session_id": self.SID, "request_id": "5" * 32}
+        for _ in range(6):
+            assert relay_call(base + "/archive", token="devicetoken", method="POST",
+                              body=body)[1] == {"ok": True, "status": "asked"}
+        assert len(reads) <= 1, "%d reads for six retries" % len(reads)
+        assert len(ran) == 1
+        # Once the short hold is over, the app's own record is read again.
+        watch_relay.LIMITS.reset()
+        words["app"] = True
+        assert relay_call(base + "/archive", token="devicetoken", method="POST",
+                          body=body)[1] == {"ok": True, "status": "archived"}
 
     def test_a_refusal_is_not_ok(self, relay):
         base, _, words = relay
@@ -27851,3 +28252,191 @@ class TestArchiveE2EReadsEachFacesOwnRelayLines:
                   'tail -c +"$((mark + 1))" "%s"' % (log, log, log))
         out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
         assert out.stdout == "relay: face two\n"
+
+
+class TestReview20261114RunnersAndTheGitPattern:
+    """The 2026-11-14 review, first part: a read-only tool that runs or
+    writes read SAFE, so --quiet allowed it; and one `git` spelling kept
+    the hook busy for as long as anyone waited."""
+
+    @pytest.mark.parametrize("command", [
+        # The splitter knows no quotes: it cut the awk program at `;` and
+        # `|`, and each piece began with a read-only word.
+        """awk 'BEGIN { cat = "sh"; printf "rm -rf ~" | cat }'""",
+        """awk 'BEGIN { c = "sh"; print "id" | c; close(c) }' /dev/null""",
+        """awk '{ f = "/tmp/out"; print $0 > f }' notes.txt""",
+        """awk 'BEGIN { cat = "id"; cat | getline x; print x }'""",
+        """gawk "BEGIN { cat = \\"sh\\"; printf \\"id\\" | cat }\"""",
+        # gawk reads its program from a file by these too.
+        """printf 'BEGIN{system("id")}' | awk -E /dev/stdin""",
+        "gawk --exec prog.awk data",
+        "gawk -l filefuncs 'BEGIN{print 1}'",
+        "gawk '@load \"filefuncs\"; BEGIN{print 1}'",
+        # flake8 appends whatever --format says to any file.
+        "flake8 --format='python3 /tmp/x.py #%(code)s' --output-file ~/.zshrc x.py",
+        "flake8 --output-file=report.txt .",
+        # mypy writes reports, installs packages, runs an interpreter.
+        "mypy --junit-xml out.xml .",
+        "mypy --html-report out .",
+        "mypy --install-types --non-interactive .",
+        "mypy --python-executable /tmp/x .",
+        # bat runs its pager.
+        "bat --paging=always --pager='python3 /tmp/x.py' README.md",
+        "bat --pager 'sh -c id' README.md",
+    ])
+    def test_a_read_tool_that_runs_or_writes_is_not_a_read(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= Risk.MEDIUM, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "awk '{print $1}' file.txt",
+        "ps aux | awk '{print $2}' | sort | head",
+        "flake8 --max-line-length 100 .",
+        "flake8 --format=pylint .",
+        "mypy --strict .",
+        "bat README.md",
+        "bat --paging=never -n README.md",
+    ])
+    def test_the_reads_beside_them_stay_safe(self, command):
+        assert crc.classify_bash(command)[0] == Risk.SAFE, crc.classify_bash(command)
+
+    @pytest.mark.parametrize("command", [
+        "awk -F: '$3 > 100 {print $1}' /etc/passwd",
+        "awk '/foo|bar/ {print $2}' log.txt",
+        "awk '{ if ($1 > 5) print $2 }' data",
+        "awk 'NR>1 {sum += $2} END {print sum}' data",
+        "awk '{print $1}' f | grep 'a|b'",
+        "awk -F'|' '{print $2}' table.txt",
+    ])
+    def test_a_comparison_or_a_pattern_is_not_called_output(self, command):
+        # A `>` or `|` outside print is a comparison or an alternation.
+        # (The quote-blind splitter already holds these at MEDIUM for its
+        # own reasons; this rule must not be one more.)
+        assert "read-tool-writes-or-runs" not in crc.classify_bash(command)[1]
+
+    @pytest.mark.parametrize("option", ["-c", "-C", "--git-dir", "--no-pager", "-p"])
+    def test_a_git_line_of_options_is_read_at_once(self, option):
+        # 27 repeats took 14 s and each one more half as long again: the
+        # pattern could read `-c` two ways, and tried every combination.
+        # Measured as growth, in the process's own time, so a busy Mac
+        # cannot fail it and a slow blow-up cannot pass it: the first
+        # version of this test asked for "under a second" at 40 repeats,
+        # which a pattern still doubling every two options met.
+        import time
+
+        def cost(repeats):
+            command = "git " + (option + " ") * repeats + "1"
+            began = time.process_time()
+            for _ in range(3):
+                crc.GIT_RE.search(command)
+            return time.process_time() - began
+
+        # A ladder, so a pattern that blows up fails on a low rung in
+        # seconds and never reaches the one that would hold the suite.
+        for repeats in (36, 44, 45, 200, 2001):
+            assert cost(repeats) < 0.5, "%d options took too long" % repeats
+
+    def test_and_so_is_the_whole_command(self):
+        import time
+        command = "git " + "-C " * 400 + "1"
+        began = time.process_time()
+        crc.classify_bash(command)
+        assert time.process_time() - began < 2.0
+
+    @pytest.mark.parametrize("command, tier", [
+        ("git -C /repo push --force origin main", Risk.CRITICAL),
+        ("git -c user.name=x push -f origin main", Risk.CRITICAL),
+        ("git --git-dir /repo/.git push --force origin main", Risk.CRITICAL),
+        ("git --no-pager status", Risk.SAFE),
+        ("git --no-pager -c color.ui=never status", Risk.MEDIUM),
+        ("git -C /repo log --oneline", Risk.SAFE),
+        ("git -p status", Risk.SAFE),
+    ])
+    def test_git_options_are_still_skipped_to_the_subcommand(self, command, tier):
+        assert crc.classify_bash(command)[0] == tier, crc.classify_bash(command)
+
+
+class TestReview20261114SecretPathsBySpelling:
+    """The 2026-11-14 review, second part: a secret read by a spelling the
+    shell takes for the same file, and the patterns did not."""
+
+    @pytest.mark.parametrize("command", [
+        # The folder in one command, the file in the next.
+        "cd ~/.config/gh && cat hosts.yml",
+        "cd ~/.tapproval && cat data/auth.json",
+        "cd ~/.codex && cat auth.json",
+        "cd ~/.kube && cat config",
+        "cd ~ && cd .config && cd gh && cat hosts.yml",
+        "cd ~/.docker; head -c 400 config.json",
+        "(cd ~/.codex && cat auth.json)",
+        "pushd ~/.kube && cat config",
+        "cd '/Users/x/.codex' && cat 'auth.json'",
+        # A slash too many, or a step that goes nowhere.
+        "cat ~/.tapproval//data/auth.json",
+        "cat ~/.kube//config",
+        "cat ~/.config/gh/./hosts.yml",
+        "cat ~/.codex//auth.json",
+        "cat ~/.kube/x/../config",
+        # The shell drops quotes and backslashes inside a word.
+        "cat ~/.a''ws/cre''dentials",
+        "cat ~/.s''sh/id_''rsa",
+        "cat .e''nv",
+        'cat ~/.a"w"s/config',
+        "cat ~/.a\\ws/config",
+        # And writes out each choice in braces.
+        "cat ~/{.a,}ws/cre{d,}entials",
+        "cat ~/.kube/{config,}",
+        # kubectl's own kind/name spelling.
+        "kubectl get secret/db -o yaml",
+        "kubectl get secrets/db -o jsonpath='{.data}'",
+        "kubectl get secrets.v1./db -o yaml",
+        "kubectl get pods,secrets -o yaml",
+        "kubectl describe secret/db",
+    ])
+    def test_the_same_secret_by_another_spelling_is_a_secret_read(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= Risk.HIGH, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "cd ~/Developer/app && cat config",
+        "cd src && cat hosts.yml",
+        "cd /tmp/x && ls data",
+        "cat docs//readme.md",
+        "cat ./a/../b.txt",
+        "echo 'a''b'",
+        "cat src/{a,b}.py",
+        "ls {src,tests}",
+        "kubectl get pods",
+        "kubectl get pod/web -o yaml",
+        "kubectl get configmap/secretary",
+    ])
+    def test_the_reads_beside_them_stay_safe(self, command):
+        assert crc.classify_bash(command)[0] == Risk.SAFE, crc.classify_bash(command)
+
+    @pytest.mark.parametrize("path", [
+        "/Users/x/.tapproval//data/auth.json",
+        "/Users/x/.codex/./auth.json",
+        "/Users/x/.kube/x/../config",
+        "/Users/x/.config//gh/hosts.yml",
+    ])
+    def test_the_read_tool_reads_the_path_as_the_disk_does(self, path):
+        result = crc.classify({"tool_name": "Read", "tool_input": {"file_path": path},
+                               "cwd": "/Users/x/project"})
+        assert result["risk"] >= Risk.HIGH, result
+
+    @pytest.mark.parametrize("path", [
+        "/Users/x/project/src//main.py", "/Users/x/project/./README.md",
+    ])
+    def test_and_an_ordinary_path_stays_a_read(self, path):
+        result = crc.classify({"tool_name": "Read", "tool_input": {"file_path": path},
+                               "cwd": "/Users/x/project"})
+        assert result["risk"] == Risk.SAFE, result
+
+    @pytest.mark.parametrize("path", [
+        "/Users/x/project/.claude/rules/style.md",
+        "/Users/x/project/AGENTS.override.md",
+    ])
+    def test_a_file_later_sessions_obey_is_not_documentation(self, path):
+        result = crc.classify({"tool_name": "Write", "cwd": "/Users/x/project",
+                               "tool_input": {"file_path": path, "content": "hello"}})
+        assert result["risk"] >= Risk.MEDIUM, result

@@ -155,7 +155,7 @@ AUTH_FILE = _home_path("AUTH_FILE")
 # quietly serving the old rules forever (see ensure_running).
 RELAY_VERSION = 5
 PAIR_WINDOW_SECONDS = 600   # a deliberately opened window, not a standing door
-PAIR_WINDOW_CLAIMS = 2      # one watch, plus one retry
+PAIR_WINDOW_CLAIMS = 3      # one watch: its ask, and two more if the answer is lost
 PAIR_FIRST_WINDOW_SECONDS = 1800   # never paired: half an hour, re-lit by every session start
 PAIR_ASK_SECONDS = 120      # how long the Mac's "Allow a watch?" question waits for a click
 PAIR_CONSENT_SECONDS = 120  # how long an Allow lets that address claim its key
@@ -2094,7 +2094,7 @@ def start_signin(agent, popen=None):
         elif run and run["proc"].poll() is None and time.time() - run["at"] < SIGNIN_RUN_SECONDS:
             # A second tap shows what the first started, never a second
             # sign-in racing it.
-            return dict(run["answer"])
+            return _signin_answer(run)
         else:
             starting = None
             mine = {"proc": None, "at": time.time(), "ready": threading.Event()}
@@ -2104,11 +2104,14 @@ def start_signin(agent, popen=None):
         with _SIGNIN_RUNS_LOCK:
             run = _SIGNIN_RUNS.get(agent)
             if run and run.get("answer"):
-                return dict(run["answer"])
-        return {"ok": False, "status": "The sign-in could not start on your computer"}
-    answer, proc = None, None
+                return _signin_answer(run)
+        return dict(_SIGNIN_NOT_STARTED)
+    answer, proc = dict(_SIGNIN_NOT_STARTED), None
     try:
         answer, proc = _launch_signin(agent, popen)
+    except Exception as error:  # noqa: BLE001 — "never raises" is the contract
+        print("relay: sign-in for %s could not start: %s" % (agent, type(error).__name__),
+              file=sys.stderr)
     finally:
         with _SIGNIN_RUNS_LOCK:
             if proc is not None and answer and answer.get("ok"):
@@ -2119,6 +2122,19 @@ def start_signin(agent, popen=None):
     if proc is not None:
         print("relay: sign-in for %s started" % agent, file=sys.stderr)
     return dict(answer)
+
+
+_SIGNIN_NOT_STARTED = {"ok": False, "status": "The sign-in could not start on your computer"}
+
+
+def _signin_answer(run, now=None):
+    """A running sign-in's answer for a later tap: the same words, and for
+    a code the seconds it still has, not the fifteen minutes it began with."""
+    answer = dict(run["answer"])
+    if "expires_in" in answer:
+        spent = (time.time() if now is None else now) - run["at"]
+        answer["expires_in"] = max(0, int(answer["expires_in"] - spent))
+    return answer
 
 
 def _launch_signin(agent, popen):
@@ -2139,7 +2155,7 @@ def _launch_signin(agent, popen):
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, start_new_session=True)
     except OSError:
-        return {"ok": False, "status": "The sign-in could not start on your computer"}, None
+        return dict(_SIGNIN_NOT_STARTED), None
     seen = {"url": None, "code": None}
     found = threading.Event()
 
@@ -3488,6 +3504,7 @@ def _open_session_window(path, script, words, on_mac, minimized=False):
     # 2026-09-24, the relay took 4.3 s to answer on loopback, and the
     # watch, whose requests give up at 5 s and travel through the phone,
     # said "Your computer didn't answer" about a session that had started.
+    command_file = None
     try:
         handle, command_file = tempfile.mkstemp(prefix="tapproval-", suffix=".command")
         with os.fdopen(handle, "w") as out:
@@ -3505,6 +3522,13 @@ def _open_session_window(path, script, words, on_mac, minimized=False):
         return "unknown"
     except (OSError, subprocess.SubprocessError) as error:
         not_opened = str(error)
+    # Nothing will run the file, so nothing will remove it: it holds the
+    # wearer's words. (After a timeout it is left: it may yet be opened.)
+    if command_file:
+        try:
+            os.remove(command_file)
+        except OSError:
+            pass
     apple = ('tell application "Terminal"\n'
              '%s'
              '  do script %s\n'
@@ -4057,6 +4081,14 @@ class _Limits:
 
 LIMITS = _Limits()
 
+# A watch's own trouble reports (/diagnostic): each is a line in the crash
+# log, which keeps one older file and no more.
+DIAGNOSTIC_REPORTS = 20
+DIAGNOSTIC_WINDOW = 600
+# A retried /archive reads the Claude app's own record of the session no
+# oftener than this, as the session list does.
+ARCHIVE_REPLAY_READ_EVERY = 3
+
 
 def _socket_alive(sock):
     """False once the peer's socket is dead. A readable socket before we
@@ -4549,7 +4581,13 @@ class RelayHandler(BaseHTTPRequestHandler):
                                   replaces=raw)
         if not auth.is_bootstrap(presented):
             # A key from the pairing window is traded in, not multiplied.
+            from_window = (auth.device_for(presented) or {}).get("source") == "lan-window"
             auth.revoke_token(presented)
+            if from_window:
+                # The watch the window was opened for has its own key:
+                # pairing is done. The owner's --pair window stayed open
+                # behind it on a Mac that had paired before.
+                auth.close_window()
         if getattr(self, "_signed_nonce", None):
             # Signed: the new key crosses plain HTTP sealed for the signer —
             # with the shared ChaCha20 seal when the watch can open it
@@ -5248,8 +5286,13 @@ class RelayHandler(BaseHTTPRequestHandler):
         if answer is not None:
             # Asked once, never again: the app's own record says when the
             # wearer's approval has archived it.
-            if answer.get("status") == "asked" and claude_app_archived(
-                    str(body.get("session_id", ""))[:64]):
+            # ...and read no oftener than the list reads it: a retry is
+            # answered before any budget is spent, and the read is up to
+            # 400 of the app's files.
+            session_id = str(body.get("session_id", ""))[:64]
+            if (answer.get("status") == "asked"
+                    and LIMITS.allow("archive-read", session_id, 1, ARCHIVE_REPLAY_READ_EVERY)[0]
+                    and claude_app_archived(session_id)):
                 answer = {"ok": True, "status": "archived"}
                 try:
                     store.finish(key, answer)
@@ -5329,6 +5372,12 @@ class RelayHandler(BaseHTTPRequestHandler):
         if not message:
             self._send_json({"error": "expected {\"kind\", \"message\"}"}, 400)
             return
+        # Each report is a line in the crash log, which rolls over once:
+        # a loop here pushed the helper's own crashes out of it.
+        who = self._presented() or self.client_address[0]
+        if self._over_limit("diagnostic", who, DIAGNOSTIC_REPORTS, DIAGNOSTIC_WINDOW,
+                            "too many reports"):
+            return
         import crash_report
         where = " / ".join(part for part in (
             str(body.get("app_version") or "")[:40],
@@ -5375,7 +5424,13 @@ class RelayHandler(BaseHTTPRequestHandler):
         elif path == "/admin/pair-open":
             # Without the key file, the person at the Mac is asked before
             # any watch gets a key: a command Claude runs can reach here.
-            until = self.auth.open_window(ask=not self._proves_bootstrap())
+            # And can reach here in a loop, which kept the question on the
+            # screen: the pairing budget, for whoever has no key file.
+            trusted = self._proves_bootstrap()
+            if not trusted and self._over_limit(
+                    "pair-open", self.client_address[0], 5, 600, "too many attempts"):
+                return
+            until = self.auth.open_window(ask=not trusted)
             self._send_json({"ok": True, "seconds": PAIR_WINDOW_SECONDS,
                              "until": int(until)})
         elif path == "/admin/pair-reset":
@@ -6268,7 +6323,14 @@ class Auth:
             return time.time() < self._window_until
 
     def claim_window(self, client_ip):
-        """Hand out a key of its own, once per address and twice at most.
+        """Hand out a key of its own, to one address per window.
+
+        The first address through owns the window: it may ask again, since
+        a watch gives up on a request after 5 s and its retry comes from
+        the same address, and each new key replaces the one that never
+        arrived. No other address gets one. Until the 2026-11-14 review it
+        was the other way round: the watch's own retry was refused and a
+        second device was served.
 
         Returns the token, or None with the window left shut. A burst is an
         attack, not a retry, so the caller closes the window on a rate-limit
@@ -6286,7 +6348,7 @@ class Auth:
                 return None
             if self._window_claims >= PAIR_WINDOW_CLAIMS:
                 return None
-            if client_ip in self._window_ips:
+            if self._window_ips and client_ip not in self._window_ips:
                 return None
             self._window_ips.add(client_ip)
             self._window_claims += 1
