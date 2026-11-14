@@ -253,9 +253,11 @@ def serve(stdin=None, stdout=None, crc=None):
             continue
         try:
             message = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             # Unanswered, a request Claude Code thinks it sent waits out its
-            # own timeout. JSON-RPC's parse error answers it at once.
+            # own timeout. JSON-RPC's parse error answers it at once. A
+            # message nested too deep to follow is one more that cannot be
+            # read, and must not end the tool.
             reply = {"jsonrpc": "2.0", "id": None,
                      "error": {"code": -32700, "message": "not JSON"}}
         else:

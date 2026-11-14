@@ -516,10 +516,14 @@ def claude_app_archived(session_id, root=None):
     import glob
     root = root or CLAUDE_APP_SESSIONS
     paths = glob.glob(os.path.join(glob.escape(root), "*", "*", "local_*.json"))
-    try:
-        paths.sort(key=os.path.getmtime, reverse=True)
-    except OSError:
-        pass
+    def changed(path):
+        # The app deletes these as it goes; one gone mid-sort must not
+        # undo the order of the rest.
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0.0
+    paths.sort(key=changed, reverse=True)
     for path in paths[:CLAUDE_APP_FILES_READ]:
         try:
             if os.path.getsize(path) > CLAUDE_APP_FILE_BYTES:
@@ -1754,20 +1758,31 @@ def _remember_transcript(path):
 
 def _find_transcript(prefix, projects_dir=None):
     """Path of the transcript whose session id starts with ``prefix``.
-    None when there is no match. Memoised — the watch resolves the same
-    session every couple of seconds while a thread view is open. Never
-    raises."""
+    None when there is no match, or more than one session matches.
+    Memoised — the watch resolves the same session every couple of
+    seconds while a thread view is open. Never raises."""
     # "".startswith("") is True: an empty prefix matched the first transcript
     # seen, in the cache and on disk alike (2026-10-25 review).
     if not prefix or not str(prefix).strip():
         return None
+    # A prefix two sessions share names neither: the first one listed was
+    # ended, spoken to or archived in the other's place (2026-11-14
+    # review). A whole id is itself, whatever longer id begins with it.
+    prefix = str(prefix)
     with _CACHE_LOCK:
-        cached = _TRANSCRIPT_PATHS.get(prefix) or next(
-            (path for session_id, path in _TRANSCRIPT_PATHS.items()
-             if session_id.startswith(prefix)), None)
+        cached = _TRANSCRIPT_PATHS.get(prefix)
+        known = [] if cached else [
+            path for session_id, path in _TRANSCRIPT_PATHS.items()
+            if session_id.startswith(prefix)]
     if cached and os.path.exists(cached):
         return cached
+    known = [path for path in known if os.path.exists(path)]
+    if len(known) > 1:
+        return None
+    if known:
+        return known[0]
     root = projects_dir or CLAUDE_PROJECTS
+    found = {}
     try:
         for project in os.listdir(root):
             pdir = os.path.join(root, project)
@@ -1775,13 +1790,15 @@ def _find_transcript(prefix, projects_dir=None):
                 continue
             for entry in os.listdir(pdir):
                 if entry.endswith(".jsonl") and entry.startswith(prefix):
-                    path = os.path.join(pdir, entry)
-                    if projects_dir is None:
-                        _remember_transcript(path)
-                    return path
+                    found.setdefault(entry[:-len(".jsonl")], os.path.join(pdir, entry))
     except OSError:
         pass
-    return None
+    if projects_dir is None:
+        for path in found.values():
+            _remember_transcript(path)
+    if prefix in found:
+        return found[prefix]
+    return next(iter(found.values())) if len(found) == 1 else None
 
 
 # Markdown is noise at watch size. These turn Claude's replies into the
