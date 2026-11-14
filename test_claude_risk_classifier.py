@@ -4096,6 +4096,29 @@ class TestRelayTunnelToken:
         assert self._get(base + "/pending") == 404
         assert self._get(base + "/health") == 404
 
+    def test_without_the_secret_path_every_request_reads_not_found(self, tokened):
+        """A POST with the wrong content type read 415 and a page's request
+        403 before the path was looked at: either told a stranger holding
+        only the travel address that a relay lives there (2026-11-14
+        review, #1340)."""
+        base, _ = tokened
+
+        def status(path, headers, data=None):
+            request = urllib.request.Request(base + path, data=data, headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=5) as reply:
+                    return reply.status
+            except urllib.error.HTTPError as error:
+                return error.code
+        page = {"Origin": "https://example.com", "Sec-Fetch-Site": "cross-site"}
+        for path in ("/decision", "/", "/t/wrong/decision"):
+            assert status(path, {"Content-Type": "text/plain"}, b"x") == 404
+            assert status(path, page) == 404
+            assert status(path, dict(page, **{"Content-Type": "application/json"}), b"{}") == 404
+        # With the secret path the old answers stand.
+        assert status("/t/s3cret/decision", {"Content-Type": "text/plain"}, b"x") == 415
+        assert status("/t/s3cret/health", page) == 403
+
     def test_every_lan_only_route_is_absent_through_the_tunnel(self, tokened):
         """Derived from ROUTES, not from a list of examples: the flag on
         the route is the ONLY thing that hides it, so a route added with
@@ -24466,7 +24489,7 @@ class TestTheHelperInstallsTheMacBridge:
             "the next update is an ordinary pull"
 
     @staticmethod
-    def _update(tmp_path, clone_from, before_run=None):
+    def _update(tmp_path, clone_from, before_run=None, prelude=""):
         """install.sh's checkout block on an existing install whose pull
         fails (its remote is gone), with ``clone_from`` as the fresh source:
         a real repository, or one that does not exist."""
@@ -24499,8 +24522,9 @@ class TestTheHelperInstallsTheMacBridge:
         block = "\n".join(lines[start:lines.index("fi", start) + 1])
         if before_run is not None:
             before_run()
-        result = run("bash", "-c", "set -euo pipefail\nDIR=%s\nREPO=%s\n%s"
-                     % (shlex.quote(str(home)), shlex.quote(repo), block), check=False)
+        result = run("bash", "-c", "set -euo pipefail\nDIR=%s\nREPO=%s\n%s\n%s"
+                     % (shlex.quote(str(home)), shlex.quote(repo), prelude, block),
+                     check=False)
         return result, home, sorted(p.name for p in tmp_path.iterdir())
 
     @posix_scripts
@@ -24535,6 +24559,23 @@ class TestTheHelperInstallsTheMacBridge:
         assert (home / "watch_relay.py").read_text() == "# installed\n"
         assert not [n for n in names if ".fresh-" in n or ".superseded-" in n], names
         assert "keeping the one installed" in result.stderr
+
+    @posix_scripts
+    def test_a_swap_that_cannot_be_undone_says_where_everything_is(self, tmp_path):
+        """The fresh copy would not move in, and then the old one would not
+        move back: the script stopped there under set -e without a word,
+        the install in one folder and the watches' keys in another
+        (2026-11-14 review, #1340)."""
+        # Nothing moves to where the install lives; every other move is real.
+        prelude = 'mv() { if [ "$2" = "$DIR" ]; then return 1; fi; command mv "$@"; }'
+        result, home, names = self._update(tmp_path, clone_from="source", prelude=prelude)
+        assert result.returncode != 0
+        [old] = [n for n in names if ".superseded-" in n]
+        [fresh] = [n for n in names if ".fresh-" in n]
+        assert (tmp_path / old / "watch_relay.py").read_text() == "# installed\n"
+        assert (tmp_path / fresh / "data" / "marker").read_text() == "kept"
+        assert old in result.stderr and fresh in result.stderr
+        assert "by hand" in result.stderr
 
     @posix_scripts
     def test_an_update_by_fresh_clone_keeps_the_bridge(self, tmp_path):
@@ -26087,6 +26128,41 @@ class TestASessionCanBeArchivedFromTheWrist:
             {"ok": True, "status": "restored"}
         assert ran == [("restore", self.THREAD)]
 
+
+
+class TestADeclinedArchiveCanBeAskedAgain:
+    """The Claude app's session asks the wrist before it archives itself.
+    A Deny there used to leave the tap asking nothing for five minutes
+    (2026-11-14 review, #1340)."""
+
+    CARD = {"tier": "MEDIUM", "tool": "Bash", "headline": "archive",
+            "detail": "x", "session_id": "arch1decline"}
+
+    def _answered(self, monkeypatch, decision, session_id="arch1decline"):
+        monkeypatch.setattr(watch_dashboard, "_ARCHIVE_ASKED", {})
+        watch_dashboard.note_archive_asked("arch1decline-and-the-rest-of-its-id")
+        watch_dashboard.note_archive_asked("another-session")
+        queue = watch_relay.CardQueue()
+        threading.Thread(target=lambda: queue.submit(
+            dict(self.CARD, session_id=session_id), 2.0), daemon=True).start()
+        [card] = _wait_until(queue.pending, what="the card")
+        assert queue.decide(card["id"], decision) is True
+
+    def test_a_deny_lifts_the_hold(self, monkeypatch):
+        self._answered(monkeypatch, "deny")
+        assert watch_dashboard.archive_asked("arch1decline-and-the-rest-of-its-id") is False
+        assert watch_dashboard.archive_progress("arch1decline-and-the-rest-of-its-id") == ""
+        # Another session's ask is its own.
+        assert watch_dashboard.archive_asked("another-session") is True
+
+    def test_an_allow_keeps_it(self, monkeypatch):
+        self._answered(monkeypatch, "allow")
+        assert watch_dashboard.archive_asked("arch1decline-and-the-rest-of-its-id") is True
+
+    def test_a_card_with_no_session_lifts_nothing(self, monkeypatch):
+        self._answered(monkeypatch, "deny", session_id="")
+        assert watch_dashboard.archive_asked("arch1decline-and-the-rest-of-its-id") is True
+        assert watch_dashboard.archive_asked("another-session") is True
 
 
 class TestArchiveAtItsEdges:
@@ -28077,6 +28153,19 @@ class TestEveryHostHasItsOwnWindows:
         text = tapproval_host.login_file_text(str(python), r"C:\h\watch_relay.py")
         assert text == '@echo off\r\nstart "" "%s" "C:\\h\\watch_relay.py" --ensure\r\n' % (
             tmp_path / "pythonw.exe")
+
+    def test_a_percent_sign_in_a_path_stays_a_percent_sign(self, linux):
+        """In a desktop entry %f, %u and the rest are field codes, and a
+        lone % is an error: a home folder named "100%me" got no relay at
+        login (2026-11-14 review, #1340)."""
+        text = tapproval_host.login_file_text("/home/100%me/py", "/home/100%me/relay.py")
+        assert 'Exec="/home/100%%me/py" "/home/100%%me/relay.py" --ensure' in text
+
+    def test_a_percent_sign_in_a_windows_path_stays_one_too(self, windows, tmp_path):
+        """A batch file reads %name% as a variable and drops a lone %."""
+        text = tapproval_host.login_file_text(r"C:\100%me\python.exe", r"C:\100%me\relay.py")
+        assert text == ('@echo off\r\nstart "" "C:\\100%%me\\python.exe" '
+                        '"C:\\100%%me\\relay.py" --ensure\r\n')
 
     def test_a_mac_keeps_launchd(self, monkeypatch):
         monkeypatch.setattr(tapproval_host.sys, "platform", "darwin")
