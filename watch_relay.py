@@ -5763,9 +5763,18 @@ class _RelayServer(ThreadingHTTPServer):
     end (2026-10-05 review)."""
     daemon_threads = True
     MAX_CONNECTIONS = 64
+    FULL_NOTE_SECONDS = 60
 
     def __init__(self, *args, **kwargs):
+        # Two rooms of MAX_CONNECTIONS seats. `_slots` is this computer's
+        # own: the hook posting a card, the bridge polling, --status. The
+        # other is everybody else's. With one room, 64 sockets held open by
+        # anything on the Wi-Fi (connecting takes no key) closed the hook
+        # and the bridge out unanswered, and nothing said so (2026-11-15
+        # review).
         self._slots = threading.BoundedSemaphore(self.MAX_CONNECTIONS)
+        self._far_slots = threading.BoundedSemaphore(self.MAX_CONNECTIONS)
+        self._full_noted = None
         super().__init__(*args, **kwargs)
 
     def server_bind(self):
@@ -5773,21 +5782,46 @@ class _RelayServer(ThreadingHTTPServer):
         _host.claim_port_alone(self)
         super().server_bind()
 
+    def _seats(self, client_address):
+        """The room a caller sits in, by its address. Never raises."""
+        try:
+            near = _is_loopback(client_address[0])
+        except (TypeError, IndexError):
+            near = False
+        return self._slots if near else self._far_slots
+
+    def _note_full(self, client_address):
+        """Said at most once a minute: a flood must not fill the log too."""
+        now = time.monotonic()
+        if self._full_noted is not None and now - self._full_noted < self.FULL_NOTE_SECONDS:
+            return
+        self._full_noted = now
+        try:
+            who = client_address[0]
+        except (TypeError, IndexError):
+            who = "an unknown address"
+        print("relay: every seat is taken (%d connections at once), so a "
+              "connection from %s was closed unanswered. Callers on this "
+              "computer keep seats of their own."
+              % (self.MAX_CONNECTIONS, who), file=sys.stderr)
+
     def process_request(self, request, client_address):
-        if not self._slots.acquire(blocking=False):
+        seats = self._seats(client_address)
+        if not seats.acquire(blocking=False):
+            self._note_full(client_address)
             self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
         except BaseException:
-            self._slots.release()
+            seats.release()
             raise
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._slots.release()
+            self._seats(client_address).release()
 
     def handle_error(self, request, client_address):
         kind, value, tb = sys.exc_info()
@@ -5871,7 +5905,7 @@ class _TLSRelayServer(_RelayServer):
             try:
                 request.close()
             finally:
-                self._slots.release()
+                self._seats(client_address).release()
             return
         super().process_request_thread(wrapped, client_address)
 
@@ -7032,6 +7066,14 @@ def watch_tunnel(handle, port, token, sleep=time.sleep, checks=None):
                  else TUNNEL_BACKOFF[min(failures, len(TUNNEL_BACKOFF)) - 1])
         sleep(pause)
         done += 1
+        if handle is None:
+            # It never opened (no cloudflared when the relay started), so
+            # nothing "stopped": start_tunnel's own sentence stands, and
+            # this only looks again. Before 2026-11-15 nobody did, and the
+            # away route stayed off until the relay next restarted.
+            handle = start_tunnel(port, _live_tunnel_secret(token))
+            failures = failures + 1 if handle is None else 0
+            continue
         url = TUNNEL_URL
         if _tunnel_alive(handle):
             if not url:
@@ -7182,36 +7224,53 @@ def _start_tls(args, queue, auth):
     return server
 
 
-def _start_tunnel(queue, auth, allow_simulator=False, port=TUNNEL_PORT):
+def _start_tunnel(queue, auth, allow_simulator=False, port=TUNNEL_PORT,
+                  retry_sleep=None):
     """The second listener and the cloudflared process behind it. Two
     independent secrets on the public path: the unguessable rendezvous
-    prefix says where, the device token says who."""
+    prefix says where, the device token says who.
+
+    A travel port that is busy is looked at again when ``retry_sleep`` is
+    given (the relay passes ``time.sleep``): its usual cause, another
+    Tapproval still shutting down, passes by itself, and before 2026-11-15
+    the away route then stayed off for the rest of this relay's life."""
     global _TUNNEL_HANDLER
-    try:
-        tunnel_server, _ = serve("127.0.0.1", port,
-                                 queue=queue, token=auth.tunnel_secret,
-                                 auth=auth, allow_simulator=allow_simulator)
-    except OSError as error:
-        # 2026-09-11, 23:58: this raised out of main() and killed a relay
-        # whose MAIN listener had already bound. The away route is the
-        # fallback, not the product — losing it must never cost the local
-        # path, which is the one the wrist uses at the desk all day. Same
-        # rule the missing-cloudflared branch below already follows: say
-        # so on the Connection screen and carry on.
-        note_condition(
-            "tunnel",
-            "Answering from away is off: the travel port is already in use "
-            "on this computer, usually another Tapproval still shutting "
-            "down. Approvals at home are unaffected.")
-        print("relay: tunnel port %d unavailable (%s) — continuing without "
-              "the away route" % (port, error), file=sys.stderr)
-        return None
+    tunnel_server, tries = None, 0
+    while tunnel_server is None:
+        try:
+            tunnel_server, _ = serve("127.0.0.1", port,
+                                     queue=queue, token=auth.tunnel_secret,
+                                     auth=auth, allow_simulator=allow_simulator)
+        except OSError as error:
+            # 2026-09-11, 23:58: this raised out of main() and killed a relay
+            # whose MAIN listener had already bound. The away route is the
+            # fallback, not the product — losing it must never cost the local
+            # path, which is the one the wrist uses at the desk all day. Same
+            # rule the missing-cloudflared branch below already follows: say
+            # so on the Connection screen and carry on.
+            if not tries:
+                note_condition(
+                    "tunnel",
+                    "Answering from away is off: the travel port is already in use "
+                    "on this computer, usually another Tapproval still shutting "
+                    "down. Approvals at home are unaffected.")
+                print("relay: tunnel port %d unavailable (%s) — continuing without "
+                      "the away route" % (port, error), file=sys.stderr)
+            if retry_sleep is None:
+                return None
+            retry_sleep(TUNNEL_BACKOFF[min(tries, len(TUNNEL_BACKOFF) - 1)])
+            tries += 1
+    if tries:
+        clear_condition("tunnel")
+        print("relay: tunnel port %d is free again — opening the away route"
+              % port, file=sys.stderr)
     _TUNNEL_HANDLER = tunnel_server.RequestHandlerClass
     threading.Thread(target=tunnel_server.serve_forever, daemon=True).start()
     handle = start_tunnel(port, auth.tunnel_secret)
-    if handle is not None:
-        threading.Thread(target=watch_tunnel, daemon=True,
-                         args=(handle, port, auth.tunnel_secret)).start()
+    # Watched whether or not it opened: no handle (no cloudflared) is
+    # exactly when somebody has to look again.
+    threading.Thread(target=watch_tunnel, daemon=True,
+                     args=(handle, port, auth.tunnel_secret)).start()
     return handle
 
 
@@ -7234,6 +7293,7 @@ class _Advertiser:
     """
 
     WATCH_SECONDS = 5.0          # how often the watchdog looks
+    ADDRESS_SECONDS = 60.0       # how often it asks whether the address moved
     WATCH_BACKOFF_MAX = 60.0     # when restarts keep failing, look less often
     MAX_RESTARTS = 3             # after this many in a row, stop and say so
 
@@ -7290,11 +7350,16 @@ class _Advertiser:
 
     def _watch(self):
         pause = self.WATCH_SECONDS
+        since_address = 0.0
         while True:
             time.sleep(pause)
             outcome = self.check_once()
             if outcome in ("none", "down"):
                 return                  # nothing left to watch, and it has been said
+            since_address += pause
+            if outcome == "fine" and since_address >= self.ADDRESS_SECONDS:
+                since_address = 0.0
+                self.follow_address()
             # A relay that restarts a dying announcer every five seconds
             # forever is a fork bomb with good intentions; back off while
             # it keeps failing, and come straight back once it holds.
@@ -7349,6 +7414,38 @@ class _Advertiser:
             if self.process is None:
                 return "down"          # advertise() has said why, in its own words
         return "restarted"
+
+    def follow_address(self):
+        """Announce again when this computer's network address has moved.
+        True when it did. Never raises.
+
+        The record carries the address so the watch need not resolve the
+        service, and the watch takes it as written. It was read when the
+        announcer started and never again, so a laptop carried to another
+        network, or given a new address by the same one, went on
+        announcing the old address for as long as the relay ran: the
+        nearest road quiet, and nothing said (2026-11-15 review). With no
+        address at all (between networks) the record is left as it was."""
+        try:
+            ips = lan_ips()
+            if not ips or ips[0] == self.txt.get("ip"):
+                return False
+            txt = advertise_txt(self.port)
+            with self._lock:
+                if self.process is None or txt == self.txt:
+                    return False
+                self.process.terminate()
+                self.txt = txt
+                self.process = advertise(self.port, txt)
+                # A deliberate fresh start, as in _republish.
+                self._restarts = min(self._restarts, 1)
+            print("relay: this computer's address changed — re-advertised "
+                  "with %s" % txt, file=sys.stderr)
+            return True
+        except Exception as error:      # noqa: BLE001 — a look, never a crash
+            print("relay: could not check this computer's address (%s)"
+                  % error, file=sys.stderr)
+            return False
 
     def terminate(self):
         with self._lock:
@@ -7412,7 +7509,8 @@ def _start_slow_parts(args, queue, auth):
     def tunnel():
         # Not kept: the tunnel outlives this relay on purpose (see main()).
         _start_tunnel(queue, auth, allow_simulator=args.allow_simulator,
-                      port=getattr(args, "tunnel_port", TUNNEL_PORT))
+                      port=getattr(args, "tunnel_port", TUNNEL_PORT),
+                      retry_sleep=time.sleep)
 
     def bonjour():
         advertiser = _Advertiser(args.port)
