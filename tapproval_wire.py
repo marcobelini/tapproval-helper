@@ -330,9 +330,19 @@ def codex_wrist_words(content):
     return None
 
 
-def wrist_inbox_message(text, brief=False):
+# A skill sent from the wrist (/code-review): the inbox delivers words, never
+# a command, so Claude is asked to run it, which it can for a skill (seen
+# 2026-11-15, Claude Code 2.1.325). It stands after the note, so the words
+# read back are the command alone.
+WRIST_INBOX_COMMAND = ("Their words are a slash command: run that skill with "
+                       "the Skill tool, passing anything after its name as its "
+                       "arguments, as if they had typed it.")
+
+
+def wrist_inbox_message(text, brief=False, command=False):
     """What the relay posts into a session's inbox for one wrist message."""
-    note = WRIST_INBOX_NOTE + (" " + WRIST_INBOX_BRIEF if brief else "")
+    note = (WRIST_INBOX_NOTE + (" " + WRIST_INBOX_COMMAND if command else "")
+            + (" " + WRIST_INBOX_BRIEF if brief else ""))
     return "%s\n\n%s\n\n%s" % (WRIST_INBOX_OPENER, text, note)
 
 
