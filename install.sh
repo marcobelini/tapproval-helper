@@ -43,7 +43,17 @@ if [ -d "$DIR/.git" ]; then
       done
       if [ "$swapped" = yes ] && mv "$DIR" "$superseded"; then
         if ! mv "$fresh" "$DIR"; then
-          mv "$superseded" "$DIR"
+          if ! mv "$superseded" "$DIR"; then
+            # Neither copy is where the hooks look, and nothing here may be
+            # deleted: say where both are and stop (2026-11-14 review; the
+            # script used to end on this line under set -e without a word).
+            echo "update: stopped halfway and could not put the install back." >&2
+            echo "  The installed copy is in:  $superseded" >&2
+            echo "  The paired watches' keys:  $fresh/data" >&2
+            echo "  Put it back by hand: move the first to $DIR, then move" >&2
+            echo "  bridge-app, data and logs from $fresh into it." >&2
+            exit 1
+          fi
           swapped=no
         fi
       else

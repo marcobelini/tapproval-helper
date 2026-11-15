@@ -204,3 +204,46 @@ def test_initial_history_scan_does_not_block_the_watch(tmp_path, monkeypatch):
             if thread.name == "activity-history":
                 thread.join(2)
     assert dashboard.activity_summary(now=NOW, background=True)["session_count"] == 0
+
+
+def _reads_from_the_start(monkeypatch):
+    """Every transcript the next pass opens at its first byte."""
+    restarted = []
+    real = dashboard._read_appended
+
+    def spy(path, offset, *args, **kwargs):
+        if offset == 0:
+            restarted.append(path)
+        return real(path, offset, *args, **kwargs)
+    monkeypatch.setattr(dashboard, "_read_appended", spy)
+    return restarted
+
+
+def test_a_second_pass_reads_no_transcript_again_however_many_there_are(
+        tmp_path, monkeypatch):
+    """Past 4,096 transcripts each one read pushed out the one the pass
+    needed next, so every file was read from its first byte about every
+    ten seconds (2026-11-14 review)."""
+    folder = tmp_path / "projects" / "-garden"
+    folder.mkdir(parents=True)
+    row = json.dumps({"type": "assistant", "timestamp": STAMP,
+                      "message": {"id": "m", "role": "assistant", "content": "Done",
+                                  "usage": {"output_tokens": 1}}}) + "\n"
+    for index in range(4200):
+        (folder / ("s%04d.jsonl" % index)).write_text(row)
+    assert dashboard.conversation_activity(now=NOW)["all_sessions"] == 4200
+    restarted = _reads_from_the_start(monkeypatch)
+    assert dashboard.conversation_activity(now=NOW)["all_sessions"] == 4200
+    assert restarted == []
+
+
+def test_a_transcript_that_is_gone_is_forgotten(tmp_path):
+    """The relay runs for weeks: what it remembers is what is on the disk."""
+    kept = claude(tmp_path, sid="kept")
+    gone = claude(tmp_path, sid="gone")
+    dashboard.conversation_activity(now=NOW)
+    assert {str(kept), str(gone)} <= set(dashboard._CONVERSATION_CACHE)
+    gone.unlink()
+    assert dashboard.conversation_activity(now=NOW)["all_sessions"] == 1
+    assert str(gone) not in dashboard._CONVERSATION_CACHE
+    assert str(kept) in dashboard._CONVERSATION_CACHE

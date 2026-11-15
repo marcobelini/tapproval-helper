@@ -422,7 +422,12 @@ def _conversation_file(path, agent, fallback_id, now):
     state["offset"], state["mtime"] = offset, stat.st_mtime_ns
     state["usage"] = {key: value for key, value in state["usage"].items()
                       if value[0] >= now - 86400}
-    _bounded_put(_CONVERSATION_CACHE, path, state, 4096)
+    # No count here: a fixed limit below the number of transcripts made
+    # each read push out the one the same pass needed next, so every file
+    # was read from its first byte each time (2026-11-14 review).
+    # conversation_activity forgets what its walk no longer finds.
+    with _CACHE_LOCK:
+        _CONVERSATION_CACHE[path] = state
     return state
 
 
@@ -463,6 +468,12 @@ def conversation_activity(projects_dir=None, codex_dir=None, now=None):
             if today in state["days"]:
                 today_counts.append(agent)
             usage_rows.append((agent, state))
+        # What is remembered is what the walk found: the relay runs for
+        # weeks and must not grow with every transcript it ever saw.
+        walked = {path for _mtime, path, _agent, _fallback in paths}
+        with _CACHE_LOCK:
+            for path in [known for known in _CONVERSATION_CACHE if known not in walked]:
+                _CONVERSATION_CACHE.pop(path, None)
         agents = sorted(set(all_counts), key=lambda agent: (agent != "codex", agent))
         usage = []
         for agent in agents:
@@ -588,6 +599,21 @@ def archive_progress(session_id, now=None):
     if entry["archived"]:
         return "archived"
     return "archiving" if now - entry["asked"] < ARCHIVE_ASK_HOLD else ""
+
+
+def forget_archive_ask(session):
+    """The wearer said no to a card of this session, perhaps the archive's
+    own: the next tap on Archive asks again, where it used to ask nothing
+    for the rest of the hold (2026-11-14 review). ``session`` is a card's
+    id for it, which may be the first characters only. At worst a deny of
+    something else costs one ask more."""
+    session = str(session or "")
+    if not session:
+        return
+    with _ARCHIVE_LOCK:
+        for session_id in [s for s in _ARCHIVE_ASKED
+                           if s.startswith(session) or session.startswith(s)]:
+            del _ARCHIVE_ASKED[session_id]
 
 
 def _forget_archive_asks(alive):

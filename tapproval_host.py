@@ -701,12 +701,16 @@ def login_file_text(python, relay):
         quiet = os.path.join(os.path.dirname(python), "pythonw.exe")
         if os.path.exists(quiet):
             python = quiet                       # no console window at login
-        return '@echo off\r\nstart "" "%s" "%s" --ensure\r\n' % (python, relay)
+        # In a batch file %name% is a variable and a lone % is dropped: a
+        # percent sign that is part of a path is written twice.
+        return '@echo off\r\nstart "" "%s" "%s" --ensure\r\n' % (
+            python.replace("%", "%%"), relay.replace("%", "%%"))
     def quoted(word):
-        # The Desktop Entry spec's quoting: double quotes, with \\ \" \` \$.
+        # The Desktop Entry spec's quoting: double quotes, with \\ \" \` \$,
+        # and %% for a percent sign (%f, %u and the rest are field codes).
         for char in '\\"`$':
             word = word.replace(char, "\\" + char)
-        return '"%s"' % word
+        return '"%s"' % word.replace("%", "%%")
     return ("[Desktop Entry]\nType=Application\nName=Tapproval Base\n"
             "Comment=Lets your watch reach this computer after a restart\n"
             "Exec=%s %s --ensure\nTerminal=false\nNoDisplay=true\n"

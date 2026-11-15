@@ -1637,8 +1637,16 @@ class CardQueue:
             self._decisions[card_id] = (decision,
                                         str(answer)[:ANSWER_CHARS] if answer else None)
             self._lock.notify_all()
+            session = card.get("session_id")
         print("relay: accepted %s for %s" % (decision, card_id),
               file=sys.stderr)
+        if decision == "deny":
+            # Perhaps the archive's own question: a no there must not leave
+            # the next tap on Archive asking nothing (never raises).
+            try:
+                forget_archive_ask(session)
+            except Exception:  # noqa: BLE001 — an answer is never lost to bookkeeping
+                pass
         return True
 
 
@@ -1664,7 +1672,7 @@ _DASHBOARD_ERROR = None
 try:
     from watch_dashboard import (  # noqa: E402
         activity_summary, archive_asked, card_session_title, claude_app_archived,
-        note_archive_asked, recap_summary,
+        forget_archive_ask, note_archive_asked, recap_summary,
         _find_transcript, image_bytes, inbox_ready,
         _message_of, _parse_thread, _read_appended,
         project_root, prompts_at_the_mac, recent_sessions, active_sessions, registry_turn, resolve_session,
@@ -1705,6 +1713,9 @@ except Exception as _error:  # noqa: BLE001 — any import-time failure, not onl
         return False            # nothing remembered: every tap asks
 
     def note_archive_asked(*_args, **_kwargs):
+        return None
+
+    def forget_archive_ask(*_args, **_kwargs):
         return None
 
     THREAD_TURN_LIMIT = 14      # watch_dashboard's own value
@@ -4696,6 +4707,12 @@ class RelayHandler(BaseHTTPRequestHandler):
     }
 
     def _dispatch(self, method):
+        if self.required_token is not None and self._route()[0] is None:
+            # The travel address without its secret path: the same "not
+            # found" whatever was sent. A 415 or a 403 here told a stranger
+            # that a relay lives at this address (2026-11-14 review).
+            self._send_json({"error": "not found"}, 404)
+            return
         if not self._host_ok():
             self._send_json({"error": "bad host"}, 403)
             return
