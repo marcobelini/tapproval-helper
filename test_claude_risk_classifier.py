@@ -8628,10 +8628,18 @@ class TestAWristMessageGoesIntoTheInbox:
                             lambda *a, **k: ("abcdef12-3", "/tmp"))
         monkeypatch.setattr(watch_relay, "_find_transcript", lambda *a, **k: None)
         monkeypatch.setattr(watch_relay, "inbox_ready", lambda *a, **k: True)
-        sent = []
+        sent, commands = [], []
         monkeypatch.setattr(watch_relay, "post_to_inbox",
-                            lambda entry, text, brief=False: sent.append((text, brief)) or posted)
+                            lambda entry, text, brief=False, command=False: (
+                                sent.append((text, brief)), commands.append(command))
+                            and posted)
         self.sent = sent
+        self.commands = commands
+        monkeypatch.setattr(watch_relay, "known_skills", lambda cwd=None, **k: [
+            {"name": "/code-review", "source": "builtin"},
+            {"name": "/design", "source": "builtin"},
+            {"name": "/wrap-up", "source": "project"},
+            {"name": "/small-business:restock", "source": "plugin"}])
         spawned = []
         monkeypatch.setattr(watch_relay, "_spawn_detached",
                             lambda *a, **k: spawned.append(a) or None)
@@ -8645,14 +8653,53 @@ class TestAWristMessageGoesIntoTheInbox:
         assert spawned == []
         assert "say abcdef12 inbox" in capsys.readouterr().err
 
-    def test_a_command_takes_the_old_route_which_runs_it(self, monkeypatch, capsys):
+    def test_a_command_only_the_app_runs_takes_the_old_route(self, monkeypatch, capsys):
         # The inbox delivers text, never a command: /recap posted there
-        # arrived as words Claude read, and Claude Code did not run it.
+        # arrived as words Claude read, and Claude Code did not run it. So
+        # a command that is not a skill, a name nobody knows, and the two
+        # built-ins not seen to run from a message keep the route that
+        # runs them.
+        for text in ("/recap", "/compact", "/no-such-thing now", "/design a poster", "/"):
+            spawned = self._stage(monkeypatch, posted=True)
+            assert watch_relay.say_to_session("abcdef12", text, force=True) == "sent"
+            assert self.sent == [], text
+            assert len(spawned) == 1 and spawned[0][0][-1] == text
+            assert "say abcdef12 headless" in capsys.readouterr().err
+
+    def test_a_skill_runs_inside_the_open_session(self, monkeypatch, capsys):
+        """2026-11-15: /code-review sent from the wrist ran beside the open
+        session, and neither the desktop nor the phone showed it. A skill is
+        something Claude itself can run, so the inbox message asks it to
+        (seen 2026-11-15 on Claude Code 2.1.325: /code-review, and a disk
+        skill with its argument)."""
+        for text in ("/code-review", "/wrap-up short note", "/small-business:restock"):
+            spawned = self._stage(monkeypatch, posted=True)
+            assert watch_relay.say_to_session("abcdef12", text) == "sent"
+            assert spawned == [], text
+            assert self.sent == [(text, True)] and self.commands == [True]
+            assert "say abcdef12 inbox command" in capsys.readouterr().err
+        self._stage(monkeypatch, posted=True)
+        watch_relay.say_to_session("abcdef12", "What's left?")
+        assert self.commands == [False]
+
+    def test_a_skill_the_session_would_hold_or_cannot_take_runs_beside(self, monkeypatch):
         spawned = self._stage(monkeypatch, posted=True)
-        assert watch_relay.say_to_session("abcdef12", "/recap", force=True) == "sent"
-        assert self.sent == []
-        assert len(spawned) == 1 and spawned[0][0][-1] == "/recap"
-        assert "say abcdef12 headless" in capsys.readouterr().err
+        monkeypatch.setattr(watch_relay, "inbox_ready", lambda *a, **k: False)   # plan, bypass
+        assert watch_relay.say_to_session("abcdef12", "/code-review", force=True) == "sent"
+        assert self.sent == [] and spawned[0][0][-1] == "/code-review"
+        spawned = self._stage(monkeypatch, posted=False)                         # the post fails
+        assert watch_relay.say_to_session("abcdef12", "/code-review", force=True) == "sent"
+        assert spawned[0][0][-1] == "/code-review"
+
+    def test_the_message_for_a_skill_asks_for_it_and_reads_back_whole(self):
+        plain = tapproval_wire.wrist_inbox_message("/code-review high")
+        asked = tapproval_wire.wrist_inbox_message("/code-review high", brief=True, command=True)
+        assert tapproval_wire.WRIST_INBOX_COMMAND not in plain
+        assert tapproval_wire.WRIST_INBOX_COMMAND in asked
+        assert "Skill tool" in tapproval_wire.WRIST_INBOX_COMMAND
+        assert tapproval_wire.WRIST_INBOX_BRIEF in asked
+        # The wrist's own bubble is the command as it was sent, nothing more.
+        assert tapproval_wire.wrist_words(asked) == "/code-review high"
 
     def test_short_replies_are_asked_for_in_the_inbox_too(self, monkeypatch):
         self._stage(monkeypatch, posted=True)
@@ -25263,6 +25310,37 @@ class TestOneSimulatorRunAtATimeOnThisMac:
         finally:
             for h in holders:
                 h.kill()
+
+    def test_a_lock_that_went_between_two_looks_is_not_cleared(self, tmp_path):
+        """The lock is there when a waiter tries to make its own, and gone
+        when it reads whose it is. The waiter then took "no lock" for a dead
+        run's, and its clearing removed the lock another waiter had made in
+        between: two runs each had the turn (CI, 2026-11-15; 16 rounds of
+        150 with staggered waiters). Nothing is cleared when nothing was
+        seen. Stand-in `ln` and `rm`: the first `ln` fails as if a lock were
+        there, and any `rm` leaves a mark."""
+        tools = tmp_path / "tools"
+        tools.mkdir()
+        (tools / "ln").write_text(
+            '#!/bin/bash\nif [ ! -e "$MARKS/first-ln" ]; then : > "$MARKS/first-ln"; exit 1; fi\n'
+            'exec /bin/ln "$@"\n')
+        (tools / "rm").write_text('#!/bin/bash\n: > "$MARKS/rm-called"\nexec /bin/rm "$@"\n')
+        for tool in ("ln", "rm"):
+            os.chmod(tools / tool, 0o755)
+        holder = subprocess.Popen(["sleep", "300"])
+        try:
+            run = subprocess.run(
+                ["bash", self.TURN, "take", str(holder.pid), "a run"],
+                env=dict(os.environ, SIM_TURN_DIR=str(tmp_path / "turn"), SIM_TURN_POLL="1",
+                         SIM_TURN_WAIT="5", MARKS=str(tmp_path),
+                         PATH="%s%s%s" % (tools, os.pathsep, os.environ["PATH"])),
+                capture_output=True, text=True, timeout=60)
+            assert run.returncode == 0, run.stderr
+            assert (tmp_path / "first-ln").exists(), "the stand-in ln was not used"
+            assert not (tmp_path / "rm-called").exists(), "it cleared a lock it never saw"
+            assert self._turn(tmp_path, "who").stdout.strip() == "a run (pid %d)" % holder.pid
+        finally:
+            holder.kill()
 
     def test_a_script_the_holder_started_is_part_of_its_run(self, tmp_path):
         """ci-local.sh takes the turn and starts watch-flows.sh, which asks

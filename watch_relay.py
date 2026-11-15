@@ -2568,7 +2568,7 @@ def _peer_pid(sock):
         return None
 
 
-def post_to_inbox(entry, text, brief=False, timeout=INBOX_TIMEOUT):
+def post_to_inbox(entry, text, brief=False, command=False, timeout=INBOX_TIMEOUT):
     """Post a wrist message into a live session's own inbox (Claude Code's
     cross-session messaging), where the open session reads it as its next
     turn: no keystrokes, no permission, and the terminal and the phone
@@ -2590,7 +2590,8 @@ def post_to_inbox(entry, text, brief=False, timeout=INBOX_TIMEOUT):
         return False
     line = json.dumps({"type": "user",
                        "message": {"role": "user",
-                                   "content": wire.wrist_inbox_message(text, brief)}}) + "\n"
+                                   "content": wire.wrist_inbox_message(
+                                       text, brief, command)}}) + "\n"
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.settimeout(timeout)
@@ -2636,12 +2637,38 @@ class _StampedStream:
         return getattr(self._stream, name)
 
 
+# The built-in skills seen to run from an inbox message. /design and
+# /slides are not: nobody has seen them run that way, so they keep the
+# route that is known to run them.
+INBOX_BUILTINS = frozenset({"code-review", "security-review"})
+
+
+def inbox_command(text, cwd=None):
+    """Whether a slash command from the wrist is a skill the open session
+    can run when the inbox message asks it to: a skill or command file on
+    this computer for that folder, or one of INBOX_BUILTINS. A command only
+    the app itself runs (/compact, /recap) and a name nobody knows are not,
+    and keep the headless route. Never raises."""
+    name = str(text or "").split(" ", 1)[0]
+    if len(name) < 2 or not name.startswith("/"):
+        return False
+    try:
+        rows = known_skills(cwd)
+    except Exception:
+        return False
+    for row in rows:
+        if row.get("name") == name:
+            return row.get("source") != "builtin" or name[1:] in INBOX_BUILTINS
+    return False
+
+
 def say_to_session(prefix, text, projects_dir=None, brief=True, force=False, agent=None):
     """Send an instruction to a session, the way the terminal would.
 
     A session open on this computer gets it in its own inbox (post_to_inbox,
-    #246), as its next turn. Otherwise — a closed session, one in bypass or
-    plan mode, a command, or a post that fails — this
+    #246), as its next turn; a skill (/code-review) goes in with a request
+    to run it. Otherwise — a closed session, one in bypass or plan mode, a
+    command that is not a skill, or a post that fails — this
     runs ``claude --resume <id> -p <text>`` in that session's directory so
     the reply lands in the same transcript the watch is reading — which is
     why the answer simply appears in the thread view. With ``brief`` (the
@@ -2677,13 +2704,16 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False, age
     # a mode where Claude Code would hold it for a click; then, and when
     # the post fails, the old route.
     entry = registry.get(session_id)
-    # A command (/recap, a skill from More) is not one: the inbox delivers
-    # text, never a command, so it goes the old way, which runs it.
-    if (entry and not text.startswith("/")
+    # The inbox delivers text, never a command. A skill is something Claude
+    # can run when asked, so it goes in with the asking; any other command
+    # (/recap, /compact) goes the old way, which runs it.
+    command = text.startswith("/")
+    if (entry and (not command or inbox_command(text, cwd))
             and inbox_ready(entry, _find_transcript(session_id, projects_dir))
-            and post_to_inbox(entry, text, brief=brief)):
-        print("relay: say %s inbox (%d ms)" % (session_id[:8],
-              (time.monotonic() - started) * 1000), file=sys.stderr)
+            and post_to_inbox(entry, text, brief=brief, command=command)):
+        print("relay: say %s inbox%s (%d ms)" % (
+            session_id[:8], " command" if command else "",
+            (time.monotonic() - started) * 1000), file=sys.stderr)
         return "sent"
     stop = say_guard(session_id, force=force, live=registry)
     if stop:
