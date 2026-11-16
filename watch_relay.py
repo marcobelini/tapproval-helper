@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import hmac
 import glob
 import json
@@ -2568,6 +2569,125 @@ def _peer_pid(sock):
         return None
 
 
+# ---- a session told, as it starts, what a wrist message is ------------------
+#
+# The Claude app draws a message from another session with its whole text,
+# so the instructions Tapproval wrote under each wrist message were on the
+# owner's phone (2026-11-16). They are now said once, out of sight, when the
+# session starts: --ensure is already every install's SessionStart hook,
+# and what such a hook prints as additionalContext reaches Claude and no
+# screen. A session told this way is remembered by a file named after it,
+# and only such a session is sent the short message (the sign and the
+# words); any other still gets the long one, which explains itself.
+WRIST_BRIEFED_DIR = (os.environ.get("TAPPROVAL_WRIST_BRIEFED_DIR")
+                     or os.path.join(TAPPROVAL_DIR, "data", "wrist-briefed"))
+WRIST_BRIEFED_KEEP = 30 * 86400         # a session older than this starts again
+_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,63}$")
+# The Claude app shows the message itself; a terminal hides it, so only
+# there is Claude asked to say the wearer's words back.
+_APP_ENTRYPOINT = "claude-desktop"
+
+
+def _note_mark(note):
+    """A short name for one wording of the note: a session briefed with
+    another wording (an older helper's) is not taken as briefed with this."""
+    return hashlib.sha256(note.encode("utf-8")).hexdigest()[:16]
+
+
+def _hook_event(stdin, wait):
+    """The JSON a hook is handed on stdin, or None. Waits at most ``wait``
+    seconds: --ensure is also run by hand, by the installer and at login,
+    where nothing is ever written to stdin and a plain read would never
+    return. Never raises."""
+    try:
+        if stdin is None or stdin.isatty():
+            return None
+    except (AttributeError, ValueError, OSError):
+        return None
+    got = []
+
+    def read():
+        try:
+            raw = getattr(stdin, "buffer", stdin).read()
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "replace")
+            got.append(json.loads(raw) if raw and raw.strip() else None)
+        except (OSError, ValueError, RecursionError):
+            got.append(None)
+    reader = threading.Thread(target=read, name="hook-stdin", daemon=True)
+    reader.start()
+    reader.join(wait)
+    event = got[0] if got else None
+    return event if isinstance(event, dict) else None
+
+
+def brief_session(stdin=None, stdout=None, environ=None, wait=1.0):
+    """As a Claude Code session starts: tell it, out of sight, what a
+    message from the wrist is, and remember that it was told. True when it
+    was. Says nothing to Codex, whose SessionStart runs this same command,
+    nor where a session has no inbox to post into (Windows). stdout gets
+    the hook's JSON and nothing else. Never raises."""
+    try:
+        stdin = sys.stdin if stdin is None else stdin
+        stdout = sys.stdout if stdout is None else stdout
+        environ = os.environ if environ is None else environ
+        if not _host.unix_sockets():
+            return False
+        event = _hook_event(stdin, wait)
+        if not event or event.get("hook_event_name") != "SessionStart":
+            return False
+        session_id = event.get("session_id")
+        transcript = str(event.get("transcript_path") or "").replace("\\", "/")
+        if (not isinstance(session_id, str) or not _SESSION_ID.match(session_id)
+                or "/.codex/" in transcript
+                or not ("/.claude/" in transcript or environ.get("CLAUDE_PROJECT_DIR"))):
+            return False
+        note = wire.wrist_session_note(
+            echo=environ.get("CLAUDE_CODE_ENTRYPOINT") != _APP_ENTRYPOINT)
+        stdout.write(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "SessionStart", "additionalContext": note}}) + "\n")
+        stdout.flush()
+        # After the note is out: a session marked but never told would be
+        # sent words with nothing to explain them.
+        os.makedirs(WRIST_BRIEFED_DIR, mode=0o700, exist_ok=True)
+        with open(os.path.join(WRIST_BRIEFED_DIR, session_id), "w",
+                  encoding="utf-8") as handle:
+            handle.write(_note_mark(note))
+        _forget_old_briefings()
+        return True
+    except Exception as error:      # noqa: BLE001 — a session must still start
+        print("relay: could not brief the session about wrist messages (%s)"
+              % error, file=sys.stderr)
+        return False
+
+
+def _forget_old_briefings(now=None):
+    """Drop the marks of sessions long gone. Never raises."""
+    now = time.time() if now is None else now
+    try:
+        for name in os.listdir(WRIST_BRIEFED_DIR):
+            path = os.path.join(WRIST_BRIEFED_DIR, name)
+            if now - os.path.getmtime(path) > WRIST_BRIEFED_KEEP:
+                os.remove(path)
+    except OSError:
+        pass
+
+
+def session_briefed(session_id):
+    """Was this session told what a wrist message is, in words this helper
+    still uses? Anything unreadable is no: the long message explains
+    itself, and the short one must never arrive unexplained."""
+    if not isinstance(session_id, str) or not _SESSION_ID.match(session_id):
+        return False
+    try:
+        with open(os.path.join(WRIST_BRIEFED_DIR, session_id), encoding="utf-8") as handle:
+            mark = handle.read(64).strip()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return mark in (_note_mark(wire.wrist_session_note(echo=True)),
+                    _note_mark(wire.wrist_session_note(echo=False)))
+
+
 def post_to_inbox(entry, text, brief=False, command=False, timeout=INBOX_TIMEOUT):
     """Post a wrist message into a live session's own inbox (Claude Code's
     cross-session messaging), where the open session reads it as its next
@@ -2588,10 +2708,13 @@ def post_to_inbox(entry, text, brief=False, command=False, timeout=INBOX_TIMEOUT
         return False
     if not stat.S_ISSOCK(found.st_mode) or found.st_uid != os.getuid():
         return False
+    # The words alone, for a session told at its start what they are and
+    # to keep its answer short; the note says both, so only then.
+    short = bool(brief) and session_briefed(entry.get("session_id"))
     line = json.dumps({"type": "user",
                        "message": {"role": "user",
                                    "content": wire.wrist_inbox_message(
-                                       text, brief, command)}}) + "\n"
+                                       text, brief, command, short=short)}}) + "\n"
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.settimeout(timeout)
@@ -7543,6 +7666,8 @@ def main(argv=None):
     forget_host_session()
     make_home_dirs()
     if args.ensure:
+        # First, and quickly: the session waits on this hook's stdout.
+        brief_session()
         return ensure_running()
     if args.update:
         # The detached half of --ensure: pull, then replace the relay if

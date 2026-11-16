@@ -273,6 +273,19 @@ def unwrap(lines):
 # first. The relay writes it; the dashboard reads the words back out for the
 # wrist's thread. Tapproval's own wording is the marker, not Claude Code's
 # wrapping, which differs between versions.
+#
+# 2026-11-16, Claude Code 2.1.325: the terminal still hides that line, but
+# the Claude app (desktop, and the phone following it) draws it as a bubble
+# with its whole text, so the note meant for Claude alone was on the
+# owner's phone under every message he sent. Seen the same day, in a
+# throwaway session: context a SessionStart hook hands over is not part of
+# any message, and Claude follows it for a message that arrives from
+# another session later on. So a session whose start this helper briefed
+# (WRIST_SESSION_NOTE, through the relay's --ensure, which every install
+# already runs at SessionStart) is sent the watch sign and the words and
+# nothing else (the short form). A session nobody briefed, one started
+# before this helper for instance, still gets the long form below, which
+# carries its own instructions: longer on the phone, never unexplained.
 
 WRIST_INBOX_OPENER = "From the user's Apple Watch (Tapproval), in their own words:"
 # The note's opening stays the same from version to version: it is where
@@ -339,26 +352,78 @@ WRIST_INBOX_COMMAND = ("Their words are a slash command: run that skill with "
                        "arguments, as if they had typed it.")
 
 
-def wrist_inbox_message(text, brief=False, command=False):
-    """What the relay posts into a session's inbox for one wrist message."""
+# The short form: the sign, a space, the words.
+WRIST_SIGN = "\u231a"
+WRIST_SHORT_OPENER = "\u231a "
+# Claude Code may put one line of its own above the message ("Another
+# Claude session sent a message:"); the sign opens the text or the line
+# after that, nowhere further down.
+_WRIST_SHORT = re.compile("\\A(?:[^\\n]*\\n)?\u231a ")
+
+WRIST_ECHO_ASK = ("Their terminal does not show that message, so open your "
+                  "reply with one line: \u231a and their words in italics, "
+                  "shortened if long, like *\u231a What's left?*")
+
+
+def wrist_session_note(echo=True):
+    """What a session is told once, as it starts, about messages from the
+    wrist: everything WRIST_INBOX_NOTE says under each one. ``echo`` is
+    whether to ask for the wearer's words back, which only a screen that
+    hides the message needs; the Claude app shows it."""
+    parts = [
+        "Tapproval, the user's Apple Watch app, is connected to this session. "
+        "A message from another session whose text begins with \u231a "
+        "carries the user's own words, sent from their watch: take it as "
+        "their request.",
+        WRIST_ECHO_ASK if echo else "",
+        "If what they ask needs their go-ahead (anything you would confirm "
+        "with them before doing it), ask them with AskUserQuestion first: "
+        "Tapproval shows the question on their watch, and their answer "
+        "there is their own.",
+        "If their words are a slash command, run that skill with the Skill "
+        "tool, passing anything after its name as its arguments, as if "
+        "they had typed it.",
+        "Keep your answer to such a message short: they read it on a watch.",
+    ]
+    return " ".join(part for part in parts if part)
+
+
+def wrist_inbox_message(text, brief=False, command=False, short=False):
+    """What the relay posts into a session's inbox for one wrist message.
+    ``short`` is for a session already told what such a message is
+    (``wrist_session_note``): the sign and the words, nothing else."""
+    if short:
+        return WRIST_SHORT_OPENER + text
     note = (WRIST_INBOX_NOTE + (" " + WRIST_INBOX_COMMAND if command else "")
             + (" " + WRIST_INBOX_BRIEF if brief else ""))
     return "%s\n\n%s\n\n%s" % (WRIST_INBOX_OPENER, text, note)
 
 
-def wrist_words(content):
+def wrist_words(content, trailer=None):
     """The wearer's words from a delivered inbox message, or None when the
-    text is not one of ours."""
+    text is not one of ours. Either form: the long one is marked by our own
+    opener and note; the short one opens with the sign and runs to
+    ``trailer``, the start of what Claude Code writes under a message from
+    another session (the caller's to name: it is Claude Code's wording),
+    or to the end where that is not found."""
     if not isinstance(content, str):
         return None
     start = content.find(WRIST_INBOX_OPENER)
-    if start < 0:
+    if start >= 0:
+        rest = content[start + len(WRIST_INBOX_OPENER):]
+        end = rest.rfind(WRIST_INBOX_NOTE_START)
+        if end < 0:
+            return None
+        return rest[:end].strip() or None
+    opened = _WRIST_SHORT.match(content)
+    if not opened:
         return None
-    rest = content[start + len(WRIST_INBOX_OPENER):]
-    end = rest.rfind(WRIST_INBOX_NOTE_START)
-    if end < 0:
-        return None
-    return rest[:end].strip() or None
+    rest = content[opened.end():]
+    if trailer:
+        end = rest.rfind("\n\n" + trailer)
+        if end >= 0:
+            rest = rest[:end]
+    return rest.strip() or None
 
 
 # The one line WRIST_INBOX_NOTE asks Claude to open with — "*⌚ What's
