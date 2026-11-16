@@ -336,10 +336,27 @@ def _read_database_catalog(open_paths=None):
         if os.path.islink(path):
             raise OSError("Codex catalog is unavailable")
         deadline = time.monotonic() + 2
-        db = sqlite3.connect("file:" + quote(path.replace(os.sep, "/"), safe="/:") + "?mode=ro",
-                             uri=True, timeout=0.25)
+        address = "file:" + quote(path.replace(os.sep, "/"), safe="/:") + "?mode=ro"
+        db = None
         try:
+            db = sqlite3.connect(address, uri=True, timeout=0.25)
             db.execute("PRAGMA query_only=ON")
+            db.execute("PRAGMA table_info(threads)").fetchall()
+        except sqlite3.OperationalError:
+            # Codex keeps this database in write-ahead mode. On the owner's
+            # Mac (2026-11-16), with Codex not holding it open and its two
+            # side files gone, the read-only open answered "unable to open
+            # database file" and the wrist said "Codex chats are
+            # unavailable" for three days. With neither side file there,
+            # nothing is unwritten and nobody is writing, so the file is
+            # read as it stands; this second open creates nothing.
+            if db is not None:
+                db.close()
+            if os.path.lexists(path + "-wal") or os.path.lexists(path + "-shm"):
+                raise
+            db = sqlite3.connect(address + "&immutable=1", uri=True, timeout=0.25)
+            db.execute("PRAGMA query_only=ON")
+        try:
             db.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
             columns = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
             required = {"id", "cwd", "rollout_path", "source", "title", "updated_at", "archived"}

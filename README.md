@@ -23,7 +23,8 @@ line of it is in this repository.
 
 **One conversation, everywhere.** A message you send from the watch to a
 session open on your computer goes into that session, so its terminal and
-the Claude app on your phone show it, and Claude's answer opens with
+the Claude app on your phone show it: the app as a message of its own,
+"⌚" and your words, and a terminal by Claude's answer opening with
 "*⌚ …*" and your words. What you type in the terminal or on the phone shows
 on the watch. If what you asked for needs your yes first, Claude asks it
 back as a question card on your wrist. You can end a session from the

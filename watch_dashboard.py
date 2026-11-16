@@ -672,6 +672,7 @@ def session_registry(sessions_dir=None):
             "pid": int(pid),
             "started_at": _started_seconds(data.get(shape("registry.started_at"))),
             "socket": str(data.get(shape("registry.messaging_socket")) or ""),
+            "session_id": session_id,
             "turn": _registry_turn(data),
         }
     return registry
@@ -1036,6 +1037,12 @@ UPSTREAM_SHAPES = {
          "summary of the conversation so far, which the terminal folds away. "
          "Read as a message it showed as the owner's own words, 30 KB of "
          "them, pinned at the head of the thread.", "2026-10-22"),
+    "text.peer_trailer":
+        ("This came from another Claude session", "The opening of the "
+         "paragraph Claude Code writes under a message from another "
+         "session. A wrist message in its short form is the watch sign and "
+         "the words, so this is where the words end; unseen, the paragraph "
+         "would read as the wearer's own.", "2026-11-16"),
     "text.interrupted":
         ("[Request interrupted", "The user line written when the person "
          "stops Claude (\"[Request interrupted by user]\", \"… for tool "
@@ -2615,7 +2622,7 @@ def _thread_line(state, line, limit):
         if isinstance(content, list):
             content = "\n".join(str(block.get("text", "")) for block in content
                                  if isinstance(block, dict))
-        words = wire.wrist_words(content)
+        words = wire.wrist_words(content, trailer=shape("text.peer_trailer"))
         if words is None:
             return
         message, inbox = {"content": words}, True

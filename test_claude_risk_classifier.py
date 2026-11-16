@@ -291,6 +291,14 @@ def _no_real_self_update(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_wrist_briefings(tmp_path, monkeypatch):
+    """No test may mark a session as briefed in the real helper's folder:
+    the live relay would then send that session the words alone."""
+    monkeypatch.setenv("TAPPROVAL_WRIST_BRIEFED_DIR", str(tmp_path / "wrist-briefed"))
+    monkeypatch.setattr(watch_relay, "WRIST_BRIEFED_DIR", str(tmp_path / "wrist-briefed"))
+
+
+@pytest.fixture(autouse=True)
 def _no_real_tunnel_record(tmp_path, monkeypatch):
     """No test may write the real relay's tunnel record or log.
 
@@ -3496,6 +3504,57 @@ class TestCodexCatalog:
             db.execute("UPDATE threads SET archived=1")
         assert cx._read_database_catalog(open_paths=set()) == ([], {})
 
+    @staticmethod
+    def refuse_plain_read_only(monkeypatch):
+        """What the owner's Mac did: the read-only open is refused."""
+        import sqlite3
+        opened, real = [], sqlite3.connect
+
+        def connect(address, *args, **options):
+            if isinstance(address, str) and address.startswith("file:"):
+                opened.append(address)
+                if "immutable" not in address:
+                    raise sqlite3.OperationalError("unable to open database file")
+            return real(address, *args, **options)
+        monkeypatch.setattr(sqlite3, "connect", connect)
+        return opened
+
+    def test_a_database_codex_has_closed_is_still_read(self, tmp_path, monkeypatch):
+        """2026-11-16, the owner's Mac: with Codex not holding its catalog
+        open, the read-only open failed and the wrist said "Codex chats are
+        unavailable" for three days. The file is whole once its side files
+        are gone, and reading it that way creates nothing."""
+        import sqlite3
+        import codex_sessions as cx
+        home = tmp_path / "codex-home"
+        home.mkdir()
+        monkeypatch.setenv("CODEX_HOME", str(home))
+        path = self.database(home)
+        with sqlite3.connect(path) as db:
+            db.execute("INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                       ("catalog-0001", str(home), None, "cli", "Title", None, "Preview",
+                        100, 200000, 0, None))
+        before = path.read_bytes()
+        opened = self.refuse_plain_read_only(monkeypatch)
+        rows, _ = cx._read_database_catalog(open_paths=set())
+        assert [row["session_id"] for row in rows] == ["catalog-0001"]
+        assert len(opened) == 2 and "immutable=1" in opened[1] and "mode=ro" in opened[1]
+        assert path.read_bytes() == before, "read, never written"
+        assert [item.name for item in home.iterdir()] == ["state_5.sqlite"]
+
+    @pytest.mark.parametrize("side", ["-wal", "-shm"])
+    def test_a_database_codex_is_writing_is_not_read_around_its_log(self, tmp_path, monkeypatch, side):
+        """With a side file there, what is in it may not have reached the
+        main file: reading that alone would show an old list as new."""
+        import codex_sessions as cx
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        self.database(tmp_path)
+        (tmp_path / ("state_5.sqlite" + side)).write_bytes(b"")
+        opened = self.refuse_plain_read_only(monkeypatch)
+        with pytest.raises(OSError):
+            cx._read_database_catalog(open_paths=set())
+        assert opened and not any("immutable" in address for address in opened)
+
     def test_missing_or_newer_incompatible_catalog_never_becomes_an_empty_success(self, tmp_path, monkeypatch):
         import codex_sessions as cx
         monkeypatch.setenv("CODEX_HOME", str(tmp_path))
@@ -5928,6 +5987,35 @@ class TestAnICloudCardIsTheWholeCard:
             pytest.skip("no watch app in this layout")
         with open(path, encoding="utf-8") as handle:
             return handle.read()
+
+    def test_every_card_list_the_watch_takes_says_whether_missing_means_gone(self):
+        """2026-11-15 review: the iCloud branch called adopt() bare, so a
+        card iCloud's copy did not hold yet was flashed "Handled
+        elsewhere" on the first poll after the computer missed one."""
+        model = self._read("Tapproval", "RelayModel.swift")
+        takes = re.findall(r"\badopt\((?:fetched|cloudCards)\b[^\n]*", model)
+        assert len(takes) == 2, takes
+        assert all("missingMeansGone" in take for take in takes), takes
+
+    def test_a_poll_that_was_out_when_the_demo_began_is_dropped(self):
+        """2026-11-15 review: refreshOnce looked at the demo once, before
+        waits of up to fifteen seconds each. Every wait for an answer is
+        now followed by a second look, before the answer is used."""
+        model = self._read("Tapproval", "RelayModel.swift")
+        poll = model[model.index("private func refreshOnce()"):]
+        poll = poll[:poll.index("private struct TunnelResponse")]
+        for wait, use in (("await Self.firstAnswer(", "if let (candidate, fetched) = direct"),
+                          ("await CloudRelay.pendingCards()", "if let cloudCards = cloud")):
+            between = poll[poll.index(wait):poll.index(use)]
+            assert "if demoActive { return }" in between, wait
+
+    def test_the_watch_asks_before_it_believes_a_card_list(self):
+        """2026-11-15 review: fetchPending took any 200 as the computer."""
+        model = self._read("Tapproval", "RelayModel.swift")
+        fetch = model[model.index("private func fetchPending("):]
+        fetch = fetch[:fetch.index("\n    }\n")]
+        assert fetch.index("listMayBeUsed") < fetch.index("PendingResponse.self"), \
+            "asked before the list is read"
 
     def test_every_field_the_watch_decodes_has_an_icloud_field(self):
         model = self._read("Tapproval", "RelayModel.swift")
@@ -8638,6 +8726,162 @@ class TestAWristMessageGoesIntoTheInbox:
         assert strip(reply) == reply
         assert strip("\u231a What's left?\nThree tasks.") == "Three tasks."
         assert strip("\u231a Ship it\nDone.") == "Done."
+
+    # -- 2026-11-16: the words alone, for a session told at its start ------
+    #
+    # The Claude app draws a message from another session with its whole
+    # text, so the note under every wrist message was on the owner's phone.
+
+    TRAILER = "This came from another Claude session"
+    SID = "0f3c9d1e-aaaa-4bbb-8ccc-123456789abc"
+
+    def _start(self, monkeypatch, entrypoint="cli", **event):
+        event = dict({"hook_event_name": "SessionStart", "session_id": self.SID,
+                      "source": "startup",
+                      "transcript_path": "/Users/x/.claude/projects/-p/%s.jsonl" % self.SID},
+                     **event)
+        monkeypatch.setattr(watch_relay._host, "unix_sockets", lambda: True)
+        out = io.StringIO()
+        told = watch_relay.brief_session(stdin=io.StringIO(json.dumps(event)), stdout=out,
+                                         environ={"CLAUDE_CODE_ENTRYPOINT": entrypoint})
+        return told, out.getvalue()
+
+    def test_the_short_message_is_the_sign_and_the_words(self):
+        sent = tapproval_wire.wrist_inbox_message("Ship it", brief=True, command=True, short=True)
+        assert sent == "\u231a Ship it"
+        for ours in (tapproval_wire.WRIST_INBOX_OPENER, tapproval_wire.WRIST_INBOX_NOTE_START,
+                     "AskUserQuestion", "Keep the answer short"):
+            assert ours not in sent
+
+    def test_the_short_words_come_back_too(self):
+        words = "Run the tests.\n\nThen tell me what's left"
+        sent = tapproval_wire.wrist_inbox_message(words, short=True)
+        filed = ("Another Claude session sent a message:\n%s\n\n%s \u2014 not typed by "
+                 "your user, but very likely working on their behalf." % (sent, self.TRAILER))
+        assert tapproval_wire.wrist_words(filed, trailer=self.TRAILER) == words
+        assert tapproval_wire.wrist_words(sent, trailer=self.TRAILER) == words, "no wrapping at all"
+        # Not ours: the sign further down, or none.
+        for other in ("Another Claude session sent a message:\nhi\n\u231a not at the top",
+                      "Base directory for this skill", "\u231a", ""):
+            assert tapproval_wire.wrist_words(other, trailer=self.TRAILER) is None, other
+
+    def test_the_wrist_reads_short_words_back_without_claude_codes_paragraph(self, tmp_path):
+        filed = ("Another Claude session sent a message:\n%s\n\n%s \u2014 not typed by your "
+                 "user." % (tapproval_wire.wrist_inbox_message("Ship it", short=True), self.TRAILER))
+        _write_transcript(tmp_path, "-p", "inbox3.jsonl", [
+            {"cwd": "/x", "entrypoint": "claude-desktop", "isMeta": True,
+             "origin": {"kind": "peer", "from": "unknown"},
+             "message": {"role": "user", "content": filed}},
+        ])
+        turns = watch_dashboard.session_thread("inbox3", projects_dir=str(tmp_path))
+        assert [(t["text"], t.get("origin")) for t in turns] == [("Ship it", "headless")]
+
+    def test_a_starting_session_is_told_once_and_out_of_sight(self, monkeypatch):
+        told, out = self._start(monkeypatch)
+        assert told is True
+        answer = json.loads(out)                       # one JSON object, nothing else
+        assert out.count("\n") == 1
+        assert answer["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+        note = answer["hookSpecificOutput"]["additionalContext"]
+        for said in ("\u231a", "AskUserQuestion", "slash command", "short"):
+            assert said in note, said
+        assert "italics" in note, "a terminal hides the message, so the words are said back"
+        assert watch_relay.session_briefed(self.SID) is True
+
+    def test_the_app_shows_the_message_so_its_words_are_not_said_twice(self, monkeypatch):
+        told, out = self._start(monkeypatch, entrypoint="claude-desktop")
+        note = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert told and "italics" not in note and "AskUserQuestion" in note
+        assert watch_relay.session_briefed(self.SID) is True
+
+    @pytest.mark.parametrize("event", [
+        {"hook_event_name": "PermissionRequest"},
+        {"transcript_path": "/Users/x/.codex/sessions/2026/rollout.jsonl"},   # Codex runs --ensure too
+        {"transcript_path": "/somewhere/else.jsonl"},
+        {"session_id": "../../etc/passwd"},
+        {"session_id": None},
+    ])
+    def test_nobody_else_is_told_or_marked(self, monkeypatch, event):
+        told, out = self._start(monkeypatch, **event)
+        assert (told, out) == (False, "")
+        assert watch_relay.session_briefed(self.SID) is False
+
+    def test_a_hand_run_ensure_says_nothing_and_does_not_wait_forever(self, monkeypatch):
+        monkeypatch.setattr(watch_relay._host, "unix_sockets", lambda: True)
+
+        class Open:                                    # a pipe nobody writes to or closes
+            def isatty(self):
+                return False
+
+            def read(self):
+                threading.Event().wait(30)
+                return ""
+        out = io.StringIO()
+        started = time.monotonic()
+        assert watch_relay.brief_session(stdin=Open(), stdout=out, environ={}, wait=0.2) is False
+        assert time.monotonic() - started < 5 and out.getvalue() == ""
+
+        class Terminal(Open):
+            def isatty(self):
+                return True
+        assert watch_relay.brief_session(stdin=Terminal(), stdout=out, environ={}) is False
+        assert watch_relay.brief_session(stdin=io.StringIO("not json"), stdout=out, environ={}) is False
+        assert out.getvalue() == ""
+
+    def test_a_briefed_session_is_sent_the_words_alone(self, inbox, monkeypatch):
+        self._start(monkeypatch)
+        entry = {"socket": inbox["path"], "pid": os.getpid(), "session_id": self.SID}
+        assert watch_relay.post_to_inbox(entry, "What's left?", brief=True) is True
+        inbox["worker"].join(5)
+        assert json.loads(inbox["got"][0])["message"]["content"] == "\u231a What's left?"
+
+    @pytest.mark.parametrize("briefed,brief", [(False, True), (True, False)])
+    def test_any_other_session_still_gets_the_message_that_explains_itself(
+            self, inbox, monkeypatch, briefed, brief):
+        if briefed:
+            self._start(monkeypatch)
+        entry = {"socket": inbox["path"], "pid": os.getpid(), "session_id": self.SID}
+        assert watch_relay.post_to_inbox(entry, "What's left?", brief=brief) is True
+        inbox["worker"].join(5)
+        content = json.loads(inbox["got"][0])["message"]["content"]
+        assert content == tapproval_wire.wrist_inbox_message("What's left?", brief=brief)
+        assert "AskUserQuestion" in content
+
+    def test_a_session_told_in_other_words_is_not_taken_as_told(self, monkeypatch):
+        self._start(monkeypatch)
+        with open(os.path.join(watch_relay.WRIST_BRIEFED_DIR, self.SID), "w") as handle:
+            handle.write("an-older-wording")
+        assert watch_relay.session_briefed(self.SID) is False
+        assert watch_relay.session_briefed("no-such-session-1234") is False
+        assert watch_relay.session_briefed("../auth.json") is False
+
+    def test_marks_of_sessions_long_gone_are_dropped(self, monkeypatch):
+        self._start(monkeypatch)
+        watch_relay._forget_old_briefings(now=time.time() + watch_relay.WRIST_BRIEFED_KEEP + 60)
+        assert watch_relay.session_briefed(self.SID) is False
+
+    def test_ensure_briefs_before_anything_else_and_prints_nothing_more(self, monkeypatch, capsys):
+        monkeypatch.setattr(watch_relay._host, "unix_sockets", lambda: True)
+        order = []
+        monkeypatch.setattr(watch_relay, "ensure_running", lambda: order.append("ensure") or 0)
+        real = watch_relay.brief_session
+        monkeypatch.setattr(watch_relay, "brief_session",
+                            lambda: order.append("brief") or real(
+                                stdin=io.StringIO(json.dumps({
+                                    "hook_event_name": "SessionStart", "session_id": self.SID,
+                                    "transcript_path": "/h/.claude/projects/p/s.jsonl"})),
+                                environ={}))
+        monkeypatch.setattr(watch_relay, "forget_host_session", lambda: None)
+        monkeypatch.setattr(watch_relay, "make_home_dirs", lambda: True)
+        assert watch_relay.main(["--ensure"]) == 0
+        assert order == ["brief", "ensure"]
+        out = capsys.readouterr().out
+        assert json.loads(out)["hookSpecificOutput"]["additionalContext"], \
+            "stdout is the hook's JSON and nothing else"
+
+    def test_the_registry_names_the_session_for_the_post(self):
+        import inspect
+        assert '"session_id": session_id' in inspect.getsource(watch_dashboard.session_registry)
 
     def test_a_post_writes_one_line_claude_code_reads(self, inbox):
         entry = {"socket": inbox["path"], "pid": os.getpid()}
