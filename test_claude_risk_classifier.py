@@ -6382,6 +6382,80 @@ class TestTheAwayAddressIsWatched:
         assert [c["tone"] for c in watch_relay.conditions()
                 if c["key"] == "tunnel"] == ["in_hand"], "the relay is reopening it itself"
 
+    def test_an_away_route_that_never_opened_is_tried_again(self, monkeypatch):
+        """2026-11-15 review. With no cloudflared at start, start_tunnel
+        returned None and nothing looked again: the wrist said "Install
+        it", the owner did, and the away route stayed off until the relay
+        next restarted, which can be weeks."""
+        monkeypatch.setattr(watch_relay, "TUNNEL_URL", None)
+        self._watch(None, checks=1)
+        assert self.restarts == [(8978, "tok")], "it looks again by itself"
+
+    def test_a_route_that_never_opened_is_not_called_stopped(self, monkeypatch):
+        """Nothing stopped: there was never a tunnel. The sentence on the
+        wrist stays the one start_tunnel wrote (what to install), not
+        "Answering from away stopped"."""
+        monkeypatch.setattr(watch_relay, "TUNNEL_URL", None)
+        said = "Answering from away is off: cloudflared is not installed."
+        watch_relay.note_condition("tunnel", said)
+        monkeypatch.setattr(watch_relay, "start_tunnel",
+                            lambda port, token: self.restarts.append(port))
+        self._watch(None, checks=3)
+        assert self.restarts == [8978, 8978, 8978]
+        assert self._said() == [said]
+        assert self.slept[1:] == [120, 300], "and it does not spin: %r" % self.slept
+
+    class _Listener:
+        """A travel listener that binds nothing."""
+        RequestHandlerClass = None
+
+        def serve_forever(self):
+            pass
+
+    def test_the_route_is_watched_even_when_it_did_not_open(self, monkeypatch, fresh_auth):
+        watched = []
+        monkeypatch.setattr(watch_relay, "_TUNNEL_HANDLER", None)
+        monkeypatch.setattr(watch_relay, "serve",
+                            lambda *a, **k: (self._Listener(), None))
+        monkeypatch.setattr(watch_relay, "start_tunnel", lambda port, token: None)
+        monkeypatch.setattr(watch_relay, "watch_tunnel",
+                            lambda handle, port, token: watched.append(handle))
+        watch_relay._start_tunnel(watch_relay.CardQueue(), fresh_auth, port=18998)
+        for _ in range(100):
+            if watched:
+                break
+            time.sleep(0.02)
+        assert watched == [None], "no handle is exactly when somebody must look again"
+
+    def test_a_busy_travel_port_is_tried_again(self, monkeypatch, fresh_auth):
+        """"Usually another Tapproval still shutting down": a passing cause,
+        so the relay looks again instead of going without the away route
+        for the rest of its life."""
+        binds, started, waits = [], [], []
+
+        def serve(*a, **k):
+            binds.append(a[1])
+            if len(binds) < 3:
+                raise OSError(48, "Address already in use")
+            return self._Listener(), None
+        monkeypatch.setattr(watch_relay, "_TUNNEL_HANDLER", None)
+        monkeypatch.setattr(watch_relay, "serve", serve)
+        monkeypatch.setattr(watch_relay, "start_tunnel",
+                            lambda port, token: started.append(port))
+        monkeypatch.setattr(watch_relay, "watch_tunnel", lambda *a: None)
+        seen = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            seen.append(self._said())
+        watch_relay._start_tunnel(watch_relay.CardQueue(), fresh_auth,
+                                  port=18998, retry_sleep=sleep)
+        assert waits == list(watch_relay.TUNNEL_BACKOFF[:2]), "it waits longer, no spin"
+        assert all(said and "already in use" in said[0] for said in seen), \
+            "said for as long as it is true: %r" % seen
+        assert started == [18998], "the third look found the port free"
+        assert self._said() == [], "and the sentence about the busy port is withdrawn"
+
     def test_a_tunnel_that_stops_answering_is_reopened(self, monkeypatch):
         monkeypatch.setattr(watch_relay, "_pid_alive", lambda pid: True)
         asked = []
@@ -14895,6 +14969,31 @@ class TestTheWristAnswersAHeadlessSend:
         decision = json.loads(replies[2]["result"]["content"][0]["text"])
         assert decision["behavior"] == "deny"
 
+    def test_the_tool_reads_utf8_whatever_the_console_says(self):
+        """2026-11-15 review. Claude Code writes UTF-8. The tool read its
+        stdin as text, so on Windows the console's code page decoded it:
+        "é" arrived as "Ã©", and an Allow handed that altered text back as
+        the input to run. The hook was cured of this in read_stdin_text;
+        the tool was not. PYTHONIOENCODING stands in for the code page, so
+        this fails on every host."""
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        talk = b"\n".join([
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "caf\u00e9"},
+                       ensure_ascii=False).encode("utf-8"),
+            b'{"jsonrpc": "2.0", "id": 2, "method": "\x81\xff"}',   # not UTF-8 at all
+            json.dumps({"jsonrpc": "2.0", "id": 3, "method": "ping"}).encode("utf-8"),
+        ]) + b"\n"
+        done = subprocess.run(
+            [sys.executable, os.path.join(_ROOT, "watch_permission_tool.py")],
+            input=talk, capture_output=True, timeout=30, env=env)
+        replies = [json.loads(line) for line in done.stdout.decode("utf-8").splitlines()
+                   if line.strip()]
+        assert len(replies) == 3, (done.stdout, done.stderr)
+        assert "caf\u00e9" in replies[0]["error"]["message"], replies[0]
+        assert replies[1]["error"]["code"] == -32700, \
+            "a line that cannot be read is refused, never guessed at"
+        assert replies[2]["id"] == 3, "and the tool is still there for the next one"
+
     def test_a_send_carries_the_wrist_as_its_permission_surface(self, tmp_path, monkeypatch):
         seen = {}
         monkeypatch.setattr(watch_relay, "resolve_session", lambda p, d=None, **k: ("s1", str(tmp_path)))
@@ -16810,6 +16909,39 @@ class TestLocalMeansLocal:
     ])
     def test_loopback_is_judged_by_address_not_prefix(self, ip, loop):
         assert watch_relay._is_loopback(ip) is loop
+
+    def test_the_network_cannot_take_the_computers_own_seats(self, fresh_auth, monkeypatch, capsys):
+        """2026-11-15 review. One pool for everybody: 64 held-open sockets
+        from anything on the Wi-Fi (no key needed to connect) and the hook's
+        card and the bridge's poll were closed unanswered, with nothing in
+        the log. Callers on this computer now have seats of their own."""
+        import socketserver
+        monkeypatch.setattr(watch_relay._RelayServer, "MAX_CONNECTIONS", 2)
+        server, _queue = watch_relay.serve(host="127.0.0.1", port=0,
+                                           auth=_known_watch(fresh_auth))
+        served, closed = [], []
+        monkeypatch.setattr(socketserver.ThreadingMixIn, "process_request",
+                            lambda self, request, address: served.append(address[0]))
+        monkeypatch.setattr(server, "shutdown_request", closed.append)
+        try:
+            for n in range(3):
+                server.process_request("far-%d" % n, ("10.0.0.5", 5000 + n))
+            assert served == ["10.0.0.5"] * 2 and closed == ["far-2"]
+            said = capsys.readouterr().err
+            assert "10.0.0.5" in said and "closed unanswered" in said, said
+            server.process_request("far-3", ("10.0.0.5", 5003))
+            assert "closed unanswered" not in capsys.readouterr().err, "said once, not per socket"
+            server.process_request("hook", ("127.0.0.1", 6000))
+            server.process_request("bridge", ("::1", 6001))
+            assert served[2:] == ["127.0.0.1", "::1"], "this computer still gets in"
+            # And a seat goes back to the pool it came from.
+            monkeypatch.setattr(socketserver.ThreadingMixIn,
+                                "process_request_thread", lambda self, request, address: None)
+            server.process_request_thread("far-0", ("10.0.0.5", 5000))
+            server.process_request("far-4", ("10.0.0.5", 5004))
+            assert served[-1] == "10.0.0.5" and closed == ["far-2", "far-3"]
+        finally:
+            server.server_close()
 
     def test_connections_past_the_cap_are_closed(self, fresh_auth, monkeypatch):
         import socket as _socket
@@ -20876,6 +21008,56 @@ class TestSilentFailuresStayLoud:
         assert adv.check_once() == "fine"
         assert watch_relay.conditions() == []
         assert "stopped" not in capsys.readouterr().err
+
+    def test_a_new_network_address_is_announced(self, monkeypatch, capsys):
+        """2026-11-15 review. The record's address was read when the
+        announcer started and never again: a laptop carried from home to
+        the office kept announcing the home address, the watch takes the
+        record's address without resolving the service, and the nearest
+        road went quiet with nothing said."""
+        old, new = self._Alive(), self._Alive()
+        adv = self._advertiser(monkeypatch, old, new)
+        adv.txt = {"ip": "192.168.1.20", "port": "8977"}
+        monkeypatch.setattr(watch_relay, "lan_ips", lambda: ["10.0.4.7"])
+        monkeypatch.setattr(watch_relay, "advertise_txt",
+                            lambda _port: {"ip": "10.0.4.7", "port": "8977"})
+        assert adv.follow_address() is True
+        assert old.terminated and adv.process is new
+        assert adv.txt["ip"] == "10.0.4.7"
+        assert adv.check_once() == "fine", "a deliberate swap is not a death"
+        assert watch_relay.conditions() == []
+        assert "10.0.4.7" in capsys.readouterr().err
+
+    def test_the_same_address_is_left_alone(self, monkeypatch):
+        """Announcing an identical record again can make the watch lose
+        the computer for a moment (2026-10-05 review)."""
+        only = self._Alive()
+        adv = self._advertiser(monkeypatch, only, self._Alive())
+        adv.txt = {"ip": "192.168.1.20", "port": "8977"}
+        monkeypatch.setattr(watch_relay, "lan_ips", lambda: ["192.168.1.20"])
+        assert adv.follow_address() is False
+        assert not only.terminated and adv.process is only
+
+    def test_no_network_at_all_keeps_the_last_record(self, monkeypatch):
+        """Between two networks there is no address. The record stays as
+        it was until there is a new one to say."""
+        only = self._Alive()
+        adv = self._advertiser(monkeypatch, only, self._Alive())
+        adv.txt = {"ip": "192.168.1.20", "port": "8977"}
+        monkeypatch.setattr(watch_relay, "lan_ips", lambda: [])
+        assert adv.follow_address() is False
+        assert not only.terminated and adv.process is only
+
+    def test_an_announcer_already_given_up_is_not_revived_by_an_address(self, monkeypatch):
+        adv = self._advertiser(monkeypatch, self._Alive())
+        adv.terminate()
+        adv.process = None
+        monkeypatch.setattr(watch_relay, "lan_ips", lambda: ["10.0.4.7"])
+        assert adv.follow_address() is False and adv.process is None
+
+    def test_the_watchdog_looks_at_the_address(self):
+        import inspect
+        assert "follow_address" in inspect.getsource(watch_relay._Advertiser._watch)
 
     def test_an_unchanged_record_is_not_published_again(self, monkeypatch):
         """The record no longer carries the away address, so the republish

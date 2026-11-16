@@ -245,15 +245,23 @@ def handle(message, crc=None):
 
 def serve(stdin=None, stdout=None, crc=None):
     """Read messages until the pipe closes. One JSON object per line."""
-    stdin = stdin or sys.stdin
+    # Bytes, read as UTF-8 here: Claude Code writes UTF-8, and a text stdin
+    # is decoded by the console's code page. On Windows that turned "é"
+    # into "Ã©", and an Allow handed the altered text back as the input to
+    # run; some bytes ended the tool outright (2026-11-15 review).
+    stdin = stdin or getattr(sys.stdin, "buffer", sys.stdin)
     stdout = stdout or sys.stdout
     for line in stdin:
-        line = line.strip()
-        if not line:
-            continue
         try:
+            if isinstance(line, bytes):
+                line = line.decode("utf-8")
+            line = line.strip()
+            if not line:
+                continue
             message = json.loads(line)
         except (ValueError, RecursionError):
+            # UnicodeDecodeError is a ValueError: a line that is not UTF-8
+            # is refused like any other that cannot be read, never guessed.
             # Unanswered, a request Claude Code thinks it sent waits out its
             # own timeout. JSON-RPC's parse error answers it at once. A
             # message nested too deep to follow is one more that cannot be
