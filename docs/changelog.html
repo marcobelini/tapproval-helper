@@ -23,6 +23,16 @@
 <main class="policy">
 <h1>Changelog</h1>
 <p><em>Every release of Tapproval Base, the helper on your computer, newest first. Starting Claude Code once updates it. Generated from <a href="https://github.com/marcobelini/tapproval-helper/releases">the releases on GitHub</a>, which may already hold a newer one. Security fixes are also explained on <a href="security.html">the security page</a>.</em></p>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.125">1.1.125</a></h2>
+<p><em>2026-11-16</em></p>
+<p><strong>The way to your computer from away mends itself, and the computer's own parts always get through.</strong></p>
+<ul>
+<li><strong>The way in from away retries by itself.</strong> If it could not open when the helper started (cloudflared not installed yet, or the previous helper still shutting down), it stayed closed until the helper next restarted. It now looks again on its own (#1367).</li>
+<li><strong>A computer that changes network says so.</strong> A laptop carried to another network kept announcing its old address, so the watch tried the wrong one first. The helper now checks once a minute and announces the new address (#1368).</li>
+<li><strong>The computer's own parts always get through.</strong> Other devices on the same Wi-Fi could hold every connection the helper allows and leave none for the hook and the Mac bridge. They now have connections of their own, and a full house is written to the log (#1370).</li>
+<li><strong>Windows: accented letters stay as written.</strong> A command with letters such as "é", approved from the wrist in a run with nobody at the computer, could be altered before it ran. It is now read as written (#1369).</li>
+</ul>
+<p>Updates itself within the hour on every computer; nothing to do.</p>
 <h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.124">1.1.124</a></h2>
 <p><em>2026-11-15</em></p>
 <p><strong>A skill sent from the watch now runs where you can see it.</strong></p>
