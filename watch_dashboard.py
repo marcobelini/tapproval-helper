@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1032,6 +1033,22 @@ UPSTREAM_SHAPES = {
     "registry.name_derived":
         ("derived", "The nameSource of a name the CLI made from the folder "
          "(\"acme-3f\"): not a title anybody chose.", "2026-09-03"),
+    "key.tool_use_result":
+        ("toolUseResult", "Beside a tool's answer in a user line: what the "
+         "tool did, as data. Read only for the receipt of a file Claude "
+         "sent to the person.", "2026-11-17"),
+    "receipt.attachments":
+        ("attachments", "In SendUserFile's toolUseResult: one entry per "
+         "file delivered, with its path on this computer.", "2026-11-17"),
+    "receipt.is_image":
+        ("isImage", "On such an entry: true when the file is a picture the "
+         "phone draws in the conversation.", "2026-11-17"),
+    "receipt.path":
+        ("path", "On such an entry: where the file is on this computer. "
+         "The picture itself is never in the transcript.", "2026-11-17"),
+    "receipt.caption":
+        ("caption", "In SendUserFile's toolUseResult: the line Claude wrote "
+         "to go with the files.", "2026-11-17"),
     "key.compact_summary":
         ("isCompactSummary", "Marks the user line /compact writes: the whole "
          "summary of the conversation so far, which the terminal folds away. "
@@ -1309,6 +1326,25 @@ IMAGE_MAX_BYTES = 6 * 1024 * 1024        # one picture; a watch shows less
 IMAGE_WRIST_EDGE = 1200
 IMAGE_WRIST_QUALITY = 70
 SIPS = "/usr/bin/sips"       # macOS's own; elsewhere the original is sent
+# A picture Claude SENDS the person (the SendUserFile tool) is not in the
+# transcript at all: the tool's receipt names a file on this computer, and
+# until 2026-11-17 the phone drew it while the wrist showed a bare tool
+# row. Only where the file is and how it looked is kept; it is read when
+# the watch asks, and again if the cache above has let it go.
+_IMAGE_FILES = OrderedDict()  # ref -> (path, size, mtime_ns)
+IMAGE_FILES_MAX = 200
+# Where each picture in the cache came from, so one the cache has let go
+# can be read again instead of being "no longer held" for good (#893): the
+# line of a transcript ("claude"), the line of a Codex chat ("codex"), or
+# a file a Codex reply linked ("file"). No picture data is kept here, and
+# what is read again is served only if it is the same picture: the
+# reference is a hash of the picture itself.
+_IMAGE_ORIGINS = OrderedDict()  # ref -> (kind, path, byte offset of the line)
+IMAGE_ORIGINS_MAX = 2000
+IMAGE_LINE_MAX = 48 * 1024 * 1024    # one transcript line read again
+# A path in a transcript is another program's word. What is served must
+# open as a picture: these first bytes, never the name or the claimed type.
+_PICTURE_BRANDS = (b"heic", b"heix", b"heif", b"mif1")
 # The most of one turn the thread view carries, cut at a word and marked.
 # A wrist-sent message (watch_relay.SEND_CHARS) must fit in it whole, or
 # the watch's echo of a long message would never find its own turn.
@@ -1340,13 +1376,209 @@ def remember_image(part):
         return None
 
 
+def _picture_type(head):
+    """The media type the first bytes of a file say it is, or None when
+    they are not a picture the watch can draw. SVG is text, and is not."""
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head[4:8] == b"ftyp" and head[8:12] in _PICTURE_BRANDS:
+        return "image/heic"
+    return None
+
+
+def _picture_file(path, expect=None):
+    """``(media_type, size, mtime_ns, handle)`` of a picture file, open for
+    reading, or None: a regular file — a link is not followed — no larger
+    than one picture may be, whose first bytes are a picture's. With
+    ``expect`` (size, mtime_ns) it must also be the file that was sent.
+    The caller closes the handle. Never raises."""
+    handle = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        if os.path.islink(path):
+            return None
+        handle = os.fdopen(os.open(path, flags), "rb")
+        found = os.fstat(handle.fileno())
+        if (not stat.S_ISREG(found.st_mode) or not 0 < found.st_size <= IMAGE_MAX_BYTES
+                or (expect and expect != (found.st_size, found.st_mtime_ns))):
+            handle.close()
+            return None
+        media = _picture_type(handle.read(16))
+        if media is None:
+            handle.close()
+            return None
+        handle.seek(0)
+        return media, found.st_size, found.st_mtime_ns, handle
+    except Exception:
+        if handle:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        return None
+
+
+def remember_image_file(path, media=None):
+    """Keep where one picture Claude sent is, and return its reference, or
+    None if it is not a picture we can serve. The reference says nothing of
+    the path, and nothing is read past the first bytes until the watch
+    asks. Never raises."""
+    try:
+        if not isinstance(path, str) or not path or not os.path.isabs(path):
+            return None
+        if media is not None and not str(media).startswith("image/"):
+            return None
+        got = _picture_file(path)
+        if got is None:
+            return None
+        _, size, mtime, handle = got
+        handle.close()
+        ref = hashlib.sha256(
+            ("file\0%s\0%d\0%d" % (path, size, mtime)).encode("utf-8", "replace")
+        ).hexdigest()[:16]
+        with _CACHE_LOCK:
+            _IMAGE_FILES[ref] = (path, size, mtime)
+            _IMAGE_FILES.move_to_end(ref)
+            while len(_IMAGE_FILES) > IMAGE_FILES_MAX:
+                _IMAGE_FILES.popitem(last=False)
+        return ref
+    except Exception:
+        return None
+
+
+def _image_from_file(ref):
+    """``(media_type, bytes)`` of a sent picture, read from its file,
+    wrist-sized and put in the cache, or None: gone, changed since it was
+    sent, or no longer a picture. Never raises."""
+    try:
+        kept = _IMAGE_FILES.get(ref)
+        if not kept:
+            return None
+        path, size, mtime = kept
+        got = _picture_file(path, expect=(size, mtime))
+        if got is None:
+            return None
+        media, _, _, handle = got
+        with handle:
+            raw = handle.read(IMAGE_MAX_BYTES + 1)
+        if not raw or len(raw) > IMAGE_MAX_BYTES:
+            return None
+        media, raw = _wrist_sized(media, raw)
+        with _CACHE_LOCK:
+            _IMAGES[ref] = (media, raw)
+            _IMAGES.move_to_end(ref)
+            while (len(_IMAGES) > IMAGE_CACHE_MAX
+                   or sum(len(v[1]) for v in _IMAGES.values()) > IMAGE_CACHE_BYTES):
+                _IMAGES.popitem(last=False)
+        return media, raw
+    except Exception:
+        return None
+
+
+def _sent_pictures(entry):
+    """The turn for a receipt of pictures Claude sent the person, or None:
+    Claude's caption and a reference per picture. Read from the receipt,
+    not the call, so a send that failed shows nothing. Never raises."""
+    try:
+        receipt = entry.get(shape("key.tool_use_result"))
+        if not isinstance(receipt, dict):
+            return None
+        attachments = receipt.get(shape("receipt.attachments"))
+        if not isinstance(attachments, list):
+            return None
+        refs = []
+        for item in attachments:
+            if not isinstance(item, dict) or item.get(shape("receipt.is_image")) is not True:
+                continue
+            ref = remember_image_file(item.get(shape("receipt.path")), item.get("media_type"))
+            if ref and ref not in refs:
+                refs.append(ref)
+        if not refs:
+            return None
+        caption = receipt.get(shape("receipt.caption"))
+        text = plain_text(caption[:TURN_CHARS]).strip() if isinstance(caption, str) else ""
+        return {"role": "assistant", "kind": "text", "text": text or "[image]",
+                "desc": "", "at": entry.get("timestamp", ""), "images": refs}
+    except Exception:
+        return None
+
+
+def note_image_origin(ref, kind, path, offset=0):
+    """Remember where a cached picture came from: ``kind`` is "claude" or
+    "codex" (a line of that transcript, starting at byte ``offset``) or
+    "file" (a picture file). Never raises."""
+    try:
+        if not ref or not isinstance(path, str) or not path:
+            return
+        with _CACHE_LOCK:
+            _IMAGE_ORIGINS[ref] = (kind, path, int(offset))
+            _IMAGE_ORIGINS.move_to_end(ref)
+            while len(_IMAGE_ORIGINS) > IMAGE_ORIGINS_MAX:
+                _IMAGE_ORIGINS.popitem(last=False)
+    except Exception:
+        return
+
+
+def _recall_image(ref):
+    """Read again the line or file a picture came from, so it is back in
+    the cache; True when it is. The source may have changed since — a
+    transcript rewritten, a file replaced — and then whatever it holds now
+    has another reference and this one stays missing. Never raises."""
+    try:
+        origin = _IMAGE_ORIGINS.get(ref)
+        if not origin:
+            return False
+        kind, path, offset = origin
+        if kind == "file":
+            got = _picture_file(path)
+            if got is None:
+                return False
+            media, _, _, handle = got
+            with handle:
+                raw = handle.read(IMAGE_MAX_BYTES + 1)
+            remember_image({"source": {"type": "base64", "media_type": media,
+                                       "data": base64.b64encode(raw).decode("ascii")}})
+        elif kind in ("claude", "codex"):
+            with open(path, "rb") as handle:
+                handle.seek(offset)
+                raw = handle.readline(IMAGE_LINE_MAX + 1)
+            if len(raw) > IMAGE_LINE_MAX or not raw.endswith(b"\n"):
+                return False
+            line = raw.decode("utf-8", "replace")
+            if kind == "claude":
+                entry = _json_object(line)
+                if entry is None:
+                    return False
+                _message_parts(_message_of(entry).get("content"))
+            else:
+                import codex_sessions
+                codex_sessions.pictures_in_line(line)
+        else:
+            return False
+        return ref in _IMAGES
+    except Exception:
+        return False
+
+
 def image_bytes(ref):
     """``(media_type, bytes)`` for a reference the watch asks for, or None.
     Wrist-sized the first time it is asked for, and kept that way, so the
-    work is done once and the cache holds the smaller copy. Never raises —
+    work is done once and the cache holds the smaller copy. A picture the
+    cache has let go is read again from where it came. Never raises —
     an unreadable picture is a missing one."""
     ref = str(ref or "")
     got = _IMAGES.get(ref)
+    if not got:
+        sent = _image_from_file(ref)
+        if sent:
+            return sent
+        got = _IMAGES.get(ref) if _recall_image(ref) else None
     if not got:
         return None
     media, data = got
@@ -2415,6 +2647,9 @@ def _parse_thread_locked(path, limit):
                     fresh += 1
                 for i, turn in enumerate(state["turns"][len(state["turns"]) - fresh:]):
                     turn["n"] = at_byte + i
+                    for ref in turn.get("images") or ():
+                        if ref not in _IMAGE_FILES:
+                            note_image_origin(ref, "claude", path, at_byte)
                 if len(state["turns"]) > THREAD_TURNS_HELD:
                     state["turns"] = state["turns"][-THREAD_TURNS_KEPT:]
                     state["floor"] = state["turns"][0]["n"]
@@ -2614,6 +2849,13 @@ def _thread_line(state, line, limit):
     if role == "user" and entry.get(shape("key.compact_summary")):
         state["turns"].append(_notice(COMPACTED_NOTICE, "output", entry))
         return
+    # The receipt of pictures Claude sent the person: the phone draws them
+    # in the conversation, so the wrist does too.
+    if role == "user":
+        sent = _sent_pictures(entry)
+        if sent:
+            state["turns"].append(sent)
+            return
     inbox = False
     if role == "user" and entry.get(shape("key.is_meta")):
         # A wrist message delivered into the session's inbox is filed as a

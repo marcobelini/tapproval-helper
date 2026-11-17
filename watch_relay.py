@@ -1357,6 +1357,7 @@ class CardQueue:
         self._session_allows = set()
         self._decisions = {}            # id -> "allow" | "deny"
         self._seen = set()              # every id queued here, for not_here_yet()
+        self._left = OrderedDict()      # id -> why it left, for a late tap (left_because)
         self.started = time.monotonic()
         self.last_poll = None           # monotonic time of last /pending fetch
         self.last_bridge_poll = None    # the same, for the Mac bridge
@@ -1512,13 +1513,39 @@ class CardQueue:
         print("relay: left %s %s after %dms" % (
             card_id, reason, int((time.monotonic() - started) * 1000)),
             file=sys.stderr)
+        with self._lock:
+            self._note_left(card_id, reason)
         return card_id, decision, answer
+
+    # Why the last cards left, for a tap that arrives after: enough for
+    # every card a wrist could still be showing, and no more.
+    LEFT_REMEMBERED = 200
+
+    def _note_left(self, card_id, reason):
+        """Held under the lock. A repost keeps its id (#795), so the newest
+        reason is the one that counts."""
+        self._left.pop(card_id, None)
+        self._left[card_id] = reason
+        while len(self._left) > self.LEFT_REMEMBERED:
+            self._left.popitem(last=False)
+
+    def left_because(self, card_id):
+        """Why a card no longer waits: "answered-here", "answered-elsewhere"
+        (the phone, the terminal, a native client), "hook-gone" (what was
+        waiting for the answer stopped), "expired", or None when this relay
+        never held it or has forgotten. The wrist tells a question answered
+        elsewhere from one given up on by it (#1384 B4)."""
+        with self._lock:
+            if card_id in self._decisions:
+                return "answered-here"
+            return self._left.get(card_id)
 
     def withdraw(self, card_id):
         """Retract a native request synchronously, before another tap/poll."""
         with self._lock:
             self._pending.pop(card_id, None)
             self._decisions.pop(card_id, None)
+            self._note_left(card_id, "answered-elsewhere")
             self._lock.notify_all()
 
     def pending(self, from_watch=False, from_bridge=False):
@@ -4865,6 +4892,22 @@ class RelayHandler(BaseHTTPRequestHandler):
     }
 
     def _dispatch(self, method):
+        try:
+            from urllib.parse import urlsplit
+            urlsplit(self.path)
+        except ValueError:
+            # An address the parser cannot read ("//[" is enough): refused
+            # here, before any key is asked for. It used to throw further
+            # down, and a throw is recorded as a crash, so anyone on the
+            # Wi-Fi could put a "Helper problem" row on the wrist, send a
+            # crash mail and push real crash records out of the log with
+            # one request (2026-11-16 review, M1). On the travel address it
+            # is the same "not found" as a missing secret path.
+            if self.required_token is not None:
+                self._send_json({"error": "not found"}, 404)
+            else:
+                self._send_json({"error": "bad address"}, 400)
+            return
         if self.required_token is not None and self._route()[0] is None:
             # The travel address without its secret path: the same "not
             # found" whatever was sent. A 415 or a 403 here told a stranger
@@ -5597,7 +5640,14 @@ class RelayHandler(BaseHTTPRequestHandler):
         # session start.
         if accepted and self._proves_bootstrap():   # a local process, by its own test
             self._note_paired()
-        self._send_json({"ok": accepted})
+        reply = {"ok": accepted}
+        # Why it was refused, when the card has left: the wrist says "No
+        # longer waiting" for one answered elsewhere, not "Too late" (#1384
+        # B4). Absent when not known; a watch before 3.0.2 reads only "ok".
+        reason = None if accepted else self.queue.left_because(card_id)
+        if reason:
+            reply["reason"] = reason
+        self._send_json(reply)
 
     def _post_admin(self, path, query):
         # Administration is for a process on this machine only — the

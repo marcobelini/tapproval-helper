@@ -41,6 +41,8 @@ UPSTREAM_SHAPES = {
     "item.custom_output": ("custom_tool_call_output", "Freeform receipt", "2026-10-14"),
     "part.input": ("input_text", "User text", "2026-10-14"),
     "part.output": ("output_text", "Assistant text", "2026-10-14"),
+    "part.image": ("input_image", "A picture the person pasted into the chat: "
+                   "image_url holds it whole, as a data: address", "2026-11-17"),
     "event.started": ("task_started", "Turn is in progress", "2026-10-14"),
     "event.complete": ("task_complete", "Turn has ended", "2026-10-14"),
     "event.aborted": ("turn_aborted", "Turn was interrupted", "2026-10-14"),
@@ -656,7 +658,7 @@ def _reply_images(markdown, cwd):
     Never fetch URLs or read outside the rollout's project (including symlinks).
     Reuse the watch's bounded cache and authenticated /image route.
     """
-    from watch_dashboard import remember_image, IMAGE_MAX_BYTES
+    from watch_dashboard import remember_image, note_image_origin, IMAGE_MAX_BYTES
     if not cwd or not os.path.isabs(cwd):
         return []
     root = os.path.realpath(cwd)
@@ -704,9 +706,49 @@ def _reply_images(markdown, cwd):
                                              'data': base64.b64encode(data).decode('ascii')}})
             if ref and ref not in refs:
                 refs.append(ref)
+                # Where it lies, so one the cache lets go is read again.
+                note_image_origin(ref, 'file', path)
         except (OSError, ValueError):
             continue
     return refs
+
+
+_PASTED = re.compile(r'^data:(image/[A-Za-z0-9.+-]+);base64,(.+)$', re.S)
+
+
+def _pasted_pictures(content):
+    """A reference for each picture the person pasted into a message: the
+    chat holds it whole, as a data: address. Never an address to fetch."""
+    from watch_dashboard import remember_image
+    refs = []
+    for part in content if isinstance(content, list) else ():
+        if len(refs) >= 8:
+            break
+        if not isinstance(part, dict) or part.get("type") != shape("part.image"):
+            continue
+        held = part.get("image_url")
+        found = _PASTED.match(held) if isinstance(held, str) else None
+        if not found:
+            continue
+        ref = remember_image({"source": {"type": "base64", "media_type": found.group(1),
+                                         "data": found.group(2)}})
+        if ref and ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def pictures_in_line(line):
+    """Put the pictures pasted in one line of a chat back in the cache:
+    how the dashboard reads again one it has let go. Never raises."""
+    try:
+        row = _json_object(line)
+        payload = row.get("payload") if row else None
+        if (isinstance(payload, dict) and payload.get("type") == shape("item.message")
+                and payload.get("role") == "user"):
+            return _pasted_pictures(payload.get("content"))
+    except Exception:
+        pass
+    return []
 
 
 def _fold(state, row, number):
@@ -778,15 +820,24 @@ def _fold(state, row, number):
         words = decoder(raw) if decoder else None
         if words is not None:
             raw = words
+    pasted = _pasted_pictures(content) if role == "user" else []
+    if not raw and pasted:
+        # Only a picture: words for a watch that cannot show it, which the
+        # watch hides when it can.
+        raw = "[image]"
     if not raw:
         return
-    from watch_dashboard import blocks, plain_text
+    from watch_dashboard import blocks, plain_text, note_image_origin
     raw = raw[:32768] + ("\n[…]" if len(raw) > 32768 else "")
     text = plain_text(raw)
     if not text:
         return
     state["tool_run"] = None
     turn = {"role": role, "kind": "text", "text": text, "at": at, "n": number}
+    if pasted:
+        turn["images"] = pasted
+        for ref in pasted:
+            note_image_origin(ref, "codex", state.get("path"), number)
     if role == "assistant":
         pictures = _reply_images(raw, state.get('cwd'))
         if pictures:
@@ -827,7 +878,7 @@ def thread_info(path, mark=None, limit=14, card_waiting=False):
             floor = _tail_start(path)
             meta = _rollout_meta(path) or {}
             state = {"identity": identity, "offset": floor, "floor": floor,
-                     "cwd": meta.get("cwd"),
+                     "cwd": meta.get("cwd"), "path": path,
                      "turns": [], "calls": {}, "busy": None, "last_said": None,
                      "tool_run": None, "changed": {}, "seen_calls": OrderedDict()}
             _THREADS[path] = state

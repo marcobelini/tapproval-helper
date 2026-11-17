@@ -111,7 +111,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.126"
+__version__ = "1.1.127"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -223,6 +223,12 @@ SECRET_PATH = re.compile(
     # with a trailing `/` read HIGH (2026-11-01 review). A whole name only:
     # `notes.aws` and `.sshd_config_backups` are not the folder.
     r"\.codex[/\\]auth\.json\b|"
+    # The token files of tools TOOL_REACH already knows, each a live login
+    # in plain text and each SAFE to `cat` until the 2026-11-16 review:
+    # fly, gcloud, Azure, Supabase, wrangler, glab and yarn.
+    r"\.fly[/\\]config\.ya?ml|\.config[/\\]gcloud[/\\]|\.azure[/\\]|"
+    r"\.supabase[/\\]access-token|\.wrangler[/\\]config[/\\]|"
+    r"\.config[/\\]glab-cli[/\\]|\.yarnrc\.yml\b|"
     r"(?<![\w-])\.(?:aws|ssh|gnupg|appstoreconnect)(?![\w.-])|\.tapproval[/\\]data(?![\w.-]))",
     re.I,
 )
@@ -309,12 +315,28 @@ def configure_site_rules(policy):
     SITE_RULES = rules
     return rules
 
+# The second and third lines are the 2026-11-16 review's: `TRUNCATE users`
+# is a whole statement without the word TABLE, a role or a function is
+# dropped as finally as a table, and COPY … PROGRAM runs a shell on the
+# database's host. Each wants the shape of a statement after it (a name,
+# then an end), because these words are also English: "truncate the
+# output" and "drop user input" are not SQL, and `truncate -s 0 f` is a
+# program.
+_SQL_NAME = r"(?:IF\s+EXISTS\s+)?[\w.\"`\[\]@'%]+"
+_SQL_END = r"\s*(?:;|,|CASCADE\b|RESTRICT\b|RESTART\b|CONTINUE\b|[\"']|$)"
 SQL_DESTRUCTIVE = re.compile(
-    r"\b(DROP\s+(DATABASE|TABLE|PROCEDURE|VIEW|INDEX|SCHEMA)|TRUNCATE\s+TABLE)\b", re.I
+    r"\b(DROP\s+(DATABASE|TABLE|PROCEDURE|VIEW|INDEX|SCHEMA)|TRUNCATE\s+TABLE)\b"
+    r"|\bTRUNCATE\s+(?:ONLY\s+)?" + _SQL_NAME + _SQL_END +
+    r"|\bDROP\s+(?:USER|ROLE|FUNCTION|TRIGGER|SEQUENCE|TYPE|EXTENSION|MATERIALIZED\s+VIEW)\s+"
+    + _SQL_NAME + r"(?:\([^)]*\))?" + _SQL_END +
+    r"|\bDROP\s+OWNED\s+BY\b|\bCOPY\b[^;]*\b(?:TO|FROM)\s+PROGRAM\b", re.I
 )
 SQL_MUTATION = re.compile(
     r"\b(INSERT\s+INTO|UPDATE\s+\S+\s+SET|DELETE\s+FROM|MERGE\s+INTO|"
-    r"ALTER\s+(TABLE|PROCEDURE)|CREATE\s+(OR\s+ALTER\s+)?PROCEDURE)",
+    r"ALTER\s+(TABLE|PROCEDURE)|CREATE\s+(OR\s+ALTER\s+)?PROCEDURE"
+    # Who may do what, and who can log in: the same review.
+    r"|(?:GRANT|REVOKE)\s+[\w, ()]+\s+ON\s+[\w.*\"` ]+\s+(?:TO|FROM)\b"
+    r"|(?:ALTER|CREATE)\s+(?:USER|ROLE)\s+[\w\"`'@%]+)",
     re.I,
 )
 # A stored procedure — but `exec` is also every shell's, VM's and container
@@ -620,6 +642,37 @@ def _root_reach(word):
     return None
 
 
+# A search through the whole home folder, every home, or the disk reads
+# every key and token in it: `grep -rA40 OPENSSH ~` prints the private
+# keys, and read SAFE, because no single secret store is named
+# (2026-11-16 review). grep reads hidden folders when it recurses;
+# ripgrep and ag only when told to.
+_GREPS = frozenset("grep egrep fgrep zgrep rgrep ggrep".split())
+_HIDDEN_ON_REQUEST = frozenset(("rg", "ag"))
+_HIDDEN_FLAGS = frozenset(("--hidden", "-.", "--no-ignore", "--unrestricted"))
+
+
+def _is_everything(word):
+    """The home folder, the folder of every home, or the root."""
+    return (_is_home(word) or _root_reach(word) == Reach.MACHINE
+            or word.strip("'\"") in ("/", "//", "/*"))
+
+
+def _searches_every_file(token, segment):
+    words = _tokens(segment)[1:]
+    if not any(_is_everything(w) for w in words if not w.startswith("-")):
+        return False
+    flags = [w for w in words if w.startswith("-")]
+    if token in _GREPS:
+        return token == "rgrep" or any(
+            f in ("--recursive", "--dereference-recursive")
+            or (not f.startswith("--") and ("r" in f or "R" in f)) for f in flags)
+    if token in _HIDDEN_ON_REQUEST:
+        return any(f in _HIDDEN_FLAGS or re.fullmatch(r"-[A-Za-z]*u[A-Za-z]*", f)
+                   for f in flags)
+    return False
+
+
 def _joined_verb(word, own):
     """The effect of a verb joined to its object: AWS spells every action
     `terminate-instances`, `delete-stack`, so none of them matched the
@@ -756,7 +809,11 @@ _PIP_READ_ONLY = frozenset("list show freeze --version".split())
 _FLY_READ_ONLY = frozenset("status logs list info version".split())
 
 VERB_TOOLS_READ_ONLY = {
-    "gh": frozenset("browse search view list diff checks status".split()),
+    # gh's own top-level commands only. `view`, `list`, `diff` and `checks`
+    # were here and are not gh commands, so `gh diff` runs whatever alias
+    # or extension carries that name, and read SAFE (2026-11-16 review).
+    # `gh pr view` and its kin are in SUBCOMMAND_SECOND_LEVEL.
+    "gh": frozenset("browse search status".split()),
     "simctl": frozenset("list get_app_container getenv".split()),
     # cms and export are NOT here: `security cms -S` signs with a keychain
     # identity and `security export -t privKeys` dumps private keys — the
@@ -828,11 +885,23 @@ SUBCOMMAND_SECOND_LEVEL = {
 # (gh accepts the attached -XDELETE form) and the value may be quoted — OR
 # when any field argument is present: gh flips the default method to POST
 # the moment a body field is given, no -X required.
-GH_API_MUTATING = re.compile(
-    r"(^|\s)(-X|--method)(\s+|=)?[\"']?(POST|PUT|PATCH|DELETE)"
-    # A field switches the request to POST, its value attached or not:
-    # `-ftitle=x` is a POST as surely as `-f title=x`.
-    r"|(^|\s)(-[fF]|--field|--raw-field|--input)", re.I)
+#
+# The method is read the other way round since the 2026-11-16 review: only
+# a literal GET is a read. Looking for POST, PUT, PATCH or DELETE written
+# plainly left `-X "DEL"ETE` and `-X ${M:-DELETE}` SAFE, and with a token
+# that may delete repositories that deletes one.
+GH_API_METHOD = re.compile(r"(?:^|\s)(?:-X|--method)(?:\s+|=)?(?P<method>\S*)")
+# A field switches the request to POST, its value attached or not:
+# `-ftitle=x` is a POST as surely as `-f title=x`.
+GH_API_FIELDS = re.compile(r"(^|\s)(-[fF]|--field|--raw-field|--input)")
+
+
+def _gh_api_mutates(segment):
+    if GH_API_FIELDS.search(segment):
+        return True
+    # As gh receives it: the shell has dropped the quotes by then.
+    return any(found.group("method").upper() != "GET"
+               for found in GH_API_METHOD.finditer(_QUOTING.sub("", segment)))
 
 
 def _subcommand_risk(segment, token):
@@ -866,7 +935,7 @@ def _subcommand_risk(segment, token):
         return None
     first = words[0]
     if token == "gh" and first == "api":
-        if GH_API_MUTATING.search(segment):
+        if _gh_api_mutates(segment):
             return None
         return ("read-only-tool", Risk.SAFE)
     pair = SUBCOMMAND_SECOND_LEVEL.get((token, first))
@@ -888,14 +957,24 @@ GIT_MEDIUM = frozenset(
 )
 
 # (rule_id, pattern, risk) applied to the whole command line.
+# What may stand between a pipe and the interpreter it feeds: words that
+# pass their arguments on, and the interpreter's own folder. `| /bin/sh`
+# and `| env bash` read MEDIUM beside `| sh`'s CRITICAL (2026-11-16 review).
+# A folder is a path as the shell would take one (`/bin/`, `./`, `~/x/`):
+# anything looser took the `|^/bin/bash` of a quoted search pattern for a
+# pipe (seen on a real command while checking this change).
+_FOLDER = r"(?:(?:~|\.{1,2})?/(?:[\w.+-]+/)*)?"
+_PIPED_INTO = r"(?:(?:sudo|" + _FOLDER + r"env|command|exec|nohup)\s+)*" + _FOLDER
+
 WHOLE_LINE_RULES = [
     # `|&` pipes stderr too, and is as much a pipe into a shell.
-    ("pipe-to-shell", re.compile(r"\|&?\s*(sudo\s+)?(ba|z|k|fi|da)?sh\b"), Risk.CRITICAL),
+    ("pipe-to-shell", re.compile(r"\|&?\s*" + _PIPED_INTO + r"(ba|z|k|fi|da|c|tc)?sh\b"),
+     Risk.CRITICAL),
     # The same thing through another interpreter, or through a
     # substitution a shell then runs: `curl … | python3`,
     # `sh -c "$(curl …)"`, `bash <(curl …)` all read MEDIUM (2026-09-30).
     ("fetch-and-run",
-     re.compile(r"\b(curl|wget)\b[^;&]*\|\s*(sudo\s+)?"
+     re.compile(r"\b(curl|wget)\b[^;&]*\|\s*" + _PIPED_INTO +
                 r"(python[\d.]*|node|perl|ruby|php|osascript)\b"
                 r"|(\b((ba|z|k|da)?sh|eval|source)|(^|\s)\.)\s[^;|]*"
                 r"(\$\(|<\(|`)\s*(curl|wget)\b"), Risk.CRITICAL),
@@ -905,7 +984,10 @@ WHOLE_LINE_RULES = [
     # Any `>` that is not a descriptor copy (`2>&1`, `>&2`) or /dev/null.
     # The lookbehind used to skip every `>` after a digit, which took
     # `1> ~/.zshrc` and `2> f` for `2>&1` and left them SAFE (2026-09-30).
-    ("redirect-write", re.compile(r"(?<![<>])>>?(?!\s*(&[\d-]|/dev/null\b))"), Risk.MEDIUM),
+    # `<>` opens its file for reading AND writing, and writes from the
+    # first byte: `cat payload 1<>~/.zshrc` was SAFE because the lookbehind
+    # skipped a `>` after `<` as well as after `>` (2026-11-16 review).
+    ("redirect-write", re.compile(r"(?<!>)>>?(?!\s*(&[\d-]|/dev/null\b))"), Risk.MEDIUM),
 ]
 
 # Commands that run the project's tests — which is to say, run code.
@@ -915,6 +997,13 @@ TEST_RUNNER = re.compile(
 
 # (rule_id, pattern, risk) applied per segment.
 SEGMENT_RULES = [
+    # gh's way to give a name to a shell command, as git's `!` alias is,
+    # and its way to install somebody's program under a gh name.
+    ("gh-shell-alias",
+     re.compile(r"\bgh\s+alias\s+(set|import)\b[^|;&]*(\s--shell\b|\s-s\b|\s[\"']?!)"),
+     Risk.CRITICAL),
+    ("gh-extension-install",
+     re.compile(r"\bgh\s+ext(ension)?\s+(install|upgrade|exec)\b"), Risk.HIGH),
     ("disk-overwrite", re.compile(r"\bdd\b[^|;&]*\bof=/dev/"), Risk.CRITICAL),
     ("format-disk", re.compile(r"\bmkfs(\.\w+)?\b"), Risk.CRITICAL),
     ("raw-device-write", re.compile(r">\s*/dev/(sd|nvme|disk|hd)"), Risk.CRITICAL),
@@ -1360,6 +1449,16 @@ def _unwrapped(segment):
     return None
 
 
+# kubectl flags that turn a read into something else: a raw API path, a
+# server or credentials other than the configured ones (the login token goes
+# to whoever `--server` names), and a kubeconfig, which names a program
+# kubectl runs to fetch credentials.
+_KUBE_REACH_FLAGS = re.compile(
+    r"(^|\s)(--raw|-s|--server|--kubeconfig|--token|--as|--as-group|--as-uid|--user"
+    r"|--username|--password|--client-key|--client-certificate|--certificate-authority"
+    r"|--insecure-skip-tls-verify|--tls-server-name|--proxy-url|--cache-dir)(=|\s|$)").search
+
+
 # Read-only tools with a spelling that writes a file or runs a command,
 # each a test that takes the segment. Checked before the tool is waved
 # through as a read: each of these read SAFE until 2026-09-25, and --quiet
@@ -1370,7 +1469,9 @@ READ_TOOL_ESCAPES = {
                       # -E/--exec and -l/--load as much as -f and -i.
                       r"|(^|\s)(-[fiEl]\s*\S|--file\b|--include\b|--exec\b|--load\b)"
                       r"|@include\b|@load\b").search,
-    "rg": re.compile(r"(^|\s)--pre(=|\s)").search,
+    # --pre runs a program per file; --hostname-bin runs one to learn the
+    # machine's name for hyperlinks (ripgrep 14; 2026-11-16 review).
+    "rg": re.compile(r"(^|\s)--(pre|hostname-bin)(=|\s)").search,
     "find": re.compile(r"(^|\s)-(fprint0?|fprintf|fls)(\s|$)").search,
     "tree": re.compile(r"(^|\s)(-o|--output)(\s|=)").search,
     # -o alone, attached (`-ofile`) or in a cluster (`-uo file`).
@@ -1378,8 +1479,15 @@ READ_TOOL_ESCAPES = {
     # fd runs a command per match (`-x`) or per batch (`-X`).
     "fd": re.compile(r"(^|\s)(-[A-Za-z]*[xX]|--exec|--exec-batch)(\s|=|$)").search,
     # sed's own commands write (`w file`, `s/a/b/w file`) and run (`e`).
-    "sed": re.compile(r"(^|\s)--in-place\b|(^|[\s;{}'\"/\d$])[wW]\s+\S"
-                      r"|(^|[\s;{}'\"/\d$])e(\s|['\";]|$)"
+    # `!` negates an address and stands before the command: `$!e sh x`.
+    "sed": re.compile(r"(^|\s)--in-place\b|(^|[\s;{}'\"/\d$!])[wW]\s+\S"
+                      r"|(^|[\s;{}'\"/\d$!])e(\s|['\";]|$)"
+                      # The same two as flags of `s`, after other flags:
+                      # `s/a/b/pw file` writes and `s/a/b/ge` runs each
+                      # line as a command. Only a `w` or `e` right after
+                      # the last delimiter was seen (2026-11-16 review).
+                      r"|(?<![A-Za-z])s(?P<d>[^\sA-Za-z0-9\\])(?:\\.|(?!(?P=d)).)*(?P=d)"
+                      r"(?:\\.|(?!(?P=d)).)*(?P=d)[gpiImM0-9]*[wWe]"
                       # A script file holds the same commands, unseen.
                       r"|(^|\s)(-[A-Za-z]*f|--file\b)").search,
     # A config file names plugins, and both import them.
@@ -1390,6 +1498,9 @@ READ_TOOL_ESCAPES = {
                        r"|[a-z-]+-report)\b").search,
     "flake8": re.compile(r"(^|\s)--(config|append-config|output-file)\b").search,
     "bat": re.compile(r"(^|\s)--pager(=|\s)").search,
+    # `kubectl get` read SAFE whatever followed it (2026-11-16 review).
+    "kubectl": _KUBE_REACH_FLAGS,
+    "oc": _KUBE_REACH_FLAGS,
     # Setting the clock or the machine's name, not reading them.
     "date": re.compile(r"(^|\s)(-s|--set)\b|(^|\s)\d{6,}(\s|$)").search,
     "hostname": lambda segment: any(not w.startswith("-") for w in _tokens(segment)[1:]),
@@ -1417,7 +1528,11 @@ _BRACES = re.compile(r"\{([^{}\s]*,[^{}\s]*)\}")
 _BRACE_SPELLINGS = 32
 _CHANGES_FOLDER = frozenset(("cd", "pushd"))
 _RELATIVE_NAME = re.compile(r"[\w.][\w.@%+/-]*")
-_KUBE_SECRET = re.compile(r"(?:^|[\s,])secrets?(?:\.[\w.-]*)?(?:/|,)|,secrets?(?=\s|$)", re.I)
+_KUBE_SECRET = re.compile(r"(?:^|[\s,])secrets?(?:\.[\w.-]*)?(?:/|,)|,secrets?(?=\s|$)"
+                          # In an API path (`get --raw …/secrets/db`), and as
+                          # a word once the shell's quotes are gone
+                          # (`get se""cret db`): 2026-11-16 review.
+                          r"|/secrets?(?=/|\s|$)|(?:^|\s)secrets?(?=\s|$)", re.I)
 
 
 def _plain_path(text):
@@ -1528,6 +1643,30 @@ CREDENTIAL_READS = re.compile(
 
 
 _QUOTING = re.compile(r"['\"\\]")
+
+
+_BARE_WORD = re.compile(r"[\w-]+")
+
+
+def _bare_verbs(segment):
+    """The segment with its subcommand as the program receives it. The
+    shell drops quotes, so `git remote "set-url" origin …` retargets the
+    remote and `kubectl "delete" ns prod` deletes it; every word test here
+    matched the quoted spelling, and they read SAFE and MEDIUM (2026-11-16
+    review). Only the first two words after the command, before any flag,
+    and only a single word with its quotes closed: a commit message, a
+    search pattern and a read tool's arguments are data, and stay as
+    written."""
+    words = _tokens(segment)
+    for word in words[1:3]:
+        if word.startswith("-"):
+            break
+        if not _QUOTING.search(word) or word.count('"') % 2 or word.count("'") % 2:
+            continue
+        bare = _QUOTING.sub("", word)
+        if _BARE_WORD.fullmatch(bare):
+            segment = segment.replace(word, bare, 1)
+    return segment
 
 
 def _bare_flags(segment):
@@ -1649,6 +1788,12 @@ def _classify_bash(command, _depth, fragment=False):
 
         segment = _bare_flags(segment)
         token = os.path.basename(_first_token(segment)).lower()
+        # Only for a program the tables know. A line of code inside a
+        # here-document is split into segments too, and `func delete\(` or
+        # `action === 'remove-plan'` is not a subcommand: de-quoting those
+        # raised 19 real commands for nothing while this was being checked.
+        if token == "git" or token in TOOL_REACH or token in TOOL_EFFECT_WORDS:
+            segment = _bare_verbs(segment)
 
         escape = READ_TOOL_ESCAPES.get(token)
         if escape is not None and escape(segment):
@@ -1669,9 +1814,11 @@ def _classify_bash(command, _depth, fragment=False):
 
         if CREDENTIAL_READS.search(segment):
             bump("credential-read", Risk.HIGH)
+        if _searches_every_file(token, segment):
+            bump("home-wide-search", Risk.HIGH)
         # kubectl's `kind/name` and `kind,kind`: the word `secret` joined to
         # a neighbour the word list never splits on.
-        if token in ("kubectl", "oc") and _KUBE_SECRET.search(segment):
+        if token in ("kubectl", "oc") and _KUBE_SECRET.search(_QUOTING.sub("", segment)):
             bump("secret-access", Risk.HIGH)
 
         # The effect the words name, before any table gets to recognise the
@@ -1823,11 +1970,19 @@ def _read_tool_risk(tool, tool_input):
     Grep's pattern is what it searches for, not where, so only Glob's
     counts; Grep's `glob` is where, and read SAFE until the 2026-11-01
     review (`glob: ".aws/*"`)."""
-    keys = ("file_path", "notebook_path", "path", "glob") + (("pattern",) if tool == "Glob" else ())
+    # `uri`: ReadMcpResourceTool's `file:///…/.ssh/id_rsa` read SAFE
+    # (2026-11-16 review).
+    keys = (("file_path", "notebook_path", "path", "glob", "uri")
+            + (("pattern",) if tool == "Glob" else ()))
     for key in keys:
         value = tool_input.get(key)
         if isinstance(value, str) and _names_a_secret_path(value):
             return Risk.HIGH, ["secret-read"]
+    # Grep reads what it searches, hidden folders included: the whole home
+    # folder is every secret in it (2026-11-16 review). Glob lists names.
+    where = tool_input.get("path")
+    if tool == "Grep" and isinstance(where, str) and _is_everything(where.strip()):
+        return Risk.HIGH, ["home-wide-search"]
     return Risk.SAFE, ["read-only-tool"]
 
 
@@ -1919,9 +2074,10 @@ def _mcp_risk(tool):
     words = [w for w in _MCP_WORDS.split(_MCP_CAMEL.sub("_", name).lower()) if w]
     if not words:
         return Risk.MEDIUM, ["mcp-unknown"]
-    # `search_and_delete` does both: every verb a name chains counts.
+    # `search_and_delete` does both: every verb a name chains counts, and
+    # `get_or_create` creates (2026-11-16 review: "or" was not a chain).
     verbs = [words[0]] + [words[i + 1] for i in range(len(words) - 1)
-                          if words[i] in ("and", "then")]
+                          if words[i] in ("and", "then", "or")]
     effects = [effect for effect in map(_mcp_verb_effect, verbs) if effect is not None]
     effect = max(effects) if effects else None
     secret = _words_name_a_secret(words)
@@ -1999,11 +2155,21 @@ def _patch_risk(patch, cwd):
     return _scan_content(added, risk, rules)
 
 
+_READ_VERB_ENDINGS = ("", "s", "es", "ing", "ed")
+
+
 def _mcp_verb_effect(verb):
     effect = MCP_EFFECT.get(verb)
     if effect is None:
-        effect = next((MCP_EFFECT[v] for v in _MCP_VERB_PREFIXES
-                       if verb.startswith(v)), None)
+        found = next((v for v in _MCP_VERB_PREFIXES if verb.startswith(v)), None)
+        if found is None:
+            return None
+        effect = MCP_EFFECT[found]
+        # A prefix may make a word a write (`setup_webhook`), never a
+        # read: `countersign_envelope` is not a count, and read LOW
+        # (2026-11-16 review). A read is its own word, or an inflection.
+        if effect is Effect.OBSERVE and verb[len(found):] not in _READ_VERB_ENDINGS:
+            return None
     return effect
 
 
@@ -2076,6 +2242,14 @@ def classify(event):
         if risk < Risk.HIGH and any(_path_like(v) and _names_a_secret_path(v)
                                     for v in _strings_in(tool_input)):
             risk, rules = Risk.HIGH, rules + ["secret-read"]
+        # A read that goes to an address it is handed is WebFetch by
+        # another name, and WebFetch is MEDIUM: `mcp__fetch__fetch` with
+        # any URL read LOW (2026-11-16 review).
+        if risk < Risk.MEDIUM and any(
+                isinstance(tool_input.get(key), str)
+                and re.match(r"https?://", tool_input[key].strip(), re.I)
+                for key in ("url", "uri", "href", "link")):
+            risk, rules = Risk.MEDIUM, rules + ["network-egress"]
     elif not tool:
         risk, rules = Risk.MEDIUM, ["missing-tool-name"]
     else:
