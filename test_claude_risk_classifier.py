@@ -4097,7 +4097,26 @@ class TestCodexThreads:
         assert second["reset"] is False
         assert cx.thread_info(str(path), second["mark"])["turns"] == []
         cx._THREADS.pop(str(path))
-        assert cx.thread_info(str(path), first["mark"])["turns"] == second["turns"]
+        # A relay that has just started answers with a fresh start (#1425);
+        # the turns keep the numbers they had.
+        after_restart = cx.thread_info(str(path), first["mark"])
+        assert after_restart["reset"] is True
+        assert after_restart["turns"][-1] == second["turns"][0]
+        assert [t["text"] for t in after_restart["turns"]] == ["Hello", "Héllo"]
+
+    def test_a_relay_just_started_has_each_watch_start_over_once(self, tmp_path):
+        import codex_sessions as cx
+        path = tmp_path / "rollout.jsonl"
+        path.write_text(self._message("user", "Hello") + self._message("assistant", "Hi"))
+        mark = cx.thread_info(str(path), 0, caller="watch-a")["mark"]
+        assert cx.thread_info(str(path), mark, caller="watch-a")["reset"] is False
+        cx._THREADS.pop(str(path))                           # the relay restarts
+        fresh = cx.thread_info(str(path), mark, caller="watch-a")
+        assert fresh["reset"] is True and [t["text"] for t in fresh["turns"]] == ["Hello", "Hi"]
+        again = cx.thread_info(str(path), mark, caller="watch-a")
+        assert again["reset"] is False and again["turns"] == []
+        assert cx.thread_info(str(path), mark, caller="watch-b")["reset"] is True
+        assert cx.thread_info(str(path), mark, caller="watch-b")["reset"] is False
 
     def test_tool_receipts_and_turn_end_control_activity(self, tmp_path):
         import codex_sessions as cx
@@ -4167,7 +4186,11 @@ class TestCodexThreads:
         assert news["reset"] is False
         assert cx.thread_info(str(path), news["mark"])["turns"] == []
         cx._THREADS.pop(str(path))
-        assert cx.thread_info(str(path), first["mark"])["turns"] == news["turns"]
+        # A relay that has just started answers with a fresh start (#1425);
+        # the merged row is the same row, under the number it had.
+        after_restart = cx.thread_info(str(path), first["mark"])
+        assert after_restart["reset"] is True
+        assert after_restart["turns"][-1:] == news["turns"]
 
     def test_unknown_and_wrapper_calls_share_one_private_counted_summary(self, tmp_path):
         import codex_sessions as cx
@@ -4974,6 +4997,26 @@ class TestAStaleTapLands:
         assert self._decide(base, device, "0123456789ab") == (200, {"ok": True})
         assert self._decide(base, device, "0123456789ab") == (
             200, {"ok": False, "reason": "answered-here"})
+
+    def test_the_reason_is_there_the_moment_the_card_stops_waiting(self, monkeypatch):
+        """The card left the waiting list in one step and its reason was
+        written in a later one, so a second tap landing between the two got
+        no reason at all: on 2026-11-18 the test above failed once in five
+        runs on main. Looked at from exactly that gap, where the relay
+        writes its "left" line."""
+        queue = watch_relay.CardQueue()
+        seen = []
+
+        def said(*args, **kwargs):
+            if args and str(args[0]).startswith("relay: left"):
+                seen.append((queue.left_because("0123456789ab"),
+                             "0123456789ab" in [c.get("id") for c in queue.pending()]))
+        monkeypatch.setattr(watch_relay, "print", said, raising=False)
+        self._queued(queue, dict(self.CARD, post_id="0123456789ab"), wait=30)
+        _wait_until(queue.pending, what="the card")
+        assert queue.decide("0123456789ab", "allow") is True
+        _wait_until(lambda: seen, what="the card to leave")
+        assert seen == [("answered-here", False)]
 
     def test_a_retracted_native_card_was_answered_elsewhere(self):
         queue = watch_relay.CardQueue()
@@ -18700,9 +18743,12 @@ class TestTapprovalIsDescribedOneWay:
         text = " ".join(self._read(*parts).replace(">", " ").split())
         assert self.IDENTITY.lower() in text.lower(), parts
 
+    # Not the store listing since 2026-11-18 (#1433, the owner's call): its
+    # visible opening shows the waiting agent with examples instead of
+    # repeating this line, which the promotional text above it carries in
+    # its own words. It still opens with the identity sentence, held above.
     @pytest.mark.parametrize("parts", [("helper", "docs", "index.html"), ("helper", "docs", "llms.txt"),
-                                       ("helper", "README.md"), ("README.md",),
-                                       ("WatchApp", "asc", "asc_write_meta.py")])
+                                       ("helper", "README.md"), ("README.md",)])
     def test_and_what_it_does_in_the_same_words(self, parts):
         text = " ".join(self._read(*parts).replace(">", " ").split())
         assert self.DOES.lower() in text.lower(), parts
@@ -19162,6 +19208,115 @@ class TestTheSiteHasOnePageFrame:
         assert "</strong></a><nav>n</nav></header>" in out
         assert '<main class="policy">\n<p>body</p>\n</main>' in out
         assert "<footer><p>foot</p></footer>" in out
+
+
+class TestTheReleaseWritesTheWebsite:
+    """The website moved to its own repository, a Lovable project
+    (Thoughtful-Steward/tapproval-site, #1428). Its changelog and privacy
+    pages are still written by the release: sync-site.sh carries them, and
+    the sitemap, over at every sync. Run for real here against a throwaway
+    site repository, with bun kept off PATH."""
+
+    IDENTITY = "Tapproval <99010972+marcobelini@users.noreply.github.com>"
+
+    @staticmethod
+    def _script(name):
+        path = os.path.join(_ROOT, name)
+        if not os.path.isfile(path):
+            pytest.skip("%s lives in the product repo only" % name)
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def _setup(self, tmp_path):
+        env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+                   PATH="/usr/bin:/bin", HOME=str(tmp_path))
+        def git(cwd, *a):
+            return subprocess.run(("git",) + a, cwd=cwd, env=dict(
+                env, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid"),
+                check=True, capture_output=True, text=True).stdout
+        product = tmp_path / "product"
+        (product / "helper" / "docs").mkdir(parents=True)
+        (product / "sync-site.sh").write_text(self._script("sync-site.sh"))
+        (product / "sync-site.sh").chmod(0o755)
+        for name in ("changelog.html", "privacy.html", "sitemap.xml"):
+            (product / "helper" / "docs" / name).write_text("<p>%s one</p>\n" % name)
+        git(product, "init", "-q", "-b", "main")
+        git(product, "add", "-A")
+        git(product, "commit", "-q", "-m", "product")
+        work = tmp_path / "site-work"
+        (work / "scripts").mkdir(parents=True)
+        (work / "src" / "content" / "pages").mkdir(parents=True)
+        (work / "public").mkdir()
+        # The import script turns a page into a content file; this one
+        # writes its arguments and the page, which is all the test needs.
+        (work / "scripts" / "import_page.py").write_text(
+            "import sys\nprint(sys.argv[1:], open(sys.argv[1]).read())\n")
+        (work / "README.md").write_text("site\n")
+        (work / "src" / "content" / "pages" / "changelog.ts").write_text("old\n")
+        (work / "src" / "content" / "pages" / "privacy.ts").write_text("old\n")
+        (work / "public" / "sitemap.xml").write_text("old\n")
+        git(work, "init", "-q", "-b", "main")
+        git(work, "add", "-A")
+        git(work, "commit", "-q", "-m", "site")
+        bare = tmp_path / "site.git"
+        git(tmp_path, "clone", "-q", "--bare", str(work), str(bare))
+        env["SITE_REPO"] = str(bare)
+        return product, bare, env, git
+
+    def _run(self, product, env, *args):
+        return subprocess.run([str(product / "sync-site.sh"), "--rendered"] + list(args),
+                              env=env, capture_output=True, text=True, timeout=60)
+
+    def test_it_pushes_the_three_pages_with_the_projects_name(self, tmp_path):
+        product, bare, env, git = self._setup(tmp_path)
+        done = self._run(product, env)
+        assert done.returncode == 0, done.stderr
+        assert "bun not found" in done.stderr, "a push without the site's tests must say so"
+        log = git(bare, "log", "-1", "--format=%an <%ae>|%cn <%ce>", "main")
+        assert log == "%s|%s\n" % (self.IDENTITY, self.IDENTITY)
+        files = git(bare, "show", "--name-only", "--format=", "main").split()
+        assert sorted(files) == ["public/sitemap.xml", "src/content/pages/changelog.ts",
+                                 "src/content/pages/privacy.ts"]
+        changelog = git(bare, "show", "main:src/content/pages/changelog.ts")
+        assert "/changelog.html" in changelog and "changelog.html one" in changelog
+
+    def test_nothing_new_is_no_commit(self, tmp_path):
+        product, bare, env, git = self._setup(tmp_path)
+        assert self._run(product, env).returncode == 0
+        before = git(bare, "rev-parse", "main")
+        again = self._run(product, env)
+        assert again.returncode == 0 and "already current" in again.stdout
+        assert git(bare, "rev-parse", "main") == before
+
+    def test_check_pushes_nothing(self, tmp_path):
+        product, bare, env, git = self._setup(tmp_path)
+        before = git(bare, "rev-parse", "main")
+        checked = self._run(product, env, "--check")
+        assert checked.returncode == 0 and "would change" in checked.stdout
+        assert git(bare, "rev-parse", "main") == before
+
+    def test_a_missing_page_writes_nothing(self, tmp_path):
+        product, bare, env, git = self._setup(tmp_path)
+        before = git(bare, "rev-parse", "main")
+        (product / "helper" / "docs" / "privacy.html").write_text("")
+        failed = self._run(product, env)
+        assert failed.returncode == 1 and "privacy.html" in failed.stderr
+        assert git(bare, "rev-parse", "main") == before
+
+    def test_it_never_force_pushes_the_shared_history(self):
+        script = self._script("sync-site.sh")
+        pushes = [line for line in script.splitlines() if "push" in line and "git" in line]
+        assert pushes, "the script pushes somewhere"
+        assert not any("--force" in line or re.search(r"\s-f\b", line) or "+HEAD" in line
+                       for line in pushes), pushes
+
+    def test_the_sync_runs_it_after_the_helper_is_out_and_in_check(self):
+        sync = self._script("sync-helper.sh")
+        after_push = sync.index('git -C "$CLONE" push -q origin main')
+        assert sync.index("./sync-site.sh --rendered ||", after_push) > after_push
+        check = sync.index('echo "would sync (--check: nothing pushed):"')
+        assert sync.index("./sync-site.sh --rendered --check", check) < sync.index("exit 0", check)
 
 
 class TestTheSyncRefusesAStalePage:
@@ -26909,6 +27064,50 @@ class TestTheWatchCatchesUp:
         turns, _, _, _, reset = watch_dashboard.thread_after(path, mark)
         assert not reset
         assert [t["text"] for t in turns] == ["answer %d" % n for n in range(40)]
+
+    def test_a_relay_just_started_has_each_watch_start_over_once(self, thread):
+        """After a helper update the watch kept the turns the old helper had
+        read: pictures Claude sent showed only once the app was restarted
+        (2026-11-17, #1425). A watch asks from where it had read to; the
+        new relay cannot know what the old one told it, so its first answer
+        to each watch about a thread is a fresh start."""
+        path, say = thread
+        say("user", "go")
+        say("assistant", "an answer the old helper read another way")
+        _, _, _, mark, _ = watch_dashboard.thread_after(path, 0, caller="watch-a")
+        watch_dashboard._THREAD_STATE.pop(path, None)       # the relay restarts
+        turns, _, _, again, reset = watch_dashboard.thread_after(path, mark, caller="watch-a")
+        assert reset and again == mark
+        assert [t["text"] for t in turns] == ["go", "an answer the old helper read another way"]
+        turns, _, _, _, reset = watch_dashboard.thread_after(path, mark, caller="watch-a")
+        assert not reset and turns == [], "only once: the second look is what is new"
+
+    def test_a_second_watch_starts_over_too(self, thread):
+        path, say = thread
+        say("user", "go")
+        _, _, _, mark, _ = watch_dashboard.thread_after(path, 0, caller="watch-a")
+        watch_dashboard._THREAD_STATE.pop(path, None)
+        assert watch_dashboard.thread_after(path, mark, caller="watch-a")[4]
+        assert watch_dashboard.thread_after(path, mark, caller="watch-b")[4]
+        assert not watch_dashboard.thread_after(path, mark, caller="watch-b")[4]
+        assert not watch_dashboard.thread_after(path, mark, caller="watch-a")[4]
+
+    def test_a_first_look_counts_as_the_start_over(self, thread):
+        path, say = thread
+        say("user", "go")
+        _, _, _, mark, reset = watch_dashboard.thread_after(path, 0, caller="watch-a")
+        assert reset
+        say("assistant", "new")
+        turns, _, _, _, reset = watch_dashboard.thread_after(path, mark, caller="watch-a")
+        assert not reset and [t["text"] for t in turns] == ["new"]
+
+    def test_the_callers_remembered_are_bounded(self, thread, monkeypatch):
+        path, say = thread
+        say("user", "go")
+        monkeypatch.setattr(watch_dashboard, "THREAD_CALLERS_KEPT", 3)
+        for n in range(8):
+            watch_dashboard.thread_after(path, 0, caller="watch-%d" % n)
+        assert len(watch_dashboard._THREAD_STATE[path]["greeted"]) == 3
 
     def test_the_old_window_did_lose_them(self, thread):
         """The positive control: the window the App Store's watches read

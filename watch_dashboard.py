@@ -2456,7 +2456,8 @@ def _fresh_thread_state():
             "wake_at": None,
             "github": None,
             "last_said": None, "floor": 0, "merged": [],
-            "result": None, "result_at": 0.0, "limit": None}
+            "result": None, "result_at": 0.0, "limit": None,
+            "greeted": OrderedDict()}
 
 
 def _parse_thread(path, limit):
@@ -2688,7 +2689,33 @@ THREAD_FIRST_LOOK = 40
 THREAD_CATCH_UP = 60
 
 
-def thread_after(path, mark):
+# How many callers a thread remembers having answered. A person has a watch
+# or two; past this the oldest is forgotten and simply starts over once more.
+THREAD_CALLERS_KEPT = 16
+
+
+def first_ask(state, caller):
+    """Is this ``caller``'s first question about a thread since its state
+    was made, which is to say since this relay started (or the transcript
+    was rewritten)? Notes the caller either way.
+
+    A watch asks from the byte it had read to, and keeps the turns it was
+    given before. A relay that has just replaced an older one may read
+    those same lines differently, and the watch would never ask for them
+    again: after helper 1.1.127 the pictures Claude had sent showed only
+    once the app was restarted (#1425). So the first answer to each caller
+    is a fresh start. ``caller`` is the device's id, or "" when the relay
+    does not know it; all such callers share one turn."""
+    greeted = state.setdefault("greeted", OrderedDict())
+    first = caller not in greeted
+    greeted[caller] = None
+    greeted.move_to_end(caller)
+    while len(greeted) > THREAD_CALLERS_KEPT:
+        greeted.popitem(last=False)
+    return first
+
+
+def thread_after(path, mark, caller=""):
     """What a watch that has read the transcript up to byte ``mark`` has
     not seen -> (turns, running, running_tool, mark, reset).
 
@@ -2699,8 +2726,9 @@ def thread_after(path, mark):
     began at or after ``mark``, each carrying ``n``, its number; the watch
     puts each one where its number says. ``mark`` in the reply is where to
     ask from next. ``reset`` says the turns are a fresh start, not an
-    addition: a first look (``mark`` 0), a file that was rewritten, or a
-    watch so far behind that what it missed is gone. Never raises.
+    addition: a first look (``mark`` 0), a file that was rewritten, a
+    watch so far behind that what it missed is gone, or ``caller``'s first
+    question to a relay that has just started (`first_ask`). Never raises.
     """
     with _thread_lock(path):
         try:
@@ -2709,7 +2737,8 @@ def thread_after(path, mark):
             return [], 0, None, mark, False
         state = _thread_state_for(path)
         merged, now = state["merged"], state["offset"]
-        if mark <= 0 or mark > now or mark < state["floor"]:
+        first = first_ask(state, caller)
+        if first or mark <= 0 or mark > now or mark < state["floor"]:
             turns = _keep_what_was_said(merged, state["last_said"], THREAD_FIRST_LOOK)
             return turns, running, tool_now, now, True
         # Each raw turn from the mark on, and the merged turn it went into:

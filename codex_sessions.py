@@ -850,16 +850,18 @@ def _fold(state, row, number):
         state["last_said"] = turn
 
 
-def thread_info(path, mark=None, limit=14, card_waiting=False):
+def thread_info(path, mark=None, limit=14, card_waiting=False, caller=""):
     """The watch's existing thread wire shape, from complete rollout lines.
 
-    Byte marks and turn numbers survive relay restarts. Only appended lines
+    Byte marks and turn numbers survive relay restarts; a relay that has just
+    started still answers each caller's first question with a fresh start
+    (``watch_dashboard.first_ask``, #1425). Only appended lines
     are parsed on a warm poll; a replaced/shrunken file resets the thread.
     The cache and cold read are bounded, as for Claude's transcript reader.
     """
     from watch_dashboard import (THREAD_CATCH_UP, THREAD_FIRST_LOOK, THREAD_TURNS_HELD,
                                  THREAD_TURNS_KEPT, _keep_what_was_said, _read_appended,
-                                 _tail_start)
+                                 _tail_start, first_ask)
     reply = {"turns": [], "running_tasks": 0, "running_tool": None,
              "modified_seconds_ago": None, "state": "idle",
              "state_reason": "", "wake_at": None}
@@ -906,7 +908,8 @@ def thread_info(path, mark=None, limit=14, card_waiting=False):
         if mark is None:
             visible = _keep_what_was_said(turns, said, limit)
         else:
-            reset = replaced or mark <= 0 or mark > offset or mark < state["floor"]
+            first = first_ask(state, caller)
+            reset = first or replaced or mark <= 0 or mark > offset or mark < state["floor"]
             visible = (_keep_what_was_said(turns, said, THREAD_FIRST_LOOK) if reset
                        else [t for t in turns
                              if state["changed"].get(t["n"], t["n"]) >= mark])

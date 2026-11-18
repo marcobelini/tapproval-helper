@@ -1505,16 +1505,18 @@ class CardQueue:
             # "dont_ask" (the terminal's "don't ask again", from a watch that
             # showed its words) stays itself here: the hook writes the rule
             # into Claude Code, so the relay keeps no grant of its own.
-        if decision != "none":
-            reason = "answered-here"    # a tap that beat the probe to it
+            if decision != "none":
+                reason = "answered-here"    # a tap that beat the probe to it
+            # In the same step as the card leaving: written a moment later,
+            # a second tap landing in between was refused with no reason
+            # (seen once in five runs on main, 2026-11-18).
+            self._note_left(card_id, reason)
         # The other half of the "queued" line: how long a card stood on the
         # wrist and why it left. A prompt answered on the phone that is slow
         # to leave the watch is read off these two lines.
         print("relay: left %s %s after %dms" % (
             card_id, reason, int((time.monotonic() - started) * 1000)),
             file=sys.stderr)
-        with self._lock:
-            self._note_left(card_id, reason)
         return card_id, decision, answer
 
     # Why the last cards left, for a tap that arrives after: enough for
@@ -2454,11 +2456,15 @@ def _query_number(query, name, kind):
     return value if value == value and value >= 0 else None   # no NaN, no negatives
 
 
-def thread_news(path, mark, wait, still=lambda: True, reader=None):
+def thread_news(path, mark, wait, still=lambda: True, reader=None, caller=""):
     """``thread_after(path, mark)``, held up to ``wait`` seconds (at most
     THREAD_WAIT_MAX) while it has nothing to say and ``still()`` holds.
-    The thread's lock is taken per look, never across the wait."""
-    reader = reader or thread_after
+    The thread's lock is taken per look, never across the wait.
+    ``caller`` is who asks, for the fresh start a relay that has just
+    started owes each of them (`first_ask`)."""
+    if reader is None:
+        def reader(path, mark):
+            return thread_after(path, mark, caller=caller)
     news = reader(path, mark)
     if news[0] or news[4] or news[3] != mark or wait <= 0:
         return news
@@ -5164,6 +5170,11 @@ class RelayHandler(BaseHTTPRequestHandler):
         # newest 14 and is answered exactly as it always was.
         mark = _query_number(query, "after", int)
         news = None
+        # Which device asks: its id, never its key. "" when it has none (a
+        # watch before device keys, a test relay's loopback caller).
+        device = (self.auth.device_for(self._presented())
+                  if hasattr(self.auth, "device_for") else None)
+        caller = str((device or {}).get("id") or "")
 
         def card_is_waiting():
             return bool(session_id) and any(
@@ -5192,7 +5203,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     def codex_after(path, after):
                         nonlocal info
                         info = codex_sessions.thread_info(
-                            path, after, card_waiting=card_is_waiting())
+                            path, after, card_waiting=card_is_waiting(), caller=caller)
                         return (info["turns"], 0, info["running_tool"],
                                 info["mark"], info["reset"])
                     thread_news(rollout, mark,
@@ -5202,7 +5213,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     # A waiting card can arrive without a rollout append.
                     if card_is_waiting() != card_waiting:
                         fresh = codex_sessions.thread_info(
-                            rollout, mark, card_waiting=card_is_waiting())
+                            rollout, mark, card_waiting=card_is_waiting(), caller=caller)
                         fresh["reset"] = fresh["reset"] or info["reset"]
                         info = fresh
                 self._send_json(info)
@@ -5214,7 +5225,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             else:
                 wait = _query_number(query, "wait", float) or 0.0
                 news = thread_news(path_on_disk, mark, wait,
-                                   lambda: card_is_waiting() == card_waiting)
+                                   lambda: card_is_waiting() == card_waiting,
+                                   caller=caller)
                 turns, running, tool_now = news[:3]
                 card_waiting = card_is_waiting()
             try:
