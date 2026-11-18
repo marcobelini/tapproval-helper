@@ -406,19 +406,38 @@ def _read_database_catalog(open_paths=None):
         validated = _catalog_delivery_path(thread)
         if validated:
             paths[row["session_id"]] = validated
-    # File ownership can inform runtime activity only for existing catalog
-    # members; it cannot add a chat, revive an archived one or enable sends.
-    opened = (open_rollout_paths(list(paths.values())[:128]) if open_paths is None else open_paths)
-    for row in rows:
-        path = paths.get(row["session_id"])
-        if path and os.path.realpath(path) in opened:
-            info = thread_info(path)
-            row.update(live=True, state=info["state"], state_reason=info["state_reason"],
-                       running_tool=info["running_tool"])
+    _mark_open(rows, paths, open_paths)
     return rows, paths
 
 
-def _read_catalog(client_factory=None, endpoints=None, database_reader=None):
+def _mark_open(rows, paths, open_paths=None):
+    """A listed chat whose transcript a program holds open is open.
+
+    File ownership can inform runtime activity only for existing catalog
+    members; it cannot add a chat, revive an archived one or enable sends.
+    Codex Desktop opened the ordinary way keeps its chats on a server of its
+    own, so the shared one lists them as not loaded: on the owner's wrist
+    (2026-11-18) a chat busy in Desktop wore the moon.
+    """
+    asleep = [row for row in rows if not row["live"] and paths.get(row["session_id"])]
+    if not asleep:
+        return  # nothing to ask about: no process inspection at all
+    asleep = sorted(asleep, key=lambda row: -row["modified"])[:128]
+    opened = (open_rollout_paths([paths[row["session_id"]] for row in asleep])
+              if open_paths is None else open_paths)
+    opened = {os.path.realpath(path) for path in opened}
+    for row in asleep:
+        path = paths[row["session_id"]]
+        if os.path.realpath(path) in opened:
+            try:
+                info = thread_info(path)
+            except (OSError, ValueError, TypeError, KeyError):
+                continue  # an unreadable transcript proves nothing
+            row.update(live=True, state=info["state"], state_reason=info["state_reason"],
+                       running_tool=info["running_tool"])
+
+
+def _read_catalog(client_factory=None, endpoints=None, database_reader=None, open_paths=None):
     from codex_desktop import server_sockets
     from codex_talk import Client
     use_database = database_reader is not None or (client_factory is None and endpoints is None)
@@ -483,7 +502,11 @@ def _read_catalog(client_factory=None, endpoints=None, database_reader=None):
         if use_database:
             return (database_reader or _read_database_catalog)()
         raise OSError("Codex chat catalog is unavailable")
-    return sorted(rows.values(), key=lambda row: (-row["modified"], row["session_id"])), paths
+    listed = sorted(rows.values(), key=lambda row: (-row["modified"], row["session_id"]))
+    # Only the owner knows runtime state, and a Desktop opened the ordinary
+    # way is an owner this helper cannot ask.
+    _mark_open(listed, paths, open_paths)
+    return listed, paths
 
 
 # How long a chat Codex has just archived stays off the snapshot, whatever

@@ -3789,7 +3789,7 @@ class TestCodexCatalog:
                      "updatedAt": 100, "recencyAt": 200, "source": "appServer",
                      "status": {"type": "notLoaded"}, "canAcceptDirectInput": None}, **changes)
 
-    def read(self, pages):
+    def read(self, pages, open_paths=frozenset()):
         import codex_sessions as cx
         calls, closed = [], []
 
@@ -3804,7 +3804,7 @@ class TestCodexCatalog:
             def close(self):
                 closed.append(True)
 
-        rows, paths = cx._read_catalog(Client, ["fixture"])
+        rows, paths = cx._read_catalog(Client, ["fixture"], open_paths=open_paths)
         assert closed == [True]
         assert all(method == "thread/list" and params["useStateDbOnly"]
                    and params["archived"] is False for method, params in calls)
@@ -3814,6 +3814,48 @@ class TestCodexCatalog:
         rows, _, _ = self.read([{"data": [self.row()]}])
         assert rows[0]["title"] == "Phone name"
         assert rows[0]["state"] == "idle" and rows[0]["can_send"] is False
+
+    def desktop_chat(self, tmp_path, **changes):
+        """A chat the shared server lists but does not hold: Desktop's own."""
+        path = TestCodexActiveSessions()._rollout(tmp_path, session_id="catalog-0001")
+        return path, self.row(path=str(path), source="vscode", **changes)
+
+    def test_a_chat_open_in_desktop_is_open_on_the_wrist(self, tmp_path):
+        """2026-11-18, the owner's wrist: a chat busy in Codex Desktop wore
+        the moon, because Desktop opened the ordinary way keeps its chats
+        on a server of its own and the shared one calls them not loaded."""
+        path, thread = self.desktop_chat(tmp_path)
+        asleep, _, _ = self.read([{"data": [thread]}])
+        assert asleep[0]["live"] is False, "listed, and nothing holds it open"
+        rows, _, _ = self.read([{"data": [thread]}], open_paths={str(path)})
+        assert rows[0]["live"] is True and rows[0]["status"] == "Desktop"
+        assert rows[0]["state"] in ("idle", "running", "asking")
+        assert rows[0]["can_send"] == asleep[0]["can_send"], "seeing is not sending"
+
+    def test_a_chat_the_server_holds_is_not_read_from_its_file(self, tmp_path, monkeypatch):
+        import codex_sessions as cx
+        path, thread = self.desktop_chat(tmp_path, status={"type": "idle"})
+        monkeypatch.setattr(cx, "thread_info", lambda *_a, **_k: pytest.fail("read"))
+        rows, _, _ = self.read([{"data": [thread]}], open_paths={str(path)})
+        assert rows[0]["live"] is True and rows[0]["state"] == "idle"
+
+    def test_no_sleeping_chat_means_no_look_at_other_programs(self, tmp_path, monkeypatch):
+        import codex_sessions as cx
+        _, thread = self.desktop_chat(tmp_path, status={"type": "idle"})
+        monkeypatch.setattr(cx, "open_rollout_paths", lambda _paths: pytest.fail("asked"))
+        self.read([{"data": [thread, self.row("catalog-0002")]}], open_paths=None)
+
+    def test_only_sleeping_chats_are_asked_about_newest_first(self, tmp_path, monkeypatch):
+        import codex_sessions as cx
+        path, thread = self.desktop_chat(tmp_path)
+        asked = []
+        monkeypatch.setattr(cx, "open_rollout_paths", lambda paths: asked.append(paths) or set())
+        many = [self.row("catalog-%04d" % number, path="/gone/%d.jsonl" % number, recencyAt=number)
+                for number in range(1000, 1200)]
+        rows, _, _ = self.read([{"data": [thread] + many}], open_paths=None)
+        assert len(asked) == 1 and len(asked[0]) == 128
+        assert asked[0][0] == "/gone/1199.jsonl" and str(path) not in asked[0]
+        assert not any(row["live"] for row in rows)
 
     def test_untitled_chat_uses_native_preview_like_the_phone(self):
         import codex_sessions as cx
