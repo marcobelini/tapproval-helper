@@ -46,6 +46,8 @@ UPSTREAM_SHAPES = {
     "event.started": ("task_started", "Turn is in progress", "2026-10-14"),
     "event.complete": ("task_complete", "Turn has ended", "2026-10-14"),
     "event.aborted": ("turn_aborted", "Turn was interrupted", "2026-10-14"),
+    "rpc.background_terminals": ("thread/backgroundTerminals/list",
+        "Paginated live terminal data: processId, itemId, command, cwd", "2026-11-18"),
     "event.usage": ("token_count", "Cumulative total_token_usage counter", "2026-10-27"),
     "origin.cli": ("codex-tui", "Terminal session", "2026-10-14"),
     "origin.desktop": ("Codex Desktop", "ChatGPT desktop session", "2026-10-14"),
@@ -228,7 +230,7 @@ def active_sessions(limit=12, sessions_dir=None, index_path=None, open_paths=Non
         cwd = meta["cwd"]
         project = os.path.basename(cwd.rstrip("/")) if cwd else "Codex"
         session_id = meta["session_id"]
-        info = thread_info(path)
+        info = thread_info(path, use_catalog=False)
         rows.append({
             "title": titles.get(session_id) or "Codex session",
             "project": project or "Codex",
@@ -312,7 +314,7 @@ def _catalog_row(thread):
             "minutes_ago": max(0, int((time.time() - thread["updatedAt"]) / 60)),
             "active_seconds_ago": max(0, int(time.time() - thread["updatedAt"])),
             "state": state, "state_reason": "terminal" if asking else "turn" if state == "running" else "",
-            "running_tool": None, "running_tasks": 0, "wake_at": None,
+            "running_tool": None, "running_tasks": 0, "running_label": None, "wake_at": None,
             # Visibility never grants a send capability. The send path still
             # rechecks unique native ownership and the permission context.
             "can_send": (thread.get("canAcceptDirectInput") is True
@@ -410,6 +412,97 @@ def _read_database_catalog(open_paths=None):
     return rows, paths
 
 
+_BACKGROUND_UNAVAILABLE_REPORTED = False
+
+
+def _background_runtime(client, row, deadline):
+    """Only the live owner's idle thread can have background-only work."""
+    global _BACKGROUND_UNAVAILABLE_REPORTED
+    if not row["live"] or row["state"] != "idle":
+        return
+    try:
+        cursor, seen, terminals = None, set(), {}
+        for _page in range(16):
+            if time.monotonic() >= deadline:
+                raise ValueError("Background lookup budget exhausted")
+            page = client.rpc(shape("rpc.background_terminals"), {
+                "threadId": row["session_id"], "cursor": cursor, "limit": 100})
+            if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+                raise ValueError("Invalid background terminal page")
+            for terminal in page["data"]:
+                if (not isinstance(terminal, dict)
+                        or not all(isinstance(terminal.get(key), str) and terminal[key]
+                                   for key in ("processId", "command"))):
+                    raise ValueError("Invalid background terminal")
+                terminals[terminal["processId"]] = terminal["command"]
+            cursor = page.get("nextCursor")
+            if cursor is None:
+                break
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                raise ValueError("Invalid background terminal cursor")
+            seen.add(cursor)
+        else:
+            raise ValueError("Background terminal page limit reached")
+        if terminals:
+            row.update(state="running", state_reason="tasks", running_tasks=len(terminals),
+                       running_label=" ".join(next(iter(terminals.values())).split())[:80])
+    except (OSError, EOFError, ValueError, TypeError, KeyError):
+        if not _BACKGROUND_UNAVAILABLE_REPORTED:
+            _BACKGROUND_UNAVAILABLE_REPORTED = True
+            try:
+                print("relay: Codex background terminal status unavailable", file=sys.stderr)
+            except (OSError, ValueError):
+                pass
+
+
+def _catalog_runtime(path):
+    """Use the same complete native snapshot for the list and thread view."""
+    if _CATALOG is None or _CATALOG_HOME != _home():
+        return None
+    with _CATALOG.lock:
+        if _CATALOG.status != "ready":
+            return None
+        for row in _CATALOG.rows:
+            catalog_path = _CATALOG.paths.get(row["session_id"])
+            if catalog_path and os.path.realpath(catalog_path) == os.path.realpath(path):
+                return {key: row.get(key) for key in (
+                    "state", "state_reason", "running_tasks", "running_label", "running_tool")}
+    return None
+
+
+# How long the last look at other programs stands in for one that got no
+# answer. On the owner's Mac (2026-11-19), busy with a build, three of
+# twelve looks ran past lsof's three seconds, and each would have put the
+# moon back on an open chat until the next look.
+OPEN_HELD_SECONDS = 60.0
+_OPEN_SEEN = {"at": None, "paths": frozenset()}
+
+
+def _proc_listable():
+    return os.path.isdir("/proc/self/fd")
+
+
+def _inspect_open(paths):
+    """The paths a program holds open, and whether the look was answered."""
+    run = _lsof_query(paths)
+    if run is not None:
+        return _lsof_open_paths(paths, run) or _proc_open_paths(paths), True
+    opened = _proc_open_paths(paths)
+    return opened, bool(opened) or _proc_listable()
+
+
+def _open_or_last_seen(paths):
+    """No answer is not "closed": the last answer stands, for a minute."""
+    opened, answered = _inspect_open(paths)
+    now = time.monotonic()
+    if answered:
+        _OPEN_SEEN.update(at=now, paths=frozenset(os.path.realpath(path) for path in opened))
+        return opened
+    if _OPEN_SEEN["at"] is not None and now - _OPEN_SEEN["at"] < OPEN_HELD_SECONDS:
+        return set(_OPEN_SEEN["paths"])
+    return set()
+
+
 def _mark_open(rows, paths, open_paths=None):
     """A listed chat whose transcript a program holds open is open.
 
@@ -423,14 +516,14 @@ def _mark_open(rows, paths, open_paths=None):
     if not asleep:
         return  # nothing to ask about: no process inspection at all
     asleep = sorted(asleep, key=lambda row: -row["modified"])[:128]
-    opened = (open_rollout_paths([paths[row["session_id"]] for row in asleep])
+    opened = (_open_or_last_seen([paths[row["session_id"]] for row in asleep])
               if open_paths is None else open_paths)
     opened = {os.path.realpath(path) for path in opened}
     for row in asleep:
         path = paths[row["session_id"]]
         if os.path.realpath(path) in opened:
             try:
-                info = thread_info(path)
+                info = thread_info(path, use_catalog=False)
             except (OSError, ValueError, TypeError, KeyError):
                 continue  # an unreadable transcript proves nothing
             row.update(live=True, state=info["state"], state_reason=info["state_reason"],
@@ -464,6 +557,7 @@ def _read_catalog(client_factory=None, endpoints=None, database_reader=None, ope
                 for thread in page["data"]:
                     row = _catalog_row(thread)
                     if row is not None:
+                        _background_runtime(client, row, deadline)
                         sid = row["session_id"]
                         server_rows[sid] = row
                         path = thread.get("path")
@@ -487,7 +581,7 @@ def _read_catalog(client_factory=None, endpoints=None, database_reader=None, ope
                 rank = {"asking": 3, "running": 2, "idle": 1}
                 runtime = row if old is None or (row["live"], rank[row["state"]]) > (old["live"], rank[old["state"]]) else old
                 rows[sid] = dict(newest, **{key: runtime[key] for key in
-                    ("live", "state", "state_reason", "can_send")})
+                    ("live", "state", "state_reason", "can_send", "running_tasks", "running_label", "running_tool")})
                 if owners[sid] > 1:
                     rows[sid]["can_send"] = False
                 if sid in server_paths:
@@ -880,7 +974,7 @@ def _fold(state, row, number):
         state["last_said"] = turn
 
 
-def thread_info(path, mark=None, limit=14, card_waiting=False, caller=""):
+def thread_info(path, mark=None, limit=14, card_waiting=False, caller="", use_catalog=True):
     """The watch's existing thread wire shape, from complete rollout lines.
 
     Byte marks and turn numbers survive relay restarts; a relay that has just
@@ -953,8 +1047,13 @@ def thread_info(path, mark=None, limit=14, card_waiting=False, caller=""):
         # Open does not mean working: task_complete/turn_aborted wins even
         # when the file was written a moment ago. An unknown lifecycle uses
         # the same short freshness window as an older Claude transcript.
+        # Catalog refresh must read the transcript, not feed its old snapshot
+        # back into the next one when Desktop owns the open file.
+        runtime = _catalog_runtime(path) if use_catalog else None
         if card_waiting:
             reply.update(state="asking", state_reason="card", running_tool=tool)
+        elif runtime is not None:
+            reply.update(runtime)
         elif state["busy"] is True or (state["busy"] is None and active < 20):
             reply.update(state="running", state_reason="tool" if state["calls"] else "turn",
                          running_tool=tool)
