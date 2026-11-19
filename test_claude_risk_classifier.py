@@ -3842,20 +3842,50 @@ class TestCodexCatalog:
     def test_no_sleeping_chat_means_no_look_at_other_programs(self, tmp_path, monkeypatch):
         import codex_sessions as cx
         _, thread = self.desktop_chat(tmp_path, status={"type": "idle"})
-        monkeypatch.setattr(cx, "open_rollout_paths", lambda _paths: pytest.fail("asked"))
+        monkeypatch.setattr(cx, "_inspect_open", lambda _paths: pytest.fail("asked"))
         self.read([{"data": [thread, self.row("catalog-0002")]}], open_paths=None)
 
     def test_only_sleeping_chats_are_asked_about_newest_first(self, tmp_path, monkeypatch):
         import codex_sessions as cx
         path, thread = self.desktop_chat(tmp_path)
         asked = []
-        monkeypatch.setattr(cx, "open_rollout_paths", lambda paths: asked.append(paths) or set())
+        monkeypatch.setattr(cx, "_inspect_open", lambda paths: (asked.append(paths) or set(), True))
         many = [self.row("catalog-%04d" % number, path="/gone/%d.jsonl" % number, recencyAt=number)
                 for number in range(1000, 1200)]
         rows, _, _ = self.read([{"data": [thread] + many}], open_paths=None)
         assert len(asked) == 1 and len(asked[0]) == 128
         assert asked[0][0] == "/gone/1199.jsonl" and str(path) not in asked[0]
         assert not any(row["live"] for row in rows)
+
+    def test_a_look_that_got_no_answer_keeps_the_last_one(self, tmp_path, monkeypatch):
+        """2026-11-19, the owner's Mac, busy with a build: three looks in
+        twelve ran out of time, and each read an open chat as asleep."""
+        import codex_sessions as cx
+        path, thread = self.desktop_chat(tmp_path)
+        monkeypatch.setattr(cx, "_OPEN_SEEN", {"at": None, "paths": frozenset()})
+        answers = [({str(path)}, True), (set(), False), (set(), True), (set(), False)]
+        monkeypatch.setattr(cx, "_inspect_open", lambda _paths: answers.pop(0))
+        seen = [self.read([{"data": [thread]}], open_paths=None)[0][0]["live"] for _ in range(4)]
+        # open; no answer, so still open; answered closed; no answer, so still closed
+        assert seen == [True, True, False, False]
+
+    def test_the_last_answer_does_not_stand_for_ever(self, tmp_path, monkeypatch):
+        import codex_sessions as cx
+        path, thread = self.desktop_chat(tmp_path)
+        monkeypatch.setattr(cx, "_OPEN_SEEN", {
+            "at": time.monotonic() - cx.OPEN_HELD_SECONDS - 1, "paths": frozenset({str(path)})})
+        monkeypatch.setattr(cx, "_inspect_open", lambda _paths: (set(), False))
+        rows, _, _ = self.read([{"data": [thread]}], open_paths=None)
+        assert rows[0]["live"] is False
+
+    def test_a_look_with_no_way_to_look_is_not_an_answer(self, monkeypatch):
+        import codex_sessions as cx
+        monkeypatch.setattr(cx, "_lsof_query", lambda _paths: None)
+        monkeypatch.setattr(cx, "_proc_open_paths", lambda _paths: set())
+        monkeypatch.setattr(cx, "_proc_listable", lambda: False)
+        assert cx._inspect_open(["/gone.jsonl"]) == (set(), False)
+        monkeypatch.setattr(cx, "_proc_listable", lambda: True)
+        assert cx._inspect_open(["/gone.jsonl"]) == (set(), True)
 
     def test_untitled_chat_uses_native_preview_like_the_phone(self):
         import codex_sessions as cx

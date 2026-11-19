@@ -410,6 +410,39 @@ def _read_database_catalog(open_paths=None):
     return rows, paths
 
 
+# How long the last look at other programs stands in for one that got no
+# answer. On the owner's Mac (2026-11-19), busy with a build, three of
+# twelve looks ran past lsof's three seconds, and each would have put the
+# moon back on an open chat until the next look.
+OPEN_HELD_SECONDS = 60.0
+_OPEN_SEEN = {"at": None, "paths": frozenset()}
+
+
+def _proc_listable():
+    return os.path.isdir("/proc/self/fd")
+
+
+def _inspect_open(paths):
+    """The paths a program holds open, and whether the look was answered."""
+    run = _lsof_query(paths)
+    if run is not None:
+        return _lsof_open_paths(paths, run) or _proc_open_paths(paths), True
+    opened = _proc_open_paths(paths)
+    return opened, bool(opened) or _proc_listable()
+
+
+def _open_or_last_seen(paths):
+    """No answer is not "closed": the last answer stands, for a minute."""
+    opened, answered = _inspect_open(paths)
+    now = time.monotonic()
+    if answered:
+        _OPEN_SEEN.update(at=now, paths=frozenset(os.path.realpath(path) for path in opened))
+        return opened
+    if _OPEN_SEEN["at"] is not None and now - _OPEN_SEEN["at"] < OPEN_HELD_SECONDS:
+        return set(_OPEN_SEEN["paths"])
+    return set()
+
+
 def _mark_open(rows, paths, open_paths=None):
     """A listed chat whose transcript a program holds open is open.
 
@@ -423,7 +456,7 @@ def _mark_open(rows, paths, open_paths=None):
     if not asleep:
         return  # nothing to ask about: no process inspection at all
     asleep = sorted(asleep, key=lambda row: -row["modified"])[:128]
-    opened = (open_rollout_paths([paths[row["session_id"]] for row in asleep])
+    opened = (_open_or_last_seen([paths[row["session_id"]] for row in asleep])
               if open_paths is None else open_paths)
     opened = {os.path.realpath(path) for path in opened}
     for row in asleep:
