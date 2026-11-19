@@ -3798,6 +3798,8 @@ class TestCodexCatalog:
                 self.pages = iter(pages)
 
             def rpc(self, method, params):
+                if method == "thread/backgroundTerminals/list":
+                    return {"data": []}
                 calls.append((method, params))
                 return next(self.pages)
 
@@ -3842,20 +3844,50 @@ class TestCodexCatalog:
     def test_no_sleeping_chat_means_no_look_at_other_programs(self, tmp_path, monkeypatch):
         import codex_sessions as cx
         _, thread = self.desktop_chat(tmp_path, status={"type": "idle"})
-        monkeypatch.setattr(cx, "open_rollout_paths", lambda _paths: pytest.fail("asked"))
+        monkeypatch.setattr(cx, "_inspect_open", lambda _paths: pytest.fail("asked"))
         self.read([{"data": [thread, self.row("catalog-0002")]}], open_paths=None)
 
     def test_only_sleeping_chats_are_asked_about_newest_first(self, tmp_path, monkeypatch):
         import codex_sessions as cx
         path, thread = self.desktop_chat(tmp_path)
         asked = []
-        monkeypatch.setattr(cx, "open_rollout_paths", lambda paths: asked.append(paths) or set())
+        monkeypatch.setattr(cx, "_inspect_open", lambda paths: (asked.append(paths) or set(), True))
         many = [self.row("catalog-%04d" % number, path="/gone/%d.jsonl" % number, recencyAt=number)
                 for number in range(1000, 1200)]
         rows, _, _ = self.read([{"data": [thread] + many}], open_paths=None)
         assert len(asked) == 1 and len(asked[0]) == 128
         assert asked[0][0] == "/gone/1199.jsonl" and str(path) not in asked[0]
         assert not any(row["live"] for row in rows)
+
+    def test_a_look_that_got_no_answer_keeps_the_last_one(self, tmp_path, monkeypatch):
+        """2026-11-19, the owner's Mac, busy with a build: three looks in
+        twelve ran out of time, and each read an open chat as asleep."""
+        import codex_sessions as cx
+        path, thread = self.desktop_chat(tmp_path)
+        monkeypatch.setattr(cx, "_OPEN_SEEN", {"at": None, "paths": frozenset()})
+        answers = [({str(path)}, True), (set(), False), (set(), True), (set(), False)]
+        monkeypatch.setattr(cx, "_inspect_open", lambda _paths: answers.pop(0))
+        seen = [self.read([{"data": [thread]}], open_paths=None)[0][0]["live"] for _ in range(4)]
+        # open; no answer, so still open; answered closed; no answer, so still closed
+        assert seen == [True, True, False, False]
+
+    def test_the_last_answer_does_not_stand_for_ever(self, tmp_path, monkeypatch):
+        import codex_sessions as cx
+        path, thread = self.desktop_chat(tmp_path)
+        monkeypatch.setattr(cx, "_OPEN_SEEN", {
+            "at": time.monotonic() - cx.OPEN_HELD_SECONDS - 1, "paths": frozenset({str(path)})})
+        monkeypatch.setattr(cx, "_inspect_open", lambda _paths: (set(), False))
+        rows, _, _ = self.read([{"data": [thread]}], open_paths=None)
+        assert rows[0]["live"] is False
+
+    def test_a_look_with_no_way_to_look_is_not_an_answer(self, monkeypatch):
+        import codex_sessions as cx
+        monkeypatch.setattr(cx, "_lsof_query", lambda _paths: None)
+        monkeypatch.setattr(cx, "_proc_open_paths", lambda _paths: set())
+        monkeypatch.setattr(cx, "_proc_listable", lambda: False)
+        assert cx._inspect_open(["/gone.jsonl"]) == (set(), False)
+        monkeypatch.setattr(cx, "_proc_listable", lambda: True)
+        assert cx._inspect_open(["/gone.jsonl"]) == (set(), True)
 
     def test_untitled_chat_uses_native_preview_like_the_phone(self):
         import codex_sessions as cx
@@ -28121,12 +28153,26 @@ class TestArchiveAtItsEdges:
                                           still=lambda: calls.append(1) or len(calls) < 3) is None
         assert time.monotonic() - started < 1
 
-    def test_the_hold_is_never_longer_than_its_cap(self, monkeypatch):
-        monkeypatch.setattr(watch_relay, "THREAD_WAIT_MAX", 0.2)
-        monkeypatch.setattr(watch_relay, "THREAD_WAIT_STEP", 0.02)
-        started = time.monotonic()
-        assert watch_relay.thread_appears(lambda: None, 60) is None
-        assert time.monotonic() - started < 1
+    @pytest.mark.parametrize("wait, polls", [(60, 4), (0.125, 2)])
+    def test_the_hold_is_never_longer_than_its_cap(self, monkeypatch, wait, polls):
+        from types import SimpleNamespace
+        clock, sleeps, finds = [0.0], [], []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+
+        # Test the wait budget, not how quickly a busy CI host schedules us.
+        # Binary fractions make the deadline exact; keep the fake clock local
+        # to this module instead of patching the shared time module.
+        monkeypatch.setattr(watch_relay, "time", SimpleNamespace(
+            monotonic=lambda: clock[0], sleep=sleep))
+        monkeypatch.setattr(watch_relay, "THREAD_WAIT_MAX", 0.25)
+        monkeypatch.setattr(watch_relay, "THREAD_WAIT_STEP", 0.0625)
+        assert watch_relay.thread_appears(lambda: finds.append(1), wait) is None
+        assert sleeps == [0.0625] * polls
+        assert len(finds) == polls
+        assert clock[0] == min(wait, 0.25)
 
 
 _REAL_END_SESSION = watch_relay.end_session
@@ -30306,6 +30352,120 @@ class TestReview20261114SecretPathsBySpelling:
         result = crc.classify({"tool_name": "Write", "cwd": "/Users/x/project",
                                "tool_input": {"file_path": path, "content": "hello"}})
         assert result["risk"] >= Risk.MEDIUM, result
+
+
+class TestCodexBackgroundTerminals:
+    @staticmethod
+    def read(terminals, status="idle"):
+        import codex_sessions as cx
+        calls = []
+        class Client:
+            def __init__(self, **_kwargs):
+                pass
+            def rpc(self, method, params, **_kwargs):
+                calls.append(method)
+                if method == "thread/list":
+                    return {"data": [TestCodexCatalog.row(status={"type": status})]}
+                assert method == "thread/backgroundTerminals/list"
+                if isinstance(terminals, Exception):
+                    raise terminals
+                return {"data": terminals}
+            def close(self):
+                pass
+        rows, _paths = cx._read_catalog(client_factory=Client, endpoints=["fixture"])
+        return rows[0], calls
+
+    def test_idle_thread_with_terminal_is_background(self):
+        row, _calls = self.read([{"processId": "p1", "itemId": "i1", "command": "sleep 30", "cwd": "/garden"}])
+        assert (row["state"], row["state_reason"], row["running_tasks"]) == ("running", "tasks", 1)
+        assert row["running_label"] == "sleep 30"
+
+    @pytest.mark.parametrize("status", ["active", "notLoaded", "systemError"])
+    def test_only_live_idle_threads_query_background_terminals(self, status):
+        row, calls = self.read([], status=status)
+        assert calls == ["thread/list"]
+        assert row["state"] == ("running" if status == "active" else "idle")
+        assert row["live"] is (status == "active")
+
+    def test_empty_or_unsupported_terminal_list_stays_idle(self):
+        for terminals in ([], ValueError("unsupported method")):
+            row, _calls = self.read(terminals)
+            assert row["state"] == "idle" and row["running_tasks"] == 0
+
+    @pytest.mark.parametrize("alias", [False, True])
+    def test_native_catalog_runtime_overrides_stale_transcript(self, tmp_path, monkeypatch, alias):
+        import codex_sessions as cx
+        path = tmp_path / "rollout-catalog-0001.jsonl"
+        path.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": "catalog-0001", "cwd": "/garden"}}) + "\n" + json.dumps({
+            "type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
+        row = cx._catalog_row(TestCodexCatalog.row(status={"type": "idle"}))
+        row.update(state="running", state_reason="tasks", running_tasks=2, running_label="sleep 30")
+        catalog_path = path
+        if alias:
+            (tmp_path / "alias").mkdir()
+            catalog_path = tmp_path / "alias" / ".." / path.name
+        catalog = cx.SessionCatalog(lambda: ([row], {row["session_id"]: str(catalog_path)}))
+        catalog.refresh()
+        monkeypatch.setattr(cx, "_CATALOG", catalog)
+        monkeypatch.setattr(cx, "_CATALOG_HOME", cx._home())
+        info = cx.thread_info(str(path))
+        assert (info["state"], info["state_reason"], info["running_tasks"]) == ("running", "tasks", 2)
+        row.update(state="idle", state_reason="", running_tasks=0, running_label=None)
+        catalog.refresh()
+        assert cx.thread_info(str(path))["state"] == "idle"
+        assert cx.thread_info(str(path), card_waiting=True)["state"] == "asking"
+
+
+    def test_open_desktop_refresh_ignores_previous_catalog_runtime(self, tmp_path, monkeypatch):
+        import codex_sessions as cx
+        path = tmp_path / "rollout-catalog-0001.jsonl"
+        path.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": "catalog-0001", "cwd": "/garden"}}) + "\n" + json.dumps({
+            "type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
+        old = cx._catalog_row(TestCodexCatalog.row(status={"type": "idle"}))
+        catalog = cx.SessionCatalog(lambda: ([old], {old["session_id"]: str(path)}))
+        catalog.refresh()
+        monkeypatch.setattr(cx, "_CATALOG", catalog)
+        monkeypatch.setattr(cx, "_CATALOG_HOME", cx._home())
+        row = cx._catalog_row(TestCodexCatalog.row())
+        cx._mark_open([row], {row["session_id"]: str(path)}, {str(path)})
+        assert row["live"] is True
+        assert (row["state"], row["state_reason"]) == ("running", "turn")
+        assert row["can_send"] is False
+
+    def test_unavailable_background_status_logs_once_without_details(self, monkeypatch, capsys):
+        import codex_sessions as cx
+        monkeypatch.setattr(cx, "_BACKGROUND_UNAVAILABLE_REPORTED", False)
+        for _ in range(2):
+            self.read(ValueError("private command and server details"))
+        assert capsys.readouterr().err == "relay: Codex background terminal status unavailable\n"
+
+    @pytest.mark.parametrize("cycle", [False, True])
+    def test_background_pages_are_complete_or_discarded(self, cycle):
+        import codex_sessions as cx
+        row = cx._catalog_row(TestCodexCatalog.row(status={"type": "idle"}))
+        calls = []
+        class Client:
+            def rpc(self, method, params):
+                assert method == "thread/backgroundTerminals/list"
+                calls.append(params["cursor"])
+                n = len(calls)
+                return {"data": [{"processId": "p%d" % n, "command": "sleep 30"}],
+                        "nextCursor": "next" if n == 1 or cycle else None}
+        cx._background_runtime(Client(), row, time.monotonic() + 3)
+        assert calls == [None, "next"]
+        assert row["running_tasks"] == (0 if cycle else 2)
+        assert row["state"] == ("idle" if cycle else "running")
+
+    def test_background_lookup_obeys_catalog_budget(self):
+        import codex_sessions as cx
+        row = cx._catalog_row(TestCodexCatalog.row(status={"type": "idle"}))
+        class Client:
+            def rpc(self, *_args):
+                pytest.fail("an expired refresh must not issue another request")
+        cx._background_runtime(Client(), row, time.monotonic() - 1)
+        assert row["running_tasks"] == 0
 
 
 class TestAmbiguousCodexRouting:
