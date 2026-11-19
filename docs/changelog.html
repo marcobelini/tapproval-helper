@@ -23,6 +23,12 @@
 <main class="policy">
 <h1>Changelog</h1>
 <p><em>Every release of Tapproval Base, the helper on your computer, newest first. Starting Claude Code once updates it. Generated from <a href="https://github.com/marcobelini/tapproval-helper/releases">the releases on GitHub</a>, which may already hold a newer one. Security fixes are also explained on <a href="security.html">the security page</a>.</em></p>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.130">v1.1.130 — Codex background terminal activity</a></h2>
+<p><em>2026-11-19</em></p>
+<p>Codex chats now show background activity when a turn has ended but one of its native terminals is still running. The session list and open thread share the task count and command label, and return to idle after the terminal finishes.</p>
+<p>An open Codex Desktop chat also keeps its last confirmed open state briefly when a busy computer cannot answer a process-inspection request. A confirmed close still takes effect immediately.</p>
+<p>Background-terminal status requires a live native owner with terminal-list support. Database-only catalogs and older servers retain their existing behavior. Approval decisions and permissions are unchanged.</p>
+<p>Validation: the release candidate passed the public test suite and host round-trip checks on macOS, Linux and Windows, each on Python 3.9–3.13, plus ShellCheck and Ruff. Physical Watch acceptance remains a separate check.</p>
 <h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.129">1.1.129</a></h2>
 <p><em>2026-11-19</em></p>
 <p><strong>A Codex chat open in the Codex Desktop app shows as open on your watch.</strong></p>
