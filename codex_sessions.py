@@ -406,19 +406,38 @@ def _read_database_catalog(open_paths=None):
         validated = _catalog_delivery_path(thread)
         if validated:
             paths[row["session_id"]] = validated
-    # File ownership can inform runtime activity only for existing catalog
-    # members; it cannot add a chat, revive an archived one or enable sends.
-    opened = (open_rollout_paths(list(paths.values())[:128]) if open_paths is None else open_paths)
-    for row in rows:
-        path = paths.get(row["session_id"])
-        if path and os.path.realpath(path) in opened:
-            info = thread_info(path)
-            row.update(live=True, state=info["state"], state_reason=info["state_reason"],
-                       running_tool=info["running_tool"])
+    _mark_open(rows, paths, open_paths)
     return rows, paths
 
 
-def _read_catalog(client_factory=None, endpoints=None, database_reader=None):
+def _mark_open(rows, paths, open_paths=None):
+    """A listed chat whose transcript a program holds open is open.
+
+    File ownership can inform runtime activity only for existing catalog
+    members; it cannot add a chat, revive an archived one or enable sends.
+    Codex Desktop opened the ordinary way keeps its chats on a server of its
+    own, so the shared one lists them as not loaded: on the owner's wrist
+    (2026-11-18) a chat busy in Desktop wore the moon.
+    """
+    asleep = [row for row in rows if not row["live"] and paths.get(row["session_id"])]
+    if not asleep:
+        return  # nothing to ask about: no process inspection at all
+    asleep = sorted(asleep, key=lambda row: -row["modified"])[:128]
+    opened = (open_rollout_paths([paths[row["session_id"]] for row in asleep])
+              if open_paths is None else open_paths)
+    opened = {os.path.realpath(path) for path in opened}
+    for row in asleep:
+        path = paths[row["session_id"]]
+        if os.path.realpath(path) in opened:
+            try:
+                info = thread_info(path)
+            except (OSError, ValueError, TypeError, KeyError):
+                continue  # an unreadable transcript proves nothing
+            row.update(live=True, state=info["state"], state_reason=info["state_reason"],
+                       running_tool=info["running_tool"])
+
+
+def _read_catalog(client_factory=None, endpoints=None, database_reader=None, open_paths=None):
     from codex_desktop import server_sockets
     from codex_talk import Client
     use_database = database_reader is not None or (client_factory is None and endpoints is None)
@@ -483,7 +502,11 @@ def _read_catalog(client_factory=None, endpoints=None, database_reader=None):
         if use_database:
             return (database_reader or _read_database_catalog)()
         raise OSError("Codex chat catalog is unavailable")
-    return sorted(rows.values(), key=lambda row: (-row["modified"], row["session_id"])), paths
+    listed = sorted(rows.values(), key=lambda row: (-row["modified"], row["session_id"]))
+    # Only the owner knows runtime state, and a Desktop opened the ordinary
+    # way is an owner this helper cannot ask.
+    _mark_open(listed, paths, open_paths)
+    return listed, paths
 
 
 # How long a chat Codex has just archived stays off the snapshot, whatever
@@ -590,10 +613,10 @@ def recall_chat(session_id):
         catalog.recall(session_id)
 
 
-def find_rollout(session_id, sessions_dir=None):
-    """Resolve an unambiguous identity, never a caller-supplied path."""
+def matching_rollouts(session_id, sessions_dir=None):
+    """Find candidate identities so dispatch can distinguish absent from ambiguous."""
     if not re.fullmatch(r"[A-Za-z0-9-]{8,64}", session_id or ""):
-        return None
+        return []
     # Native metadata resolves older chats beyond the 128-recent-rollout
     # discovery window. Never trust a server-provided path outside this home.
     if sessions_dir is None and _CATALOG is not None and _CATALOG_HOME == _home():
@@ -605,7 +628,7 @@ def find_rollout(session_id, sessions_dir=None):
             if real.startswith(root + os.sep):
                 meta = _rollout_meta(real)
                 if meta and meta["session_id"] == session_id:
-                    return real
+                    return [real]
     matches = []
     for _mtime, path in _rollouts(sessions_dir or os.path.join(_home(), "sessions")):
         if session_id not in os.path.basename(path):
@@ -613,6 +636,13 @@ def find_rollout(session_id, sessions_dir=None):
         meta = _rollout_meta(path)
         if meta and meta["session_id"].startswith(session_id):
             matches.append(path)
+    return matches
+
+
+
+def find_rollout(session_id, sessions_dir=None):
+    """Resolve an unambiguous identity, never a caller-supplied path."""
+    matches = matching_rollouts(session_id, sessions_dir)
     return matches[0] if len(matches) == 1 else None
 
 

@@ -2842,6 +2842,8 @@ def say_to_session(prefix, text, projects_dir=None, brief=True, force=False, age
         return "unknown agent"
     import codex_sessions
     codex_path = codex_sessions.find_rollout(prefix)
+    if agent is None and not codex_path and len(codex_sessions.matching_rollouts(prefix)) > 1:
+        return "unknown session"
     if agent == "codex" or codex_path:
         if agent == "claude":
             return "session belongs to Codex"
@@ -3001,6 +3003,8 @@ def archive_session(prefix, waiting=(), agent=None, projects_dir=None):
         return "unknown session"
     import codex_sessions
     codex = agent == "codex" or (agent is None and codex_sessions.find_rollout(prefix))
+    if agent is None and not codex and len(codex_sessions.matching_rollouts(prefix)) > 1:
+        return "unknown session"
     try:
         session_id, word = (_archive_codex(prefix, waiting) if codex
                             else _archive_claude(prefix, waiting, projects_dir))
