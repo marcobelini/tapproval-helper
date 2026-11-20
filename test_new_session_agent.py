@@ -41,6 +41,10 @@ def _no_real_codex(tmp_path, monkeypatch):
     """A Codex start may reach the shared server in CODEX_HOME. Never the
     owner's: it would open a real chat on his phone."""
     monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'no-codex'))
+    # No sign-in answer kept from an earlier test, or from this computer's
+    # own Codex: on 2026-11-20 one read "signed out" for two minutes and
+    # six starts below said "codex signed out" on the Mac mini.
+    monkeypatch.setattr(relay, '_SIGNIN_CODEX', {'at': 0.0, 'in': None, 'asked': False})
     import codex_talk
     native_start = codex_talk._start_shared_service
     def refuse(_binary):
@@ -182,6 +186,7 @@ def _codex_project(monkeypatch, start):
     import codex_talk
     monkeypatch.setattr(relay, 'known_projects', lambda *_: [{'path': '/project', 'agent': 'codex'}])
     monkeypatch.setattr(classifier, 'ensure_codex_on_path', lambda: '/bin/codex')
+    monkeypatch.setattr(relay, 'signed_in', lambda **_: True)
     monkeypatch.setattr(relay, 'trust_folder', lambda _: pytest.fail('Claude trust reached'))
     monkeypatch.setattr(relay._host, 'is_windows', lambda: False)
     monkeypatch.setattr(codex_talk, 'start', start)

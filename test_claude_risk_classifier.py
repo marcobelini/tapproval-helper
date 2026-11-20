@@ -14218,6 +14218,70 @@ class TestSigningInFromTheWrist:
         assert answer["code"] == "ABCD-EF123"
         proc.done.set()
 
+    _OAUTH = ["Starting local login server on http://localhost:1455.\n",
+              "If your browser did not open, navigate to this URL to authenticate:\n",
+              "\n", "https://auth.example.test/oauth/authorize?response_type=code&state=x\n"]
+
+    def test_codex_can_open_its_sign_in_on_this_computer(self, monkeypatch):
+        """At the desk there is nothing to type (2026-11-20): Codex's own
+        browser sign-in, as Claude Code's, never its address on the wrist."""
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
+        monkeypatch.setattr(watch_relay, "signed_in", lambda **k: False)
+        started = []
+        proc = self._Proc(self._OAUTH)
+        answer = watch_relay.start_signin(
+            "codex", popen=lambda cmd, **k: started.append(cmd) or proc, where="computer")
+        assert answer == {"ok": True, "status": "opened"}
+        assert started == [["/x/codex", "login"]]
+        proc.done.set()
+
+    def test_codex_signed_in_is_never_signed_in_again_on_the_computer(self, monkeypatch):
+        """Codex clears the sign-in it holds as its browser sign-in starts
+        (seen 2026-11-20): a tap must never sign a working Codex out."""
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
+        for said, words in ((True, "already signed in"), (None, "did not say")):
+            monkeypatch.setattr(watch_relay, "signed_in", lambda said=said, **k: said)
+            answer = watch_relay.start_signin(
+                "codex", popen=lambda cmd, **k: pytest.fail("a sign-in was started"),
+                where="computer")
+            assert answer["ok"] is False and words in answer["status"]
+
+    def test_the_computer_takes_over_from_a_code_and_back(self, monkeypatch):
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
+        monkeypatch.setattr(watch_relay, "signed_in", lambda **k: False)
+        phone = self._Proc(["https://auth.example.test/codex/device\n", "ABCD-EF123\n"])
+        assert watch_relay.start_signin("codex", popen=lambda cmd, **k: phone)["status"] == "code"
+        desk = self._Proc(self._OAUTH)
+        answer = watch_relay.start_signin("codex", popen=lambda cmd, **k: desk, where="computer")
+        assert answer["status"] == "opened"
+        assert phone.killed, "two sign-ins racing"
+        again = watch_relay.start_signin("codex", popen=lambda cmd, **k: pytest.fail("a third"),
+                                         where="computer")
+        assert again["status"] == "opened", "a second tap starts a second sign-in"
+        phone2 = self._Proc(["https://auth.example.test/codex/device\n", "WXYZ-12345\n"])
+        back = watch_relay.start_signin("codex", popen=lambda cmd, **k: phone2)
+        assert back["code"] == "WXYZ-12345" and desk.killed
+        phone2.done.set()
+
+    def test_codex_that_opens_nothing_on_the_computer_says_so(self, monkeypatch):
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
+        monkeypatch.setattr(watch_relay, "signed_in", lambda **k: False)
+        monkeypatch.setattr(watch_relay, "SIGNIN_CODE_WAIT", 0.2)
+        proc = self._Proc(["Error: port 1455 is in use\n"])
+        answer = watch_relay.start_signin("codex", popen=lambda cmd, **k: proc, where="computer")
+        assert answer == {"ok": False, "status": "Codex could not open its sign-in on this computer"}
+        assert proc.killed
+
+    def test_where_means_nothing_to_claude_code(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
+        monkeypatch.setattr(watch_relay, "signed_in", lambda **k: pytest.fail("asked"))
+        started = []
+        proc = self._Proc([])
+        answer = watch_relay.start_signin(
+            "claude", popen=lambda cmd, **k: started.append(cmd) or proc, where="computer")
+        assert answer["status"] == "opened" and started == [["claude", "auth", "login"]]
+        proc.done.set()
+
     def test_codex_without_a_code_fails_in_words_and_stops(self, monkeypatch):
         monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
         monkeypatch.setattr(watch_relay, "SIGNIN_CODE_WAIT", 0.2)
@@ -17649,7 +17713,7 @@ class TestTheRelayRefusesASimulator:
         monkeypatch.setattr(watch_relay, "set_auto_update",
                             lambda on: ran.append("auto-update") or (on, None))
         monkeypatch.setattr(watch_relay, "start_signin",
-                            lambda agent: ran.append("signin") or {"ok": True, "status": "opened"})
+                            lambda agent, **k: ran.append("signin") or {"ok": True, "status": "opened"})
         allow = getattr(request, "param", False)
         server, _ = watch_relay.serve(port=0, auth=_known_watch(fresh_auth),
                                       allow_simulator=allow)
@@ -17693,6 +17757,18 @@ class TestTheRelayRefusesASimulator:
         assert status == 400 and answer == {"ok": False, "status": "unknown agent"}
 
     _real_start_signin = staticmethod(watch_relay.start_signin)
+
+    def test_a_sign_in_on_the_computer_is_passed_on_and_nothing_else_is(self, relay, monkeypatch):
+        """"where": "computer" reaches start_signin; anything else is the
+        code, as before (2026-11-20)."""
+        asked = []
+        monkeypatch.setattr(watch_relay, "start_signin",
+                            lambda agent, where=None: asked.append((agent, where))
+                            or {"ok": True, "status": "opened"})
+        base, _ = relay
+        for body in ({"agent": "codex", "where": "computer"}, {"agent": "codex"}):
+            assert self._post(base + "/signin", body, simulator=None)[0] == 200
+        assert asked == [("codex", "computer"), ("codex", None)]
 
     def test_the_answering_routes_carry_the_rule(self):
         post = watch_relay.RelayHandler.ROUTES["POST"]
