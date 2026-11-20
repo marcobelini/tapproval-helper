@@ -64,6 +64,12 @@ _HOOKS = threading.excepthook, sys.excepthook
 _LAST_TEST = [None]
 
 
+def _no_since(conditions):
+    """Conditions without the time each was first noted, which no test of
+    their words or tone has a reason to pin."""
+    return [{k: v for k, v in c.items() if k != "since"} for c in conditions]
+
+
 def _crash_hooks_put_back(test):
     """Put back the excepthooks the suite started with; fail, naming
     ``test``, if they had been changed."""
@@ -6300,7 +6306,7 @@ class TestTextFollowsTheTextSize:
     FIXED = {
         "SettingsScreens.swift": {
             'Image(systemName: icon)',              # a row's glyph column
-            'Image(systemName: "stethoscope")',     # the same column
+            'Image(systemName: state.light)',       # the same column: the status light
             'Image(systemName: "chevron.right")',   # the row's arrow
             '"circle.fill" : "square.fill"',        # an agent's dot
             'Text(label)',                          # a row's words; a keypad key
@@ -6337,6 +6343,8 @@ class TestTextFollowsTheTextSize:
             'Text("Address")',                      # the address row
             'Text(relayHost.isEmpty',
             'Text("Use automatic instead")',
+            'Text("Details")',                      # the row down to the checks
+            'Image(systemName: "chevron.right")',   # its arrow
         },
         "SessionDetail.swift": {
             'Image(systemName: "circle.fill")',     # a status dot
@@ -21997,9 +22005,25 @@ class TestConditionsCarryATone:
 
     def test_a_condition_asks_for_the_person_unless_told_otherwise(self):
         watch_relay.note_condition("port", "Another program is using the port.")
-        assert watch_relay.conditions() == [
+        said = watch_relay.conditions()
+        assert [{k: v for k, v in c.items() if k != "since"} for c in said] == [
             {"key": "port", "detail": "Another program is using the port.",
              "tone": "needs_you"}]
+
+    def test_a_condition_says_since_when(self, monkeypatch):
+        """The first noting sets the time; the same key noted again, with
+        the same words or new ones, keeps it; a clear starts it afresh."""
+        clock = [1000.0]
+        monkeypatch.setattr(watch_relay.time, "time", lambda: clock[0])
+        watch_relay.note_condition("port", "Another program is using the port.")
+        clock[0] = 2000.0
+        watch_relay.note_condition("port", "Another program is using the port.")
+        watch_relay.note_condition("port", "Still in use.")
+        assert watch_relay.conditions()[0]["since"] == 1000
+        watch_relay.clear_condition("port")
+        clock[0] = 3000.0
+        watch_relay.note_condition("port", "Another program is using the port.")
+        assert watch_relay.conditions()[0]["since"] == 3000
 
     def test_in_hand_is_carried(self):
         watch_relay.note_condition("tunnel", "The away address changed.", tone="in_hand")
@@ -22024,7 +22048,7 @@ class TestConditionsCarryATone:
         try:
             base = "http://127.0.0.1:%d" % server.server_address[1]
             _status, body = relay_call(base + "/health", token="devicetoken")
-            assert body["conditions"] == [
+            assert _no_since(body["conditions"]) == [
                 {"key": "claude", "detail": "The helper cannot find Claude Code.",
                  "tone": "needs_you"}]
         finally:
@@ -22387,7 +22411,7 @@ class TestConditionsAreSaidOutLoud:
 
     def test_a_condition_is_recorded_and_withdrawn(self):
         watch_relay.note_condition("tunnel", "off")
-        assert watch_relay.conditions() == [{"key": "tunnel", "detail": "off",
+        assert _no_since(watch_relay.conditions()) == [{"key": "tunnel", "detail": "off",
                                              "tone": "needs_you"}]
         watch_relay.clear_condition("tunnel")
         assert watch_relay.conditions() == []
@@ -22460,7 +22484,7 @@ class TestConditionsAreSaidOutLoud:
             _status, body = relay_call(base + "/health")
             assert body == {"ok": True}
             _status, body = relay_call(base + "/health", token="devicetoken")
-            assert body["conditions"] == [{"key": "bonjour",
+            assert _no_since(body["conditions"]) == [{"key": "bonjour",
                                            "detail": "not announcing",
                                            "tone": "needs_you"}]
         finally:
@@ -22557,7 +22581,7 @@ class TestConditionsAreSaidOutLoud:
             # A paired caller: a raw loopback /health carries no conditions
             # since the 2026-10-25 review.
             _status, body = relay_call(base + "/health", token="devicetoken")
-            assert body["conditions"] == [{"key": "bonjour",
+            assert _no_since(body["conditions"]) == [{"key": "bonjour",
                                            "detail": "not announcing",
                                            "tone": "needs_you"}]
         finally:

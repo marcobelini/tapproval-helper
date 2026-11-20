@@ -376,8 +376,14 @@ def note_condition(key, detail, tone="needs_you"):
     if tone not in CONDITION_TONES:
         tone = "needs_you"
     with _CONDITIONS_LOCK:
-        repeated = _CONDITIONS.get(key, (None, None))[0] == detail
-        _CONDITIONS[key] = (detail, tone)
+        before = _CONDITIONS.get(key)
+        repeated = before is not None and before[0] == detail
+        # Since when: the first time this key was noted and not yet
+        # cleared. A sentence that changes meanwhile keeps the time, so
+        # the wrist can say how long a problem has stood (2026-11-19: a
+        # Codex warning stood six hours and read as if it were new).
+        since = before[2] if before is not None else time.time()
+        _CONDITIONS[key] = (detail, tone, since)
     if not repeated:
         print("relay: %s" % detail, file=sys.stderr)
 
@@ -391,8 +397,8 @@ def clear_condition(key):
 def conditions():
     """Everything currently wrong, key order, for /health and the tests."""
     with _CONDITIONS_LOCK:
-        return [{"key": key, "detail": detail, "tone": tone}
-                for key, (detail, tone) in sorted(_CONDITIONS.items())]
+        return [{"key": key, "detail": detail, "tone": tone, "since": int(since)}
+                for key, (detail, tone, since) in sorted(_CONDITIONS.items())]
 
 
 # The admin routes that only say something about this relay, or take it
@@ -1779,12 +1785,39 @@ def _codex_catalog_status(status):
         clear_condition("codex_sessions")
 
 
+# What ApprovalHub says when one chat, not Codex itself, cannot be linked
+# for approvals (codex_approvals.py: _problem, and the ownership guard).
+_CODEX_ONE_CHAT = ("Thread is ", "Codex server ownership could not be verified",
+                   "Codex thread ownership is unavailable")
+_CODEX_SYNC_SAID = [None]
+
+
+def codex_sync_is_one_chat(error):
+    """Whether a codex_sync error is about one chat. Anything else, an
+    error this has never heard of included, is read as Codex itself."""
+    return isinstance(error, str) and error.startswith(_CODEX_ONE_CHAT)
+
+
 def _codex_sync_status(error):
-    if error:
-        note_condition("codex_sync", "Codex approvals are unavailable on the watch. "
-                       "Answer on your computer or iPhone while Base reconnects.")
-    else:
+    """The wrist's words for the approval link. One chat that cannot be
+    linked is said as one chat: on 2026-11-19 a single chat's failure told
+    the owner all of Codex's approvals were gone, for six hours, and the
+    log never said why."""
+    one_chat = codex_sync_is_one_chat(error)
+    # The hub's own fixed words for a chat; for Codex itself only that it
+    # was unreachable (the observer's line beside this one names the kind).
+    reason = None if not error else error if one_chat else "Codex unreachable"
+    if reason and _CODEX_SYNC_SAID[0] != reason:
+        print("relay: codex approvals: %s" % reason, file=sys.stderr)
+    _CODEX_SYNC_SAID[0] = reason
+    if not error:
         clear_condition("codex_sync")
+    elif one_chat:
+        note_condition("codex_sync", "One Codex chat can't ask on the watch. "
+                       "Answer it on your computer or iPhone.")
+    else:
+        note_condition("codex_sync", "Codex approvals can't reach the watch right now. "
+                       "Answer on your computer or iPhone until Codex reconnects.")
 
 
 def codex_approval_sync(queue):

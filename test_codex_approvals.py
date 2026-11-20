@@ -670,6 +670,34 @@ def test_reconnect_reuses_pending_card_identity_and_keeps_resolved_tombstones(mo
         adapter.close()
 
 
+def test_one_chat_is_said_as_one_chat_and_the_reason_is_logged_once(capsys):
+    """2026-11-19: one chat that could not be linked told the wrist all of
+    Codex's approvals were gone, and the log never said why."""
+    import codex_approvals
+    import watch_relay as relay
+    relay._codex_sync_status(None)
+    capsys.readouterr()
+    source = open(codex_approvals.__file__, encoding="utf-8").read()
+    for reason in ("Thread is not loaded on an accessible Codex server",
+                   "Thread is loaded on multiple Codex servers",
+                   "Codex server ownership could not be verified",
+                   "Codex thread ownership is unavailable"):
+        assert reason in source, "the hub no longer says: " + reason
+        relay._codex_sync_status(reason)
+        relay._codex_sync_status(reason)
+        said = relay._CONDITIONS["codex_sync"][0]
+        assert said.startswith("One Codex chat can't ask on the watch"), said
+        assert capsys.readouterr().err.count("codex approvals: " + reason) == 1
+    relay._codex_sync_status("[Errno 61] Connection refused")
+    said = relay._CONDITIONS["codex_sync"][0]
+    assert said.startswith("Codex approvals can't reach the watch"), said
+    assert "Base" not in said
+    err = capsys.readouterr().err
+    assert "codex approvals: Codex unreachable" in err and "Errno" not in err
+    relay._codex_sync_status(None)
+    assert "codex_sync" not in relay._CONDITIONS
+
+
 def test_connection_notice_reports_failure_and_recovery():
     import watch_relay as relay
     relay._codex_sync_status("unavailable")
