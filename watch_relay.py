@@ -2149,17 +2149,40 @@ _DEVICE_URL = re.compile(r"https://\S+")
 _DEVICE_CODE = re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4,6}\b")
 
 
-def start_signin(agent, popen=None):
+def start_signin(agent, popen=None, where=None):
     """Start the agent's own sign-in on this computer. Returns a dict for
     the watch: {"ok": True, "status": "opened"} (Claude Code: approve in
     the computer's browser), {"ok": True, "status": "code", "url", "code"}
     (Codex: enter the code on any device), or {"ok": False, "status":
     words}. Never raises; never says signed in — /health does, once the
-    agent itself says so."""
+    agent itself says so.
+
+    ``where="computer"`` asks Codex for its browser sign-in on this
+    computer instead of a code (2026-11-20): at the desk there is nothing
+    to type, as with Claude Code. Codex clears the sign-in it holds the
+    moment that starts (seen 2026-11-20, codex-cli 0.169), so it is never
+    started while Codex says it is signed in."""
     if not isinstance(agent, str) or agent not in SIGNIN_SAYS:
         return {"ok": False, "status": "unknown agent"}
+    where = "computer" if agent == "codex" and where == "computer" else None
+    if where:
+        # Signed in, or no answer yet: either way, never risk replacing
+        # a sign-in that works.
+        now_in = signed_in(agent=agent)
+        if now_in is not False:
+            return {"ok": False, "status": "Codex is already signed in on this computer" if now_in
+                    else "Codex did not say whether it is signed in. Try again in a moment."}
     with _SIGNIN_RUNS_LOCK:
         run = _SIGNIN_RUNS.get(agent)
+        if run and run["proc"] is not None and run.get("where") != where:
+            # The other way was asked for: the code on the phone gives way
+            # to the computer's browser, or back. One sign-in at a time.
+            try:
+                run["proc"].kill()
+            except Exception:
+                pass
+            run = None
+            _SIGNIN_RUNS.pop(agent, None)
         if run and run["proc"] is None:
             # Another tap's sign-in is still starting (Codex takes up to
             # SIGNIN_CODE_WAIT to print its code, the watch gives up after
@@ -2171,7 +2194,8 @@ def start_signin(agent, popen=None):
             return _signin_answer(run)
         else:
             starting = None
-            mine = {"proc": None, "at": time.time(), "ready": threading.Event()}
+            mine = {"proc": None, "at": time.time(), "ready": threading.Event(),
+                    "where": where}
             _SIGNIN_RUNS[agent] = mine
     if starting is not None:
         starting["ready"].wait(SIGNIN_CODE_WAIT + 5)
@@ -2182,14 +2206,15 @@ def start_signin(agent, popen=None):
         return dict(_SIGNIN_NOT_STARTED)
     answer, proc = dict(_SIGNIN_NOT_STARTED), None
     try:
-        answer, proc = _launch_signin(agent, popen)
+        answer, proc = _launch_signin(agent, popen, where)
     except Exception as error:  # noqa: BLE001 — "never raises" is the contract
         print("relay: sign-in for %s could not start: %s" % (agent, type(error).__name__),
               file=sys.stderr)
     finally:
         with _SIGNIN_RUNS_LOCK:
             if proc is not None and answer and answer.get("ok"):
-                _SIGNIN_RUNS[agent] = {"proc": proc, "at": time.time(), "answer": answer}
+                _SIGNIN_RUNS[agent] = {"proc": proc, "at": time.time(), "answer": answer,
+                                       "where": where}
             elif _SIGNIN_RUNS.get(agent) is mine:
                 del _SIGNIN_RUNS[agent]
         mine["ready"].set()
@@ -2211,7 +2236,7 @@ def _signin_answer(run, now=None):
     return answer
 
 
-def _launch_signin(agent, popen):
+def _launch_signin(agent, popen, where=None):
     """start_signin's work once it holds the agent's one slot: (answer for
     the watch, the running process or None when nothing runs on)."""
     if agent == "codex":
@@ -2219,7 +2244,9 @@ def _launch_signin(agent, popen):
         binary = ensure_codex_on_path()
         if not binary:
             return {"ok": False, "status": "Codex is not installed on your computer"}, None
-        command = [binary, "login", "--device-auth"]
+        # Its browser sign-in opens the computer's browser itself and
+        # prints the page's address; the device code prints a code.
+        command = [binary, "login"] if where == "computer" else [binary, "login", "--device-auth"]
     else:
         if not ensure_claude_on_path():
             return {"ok": False, "status": "claude not on PATH"}, None
@@ -2241,12 +2268,12 @@ def _launch_signin(agent, popen):
                 plain = _ANSI.sub("", line)
                 if agent == "codex":
                     url = _DEVICE_URL.search(plain)
-                    code = _DEVICE_CODE.search(plain)
+                    code = _DEVICE_CODE.search(plain) if where != "computer" else None
                     if url and not seen["url"]:
                         seen["url"] = url.group(0).rstrip(".,)")
                     if code and not seen["code"]:
                         seen["code"] = code.group(0)
-                    if seen["url"] and seen["code"]:
+                    if seen["url"] and (seen["code"] or where == "computer"):
                         found.set()
         except (OSError, ValueError):
             pass
@@ -2268,7 +2295,19 @@ def _launch_signin(agent, popen):
 
     threading.Thread(target=read, daemon=True, name="signin-read").start()
     threading.Thread(target=finish, daemon=True, name="signin-wait").start()
-    if agent == "codex":
+    if agent == "codex" and where == "computer":
+        # The page's address is Codex's word that its sign-in started
+        # (and its browser was asked to open); the address itself stays
+        # on the computer.
+        found.wait(SIGNIN_CODE_WAIT)
+        if not seen["url"]:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return {"ok": False, "status": "Codex could not open its sign-in on this computer"}, None
+        answer = {"ok": True, "status": "opened"}
+    elif agent == "codex":
         found.wait(SIGNIN_CODE_WAIT)
         if not (seen["url"] and seen["code"]):
             try:
@@ -5604,10 +5643,12 @@ class RelayHandler(BaseHTTPRequestHandler):
             "restored"), path)
 
     def _post_signin(self, path, query):
-        """{"agent": "claude" | "codex"} → what start_signin says."""
+        """{"agent": "claude" | "codex", "where": "computer"?} → what
+        start_signin says."""
         body = self._read_json()
         agent = body.get("agent") if isinstance(body, dict) else None
-        answer = start_signin(agent)
+        where = body.get("where") if isinstance(body, dict) else None
+        answer = start_signin(agent, where=where)
         known = isinstance(agent, str) and agent in SIGNIN_SAYS
         self._send_json(answer, 200 if answer.get("ok") or known else 400)
 
