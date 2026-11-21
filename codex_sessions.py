@@ -413,13 +413,22 @@ def _read_database_catalog(open_paths=None):
 
 
 _BACKGROUND_UNAVAILABLE_REPORTED = False
+# The background lookups' own time on one server, apart from the list's:
+# sharing the list's fifteen seconds, a few slow lookups on idle chats lost
+# the whole list (2026-11-21 review, R6).
+BACKGROUND_BUDGET_SECONDS = 5.0
 
 
 def _background_runtime(client, row, deadline):
-    """Only the live owner's idle thread can have background-only work."""
+    """Only the live owner's idle thread can have background-only work.
+
+    Returns False when the connection can no longer be trusted: a timeout
+    or a broken socket may leave half a frame unread, so the next answer
+    read from it would be the wrong one."""
     global _BACKGROUND_UNAVAILABLE_REPORTED
     if not row["live"] or row["state"] != "idle":
-        return
+        return True
+    broken = False
     try:
         cursor, seen, terminals = None, set(), {}
         for _page in range(16):
@@ -446,13 +455,18 @@ def _background_runtime(client, row, deadline):
         if terminals:
             row.update(state="running", state_reason="tasks", running_tasks=len(terminals),
                        running_label=" ".join(next(iter(terminals.values())).split())[:80])
-    except (OSError, EOFError, ValueError, TypeError, KeyError):
+        # Working again: the next failure is news, and is said.
+        _BACKGROUND_UNAVAILABLE_REPORTED = False
+        return True
+    except (OSError, EOFError, ValueError, TypeError, KeyError) as error:
+        broken = isinstance(error, (OSError, EOFError))
         if not _BACKGROUND_UNAVAILABLE_REPORTED:
             _BACKGROUND_UNAVAILABLE_REPORTED = True
             try:
                 print("relay: Codex background terminal status unavailable", file=sys.stderr)
             except (OSError, ValueError):
                 pass
+    return not broken
 
 
 def _catalog_runtime(path):
@@ -546,8 +560,11 @@ def _read_catalog(client_factory=None, endpoints=None, database_reader=None, ope
         try:
             cursor, seen, server_rows, server_paths = None, set(), {}, {}
             deadline = time.monotonic() + 15
+            background_deadline = time.monotonic() + BACKGROUND_BUDGET_SECONDS
+            background_spent, background_ok = 0.0, True
             for _page in range(64):
-                if time.monotonic() > deadline:
+                # The list's own time: the background lookups have theirs.
+                if time.monotonic() - background_spent > deadline:
                     raise ValueError("Codex catalog exceeded its time bound")
                 page = client.rpc("thread/list", {"cursor": cursor, "limit": 100,
                     "archived": False, "sortKey": "recency_at", "sortDirection": "desc",
@@ -557,7 +574,15 @@ def _read_catalog(client_factory=None, endpoints=None, database_reader=None, ope
                 for thread in page["data"]:
                     row = _catalog_row(thread)
                     if row is not None:
-                        _background_runtime(client, row, deadline)
+                        if background_ok and row["live"] and row["state"] == "idle":
+                            started = time.monotonic()
+                            if not _background_runtime(client, row, background_deadline):
+                                # Never read from it again: reopen for the
+                                # list, and ask no more background questions.
+                                background_ok = False
+                                client.close()
+                                client = client_factory(socket_path=endpoint)
+                            background_spent += time.monotonic() - started
                         sid = row["session_id"]
                         server_rows[sid] = row
                         path = thread.get("path")

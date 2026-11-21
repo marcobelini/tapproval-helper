@@ -60,7 +60,11 @@ class LocalWebSocket:
             expected = base64.b64encode(hashlib.sha1(
                 (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
             ).digest()).decode("ascii")
-            if (lines[0].split()[1] != "101"
+            status = lines[0].split()
+            # A status line with no code (`HTTP/1.1`) raised IndexError,
+            # which no watcher caught: the one Codex watcher died for good
+            # (2026-11-21 review). It is a refused handshake.
+            if (len(status) < 2 or status[1] != "101"
                     or fields.get("sec-websocket-accept") != expected
                     or fields.get("upgrade", "").lower() != "websocket"):
                 raise ValueError("invalid WebSocket handshake")
@@ -258,6 +262,12 @@ def approval_card(message, item=None, hook_event=None):
         if event is None:
             return None
     else:
+        # `grantRoot` asks to allow writes under a whole folder for the
+        # rest of the session, which no card here can show or bound: Allow
+        # sent "accept" with only the files on the wrist (2026-11-21
+        # review). Such a change stays with Codex.
+        if params.get("grantRoot"):
+            return None
         changes = (item or {}).get("changes")
         if not isinstance(changes, list) or not changes:
             return None
@@ -278,7 +288,15 @@ def approval_card(message, item=None, hook_event=None):
                 if not isinstance(move, str) or "\n" in move:
                     return None
                 patch += "*** Move to: %s\n" % move
-            patch += change["diff"] + "\n"
+            diff = change["diff"]
+            if change["kind"]["type"] == "add":
+                # Codex gives an added file's contents as its diff, without
+                # the `+` the patch form puts on each line, so the content
+                # scan read nothing: DROP TABLE in a new app.py was MEDIUM
+                # (2026-11-21 review). A line already marked stays as it is.
+                diff = "\n".join(line if line.startswith("+") else "+" + line
+                                  for line in diff.split("\n"))
+            patch += diff + "\n"
         patch += "*** End Patch"
         event = {"tool_name": "apply_patch", "tool_input": {"command": patch}}
     event.update(session_id=params["threadId"], cwd=params.get("cwd"))
@@ -288,12 +306,21 @@ def approval_card(message, item=None, hook_event=None):
         card["headline"] = "Send input to terminal"
         card["detail"] = classifier._fit_lines(
             "Codex terminal input approval\n" + command, classifier.DETAIL_CHARS)
+        # Input to a live shell runs there: never marked below what the
+        # same text would be as a command (`rm -rf ~` read MEDIUM, and its
+        # notification offered Allow; 2026-11-21 review).
+        typed = classifier.classify({"tool_name": "Bash", "tool_input": {"command": command},
+                                     "cwd": params.get("cwd")})["risk"]
+        if typed > classifier.Risk[card["tier"]]:
+            card["tier"] = classifier.Risk(typed).name
     card["can_always"] = False
     if refusal == "cancel":
         card["deny_label"] = "No, stop this turn"
     reason = params.get("reason")
     if isinstance(reason, str) and reason:
-        card["detail"] += "\n\n" + reason
+        # Capped like every other card text: uncapped, one reason grew the
+        # card past what the bridge and iCloud carry (2026-11-21 review).
+        card["detail"] += "\n\n" + classifier._fit_lines(reason, classifier.DETAIL_CHARS)
     return card
 
 
@@ -353,6 +380,8 @@ def native_consent(message):
     Response data never travels on the card. No session/persistent grants,
     implicit form defaults, browser tokens or device-verification proofs.
     """
+    import ClaudeRiskClassifier as classifier
+
     method, params = message.get("method"), message.get("params")
     if not isinstance(params, dict) or not isinstance(params.get("threadId"), str):
         return None
@@ -419,7 +448,16 @@ def native_consent(message):
             if not isinstance(title, str) or not isinstance(description, str):
                 return None
             detail += "\n" + name + ": " + title + "\n" + description
-            card.update(kind="question", options=labels + ["Decline request"], question_header=title)
+            # A question card shows its headline, never its detail: the
+            # headline is the tool's own question, named by its server, or
+            # the wearer saw only "Approve connected tool?" (owner, 2026-11-21
+            # review). Too long to show whole, it stays with Codex rather
+            # than be answered cut.
+            question = server + ": " + reason
+            if len(question) > classifier.TEXT_CHARS:
+                return None
+            card.update(kind="question", options=labels + ["Decline request"],
+                        question_header=title, headline=question)
             for index, label in enumerate(labels):
                 value = values[index]
                 answers[("answer", label)] = {"action": "accept", "content": {name: value}}
@@ -711,10 +749,12 @@ class ApprovalSync:
             self.queue.withdraw(self._card_id(key))
             self._trace("resolved" if terminal else "disconnected", key)
         if len(self._finished) > 4096:
-            # Reconnect/replay gives an authoritative pending set rather
-            # than silently forgetting tombstones on a live event stream.
+            # The oldest answered request is long settled: forget it.
+            # Closing here to replay the pending set never emptied this
+            # table, so past 4,096 answers every further answer closed the
+            # connection, every waiting card left and came back, and a tap
+            # in that second was lost (2026-11-21 review).
             self._finished.popitem(last=False)
-            self.close()
 
     def _finish_thread(self, thread_id):
         for key in list(self._pending):
@@ -1040,6 +1080,14 @@ class ApprovalSync:
 class ApprovalHub:
     """Observe servers independently and recover only the affected targets."""
 
+    # A chat no reachable server has ever listed as loaded has no owner whose
+    # poll can clear its error. Kept for this long, then let go as a passing
+    # fault: until 2026-11-21 it stayed until the relay restarted, and was
+    # asked about every second (review R1). The newest are kept, at most this
+    # many.
+    TARGET_ERROR_SECONDS = 300
+    TARGET_ERRORS_MAX = 32
+
     def __init__(self, queue, card_title=None, status=None, paths=None):
         from codex_desktop import server_sockets
         self.queue, self.card_title = queue, card_title
@@ -1052,6 +1100,8 @@ class ApprovalHub:
         self._target_errors = {}
         self._recovering = {}
         self._known_owners = {}
+        self._target_at = {}
+        self._clock = time.monotonic
         self._reported = object()
         self._stop = threading.Event()
         self._monitor = None
@@ -1060,7 +1110,9 @@ class ApprovalHub:
     def _publish(self):
         # Called under the hub lock. Status callbacks only report conditions;
         # no server operation is performed while this lock is held.
-        errors = list(self._target_errors.values()) + list(self._states.values())
+        # A server's own state first: when the server is down, that is the
+        # news, not one chat of it (2026-11-21 review).
+        errors = list(self._states.values()) + list(self._target_errors.values())
         error = next((value for value in errors if value), None)
         self.last_error = error
         if error != self._reported:
@@ -1077,8 +1129,7 @@ class ApprovalHub:
                 # An unrelated server cannot discharge these target failures.
                 for sid, owner in list(self._recovering.items()):
                     if owner == path:
-                        self._target_errors.pop(sid, None)
-                        self._recovering.pop(sid, None)
+                        self._forget_target(sid)
             self._publish()
 
     def _refresh(self):
@@ -1140,10 +1191,21 @@ class ApprovalHub:
                  "Thread is not loaded on an accessible Codex server")
         with self._lock:
             if not self._stop.is_set():
+                self._target_errors.pop(thread_id, None)
                 self._target_errors[thread_id] = error
+                self._target_at[thread_id] = self._clock()
                 self._recovering.pop(thread_id, None)
+                while len(self._target_errors) > self.TARGET_ERRORS_MAX:
+                    oldest = next(iter(self._target_errors))
+                    self._forget_target(oldest)
                 self._publish()
         return False
+
+    def _forget_target(self, thread_id):
+        # Called under the hub lock.
+        self._target_errors.pop(thread_id, None)
+        self._target_at.pop(thread_id, None)
+        self._recovering.pop(thread_id, None)
 
     def _mark_recovering(self, thread_id, path, owner):
         with owner._lock:
@@ -1185,6 +1247,12 @@ class ApprovalHub:
                 return
             with self._lock:
                 previous = set(self._known_owners.get(sid, ()))
+                since = self._target_at.get(sid)
+                if (not previous and since is not None
+                        and self._clock() - since > self.TARGET_ERROR_SECONDS):
+                    self._forget_target(sid)
+                    self._publish()
+                    continue
             owners, uncertain, verified = self._owners(sid)
             if not uncertain and len(owners) == 1:
                 self._attach_owner(sid, None, owners, uncertain)
@@ -1198,8 +1266,7 @@ class ApprovalHub:
                         sync._healthy = None
                 with self._lock:
                     if all(self._syncs.get(path) is verified[path] for path in previous):
-                        self._target_errors.pop(sid, None)
-                        self._recovering.pop(sid, None)
+                        self._forget_target(sid)
                         self._known_owners.pop(sid, None)
                         self._publish()
 
