@@ -1559,6 +1559,10 @@ def _git_risk(segment):
         return ("git-config-shell-alias", Risk.CRITICAL)
 
     if sub == "push":
+        # `--mirror` makes the remote what this checkout is: every branch
+        # the remote has and this one lacks is deleted (2026-11-16 review).
+        if re.search(r"(^|\s)--mirror\b", rest):
+            return ("git-push-mirror", Risk.CRITICAL)
         # Deleting a remote branch loses it as surely as overwriting it.
         if re.search(r"(^|\s)(--delete|-d)\b|(^|\s):\S", rest):
             forced = True
@@ -5306,6 +5310,27 @@ def _write_settings(path, data):
         raise
 
 
+def _event_list(data, event):
+    """``data["hooks"][event]`` as a list to edit, made when it is absent,
+    null or empty; None when it holds something else, which is the user's
+    and is left alone. `"hooks": null` and the like crashed --install and
+    --uninstall with a traceback (2026-11-21 review)."""
+    hooks = data.get("hooks")
+    if hooks is None or (not hooks and isinstance(hooks, (list, dict))):
+        hooks = data["hooks"] = {} if not isinstance(hooks, dict) else hooks
+    if not isinstance(hooks, dict):
+        return None
+    entries = hooks.get(event)
+    if entries is None or (not entries and isinstance(entries, (list, dict))):
+        entries = hooks[event] = [] if not isinstance(entries, list) else entries
+    return entries if isinstance(entries, list) else None
+
+
+def _left_alone(path, what="its \"hooks\""):
+    print("Settings : %s holds %s in a shape this installer does not read; "
+          "left alone. Nothing was changed." % (path, what))
+
+
 def _sync_hook(entry_list, wanted, matcher, marker):
     """Idempotently point our hook entry in ``entry_list`` at ``wanted``.
 
@@ -5315,8 +5340,9 @@ def _sync_hook(entry_list, wanted, matcher, marker):
     list changed, which is what decides whether settings are rewritten.
     """
     shell = _hook_shell()
-    ours = [h for entry in entry_list for h in entry.get("hooks", [])
-            if marker in str(h.get("command", ""))]
+    ours = [h for entry in entry_list if isinstance(entry, dict)
+            for h in (entry.get("hooks") if isinstance(entry.get("hooks"), list) else [])
+            if isinstance(h, dict) and marker in str(h.get("command", ""))]
     if ours:
         if all(h.get("command") == wanted and h.get("shell") == shell for h in ours):
             return False
@@ -5343,11 +5369,20 @@ def _remove_our_hooks(hooks):
     events disappear. Returns how many handlers went."""
     removed = 0
     for event in ("PermissionRequest", "SessionStart"):
+        entries = hooks.get(event)
+        if entries is None:
+            continue
+        if not isinstance(entries, list):
+            continue           # the user's, in a shape we never wrote
         kept = []
-        for entry in hooks.get(event, []):
-            handlers = [h for h in entry.get("hooks", [])
-                        if not _is_our_hook(h)]
-            removed += len(entry.get("hooks", [])) - len(handlers)
+        for entry in entries:
+            inner = entry.get("hooks") if isinstance(entry, dict) else None
+            if not isinstance(inner, list):
+                kept.append(entry)
+                continue
+            handlers = [h for h in inner
+                        if not (isinstance(h, dict) and _is_our_hook(h))]
+            removed += len(inner) - len(handlers)
             if handlers:
                 entry["hooks"] = handlers
                 kept.append(entry)
@@ -5450,7 +5485,10 @@ def codex_hook_trusted():
     path = _codex_hooks_path()
     if not os.path.isdir(_codex_home()):
         return None
-    entries = (_read_settings_quietly(path).get("hooks") or {}).get("PermissionRequest") or []
+    hooks = _read_settings_quietly(path).get("hooks")
+    entries = (hooks.get("PermissionRequest") if isinstance(hooks, dict) else None) or []
+    if not isinstance(entries, list):
+        entries = []
     ours = [('[hooks.state."%s:permission_request:%d:%d"]' % (path, i, j),
              _codex_hook_hash("permission_request", entry.get("matcher"), handler))
             for i, entry in enumerate(entries) if isinstance(entry, dict)
@@ -5487,10 +5525,14 @@ def install_codex():
     except ValueError:
         print("Codex  : %s is not valid JSON; left alone." % path)
         return None
-    entries = data.setdefault("hooks", {}).setdefault("PermissionRequest", [])
+    entries = _event_list(data, "PermissionRequest")
+    starters = _event_list(data, "SessionStart") if os.path.exists(_relay_path()) else []
+    if entries is None or starters is None:
+        print("Codex  : %s holds its hooks in a shape this installer does not "
+              "read; left alone." % path)
+        return None
     changed = _sync_hook(entries, _codex_command(), "*", os.path.basename(__file__))
     if os.path.exists(_relay_path()):
-        starters = data["hooks"].setdefault("SessionStart", [])
         changed = _sync_hook(starters, _relay_command(), None,
                              "watch_relay.py") or changed
     for handler in _settings_handlers(data):
@@ -5682,9 +5724,12 @@ def run_install(then_watch=False, bridge=None):
 
     command = _hook_command()
     relay_command = _relay_command() if os.path.exists(_relay_path()) else None
-    hooks = data.setdefault("hooks", {})
-    entries = hooks.setdefault("PermissionRequest", [])
-    starters = hooks.setdefault("SessionStart", [])
+    entries = _event_list(data, "PermissionRequest")
+    starters = _event_list(data, "SessionStart")
+    if entries is None or starters is None:
+        _left_alone(path)
+        return 1
+    hooks = data["hooks"]
 
     changed = _sync_hook(entries, command, "*", os.path.basename(__file__))
     if relay_command:
@@ -5692,6 +5737,14 @@ def run_install(then_watch=False, bridge=None):
                              "watch_relay.py") or changed
     if not starters:
         hooks.pop("SessionStart", None)
+
+    # The settings are written before the slow steps (Codex, the bridge's
+    # notarization check, the login wake-up), never after them: written
+    # after, the copy read here overwrote whatever Claude Code had saved in
+    # the meantime (2026-11-21 review).
+    backup = _backup(path) if changed else None
+    if changed:
+        _write_settings(path, data)
 
     codex = install_codex()
     closed = _bridge_step(bridge)
@@ -5713,9 +5766,6 @@ def run_install(then_watch=False, bridge=None):
         _say_command(short)
         print("  Nothing to do.")
         return 0
-
-    backup = _backup(path)
-    _write_settings(path, data)
 
     print("Installed.")
     print("  Settings : %s" % path)
@@ -5960,7 +6010,11 @@ def _edit_settings_env(mutate):
     if found is None:
         return 1
     path, data = found
-    data.setdefault("env", {})
+    if data.get("env") is None:
+        data["env"] = {}       # `"env": null` crashed --watch (2026-11-21 review)
+    if not isinstance(data["env"], dict):
+        _left_alone(path, 'its "env"')
+        return 1
     message = mutate(data)
     if message is None:
         return 0
