@@ -1681,3 +1681,114 @@ def test_legacy_activity_performs_one_process_inspection(tmp_path, monkeypatch, 
     expected = True if outcome == 'live' else False if outcome == 'closed' else None
     assert talk.activity(str(path), 'legacy-thread') is expected
     assert len(calls) == 1, 'one wrist send must not repeat its process inspection'
+
+
+# Review 2026-11-21 ---------------------------------------------------------
+
+def _file_message():
+    message = request()
+    message["method"] = "item/fileChange/requestApproval"
+    return message
+
+
+@pytest.mark.parametrize("path,content", [
+    ("/repo/app.py", "import db\nDROP TABLE users;"),
+    ("/repo/app.py", "TRUNCATE orders;"),
+    ("/repo/m.sql", "DROP TABLE users;"),
+])
+def test_a_new_file_from_codex_has_its_contents_read(path, content):
+    """Codex hands an added file's contents as its `diff`, with no `+` on
+    each line, so the content scan saw nothing: `DROP TABLE` in a new
+    app.py read MEDIUM where Claude's Write of it reads CRITICAL."""
+    item = {"changes": [{"path": path, "kind": {"type": "add"}, "diff": content}]}
+    card = approval_card(_file_message(), item)
+    claude = classifier.classify({"tool_name": "Write", "tool_input": {
+        "file_path": path, "content": content}, "cwd": "/repo"})["risk"]
+    assert card["tier"] == classifier.Risk(claude).name == "CRITICAL"
+
+
+def test_a_new_file_already_written_as_added_lines_is_read_once():
+    item = {"changes": [{"path": "/repo/app.py", "kind": {"type": "add"},
+                         "diff": "+DROP TABLE users;"}]}
+    assert approval_card(_file_message(), item)["tier"] == "CRITICAL"
+
+
+@pytest.mark.parametrize("text,tier", [
+    ("rm -rf ~", "CRITICAL"),
+    ("git push --force origin main", "CRITICAL"),
+    ("ls", "MEDIUM"),
+    ("\n", "MEDIUM"),
+])
+def test_terminal_input_is_never_marked_below_what_it_would_run(text, tier):
+    """Text typed into a live shell runs there: `rm -rf ~` sent as input
+    read MEDIUM, and its notification offered Allow."""
+    message = request(command=text)
+    message["params"].update(kind="writeStdin", availableDecisions=["accept", "cancel"])
+    card = approval_card(message)
+    assert card["headline"] == "Send input to terminal"
+    assert card["tier"] == tier
+
+
+def test_a_long_reason_does_not_grow_the_card_without_end():
+    message = request(command="ls")
+    message["params"]["reason"] = "x" * 50000
+    card = approval_card(message)
+    assert len(card["detail"]) <= classifier.DETAIL_CHARS + 2000
+
+
+def test_a_change_that_would_grant_a_whole_folder_stays_with_codex():
+    """`grantRoot` asks to allow writes under a folder for the rest of the
+    session; the card showed only the files, and Allow sent accept."""
+    message = _file_message()
+    message["params"]["grantRoot"] = "/repo"
+    item = {"changes": [{"path": "/repo/app.py", "kind": {"type": "update"}, "diff": "+x"}]}
+    assert approval_card(message, item) is None
+
+
+def test_a_handshake_with_no_status_code_is_a_refusal_not_a_crash(monkeypatch):
+    """`HTTP/1.1` with no code raised IndexError, which no watcher caught:
+    the one Codex watcher thread died until the relay restarted."""
+    fake = HandshakeSocket()
+
+    def sendall(data):
+        fake.writes.append(data)
+        if data.startswith(b"GET "):
+            fake.data.extend(b"HTTP/1.1\r\n\r\n")
+
+    fake.sendall = sendall
+    monkeypatch.setattr("codex_approvals.socket.socket", lambda *a: fake)
+    monkeypatch.setattr("codex_approvals.socket.AF_UNIX", 1, raising=False)
+    with pytest.raises(ValueError):
+        LocalWebSocket("/test/socket").send({"hello": "world"})
+
+
+def test_many_answered_requests_never_drop_the_connection(sync):
+    """Past 4,096 answered requests every further answer closed the
+    connection: every other waiting card left and came back a second later,
+    and a tap in that second was lost."""
+    adapter, wire, _cards = sync
+    with adapter._lock:
+        for n in range(4200):
+            adapter._finish(("thread-1", n))
+    assert not wire.closed
+    assert len(adapter._finished) <= 4096
+
+
+def test_a_connected_tools_question_is_what_the_wrist_shows():
+    """Review 2026-11-21 (owner: show it): the card said only "Approve
+    connected tool?", and the tool's own question was in a field the watch
+    never draws for a question card."""
+    message = consent_request(schema={"type": "object", "properties": {
+        "confirmed": {"type": "boolean", "title": "Confirm"}}, "required": ["confirmed"]})
+    message["params"]["message"] = "Delete repository acme/prod and all its forks?"
+    card, _answers = native_consent(message)
+    assert card["kind"] == "question"
+    assert "Delete repository acme/prod and all its forks?" in card["headline"]
+    assert message["params"]["serverName"] in card["headline"]
+
+
+def test_a_question_too_long_for_the_wrist_stays_with_codex():
+    message = consent_request(schema={"type": "object", "properties": {
+        "confirmed": {"type": "boolean", "title": "Confirm"}}, "required": ["confirmed"]})
+    message["params"]["message"] = "Delete " + "x" * (classifier.TEXT_CHARS + 10) + "?"
+    assert native_consent(message) is None

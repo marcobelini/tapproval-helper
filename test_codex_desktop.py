@@ -667,6 +667,42 @@ def test_hub_recovery_accepts_verified_native_closure_but_not_an_unknown_target(
     assert events[-1], "absence is not closure proof for a never-observed target"
 
 
+def test_a_never_observed_target_error_ends_on_its_own(health_hub):
+    """Review 2026-11-21 (R1): a chat no reachable server ever listed kept
+    "one Codex chat can't ask" until the relay restarted, and was asked
+    about every second. It now ends after a while, as a passing fault."""
+    hub, wires, events = health_hub
+    now = [1000.0]
+    hub._clock = lambda: now[0]
+    assert not hub.attach("never-observed")
+    for sync in hub._syncs.values():
+        sync.reconcile()
+    hub._retry_targets()
+    assert events[-1], "absence is not closure proof, within the window"
+    now[0] += hub.TARGET_ERROR_SECONDS + 1
+    hub._retry_targets()
+    assert events[-1] is None and "never-observed" not in hub._target_errors
+
+
+def test_target_errors_are_capped(health_hub):
+    hub, _wires, _events = health_hub
+    for index in range(hub.TARGET_ERRORS_MAX + 10):
+        hub._problem("chat-%d" % index, [], False)
+    assert len(hub._target_errors) == hub.TARGET_ERRORS_MAX
+    assert "chat-0" not in hub._target_errors, "the oldest goes first"
+
+
+def test_a_server_outage_is_said_before_one_chats_trouble(health_hub):
+    """A target error was published ahead of the servers' own state, so a
+    full outage still read as one chat that could not ask."""
+    hub, _wires, events = health_hub
+    hub._problem("one-chat", [], False)
+    with hub._lock:
+        hub._states["desktop"] = "Codex is not answering"
+        hub._publish()
+    assert hub.last_error == "Codex is not answering"
+
+
 def test_prepared_wrapper_runs_without_launcher_environment(tmp_path, monkeypatch):
     """Desktop tool subprocesses can retain the wrapper path but drop its env."""
     import subprocess

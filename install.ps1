@@ -34,7 +34,7 @@ if (Test-Path (Join-Path $Dir ".git")) {
     git -C $Dir pull -q --ff-only 2>$null
     if ($LASTEXITCODE -ne 0) {
         # As install.sh: a fresh clone beside it, swapped in only once whole,
-        # carrying the helper's data (the paired watches' keys) and logs.
+        # carrying the helper's data (the paired watches' keys), logs and site rules.
         Write-Host "update: fetching a fresh copy (the existing one could not fast-forward)"
         $fresh = "$Dir.fresh-$PID"
         if (Test-Path $fresh) { Remove-Item -Recurse -Force $fresh }
@@ -42,14 +42,14 @@ if (Test-Path (Join-Path $Dir ".git")) {
         if ($LASTEXITCODE -eq 0) {
             $superseded = "$Dir.superseded-" + (Get-Date -Format "yyyyMMdd-HHmmss")
             try {
-                foreach ($kept in @("data", "logs")) {
+                foreach ($kept in @("data", "logs", "site-rules.json")) {
                     $from = Join-Path $Dir $kept
                     if (Test-Path $from) { Move-Item $from (Join-Path $fresh $kept) }
                 }
                 Move-Item $Dir $superseded
                 Move-Item $fresh $Dir
             } catch {
-                foreach ($kept in @("data", "logs")) {
+                foreach ($kept in @("data", "logs", "site-rules.json")) {
                     $moved = Join-Path $fresh $kept
                     if ((Test-Path $moved) -and -not (Test-Path (Join-Path $Dir $kept))) {
                         Move-Item $moved (Join-Path $Dir $kept) -ErrorAction SilentlyContinue

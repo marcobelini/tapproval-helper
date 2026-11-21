@@ -180,7 +180,6 @@ def record(entry, path=None):
     path = path or CRASH_LOG
     try:
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-        _rotate(path)
         # One write() of one whole line: an entry can exceed the text
         # layer's 8 KiB buffer, so two request threads crashing together
         # could interleave halves, and the reader skipped the torn line
@@ -190,6 +189,9 @@ def record(entry, path=None):
         # Windows has no atomic append: its O_APPEND is a seek to the end
         # and then a write, so two threads could still land on one offset.
         with _RECORD_LOCK:
+            # Inside the lock: two threads rotating at once moved the
+            # first's fresh file over the rotated history (2026-11-21).
+            _rotate(path)
             fresh = not os.path.exists(path)
             handle = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             try:
