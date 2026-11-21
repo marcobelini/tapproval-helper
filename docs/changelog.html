@@ -23,6 +23,19 @@
 <main class="policy">
 <h1>Changelog</h1>
 <p><em>Every release of Tapproval Base, the helper on your computer, newest first. Starting Claude Code once updates it. Generated from <a href="https://github.com/marcobelini/tapproval-helper/releases">the releases on GitHub</a>, which may already hold a newer one. Security fixes are also explained on <a href="security.html">the security page</a>.</em></p>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.133">1.1.133</a></h2>
+<p><em>2026-11-21</em></p>
+<p><strong>The fixes from the 2026-11-21 review.</strong></p>
+<ul>
+<li><strong>More risky commands get the mark they deserve.</strong> Hidden tricks that run code (a zsh glob qualifier), quiet file writes (<code>sed -I</code>, <code>ruff -o</code>, <code>yq -s</code>), searches of the whole home folder for keys, a secret sent away inside a URL, writes through a link that leads outside the project, and <code>git</code> in a temporary folder no longer pass as harmless. Nothing gets a lower mark. This matters most if you switched on auto-approve.</li>
+<li><strong>Another account on your Mac can no longer tell the watch it is on your wrist.</strong> The watch's "seen recently" now takes the key file, as answers do.</li>
+<li><strong>Signing Codex in from the watch is safer.</strong> It never signs out a Codex that already works, a tap always gets the answer it asked for, and a cancelled sign-in stops completely.</li>
+<li><strong>Codex warnings end and say what is true.</strong> "One Codex chat can't ask on the watch" ends by itself, and when Codex as a whole is down, Connection says so.</li>
+<li><strong>A few slow Codex chats no longer cost you the whole Codex list.</strong></li>
+<li><strong>A burst of crashes can no longer erase the crash history.</strong></li>
+</ul>
+<p>A message and /recap from the watch were checked on a real session before release. Passed the public tests on macOS, Linux and Windows, Python 3.9–3.13.</p>
+<p>Already installed? A terminal install updates itself when Claude Code starts. A plugin install updates when auto-update is on: in Claude Code, type <code>/plugin</code>, open Marketplaces, choose tapproval and pick Enable auto-update.</p>
 <h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.132">1.1.132</a></h2>
 <p><em>2026-11-20</em></p>
 <ul>
