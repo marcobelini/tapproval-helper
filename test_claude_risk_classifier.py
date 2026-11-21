@@ -12276,12 +12276,11 @@ class TestCloudHeartbeat:
         port, queue = live_relay
         queue.last_poll = None      # no direct watch poll ever
         assert not _watch_present(queue)
-        request = urllib.request.Request(
-            "http://127.0.0.1:%d/heartbeat" % port,
-            data=json.dumps({"watch_seen_seconds_ago": 12}).encode(),
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=5) as reply:
-            assert _json.loads(reply.read())["ok"] is True
+        # Signed with the key file, as the bridge signs it.
+        status, body = signed_call("http://127.0.0.1:%d/heartbeat" % port,
+                                   watch_relay.Auth().bootstrap,
+                                   {"watch_seen_seconds_ago": 12})[:2]
+        assert status == 200 and body["ok"] is True
         assert _watch_present(queue)
 
     def test_stale_heartbeat_is_ignored(self):
@@ -14271,6 +14270,60 @@ class TestSigningInFromTheWrist:
         answer = watch_relay.start_signin("codex", popen=lambda cmd, **k: proc, where="computer")
         assert answer == {"ok": False, "status": "Codex could not open its sign-in on this computer"}
         assert proc.killed
+
+    def test_a_tap_for_the_other_way_never_gets_the_starting_ones_answer(self, monkeypatch):
+        """Review 2026-11-21: a "sign in on this computer" tap while a code
+        sign-in was still starting was handed the code, and the reverse
+        handed a tap from away "opened" with no code."""
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
+        monkeypatch.setattr(watch_relay, "signed_in", lambda **k: False)
+        ready = threading.Event()
+        watch_relay._SIGNIN_RUNS["codex"] = {"proc": None, "at": time.time(),
+                                             "ready": ready, "where": None}
+        phone = self._Proc([])
+
+        def code_lands():
+            time.sleep(0.1)
+            with watch_relay._SIGNIN_RUNS_LOCK:
+                watch_relay._SIGNIN_RUNS["codex"] = {
+                    "proc": phone, "at": time.time(), "where": None,
+                    "answer": {"ok": True, "status": "code", "url": "u", "code": "C"}}
+            ready.set()
+        threading.Thread(target=code_lands, daemon=True).start()
+        answer = watch_relay.start_signin("codex", popen=lambda cmd, **k: pytest.fail("a second"),
+                                          where="computer")
+        assert answer.get("status") != "code", answer
+        assert answer["ok"] is False
+        phone.done.set()
+
+    def test_the_computer_sign_in_asks_afresh_whether_codex_is_signed_in(self, monkeypatch):
+        """Review 2026-11-21: a "signed out" two minutes old let a tap start
+        `codex login` over a sign-in made at the terminal since, which
+        clears it."""
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
+        forgotten = []
+        monkeypatch.setattr(watch_relay, "forget_signed_in", lambda agent: forgotten.append(agent))
+        monkeypatch.setattr(watch_relay, "signed_in", lambda **k: bool(forgotten))
+        answer = watch_relay.start_signin(
+            "codex", popen=lambda cmd, **k: pytest.fail("a sign-in was started"), where="computer")
+        assert answer["ok"] is False and "already signed in" in answer["status"]
+
+    def test_a_stopped_sign_in_stops_what_its_launcher_started(self, monkeypatch):
+        """Review 2026-11-21: npm's codex is a launcher, and killing it left
+        the real `codex login` running with its callback port held."""
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
+        monkeypatch.setattr(watch_relay, "signed_in", lambda **k: False)
+        groups = []
+        monkeypatch.setattr(os, "killpg", lambda pid, sig: groups.append(pid), raising=False)
+        phone = self._Proc(["https://auth.example.test/codex/device\n", "ABCD-EF123\n"])
+        phone.pid = 4242
+        assert watch_relay.start_signin("codex", popen=lambda cmd, **k: phone)["status"] == "code"
+        desk = self._Proc(self._OAUTH)
+        watch_relay.start_signin("codex", popen=lambda cmd, **k: desk, where="computer")
+        assert phone.killed
+        if hasattr(signal, "SIGKILL"):
+            assert groups == [4242], "only the launcher was stopped"
+        desk.done.set()
 
     def test_where_means_nothing_to_claude_code(self, monkeypatch):
         monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
@@ -17624,11 +17677,22 @@ class TestRelayRoutes:
         assert signed_call(base + "/card", auth.bootstrap, {"nope": 1})[0] == 400
 
     def test_the_heartbeat_records_the_watchs_presence(self, relay):
-        base, queue, _ = relay
-        status, body = self._call(base + "/heartbeat", method="POST",
-                                  body={"watch_seen_seconds_ago": 3})
+        base, queue, auth = relay
+        status, body = signed_call(base + "/heartbeat", auth.bootstrap,
+                                   {"watch_seen_seconds_ago": 3})[:2]
         assert status == 200 and body == {"ok": True}
         assert queue.watch_seen_seconds_ago() is not None
+
+    def test_a_heartbeat_takes_the_key_file(self, relay):
+        """Loopback alone opens only /health: any account on this Mac, or a
+        port-forward into it, could tell /health a watch was on the wrist
+        (2026-11-21 review). The bridge signs with the key file."""
+        base, queue, auth = relay
+        assert self._call(base + "/heartbeat", method="POST",
+                          body={"watch_seen_seconds_ago": 0})[0] == 403
+        assert self._call(base + "/heartbeat", token=auth.bootstrap, method="POST",
+                          body={"watch_seen_seconds_ago": 0})[0] == 403
+        assert queue.watch_seen_seconds_ago() is None
 
     def test_a_new_session_with_no_words_is_refused_in_words(self, relay):
         base, _, _ = relay
@@ -25986,11 +26050,11 @@ class TestTheHelperInstallsTheMacBridge:
         try:
             relay_call(base + "/heartbeat", method="POST", body={"watch_seen_seconds_ago": 5})
             assert not auth.paired_ever, "a stray local process is no witness"
-            relay_call(base + "/heartbeat", method="POST", token="bootstraptoken",
-                       body={"watch_seen_seconds_ago": 10_000})
+            signed_call(base + "/heartbeat", "bootstraptoken",
+                        {"watch_seen_seconds_ago": 10_000})
             assert not auth.paired_ever, "a stale heartbeat is no witness either"
-            relay_call(base + "/heartbeat", method="POST", token="bootstraptoken",
-                       body={"watch_seen_seconds_ago": 5})
+            signed_call(base + "/heartbeat", "bootstraptoken",
+                        {"watch_seen_seconds_ago": 5})
             assert auth.paired_ever and not auth.window_open()
         finally:
             server.shutdown()
@@ -30588,3 +30652,22 @@ class TestAmbiguousCodexRouting:
         else:
             result = watch_relay.archive_session("shared00")
         assert result == "unknown session"
+
+
+class TestReview20261121RelayAndCrashLog:
+    """The 2026-11-21 review's relay and crash-log findings."""
+
+    def test_the_crash_log_rotates_under_the_same_lock_it_writes_under(self, tmp_path,
+                                                                       monkeypatch):
+        """Two threads crashing together over the size limit: the second's
+        rename moved the first's fresh one-line file over the rotated
+        history, which was lost."""
+        held = []
+        real = crash_report._rotate
+
+        def watching(path, *args, **kwargs):
+            held.append(crash_report._RECORD_LOCK.locked())
+            return real(path, *args, **kwargs)
+        monkeypatch.setattr(crash_report, "_rotate", watching)
+        assert crash_report.record({"message": "x"}, path=str(tmp_path / "c.jsonl"))
+        assert held == [True]

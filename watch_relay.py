@@ -2167,7 +2167,10 @@ def start_signin(agent, popen=None, where=None):
     where = "computer" if agent == "codex" and where == "computer" else None
     if where:
         # Signed in, or no answer yet: either way, never risk replacing
-        # a sign-in that works.
+        # a sign-in that works. Asked afresh: a "signed out" two minutes
+        # old let `codex login` clear a sign-in made at the terminal since
+        # (2026-11-21 review).
+        forget_signed_in(agent)
         now_in = signed_in(agent=agent)
         if now_in is not False:
             return {"ok": False, "status": "Codex is already signed in on this computer" if now_in
@@ -2177,10 +2180,7 @@ def start_signin(agent, popen=None, where=None):
         if run and run["proc"] is not None and run.get("where") != where:
             # The other way was asked for: the code on the phone gives way
             # to the computer's browser, or back. One sign-in at a time.
-            try:
-                run["proc"].kill()
-            except Exception:
-                pass
+            _stop_signin(run["proc"])
             run = None
             _SIGNIN_RUNS.pop(agent, None)
         if run and run["proc"] is None:
@@ -2202,6 +2202,12 @@ def start_signin(agent, popen=None, where=None):
         with _SIGNIN_RUNS_LOCK:
             run = _SIGNIN_RUNS.get(agent)
             if run and run.get("answer"):
+                if run.get("where") != where:
+                    # The other way was starting: its answer is not this
+                    # tap's — a code for a tap at the desk, or "opened" for
+                    # one from away (2026-11-21 review).
+                    return {"ok": False, "status": "Another sign-in is starting on your "
+                                                   "computer. Try again in a moment."}
                 return _signin_answer(run)
         return dict(_SIGNIN_NOT_STARTED)
     answer, proc = dict(_SIGNIN_NOT_STARTED), None
@@ -2224,6 +2230,24 @@ def start_signin(agent, popen=None, where=None):
 
 
 _SIGNIN_NOT_STARTED = {"ok": False, "status": "The sign-in could not start on your computer"}
+
+
+def _stop_signin(proc):
+    """Stop a sign-in and what it started. It runs in a session of its own,
+    and npm's codex is a launcher whose child is the real `codex login`:
+    killing the launcher alone left that running, its callback port held
+    and its code still good (2026-11-21 review). Never raises."""
+    try:
+        pid = getattr(proc, "pid", None)
+        if (isinstance(pid, int) and pid > 1 and hasattr(os, "killpg")
+                and hasattr(signal, "SIGKILL") and proc.poll() is None):
+            os.killpg(pid, signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
 
 
 def _signin_answer(run, now=None):
@@ -2284,7 +2308,7 @@ def _launch_signin(agent, popen, where=None):
         try:
             proc.wait(timeout=SIGNIN_RUN_SECONDS)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _stop_signin(proc)
         except Exception:
             pass
         # Whatever happened, the next question is asked afresh: a success
@@ -2301,19 +2325,13 @@ def _launch_signin(agent, popen, where=None):
         # on the computer.
         found.wait(SIGNIN_CODE_WAIT)
         if not seen["url"]:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            _stop_signin(proc)
             return {"ok": False, "status": "Codex could not open its sign-in on this computer"}, None
         answer = {"ok": True, "status": "opened"}
     elif agent == "codex":
         found.wait(SIGNIN_CODE_WAIT)
         if not (seen["url"] and seen["code"]):
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            _stop_signin(proc)
             return {"ok": False, "status": "Codex did not give a sign-in code"}, None
         answer = {"ok": True, "status": "code", "url": seen["url"],
                   "code": seen["code"], "expires_in": 900}
@@ -4929,7 +4947,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             # hook believes only an answer that proves the key back (S1).
             "/card": ("_post_card", dict(local=True, lan_only=True, key_file=True)),
             "/codex/attach": ("_post_codex_attach", dict(local=True, lan_only=True, key_file=True)),
-            "/heartbeat": ("_post_heartbeat", dict(local=True, lan_only=True)),
+            # key_file: an unsigned local caller could tell /health a
+            # watch was on the wrist; the bridge signs (2026-11-21 review).
+            "/heartbeat": ("_post_heartbeat", dict(local=True, lan_only=True, key_file=True)),
             # The bridge saying whether this Mac's iCloud account can carry
             # cards at all. admin: the key file, which the bridge signs
             # with. Loopback alone is any process, and "noAccount" from
