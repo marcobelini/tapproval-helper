@@ -28,15 +28,17 @@ if [ -d "$DIR/.git" ]; then
     rm -rf "$fresh"
     if git clone -q --depth 1 "$REPO" "$fresh"; then
       # The installed Mac bridge, the helper's data (the paired watches'
-      # keys among it) and its logs live in the checkout but are not part
-      # of it (gitignored): they move with the install, not with the old copy.
+      # keys among it), its logs and the user's site rules live in the
+      # checkout but are not part of it (gitignored): they move with the
+      # install, not with the old copy. site-rules.json stayed behind until
+      # the 2026-11-21 review, and every sensitive-host rule went quietly.
       # Each step is checked: under set -e a move that failed halfway
       # stopped the script with the watches' keys in $fresh, where nothing
       # looks (2026-10-24 review). On any failure what moved goes back.
       superseded="$DIR.superseded-$(date +%Y%m%d-%H%M%S)"
       swapped=yes
-      for kept in bridge-app data logs; do
-        if [ -d "$DIR/$kept" ] && ! mv "$DIR/$kept" "$fresh/$kept"; then
+      for kept in bridge-app data logs site-rules.json; do
+        if [ -e "$DIR/$kept" ] && ! mv "$DIR/$kept" "$fresh/$kept"; then
           swapped=no
           break
         fi
@@ -51,7 +53,7 @@ if [ -d "$DIR/.git" ]; then
             echo "  The installed copy is in:  $superseded" >&2
             echo "  The paired watches' keys:  $fresh/data" >&2
             echo "  Put it back by hand: move the first to $DIR, then move" >&2
-            echo "  bridge-app, data and logs from $fresh into it." >&2
+            echo "  bridge-app, data, logs and site-rules.json from $fresh into it." >&2
             exit 1
           fi
           swapped=no
@@ -60,8 +62,8 @@ if [ -d "$DIR/.git" ]; then
         swapped=no
       fi
       if [ "$swapped" = no ]; then
-        for kept in bridge-app data logs; do
-          if [ -d "$fresh/$kept" ] && [ ! -e "$DIR/$kept" ]; then
+        for kept in bridge-app data logs site-rules.json; do
+          if [ -e "$fresh/$kept" ] && [ ! -e "$DIR/$kept" ]; then
             mv "$fresh/$kept" "$DIR/$kept" || true
           fi
         done

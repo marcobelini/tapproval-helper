@@ -199,11 +199,22 @@ def install_crash_reporting():
         print("relay: crash reporting unavailable (%s)" % error, file=sys.stderr)
         return False
 
+    # A dead thread stays dead until the helper starts again, and restarting
+    # Claude Code does not start it again (--ensure keeps a running relay):
+    # the row stays and says what clears it. A request that crashed is over
+    # once it was answered, so its row leaves on its own an hour after the
+    # last one (owner, 2026-11-21 review).
     def _wrist(entry):
         note_condition("crash", "Tapproval's helper hit a problem it did not "
                        "expect (%s). It is written down on the computer; "
-                       "restarting Claude Code clears this."
+                       "restarting the computer clears this."
                        % entry.get("message", "")[:80])
+
+    def _wrist_request(entry):
+        note_condition("crash", "Tapproval's helper hit a problem it did not "
+                       "expect (%s). It is written down on the computer, "
+                       "and this clears on its own within an hour."
+                       % entry.get("message", "")[:80], expires_in=CRASH_ROW_SECONDS)
 
     previous_thread = threading.excepthook
     previous_process = sys.excepthook
@@ -225,7 +236,7 @@ def install_crash_reporting():
     def on_request(kind, value, tb):
         stack = "".join(traceback.format_exception(kind, value, tb))
         crash_report.report("%s: %s" % (kind.__name__, value), stack,
-                            source="request", helper=HELPER_VERSION, note=_wrist)
+                            source="request", helper=HELPER_VERSION, note=_wrist_request)
 
     global _ON_HANDLER_ERROR
     threading.excepthook = on_thread
@@ -364,19 +375,35 @@ CONDITION_TONES = ("needs_you", "in_hand")
 
 _CONDITIONS = {}
 _CONDITIONS_LOCK = threading.Lock()
+# When a condition noted with `expires_in` leaves on its own. A key not
+# here stays until it is cleared.
+_CONDITION_EXPIRES = {}
+CRASH_ROW_SECONDS = 3600     # a crashed request's row, after the last one
 
 
-def note_condition(key, detail, tone="needs_you"):
+def note_condition(key, detail, tone="needs_you", expires_in=None):
     """Record something degraded, and say it on stderr the first time.
 
     Re-noting the same detail is silent: a warning that repeats on every
     retry teaches the reader to skip warnings. A tone nobody defined is
     read as needs_you: fail toward the person's attention.
+
+    ``expires_in``: seconds after which the condition leaves by itself,
+    for a problem that is over once it happened (a request that crashed).
+    It never shortens one that stays until cleared: that one is kept as it
+    was.
     """
     if tone not in CONDITION_TONES:
         tone = "needs_you"
     with _CONDITIONS_LOCK:
+        _drop_expired_conditions()
         before = _CONDITIONS.get(key)
+        if expires_in is not None and before is not None and key not in _CONDITION_EXPIRES:
+            return
+        if expires_in is None:
+            _CONDITION_EXPIRES.pop(key, None)
+        else:
+            _CONDITION_EXPIRES[key] = time.time() + expires_in
         repeated = before is not None and before[0] == detail
         # Since when: the first time this key was noted and not yet
         # cleared. A sentence that changes meanwhile keeps the time, so
@@ -392,11 +419,22 @@ def clear_condition(key):
     """Withdraw a condition that has since resolved. Never raises."""
     with _CONDITIONS_LOCK:
         _CONDITIONS.pop(key, None)
+        _CONDITION_EXPIRES.pop(key, None)
+
+
+def _drop_expired_conditions():
+    """Under _CONDITIONS_LOCK: let go of what has run its time."""
+    now = time.time()
+    for key, deadline in list(_CONDITION_EXPIRES.items()):
+        if now >= deadline:
+            _CONDITION_EXPIRES.pop(key, None)
+            _CONDITIONS.pop(key, None)
 
 
 def conditions():
     """Everything currently wrong, key order, for /health and the tests."""
     with _CONDITIONS_LOCK:
+        _drop_expired_conditions()
         return [{"key": key, "detail": detail, "tone": tone, "since": int(since)}
                 for key, (detail, tone, since) in sorted(_CONDITIONS.items())]
 
@@ -2747,17 +2785,25 @@ def brief_session(stdin=None, stdout=None, environ=None, wait=1.0):
                 or "/.codex/" in transcript
                 or not ("/.claude/" in transcript or environ.get("CLAUDE_PROJECT_DIR"))):
             return False
+        # One code per session, kept when it is told again (a resume or a
+        # compaction starts it again): the note it holds and the messages
+        # it is sent must name the same one.
+        code = session_code(session_id, any_wording=True) or wire.new_wrist_code()
         note = wire.wrist_session_note(
-            echo=environ.get("CLAUDE_CODE_ENTRYPOINT") != _APP_ENTRYPOINT)
+            echo=environ.get("CLAUDE_CODE_ENTRYPOINT") != _APP_ENTRYPOINT, code=code)
         stdout.write(json.dumps({"hookSpecificOutput": {
             "hookEventName": "SessionStart", "additionalContext": note}}) + "\n")
         stdout.flush()
         # After the note is out: a session marked but never told would be
         # sent words with nothing to explain them.
+        # Readable by this account alone: the code is what tells the
+        # wearer's words from another session's.
         os.makedirs(WRIST_BRIEFED_DIR, mode=0o700, exist_ok=True)
-        with open(os.path.join(WRIST_BRIEFED_DIR, session_id), "w",
-                  encoding="utf-8") as handle:
-            handle.write(_note_mark(note))
+        path = os.path.join(WRIST_BRIEFED_DIR, session_id)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.chmod(path, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(_note_mark(note) + "\n" + code + "\n")
         _forget_old_briefings()
         return True
     except Exception as error:      # noqa: BLE001 — a session must still start
@@ -2778,19 +2824,33 @@ def _forget_old_briefings(now=None):
         pass
 
 
-def session_briefed(session_id):
-    """Was this session told what a wrist message is, in words this helper
-    still uses? Anything unreadable is no: the long message explains
-    itself, and the short one must never arrive unexplained."""
+def session_code(session_id, any_wording=False):
+    """The code this session was told its wrist messages carry, when it was
+    told in words this helper still uses; None otherwise. ``any_wording``
+    takes the code whatever the wording, for telling the same session
+    again. Anything unreadable is None: the long message explains itself,
+    and the short one must never arrive unexplained."""
     if not isinstance(session_id, str) or not _SESSION_ID.match(session_id):
-        return False
+        return None
     try:
         with open(os.path.join(WRIST_BRIEFED_DIR, session_id), encoding="utf-8") as handle:
-            mark = handle.read(64).strip()
+            lines = handle.read(256).split("\n")
     except (OSError, UnicodeDecodeError):
-        return False
-    return mark in (_note_mark(wire.wrist_session_note(echo=True)),
-                    _note_mark(wire.wrist_session_note(echo=False)))
+        return None
+    mark = lines[0].strip()
+    code = lines[1].strip() if len(lines) > 1 else ""
+    if not wire.WRIST_CODE.fullmatch(code):
+        return None         # told before codes: the long message, which explains itself
+    if any_wording or mark in (_note_mark(wire.wrist_session_note(echo=True, code=code)),
+                               _note_mark(wire.wrist_session_note(echo=False, code=code))):
+        return code
+    return None
+
+
+def session_briefed(session_id):
+    """Was this session told what a wrist message is, with its code, in
+    words this helper still uses?"""
+    return session_code(session_id) is not None
 
 
 def post_to_inbox(entry, text, brief=False, command=False, timeout=INBOX_TIMEOUT):
@@ -2815,11 +2875,12 @@ def post_to_inbox(entry, text, brief=False, command=False, timeout=INBOX_TIMEOUT
         return False
     # The words alone, for a session told at its start what they are and
     # to keep its answer short; the note says both, so only then.
-    short = bool(brief) and session_briefed(entry.get("session_id"))
+    code = session_code(entry.get("session_id")) if brief else None
     line = json.dumps({"type": "user",
                        "message": {"role": "user",
                                    "content": wire.wrist_inbox_message(
-                                       text, brief, command, short=short)}}) + "\n"
+                                       text, brief, command, short=bool(code),
+                                       code=code or "")}}) + "\n"
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.settimeout(timeout)
@@ -3860,6 +3921,11 @@ class _PromptResolver:
         # they were written: the fallback when nothing matches by content.
         self.open_calls = {}
         self.first_read = True      # the fallback is decided once, here
+        self.read_once = set()      # transcripts whose first tail is read
+        # Matching calls whose result was already in a first tail: an
+        # earlier run of the same command, or this card's own call answered
+        # before the relay looked. Which one is decided after the read.
+        self.closed_early = set()
         self.scan_at = 0.0          # next time to look for new subagents
         self.retry_at = 0.0         # next time to look for a missing transcript
 
@@ -3872,8 +3938,21 @@ class _PromptResolver:
             for path in list(self.files):
                 lines, self.files[path], shrunk = _read_appended(
                     path, self.files[path])
-                if self._scan(lines, shrunk, path):
+                fresh = path not in self.read_once
+                self.read_once.add(path)
+                if self._scan(lines, shrunk, path, fresh=fresh):
                     resolved = True
+            if self.closed_early:
+                # A matching call still waiting is this card's: the closed
+                # ones are history. The same command asked and answered
+                # earlier sat in the first tail, and its result retracted
+                # the new card at once, before the wrist saw it (2026-11-21
+                # review). With none waiting, the card's own call was
+                # answered before the first look, and the card leaves.
+                if not self.use_ids & set(self.open_calls):
+                    resolved = True
+                self.use_ids -= self.closed_early
+                self.closed_early.clear()
             if self.first_read:
                 self.first_read = False
                 self._adopt_the_one_open_call()
@@ -3930,7 +4009,7 @@ class _PromptResolver:
                 except OSError:
                     pass
 
-    def _scan(self, lines, shrunk, path):
+    def _scan(self, lines, shrunk, path, fresh=False):
         # Through the dashboard's table of upstream shapes, so a rename in
         # Claude Code's transcript is one entry to update, and dated.
         call, answer = shape("type.tool_use"), shape("type.tool_result")
@@ -3959,6 +4038,11 @@ class _PromptResolver:
                 elif part.get("type") == answer:
                     self.open_calls.pop(part.get("tool_use_id"), None)
                     if part.get("tool_use_id") in self.use_ids:
+                        if fresh:
+                            # Decided by the caller once the whole tail
+                            # is read: see `closed_early`.
+                            self.closed_early.add(part.get("tool_use_id"))
+                            continue
                         return True
         except (OSError, ValueError):
             return False
@@ -4266,6 +4350,10 @@ def verify_signature(header, method, path, body, candidates, now=None, query="")
         return None, None
     signed_query = query if version == "v2" else None
     moment = time.time() if now is None else now
+    # A time of 400 digits is no time: no float holds it, and the age
+    # check below raised before any key was asked for (2026-11-21 review).
+    if not 0 <= stamp < 10 ** 12:
+        return None, None
     if abs(moment - stamp) > SIGNATURE_WINDOW_SECONDS:
         return None, None
     # Bytes, never str: compare_digest raises on a str with non-ASCII in
@@ -4650,10 +4738,19 @@ class RelayHandler(BaseHTTPRequestHandler):
             if header:
                 if self.auth is not None and hasattr(self.auth, "credentials"):
                     from urllib.parse import unquote, urlsplit
-                    split = urlsplit(self.path)
-                    key, nonce = verify_signature(
-                        header, self.command, unquote(split.path),
-                        self._raw_body(), self.auth.credentials(), query=split.query)
+                    # Every refusal asks this too (`_wants_sealed`), so it
+                    # must never raise: an address the parser cannot read
+                    # (#1399's) crashed the refusal of that very address
+                    # once a signature and the seal header came with it
+                    # (2026-11-21 review). What cannot be read proves no key.
+                    try:
+                        split = urlsplit(self.path)
+                        key, nonce = verify_signature(
+                            header, self.command, unquote(split.path),
+                            self._raw_body(), self.auth.credentials(),
+                            query=split.query)
+                    except (ValueError, OverflowError):
+                        key, nonce = None, None
                     self._presented_key, self._signed_nonce = key or "", nonce
                     # Only a 2.1 watch, which has pinned this computer's
                     # certificate, signs on the encrypted listener.
@@ -4754,7 +4851,10 @@ class RelayHandler(BaseHTTPRequestHandler):
             return None
         try:
             data = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            # RecursionError: JSON nested past the parser's depth, which
+            # anyone on the Wi-Fi could send to /enroll before any key was
+            # asked for (2026-11-21 review). An unreadable body, no more.
             return None
         return data if isinstance(data, dict) else None
 

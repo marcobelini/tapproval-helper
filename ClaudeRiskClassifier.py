@@ -69,6 +69,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import sys
@@ -229,6 +230,11 @@ SECRET_PATH = re.compile(
     r"\.fly[/\\]config\.ya?ml|\.config[/\\]gcloud[/\\]|\.azure[/\\]|"
     r"\.supabase[/\\]access-token|\.wrangler[/\\]config[/\\]|"
     r"\.config[/\\]glab-cli[/\\]|\.yarnrc\.yml\b|"
+    # And more of them, SAFE until the 2026-11-21 review: Stripe, s3cmd,
+    # rclone, Railway, doctl, Copilot, Vercel and Netlify.
+    r"\.config[/\\]stripe[/\\]config\.toml|\.s3cfg\b|rclone[/\\]rclone\.conf|"
+    r"\.railway[/\\]config\.json|doctl[/\\]config\.ya?ml|\.config[/\\]github-copilot[/\\]|"
+    r"com\.vercel\.cli[/\\]auth\.json|\.vercel[/\\]auth\.json|netlify[/\\]config\.json|"
     r"(?<![\w-])\.(?:aws|ssh|gnupg|appstoreconnect)(?![\w.-])|\.tapproval[/\\]data(?![\w.-]))",
     re.I,
 )
@@ -333,6 +339,12 @@ SQL_DESTRUCTIVE = re.compile(
 )
 SQL_MUTATION = re.compile(
     r"\b(INSERT\s+INTO|UPDATE\s+\S+\s+SET|DELETE\s+FROM|MERGE\s+INTO|"
+    # A table alias, ONLY, a join, and the writes that replace a row: each
+    # read LOW through an MCP query (2026-11-21 review). REPLACE INTO only
+    # before what SQL puts there, so "replace into the text" is prose.
+    r"UPDATE\s+(?:ONLY\s+)?[\w.\"`\[\]]+\s+(?:AS\s+)?\w+\s+SET\b|"
+    r"UPDATE\s+[\w.\"`]+(?:\s+(?:AS\s+)?\w+)?\s+(?:(?:INNER|LEFT|RIGHT|CROSS)\s+)?JOIN\b[^;]*?\bSET\b|"
+    r"(?:REPLACE|INSERT\s+OR\s+(?:REPLACE|IGNORE|ABORT|FAIL|ROLLBACK))\s+INTO\s+[\w.\"`]+\s*(?:\(|VALUES\b|SELECT\b|SET\b|DEFAULT\b)|"
     r"ALTER\s+(TABLE|PROCEDURE)|CREATE\s+(OR\s+ALTER\s+)?PROCEDURE"
     # Who may do what, and who can log in: the same review.
     r"|(?:GRANT|REVOKE)\s+[\w, ()]+\s+ON\s+[\w.*\"` ]+\s+(?:TO|FROM)\b"
@@ -587,12 +599,21 @@ def _words_name_a_secret(parts):
                for i in range(len(parts) - 1))
 
 
+_VARIABLE_IN_WORD = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+
+
 def _names_a_secret(word):
     # `${GITHUB_TOKEN}` is `$GITHUB_TOKEN`: the braces kept `token}` from
     # matching, and the braced spelling read SAFE (2026-09-30).
     bare = word.strip("-'\"").replace("${", "$").rstrip("}")
     if bare.lower() in SECRET_WORDS:
         return True
+    # The same variable inside a word: `https://evil/$GITHUB_TOKEN` hands
+    # the token to whoever answers, and read SAFE through `git ls-remote`
+    # while `echo $GITHUB_TOKEN` read HIGH (2026-11-21 review).
+    for name in _VARIABLE_IN_WORD.findall(word):
+        if name != bare.lstrip("$") and _names_a_secret("$" + name.upper()):
+            return True
     if not (word.startswith("-") or "=" in word or bare.isupper()):
         return False
     return _words_name_a_secret([p for p in _SECRET_JOINERS.split(bare.lower()) if p])
@@ -602,6 +623,26 @@ def _names_a_secret(word):
 # value: the same folder when the command runs (2026-11-14 review).
 _HOME_VARIABLE = r"\$(?:HOME|\{HOME(?::?\?[^}]*)?\})"
 _HOME_ITSELF = re.compile(r"^(~|%s)/?\*?$" % _HOME_VARIABLE)
+
+
+def _reached_path(word):
+    """A path argument as the shell reaches it: `~`, `~user` and `$HOME`
+    written out, and `.`, `..` and doubled slashes folded. `$HOME/..`,
+    `~you` and `/Users/.` named the folder of every home, or the home
+    folder, and were not seen as either (2026-11-21 review). A relative
+    path comes back as written, without its quotes."""
+    path = word.strip("'\"")
+    home = os.path.expanduser("~")
+    if len(home) > 1:
+        path = re.sub(r"^(?:~|%s)(?=/|$)" % _HOME_VARIABLE, lambda _: home, path)
+    named = re.match(r"^~([A-Za-z0-9_][\w.-]*)(?=/|$)", path)
+    if named:
+        other = os.path.expanduser("~" + named.group(1))
+        if not other.startswith("~"):
+            path = other + path[named.end():]
+    if path.startswith("/") and path not in ("//", "//*"):
+        path = posixpath.normpath(path)
+    return path
 
 
 def _is_home(word):
@@ -615,9 +656,9 @@ def _is_home(word):
     home = os.path.expanduser("~")
     if len(home) < 2:
         return False
-    # `~/.` is the home folder too (2026-10-26 review).
-    path = re.sub(r"^(?:~|%s)(?=/|$)" % _HOME_VARIABLE, lambda _: home, path)
-    return os.path.normpath(path.rstrip("*") or "/") == home
+    # `~/.` is the home folder too (2026-10-26 review), and so is `~you`.
+    path = _reached_path(path.rstrip("*") or "/")
+    return os.path.normpath(path or "/") == os.path.normpath(home)
 # The machine's own folders: one list for every tool. find and rm kept two
 # that disagreed — `find /Users -delete` read HIGH beside `rm -rf /Users`'s
 # CRITICAL, and `rm -rf /System` HIGH beside find's — and a bare prefix took
@@ -634,7 +675,20 @@ def _root_reach(word):
     path = word.strip("'\"")
     if path in ("/", "//", "/*"):
         return Reach.SYSTEM
-    bare = path.rstrip("*").rstrip("/") or "/"
+    # Folded, so `/./`, `/tmp/..` and `$HOME/..` are what they reach. A
+    # path written from the home folder that stays inside it reaches only
+    # the home folder, which `_is_home` judges.
+    written = path.rstrip("*")
+    bare = _reached_path(written).rstrip("/") or "/"
+    # Folded to the root by its steps (`/./`, `/tmp/..`). A word that is
+    # only slashes, stars or quotes is not a path: `"`, `*` and the `/**`
+    # of a comment read as the root in 3,000 real commands.
+    if bare == "/":
+        return Reach.SYSTEM if written.strip("/") else None
+    if not written.startswith("/"):
+        home = os.path.normpath(os.path.expanduser("~")).replace("\\", "/")
+        if bare == home or bare.startswith(home.rstrip("/") + "/"):
+            return None
     if any(bare == root or bare.startswith(root + "/") for root in SYSTEM_ROOTS):
         return Reach.SYSTEM
     if bare in MACHINE_ROOTS:
@@ -664,6 +718,10 @@ def _searches_every_file(token, segment):
         return False
     flags = [w for w in words if w.startswith("-")]
     if token in _GREPS:
+        # `-d recurse` is -r by its other name (2026-11-21 review).
+        spelled = " ".join(words)
+        if re.search(r"(^|\s)(-d\s*|--directories(=|\s+))recurse\b", spelled):
+            return True
         return token == "rgrep" or any(
             f in ("--recursive", "--dereference-recursive")
             or (not f.startswith("--") and ("r" in f or "R" in f)) for f in flags)
@@ -795,9 +853,12 @@ def phone_would_auto_allow(tool, tool_input):
 CONDITIONALLY_SAFE = {
     # -i alone or in a cluster: `sed -ri`, `-ni`, `-Ei` and `-ie` (suffix
     # "e") all edit in place, and read SAFE when only `-i` was matched.
-    "sed": re.compile(r"(^|\s)-[A-Za-z]*i"),
+    # BSD sed, macOS's, spells it -I as well (2026-11-21 review).
+    "sed": re.compile(r"(^|\s)-[A-Za-z]*[iI]"),
     # `\b--fix` never matched: there is no word boundary before a `-`.
-    "ruff": re.compile(r"\bformat\b|(^|\s)--fix\b"),
+    # -o names a file ruff overwrites with its report, and --add-noqa
+    # edits every file it checks (2026-11-21 review).
+    "ruff": re.compile(r"\bformat\b|(^|\s)(--fix|--add-noqa)\b|(^|\s)(-o|--output-file)"),
     "npm": re.compile(r"\bnpm\s+(?!test\b|ls\b|list\b|view\b|outdated\b)"),
 }
 
@@ -806,7 +867,7 @@ CONDITIONALLY_SAFE = {
 # unknown-command. This widens what the classifier *recognises*, never what
 # it forgives. Aliases share one set so they cannot drift apart.
 _PIP_READ_ONLY = frozenset("list show freeze --version".split())
-_FLY_READ_ONLY = frozenset("status logs list info version".split())
+_FLY_READ_ONLY = frozenset("status logs list info".split())
 
 VERB_TOOLS_READ_ONLY = {
     # gh's own top-level commands only. `view`, `list`, `diff` and `checks`
@@ -844,7 +905,9 @@ VERB_TOOLS_READ_ONLY = {
 # turn a read into a write.
 FLAG_TOOLS_READ_ONLY = {
     "plutil": frozenset("-p -lint".split()),
-    "dns-sd": frozenset("-B -L -Z -G".split()),
+    # -G looks a name up, and the name can carry data out: a lookup of
+    # `<secret>.evil.example` reaches whoever answers for it (2026-11-21).
+    "dns-sd": frozenset("-B -L -Z".split()),
     # Query flags only — never the value-taking selectors (-project,
     # -scheme, …): those describe a build, and "xcodebuild -project X
     # -scheme Y" with no verb at all RUNS one. Requiring a query flag and
@@ -871,6 +934,10 @@ SUBCOMMAND_SECOND_LEVEL = {
     ("gh", "auth"): frozenset("status".split()),
     ("fly", "apps"): frozenset("list".split()),
     ("flyctl", "apps"): frozenset("list".split()),
+    # `fly version upgrade` installs a new flyctl (2026-11-21 review);
+    # `fly version` alone, the "" here, reads.
+    ("fly", "version"): frozenset(("", "--json")),
+    ("flyctl", "version"): frozenset(("", "--json")),
     ("swift", "package"): frozenset("describe dump-package show-dependencies".split()),
     ("gcloud", "config"): frozenset("list get get-value".split()),
     ("gh", "pr"): frozenset("view list diff checks status".split()),
@@ -966,6 +1033,47 @@ GIT_MEDIUM = frozenset(
 _FOLDER = r"(?:(?:~|\.{1,2})?/(?:[\w.+-]+/)*)?"
 _PIPED_INTO = r"(?:(?:sudo|" + _FOLDER + r"env|command|exec|nohup)\s+)*" + _FOLDER
 
+class _GlobQualifiers:
+    """Finds a zsh glob qualifier that runs code: `e` with a delimiter, or
+    `+` and a function name, in the parentheses after an unquoted glob
+    (`*`, `?`, `]`) or as `(#q…)`. Only qualifier letters may stand before
+    the `e`, and quoted text is skipped: a first, looser pattern took
+    `--format='%(refname:short)'`, Swift's `.font(.system(` and Markdown's
+    `[evidence](evidence/…)` for qualifiers in thousands of real commands.
+    A bare word with a qualifier and no glob (`foo(e:…:)`) is not seen."""
+
+    _RUNS = re.compile(r"(?:#q)?[-/.@=p*%rwxAIERWXsStfedDlUGugamcLMTNnoOY^0-9\[\],]{0,16}?"
+                       r"e[:'\"{/]")
+    # `+name` only after `*`, `?` or `(#q`: after `]` it is Markdown's
+    # `[+x+](+x+)` far more often than a bracket glob.
+    _CALLS = re.compile(r"(?:#q)?\.?\+[A-Za-z_]")
+
+    def search(self, command):
+        quote = None
+        escaped = False
+        for i, ch in enumerate(command or ""):
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\" and quote != "'":
+                escaped = True
+                continue
+            if quote:
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in "'\"":
+                quote = ch
+                continue
+            if ch == "(" and i and (command[i - 1] in "*?]" or command.startswith("(#q", i)):
+                found = self._RUNS.match(command, i + 1)
+                if not found and command[i - 1] != "]":
+                    found = self._CALLS.match(command, i + 1)
+                if found:
+                    return found
+        return None
+
+
 WHOLE_LINE_RULES = [
     # `|&` pipes stderr too, and is as much a pipe into a shell.
     ("pipe-to-shell", re.compile(r"\|&?\s*" + _PIPED_INTO + r"(ba|z|k|fi|da|c|tc)?sh\b"),
@@ -981,6 +1089,10 @@ WHOLE_LINE_RULES = [
     ("fork-bomb", re.compile(r":\s*\(\s*\)\s*\{.*\}\s*;\s*:"), Risk.CRITICAL),
     ("history-rewrite", re.compile(r"\bgit\s+filter-(branch|repo)\b"), Risk.CRITICAL),
     ("cmd-substitution", re.compile(r"\$\(|[<>]\(|(?<!\S)=\(|`"), Risk.MEDIUM),  # inner cmd classified in classify_bash()
+    # zsh, macOS's shell, runs the string in a glob qualifier once per
+    # matching file: `ls *(e:'rm -rf ~':)` read SAFE behind `ls`, and so did
+    # `*(+func)` (2026-11-21 review). See _GlobQualifiers.
+    ("glob-qualifier-runs-code", _GlobQualifiers(), Risk.CRITICAL),
     # Any `>` that is not a descriptor copy (`2>&1`, `>&2`) or /dev/null.
     # The lookbehind used to skip every `>` after a digit, which took
     # `1> ~/.zshrc` and `2> f` for `2>&1` and left them SAFE (2026-09-30).
@@ -1237,7 +1349,9 @@ def _rm_risk(segment):
     for target in targets.split():
         if target.startswith("-"):
             continue
-        if CATASTROPHIC_TARGETS.match(target.strip("'\"")) or _is_home(target):
+        if (CATASTROPHIC_TARGETS.match(target.strip("'\""))
+                or CATASTROPHIC_TARGETS.match(_reached_path(target).rstrip("/") or "/")
+                or _is_home(target)):
             return ("rm-catastrophic", Risk.CRITICAL)
     if recursive:
         return ("rm-recursive", Risk.HIGH)
@@ -1268,6 +1382,12 @@ def _git_risk(segment):
                           opening)
                 or re.search(r"(^|\s)(--upload-pack|--receive-pack|--exec|--ext-diff)\b"
                              r"|(^|\s)-u\s", rest))
+    # A repository in a scratch folder was written there at LOW, its config
+    # included, and `core.fsmonitor` runs on `git status` (2026-11-21 review).
+    for target in re.findall(r"(?:^|\s)-C\s*(\S+)", opening):
+        plain = target.strip("'\"").replace("\\", "/")
+        if TEMP_ROOT.match(plain) or SCRATCH_PATH.search("/" + plain.lstrip("./") + "/"):
+            runs = True
 
     if sub == "push":
         # Deleting a remote branch loses it as surely as overwriting it.
@@ -1480,7 +1600,10 @@ READ_TOOL_ESCAPES = {
     "fd": re.compile(r"(^|\s)(-[A-Za-z]*[xX]|--exec|--exec-batch)(\s|=|$)").search,
     # sed's own commands write (`w file`, `s/a/b/w file`) and run (`e`).
     # `!` negates an address and stands before the command: `$!e sh x`.
-    "sed": re.compile(r"(^|\s)--in-place\b|(^|[\s;{}'\"/\d$!])[wW]\s+\S"
+    # `w` takes its file with no space before it too: `w/Users/x/.zshrc`
+    # read SAFE (2026-11-21 review). Unspaced, only before a path, so the
+    # `w` of `/warning/` stays a letter.
+    "sed": re.compile(r"(^|\s)--in-place\b|(^|[\s;{}'\"/\d$!])[wW](\s+\S|[/~])"
                       r"|(^|[\s;{}'\"/\d$!])e(\s|['\";]|$)"
                       # The same two as flags of `s`, after other flags:
                       # `s/a/b/pw file` writes and `s/a/b/ge` runs each
@@ -1507,7 +1630,9 @@ READ_TOOL_ESCAPES = {
     "uniq": lambda segment: len([w for w in _tokens(segment)[1:]
                                  if not w.startswith("-") and not w.isdigit()]) >= 2,
     "security": re.compile(r"\b(list|default|login)-keychains?\b[^|;&]*\s-[sd]\b").search,
-    "yq": re.compile(r"(^|\s)-[A-Za-z]*i|(^|\s)--inplace\b").search,
+    # -s/--split-exp writes one file per document, named by the
+    # expression, anywhere (2026-11-21 review).
+    "yq": re.compile(r"(^|\s)-[A-Za-z]*[is](\s|=|$)|(^|\s)--(inplace|split-exp)\b").search,
     "git": re.compile(r"(^|\s)--output(=|\s)").search,
 }
 for _awk in ("gawk", "nawk", "mawk"):
@@ -1884,7 +2009,10 @@ LOW_RISK_PATH = re.compile(
 INFRA_PATH = re.compile(
     r"((^|[/\\])\.github[/\\]workflows[/\\]|(^|[/\\])\.claude[/\\]settings|"
     r"(^|[/\\])(Dockerfile|docker-compose\.ya?ml|[^/\\]*\.tf|Makefile|"
-    r"pyproject\.toml|package\.json|requirements\.txt)$)",
+    # CMakeLists.txt and every requirements or constraints list run code
+    # at the next build or install, and read LOW as .txt (2026-11-21).
+    r"pyproject\.toml|package\.json|requirements[\w.-]*\.txt|constraints[\w.-]*\.txt|"
+    r"CMakeLists\.txt)$)",
     re.I,
 )
 SCRATCH_PATH = re.compile(r"([/\\](tmp|scratchpad|\.cache)[/\\])", re.I)
@@ -1908,8 +2036,42 @@ def _within(path, cwd):
     return absolute == root or absolute.startswith(root.rstrip(os.sep) + os.sep)
 
 
+def _through_links(path, cwd):
+    """Where a write really lands when a link on its way leads elsewhere,
+    as ``(real path, real cwd)``; None when nothing on the way is a link
+    or the path cannot be resolved."""
+    try:
+        written = str(path)
+        if cwd and not os.path.isabs(written):
+            written = os.path.join(str(cwd), written)
+        absolute = os.path.abspath(written)
+        real = os.path.realpath(absolute)
+        if os.path.normcase(real) == os.path.normcase(absolute):
+            return None
+        return real, (os.path.realpath(str(cwd)) if cwd else None)
+    except (ValueError, OSError):
+        return None
+
+
 def classify_path(path, cwd=None):
-    """Classify a filesystem write target. Returns ``(Risk, [rule_id, ...])``."""
+    """Classify a filesystem write target. Returns ``(Risk, [rule_id, ...])``.
+
+    A link in the project is judged where it leads, as well as where it
+    stands: `docs/notes.md`, a committed link to `~/.zshrc`, read LOW
+    (2026-11-21 review)."""
+    here = _classify_path_as_written(path, cwd)
+    if not path:
+        return here
+    landing = _through_links(path, cwd)
+    if landing is None:
+        return here
+    there = _classify_path_as_written(*landing)
+    if there[0] > here[0]:
+        return there[0], there[1] + ["through-link"]
+    return here
+
+
+def _classify_path_as_written(path, cwd=None):
     if not path:
         return Risk.MEDIUM, ["no-path"]
 
@@ -1942,6 +2104,10 @@ def classify_path(path, cwd=None):
     # run on the next commit (2026-10-24).
     if SCRATCH_PATH.search(normalised) and (
             not cwd or TEMP_ROOT.match(normalised) or _within(path, cwd)):
+        # A skill or CLAUDE.md in a folder named tmp is still read as
+        # instructions: `.claude/skills/tmp/SKILL.md` read LOW (2026-11-21).
+        if INSTRUCTION_PATH.search(normalised):
+            return Risk.MEDIUM, ["agent-instructions"]
         return Risk.LOW, ["scratch-file"]
 
     if cwd:
@@ -5297,6 +5463,15 @@ def run_watch(enable=True):
         env = data["env"]
         if enable:
             if all(env.get(key) == value for key, value in WATCH_ENV.items()):
+                # A hook added back by hand or by a fresh install carries
+                # the plain 10 s: Claude Code then ends it long before the
+                # wrist answers (2026-11-21 review). Already on is only
+                # true once every handler of ours outlives the wait.
+                if any(handler.get("timeout") != WATCH_HOOK_TIMEOUT
+                       for handler in _settings_handlers(data)):
+                    _set_hook_timeout(data, WATCH_HOOK_TIMEOUT)
+                    return ("Wrist approvals were on; the hook's time limit "
+                            "now outlasts the wait again.\n  Settings : %(path)s")
                 print("Wrist approvals are already on for every session.")
                 return None
             env.update(WATCH_ENV)
