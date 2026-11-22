@@ -247,3 +247,14 @@ def test_a_transcript_that_is_gone_is_forgotten(tmp_path):
     assert dashboard.conversation_activity(now=NOW)["all_sessions"] == 1
     assert str(gone) not in dashboard._CONVERSATION_CACHE
     assert str(kept) in dashboard._CONVERSATION_CACHE
+
+
+def test_one_far_future_line_does_not_freeze_the_rest(tmp_path):
+    """Review 2026-11-21: a line stamped years ahead held the read position
+    there, so nothing after it counted until the clock caught up."""
+    path = claude(tmp_path, sid="ahead", stamp="2036-10-27T11:00:00Z")
+    with open(path, "a") as handle:
+        handle.write(json.dumps({"type": "assistant", "timestamp": STAMP, "message": {
+            "id": "now", "role": "assistant", "content": "Done",
+            "usage": {"output_tokens": 7}}}) + "\n")
+    assert dashboard.conversation_activity(now=NOW)["sessions"] == 1

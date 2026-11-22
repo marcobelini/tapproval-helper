@@ -31569,3 +31569,145 @@ class TestReview20261121SmallGaps:
     def test_code_and_words_with_brackets_are_not_qualifiers(self, command):
         risk, rules = crc.classify_bash(command)
         assert "glob-qualifier-runs-code" not in rules, (command, risk, rules)
+
+
+class TestReview20261122HelperLows:
+    """The Low findings of the 2026-11-16 and 2026-11-21 reviews (#1491,
+    #1414) that the owner chose to fix on 2026-11-22."""
+
+    # L1 -------------------------------------------------------------------
+    def test_install_keeps_a_settings_change_made_while_it_ran(self, settings, monkeypatch,
+                                                               capsys):
+        """The installer read settings, ran the slow bridge step, then wrote
+        its earlier copy back: a change Claude Code made meanwhile was lost."""
+        settings.write_text(json.dumps({"model": "opus"}))
+
+        def slow_bridge(choice=None):
+            data = json.loads(settings.read_text())
+            data["theme"] = "dark"
+            settings.write_text(json.dumps(data))
+            return None
+        monkeypatch.setattr(crc, "_bridge_step", slow_bridge)
+        assert crc.run_install() == 0
+        capsys.readouterr()
+        data = json.loads(settings.read_text())
+        assert data.get("theme") == "dark", "a change made during the install was lost"
+        assert data["model"] == "opus"
+        assert any("ClaudeRiskClassifier.py" in h.get("command", "")
+                   for e in data["hooks"]["PermissionRequest"] for h in e["hooks"])
+
+    # L2 -------------------------------------------------------------------
+    @pytest.mark.parametrize("odd", [
+        {"hooks": None},
+        {"hooks": {"PermissionRequest": None}},
+        {"hooks": {"PermissionRequest": [None, {"hooks": [None, "x"]}]}},
+        {"env": None},
+    ], ids=["hooks-null", "event-null", "odd-entries", "env-null"])
+    def test_odd_but_valid_settings_install_and_uninstall(self, settings, odd, capsys):
+        settings.write_text(json.dumps(odd))
+        assert crc.run_install() == 0
+        assert crc.run_uninstall() == 0
+        capsys.readouterr()
+        json.loads(settings.read_text())
+
+    def test_a_hooks_value_it_cannot_read_is_left_alone_in_words(self, settings, capsys):
+        settings.write_text(json.dumps({"hooks": {"PermissionRequest": {"x": 1}}}))
+        assert crc.run_install() == 1
+        assert "left alone" in capsys.readouterr().out
+        assert json.loads(settings.read_text()) == {"hooks": {"PermissionRequest": {"x": 1}}}
+        assert crc.run_uninstall() in (0, 1)
+        capsys.readouterr()
+
+    def test_codex_hooks_as_an_empty_list_installs(self, tmp_path, monkeypatch):
+        home = tmp_path / "codex"
+        home.mkdir()
+        monkeypatch.setenv("CODEX_HOME", str(home))
+        (home / "hooks.json").write_text(json.dumps({"hooks": []}))
+        assert crc.install_codex() == "installed"
+        assert crc.codex_hook_trusted() in (False, None)
+
+    def test_watch_on_with_env_null(self, settings, capsys):
+        settings.write_text(json.dumps({"env": None}))
+        assert crc._edit_settings_env(lambda data: data["env"].setdefault("X", "1") and "ok") == 0
+        capsys.readouterr()
+        assert json.loads(settings.read_text())["env"] == {"X": "1"}
+
+    # L3 -------------------------------------------------------------------
+    def test_a_full_log_disk_leaves_no_card_behind(self, monkeypatch):
+        import errno
+
+        class FullDisk:
+            def write(self, _text):
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+            def flush(self):
+                raise OSError(errno.ENOSPC, "No space left on device")
+        queue = watch_relay.CardQueue()
+        monkeypatch.setattr(watch_relay.sys, "stderr", FullDisk())
+        queue.submit({"tier": "HIGH", "headline": "x", "tool": "Bash"}, wait=0.2)
+        monkeypatch.undo()
+        assert queue.pending() == [], "a card nothing waits for still takes taps"
+
+    # L4 -------------------------------------------------------------------
+    def test_the_travel_address_record_survives_a_failed_write(self, tmp_path, monkeypatch):
+        path = tmp_path / "tunnel.json"
+        watch_relay._remember_tunnel(41, "https://a.example.test", 8977, path=str(path))
+        before = path.read_text()
+
+        def broken(*_args, **_kwargs):
+            raise OSError("disk full")
+        monkeypatch.setattr(watch_relay.json, "dump", broken)
+        monkeypatch.setattr(watch_relay.json, "dumps", broken)
+        watch_relay._remember_tunnel(42, "https://b.example.test", 8977, path=str(path))
+        monkeypatch.undo()
+        assert path.read_text() == before, "a failed write emptied the travel address"
+        assert not [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")], \
+            "a temp file was left"
+
+    # L5 -------------------------------------------------------------------
+    def test_usage_reads_past_a_model_that_is_not_a_word(self, tmp_path):
+        line = json.dumps({"type": "assistant", "timestamp": "2026-10-27T11:00:00Z",
+                           "message": {"model": ["x"], "usage": {"output_tokens": 5}}})
+        entry = watch_dashboard._usage_entry_of(line)
+        assert entry is not None and entry[-1] == "unknown"
+
+    def test_the_registry_reads_past_an_entrypoint_that_is_not_a_word(self, tmp_path,
+                                                                        monkeypatch):
+        (tmp_path / "1.json").write_text(json.dumps(
+            {"sessionId": "s1", "pid": os.getpid(), "entrypoint": ["cli"]}))
+        rows = watch_dashboard.session_registry(str(tmp_path))
+        assert rows["s1"]["status"] == "Connected"
+
+    def test_a_tool_call_id_that_is_not_a_word_is_dropped(self):
+        state = watch_dashboard._fresh_thread_state()
+        line = json.dumps({"type": "assistant", "timestamp": "2026-10-27T11:00:00Z",
+                           "message": {"role": "assistant", "content": [
+                               {"type": "tool_use", "id": {"x": 1}, "name": "Bash",
+                                "input": {"command": "ls", "description": "List"}}]}})
+        watch_dashboard._thread_line(state, line, 14)
+        assert state.get("running_tool_id") is None
+
+    # L7 -------------------------------------------------------------------
+    @pytest.mark.parametrize("command", ["git push --mirror origin",
+                                         "git -C x push --mirror", "git push --mirror"])
+    def test_a_mirror_push_is_critical(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk == Risk.CRITICAL, (command, risk, rules)
+
+    # L8 -------------------------------------------------------------------
+    @pytest.mark.parametrize("registry", [[], {"plugins": []}, {"plugins": "x"}],
+                             ids=["list", "plugins-list", "plugins-word"])
+    def test_skills_read_past_an_odd_plugin_list(self, tmp_path, registry):
+        plugins = tmp_path / ".claude" / "plugins"
+        plugins.mkdir(parents=True)
+        (plugins / "installed_plugins.json").write_text(json.dumps(registry))
+        rows = watch_relay.known_skills(None, home=str(tmp_path), now=1.0)
+        assert isinstance(rows, list)
+
+    def test_auto_update_with_settings_that_are_not_an_object_says_why(self, tmp_path,
+                                                                         monkeypatch):
+        settings = tmp_path / "settings.json"
+        settings.write_text("[]")
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(settings))
+        result = watch_relay.set_auto_update(True)
+        assert result[0] is None and result[1]
