@@ -1384,6 +1384,37 @@ def alert_bucket(card):
         card.get("tier") if isinstance(card.get("tier"), str) else None, "stop")
 
 
+def _log(line):
+    """A line for the relay log that can never cost a card: with the disk
+    full, the "queued" line raised before the card's cleanup was armed, and
+    left a card on the wrist that took taps nothing acted on (2026-11-21
+    review)."""
+    try:
+        print(line, file=sys.stderr)
+    except (OSError, ValueError):
+        pass
+
+
+def _write_private_atomic(path, text):
+    """Write ``text`` to ``path`` (0600) whole or not at all: a temporary
+    file beside it, flushed, then renamed over. Raises on failure, with the
+    old file intact and no temporary left behind."""
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class CardQueue:
     """Pending wrist cards and the decisions made about them."""
 
@@ -1480,9 +1511,8 @@ class CardQueue:
             self._lock.notify_all()
         # T0 of the buzz-when-closed latency measurement (with the bridge's
         # "mirrored" line and the watch's "alert delivered" line).
-        print("relay: queued %s %s at %d" % (card_id, entry["alert"],
-                                             int(time.time() * 1000)),
-              file=sys.stderr)
+        _log("relay: queued %s %s at %d" % (card_id, entry["alert"],
+                                            int(time.time() * 1000)))
         # Once a card is up it STAYS up — a lowered wrist pauses polling
         # for minutes at a time and must not cost the question. A card
         # leaves in exactly three ways: answered here, its prompt resolved
@@ -1558,9 +1588,8 @@ class CardQueue:
         # The other half of the "queued" line: how long a card stood on the
         # wrist and why it left. A prompt answered on the phone that is slow
         # to leave the watch is read off these two lines.
-        print("relay: left %s %s after %dms" % (
-            card_id, reason, int((time.monotonic() - started) * 1000)),
-            file=sys.stderr)
+        _log("relay: left %s %s after %dms" % (
+            card_id, reason, int((time.monotonic() - started) * 1000)))
         return card_id, decision, answer
 
     # Why the last cards left, for a tap that arrives after: enough for
@@ -3291,9 +3320,12 @@ def _skill_roots(cwd, home):
     try:
         with open(os.path.join(plugins_dir, "installed_plugins.json"),
                   encoding="utf-8") as handle:
-            registry = json.load(handle).get("plugins", {})
+            loaded = json.load(handle)
+        registry = loaded.get("plugins") if isinstance(loaded, dict) else None
     except (OSError, ValueError):
-        registry = {}
+        registry = None
+    if not isinstance(registry, dict):
+        registry = {}          # a list at the top crashed /skills (2026-11-21 review)
     for key, entries in registry.items():
         for entry in (entries if isinstance(entries, list) else [entries]):
             path = entry.get("installPath") if isinstance(entry, dict) else None
@@ -7124,9 +7156,11 @@ def _remember_tunnel(pid, url, port, path=None):
     """Write the running tunnel down (0600), for the next relay. Never raises."""
     path = path or TUNNEL_STATE
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({"pid": int(pid), "url": url, "port": int(port)}, handle)
+        # Whole or not at all: a write cut short left a broken record, and
+        # the next relay opened a new tunnel with a new travel address
+        # (2026-11-21 review).
+        _write_private_atomic(path, json.dumps({"pid": int(pid), "url": url,
+                                                "port": int(port)}))
         os.chmod(path, 0o600)
         _host.restrict_to_owner(path)
     except (OSError, ValueError, TypeError):

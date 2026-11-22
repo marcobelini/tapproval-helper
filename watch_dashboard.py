@@ -223,6 +223,18 @@ def _usage_entry(line):
         return None
 
 
+def _a_word(value):
+    """``value`` when it is a non-empty string, else None. Another
+    product's file can hold any type where a word is expected, and a list
+    or an object used as a key crashed the reader (2026-11-21 review)."""
+    return value if isinstance(value, str) and value else None
+
+
+# How far ahead of this computer's clock a transcript line may be and still
+# be waited for: two clocks a little apart, or a line written this second.
+FUTURE_WAIT_SECONDS = 300
+
+
 def _usage_entry_of(line):
     entry = _json_object(line)
     if entry is None:
@@ -238,7 +250,8 @@ def _usage_entry_of(line):
             int(usage.get("input_tokens") or 0),
             int(usage.get("output_tokens") or 0),
             int(usage.get("cache_read_input_tokens") or 0),
-            message.get("model") or "unknown")
+            # A word only: a list here crashed the whole usage page.
+            _a_word(message.get("model")) or "unknown")
 
 
 def usage_summary(projects_dir=None, now=None, background=False):
@@ -362,6 +375,11 @@ def _conversation_file(path, agent, fallback_id, now):
         if not row:
             continue
         stamp = _parse_stamp(row.get("timestamp"))
+        if stamp is not None and stamp > now + FUTURE_WAIT_SECONDS:
+            # Far ahead of this clock: a wrong stamp, not a line written a
+            # moment early. Waiting for it held every later line back until
+            # that day came (2026-11-21 review); it is read past, uncounted.
+            continue
         if stamp is not None and stamp > now:
             # Leave a future/just-appended record for the next clock tick,
             # rather than consuming it without ever counting its message.
@@ -657,7 +675,7 @@ def session_registry(sessions_dir=None):
         if not _host.pid_alive(pid):     # "are you there?"
             continue
         registry[session_id] = {
-            "status": ENTRYPOINTS.get(data.get("entrypoint", ""), "Connected"),
+            "status": ENTRYPOINTS.get(_a_word(data.get("entrypoint")) or "", "Connected"),
             "bridged": bool(data.get(shape("registry.bridged"))),
             # The title the phone and the desktop app show. A name the CLI
             # derived from the folder ("acme-3f") is not a title, so that
@@ -2905,10 +2923,11 @@ def _thread_line(state, line, limit):
         tool_description = inp.get("description")
         phrase = _tool_phrase(tool)
         # Which call: a prompt for it at the terminal is "needs you".
-        state["running_tool_id"] = part.get("id")
-        if part.get("id") and tool_description:
+        call_id = _a_word(part.get("id"))
+        state["running_tool_id"] = call_id
+        if call_id and tool_description:
             kept = state.setdefault("descriptions", OrderedDict())
-            kept[part["id"]] = " ".join(str(tool_description).split())[:80]
+            kept[call_id] = " ".join(str(tool_description).split())[:80]
             while len(kept) > _DESCRIPTIONS_KEPT:
                 kept.popitem(last=False)
         if phrase:
