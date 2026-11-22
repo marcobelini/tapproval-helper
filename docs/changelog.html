@@ -23,6 +23,17 @@
 <main class="policy">
 <h1>Changelog</h1>
 <p><em>Every release of Tapproval Base, the helper on your computer, newest first. Starting Claude Code once updates it. Generated from <a href="https://github.com/marcobelini/tapproval-helper/releases">the releases on GitHub</a>, which may already hold a newer one. Security fixes are also explained on <a href="security.html">the security page</a>.</em></p>
+<h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.135">1.1.135</a></h2>
+<p><em>2026-11-22</em></p>
+<p><strong>Fixes from the 2026-11-22 review.</strong></p>
+<ul>
+<li><strong>Only your watch speaks as you.</strong> A message from the watch carries a code that only that session knows, now in both of the forms a watch message can take. A message without the code, from another session on the computer, is not taken as yours, and the watch no longer shows it as your words.</li>
+<li><strong>A failed update never deletes the key that pairs your watch</strong>, on Windows, Mac or Linux. If the update can't finish, it keeps everything and says where it is.</li>
+<li><strong>Stopping a Codex sign-in on Windows stops it completely.</strong> The sign-in used to keep running in the background with its code still good.</li>
+<li><strong>More risky commands get the mark they deserve.</strong> These are commands that run code, edit a file, or read a cloud tool's login while looking like a plain read. Each is now marked for a tap.</li>
+</ul>
+<p>A message and /recap from the watch were checked on a real session before release. Passed the public tests on macOS, Linux and Windows, Python 3.9–3.13.</p>
+<p>Already installed? A terminal install updates itself when Claude Code starts. A plugin install updates when auto-update is on: in Claude Code, type <code>/plugin</code>, open Marketplaces, choose tapproval and pick Enable auto-update.</p>
 <h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.134">1.1.134</a></h2>
 <p><em>2026-11-22</em></p>
 <p><strong>Small things that could go wrong on the computer, fixed.</strong></p>
