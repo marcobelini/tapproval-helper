@@ -194,6 +194,29 @@ def stop(pid, hard=False):
         return False
 
 
+def stop_tree(pid, run=None):
+    """End ``pid`` and every process it started, at once. On POSIX the pid
+    must lead its own session (``start_new_session``), whose group is
+    killed whether or not the leader has already exited; on Windows
+    `taskkill /T` walks the tree, since a group there cannot be signalled
+    and killing a launcher (`codex.cmd`) left its child running
+    (2026-11-22 review). True when it was asked. Never raises."""
+    try:
+        pid = int(pid)
+        if pid <= 1:
+            return False
+        if native_windows():
+            import subprocess
+            run = subprocess.run if run is None else run
+            run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True,
+                timeout=10, creationflags=0x08000000)      # CREATE_NO_WINDOW
+            return True
+        os.killpg(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        return True
+    except Exception:   # noqa: BLE001 — a process already gone, or no taskkill
+        return False
+
+
 # Windows: a new process group with no console, and out of the job Claude
 # Code's process tree runs in, so the relay outlives the session that
 # started it. Breaking away is refused inside a job that forbids it, so the

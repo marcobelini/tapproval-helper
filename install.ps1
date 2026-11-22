@@ -49,16 +49,29 @@ if (Test-Path (Join-Path $Dir ".git")) {
                 Move-Item $Dir $superseded
                 Move-Item $fresh $Dir
             } catch {
+                # The installed copy goes back first: until it is there the
+                # kept items have nowhere to go. They used to be moved first,
+                # into a folder that was gone, and were then deleted with
+                # $fresh, the paired watches' keys among them (2026-11-22 review).
+                if ((Test-Path $superseded) -and -not (Test-Path $Dir)) {
+                    Move-Item $superseded $Dir -ErrorAction SilentlyContinue
+                }
                 foreach ($kept in @("data", "logs", "site-rules.json")) {
                     $moved = Join-Path $fresh $kept
-                    if ((Test-Path $moved) -and -not (Test-Path (Join-Path $Dir $kept))) {
+                    if ((Test-Path $moved) -and (Test-Path $Dir) -and -not (Test-Path (Join-Path $Dir $kept))) {
                         Move-Item $moved (Join-Path $Dir $kept) -ErrorAction SilentlyContinue
                     }
                 }
-                if ((Test-Path $superseded) -and -not (Test-Path $Dir)) { Move-Item $superseded $Dir }
                 Write-Warning "update: could not swap in the fresh copy; keeping the one installed"
             }
-            if (Test-Path $fresh) { Remove-Item -Recurse -Force $fresh -ErrorAction SilentlyContinue }
+            # Never delete what still holds something kept: say where it is.
+            $left = @("data", "logs", "site-rules.json") | Where-Object { Test-Path (Join-Path $fresh $_) }
+            if ($left) {
+                Write-Warning ("update: stopped halfway. $fresh still holds " + ($left -join ", ") +
+                    ": move them into $Dir by hand.")
+            } elseif (Test-Path $fresh) {
+                Remove-Item -Recurse -Force $fresh -ErrorAction SilentlyContinue
+            }
         } else {
             if (Test-Path $fresh) { Remove-Item -Recurse -Force $fresh -ErrorAction SilentlyContinue }
             Write-Warning "update: could not fetch a fresh copy either; keeping the one installed"
