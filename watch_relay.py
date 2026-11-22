@@ -2303,14 +2303,12 @@ def _stop_signin(proc):
     """Stop a sign-in and what it started. It runs in a session of its own,
     and npm's codex is a launcher whose child is the real `codex login`:
     killing the launcher alone left that running, its callback port held
-    and its code still good (2026-11-21 review). Never raises."""
-    try:
-        pid = getattr(proc, "pid", None)
-        if (isinstance(pid, int) and pid > 1 and hasattr(os, "killpg")
-                and hasattr(signal, "SIGKILL") and proc.poll() is None):
-            os.killpg(pid, signal.SIGKILL)
-    except Exception:
-        pass
+    and its code still good (2026-11-21 review). The whole tree, on Windows
+    too, and even once the launcher itself has ended (2026-11-22). Never
+    raises."""
+    pid = getattr(proc, "pid", None)
+    if isinstance(pid, int):
+        _host.stop_tree(pid)
     try:
         proc.kill()
     except Exception:
@@ -2894,6 +2892,14 @@ def session_code(session_id, any_wording=False):
     return None
 
 
+# The wrist thread shows a message as the wearer's only with the session's
+# own code, so the dashboard asks the relay for it (the relay keeps the
+# codes). Nothing to tell where the dashboard did not load.
+if "watch_dashboard" in sys.modules:
+    sys.modules["watch_dashboard"].WRIST_CODE_FOR = (
+        lambda session_id: session_code(session_id, any_wording=True))
+
+
 def session_briefed(session_id):
     """Was this session told what a wrist message is, with its code, in
     words this helper still uses?"""
@@ -2921,12 +2927,16 @@ def post_to_inbox(entry, text, brief=False, command=False, timeout=INBOX_TIMEOUT
     if not stat.S_ISSOCK(found.st_mode) or found.st_uid != os.getuid():
         return False
     # The words alone, for a session told at its start what they are and
-    # to keep its answer short; the note says both, so only then.
-    code = session_code(entry.get("session_id")) if brief else None
+    # to keep its answer short; the note says both, so only then. The code
+    # goes with every message to a session that holds one, the long form
+    # included: the note says a message without it is not the wearer's.
+    session_id = entry.get("session_id")
+    code = session_code(session_id, any_wording=True)
+    short = bool(brief and code and session_code(session_id))
     line = json.dumps({"type": "user",
                        "message": {"role": "user",
                                    "content": wire.wrist_inbox_message(
-                                       text, brief, command, short=bool(code),
+                                       text, brief, command, short=short,
                                        code=code or "")}}) + "\n"
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
