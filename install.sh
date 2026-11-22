@@ -62,12 +62,22 @@ if [ -d "$DIR/.git" ]; then
         swapped=no
       fi
       if [ "$swapped" = no ]; then
+        left=""
         for kept in bridge-app data logs site-rules.json; do
           if [ -e "$fresh/$kept" ] && [ ! -e "$DIR/$kept" ]; then
             mv "$fresh/$kept" "$DIR/$kept" || true
           fi
+          if [ -e "$fresh/$kept" ]; then left="$left $kept"; fi
         done
-        rm -rf "$fresh"
+        # Never delete what still holds something kept: a move back that
+        # failed went with $fresh, the paired watches' keys among it
+        # (2026-11-22 review).
+        if [ -n "$left" ]; then
+          echo "update: stopped halfway. $fresh still holds:$left" >&2
+          echo "  Move them into $DIR by hand." >&2
+        else
+          rm -rf "$fresh"
+        fi
         echo "update: could not swap in the fresh copy; keeping the one installed" >&2
       fi
     else

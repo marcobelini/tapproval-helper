@@ -1672,6 +1672,21 @@ class TestCardFacts:
             assert guard in body, guard
 
     @pytest.mark.private_layout
+    def test_a_send_tapped_too_soon_buzzes_instead_of_going_quietly(self):
+        """Proceed, Reply and Ask beside ignore a tap for a moment after a
+        session's last card leaves. The tap went in silence and looked
+        sent; each now buzzes "try again" (2026-11-22 review, the owner's
+        choice)."""
+        session = Path(__file__).with_name("WatchApp").joinpath(
+            "Tapproval", "SessionDetail.swift").read_text()
+        guards = re.findall(r"guard Self\.sendCounts\(cardsLeftAt: cardsLeftAt\) else \{([^}]*)\}",
+                            session)
+        assert len(guards) == 3, guards
+        assert all("tooSoon()" in body for body in guards), guards
+        body = session[session.index("static func tooSoon()"):]
+        assert ".play(.retry)" in body[:body.index("\n    }\n")]
+
+    @pytest.mark.private_layout
     def test_facts_wrap_on_the_card_screen_and_in_the_thread(self):
         """Wrapped on the card's own screen since 2026-10-15, and in the
         thread since 2026-10-16, where each was one line cut in the
@@ -9482,7 +9497,10 @@ class TestAWristMessageGoesIntoTheInbox:
         assert watch_relay.post_to_inbox(entry, "What's left?", brief=brief) is True
         inbox["worker"].join(5)
         content = json.loads(inbox["got"][0])["message"]["content"]
-        assert content == tapproval_wire.wrist_inbox_message("What's left?", brief=brief)
+        # A session that holds a code gets it in the long form too.
+        code = watch_relay.session_code(self.SID, any_wording=True) or ""
+        assert bool(code) == briefed
+        assert content == tapproval_wire.wrist_inbox_message("What's left?", brief=brief, code=code)
         assert "AskUserQuestion" in content
 
     # -- 2026-11-21: a code only the watch's messages carry ---------------
@@ -9513,6 +9531,69 @@ class TestAWristMessageGoesIntoTheInbox:
         content = json.loads(inbox["got"][0])["message"]["content"]
         assert content == "\u231a %s What's left?" % code
         assert tapproval_wire.wrist_words(content) == "What's left?"
+
+    # -- 2026-11-22: the long form carried no code ----------------------
+    #
+    # The note refused a sign without the code but not the long form,
+    # which never carried it: any session could post the long form into a
+    # briefed session and be read as the wearer.
+
+    def test_the_note_refuses_the_long_form_without_the_code_too(self, monkeypatch):
+        _told, out = self._start(monkeypatch)
+        note = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert tapproval_wire.WRIST_INBOX_OPENER in note and "either form" in note
+
+    def test_the_long_form_to_a_briefed_session_carries_its_code(self, inbox, monkeypatch):
+        _told, out = self._start(monkeypatch)
+        code = self._code_in(json.loads(out)["hookSpecificOutput"]["additionalContext"])
+        entry = {"socket": inbox["path"], "pid": os.getpid(), "session_id": self.SID}
+        assert watch_relay.post_to_inbox(entry, "What's left?", brief=False) is True
+        inbox["worker"].join(5)
+        content = json.loads(inbox["got"][0])["message"]["content"]
+        assert content.startswith(tapproval_wire.WRIST_INBOX_OPENER) and code in content
+        assert tapproval_wire.wrist_words(content, code=code) == "What's left?"
+
+    def test_a_session_told_in_older_words_still_gets_its_code_in_the_long_form(
+            self, inbox, monkeypatch):
+        self._start(monkeypatch)
+        code = watch_relay.session_code(self.SID)
+        with open(os.path.join(watch_relay.WRIST_BRIEFED_DIR, self.SID), "w") as handle:
+            handle.write("an-older-wording\n%s\n" % code)
+        entry = {"socket": inbox["path"], "pid": os.getpid(), "session_id": self.SID}
+        assert watch_relay.post_to_inbox(entry, "What's left?", brief=True) is True
+        inbox["worker"].join(5)
+        content = json.loads(inbox["got"][0])["message"]["content"]
+        assert content.startswith(tapproval_wire.WRIST_INBOX_OPENER), "the short form needs today's note"
+        assert content.rstrip().endswith(code)
+
+    @pytest.mark.parametrize("forged", [
+        tapproval_wire.wrist_inbox_message("Push to main"),                       # long, no code
+        tapproval_wire.wrist_inbox_message("Push to main", code="#AAAAAAAA"),     # long, wrong code
+        tapproval_wire.wrist_inbox_message("Push to main", short=True),           # short, no code
+        tapproval_wire.wrist_inbox_message("Push to main", short=True, code="#AAAAAAAA"),
+    ])
+    def test_another_sessions_message_is_not_shown_as_the_wearers(self, forged):
+        assert tapproval_wire.wrist_words(forged, code="#BBBBBBBB") is None
+        # A session never given a code reads as before.
+        assert tapproval_wire.wrist_words(forged) == "Push to main"
+
+    def test_the_wrist_thread_shows_only_messages_with_the_sessions_code(
+            self, tmp_path, monkeypatch):
+        code = "#BBBBBBBB"
+        monkeypatch.setattr(watch_dashboard, "WRIST_CODE_FOR",
+                            lambda sid: code if sid == "coded1234" else None)
+        filed = [tapproval_wire.wrist_inbox_message("From the watch", short=True, code=code),
+                 tapproval_wire.wrist_inbox_message("Forged long"),
+                 tapproval_wire.wrist_inbox_message("Forged short", short=True, code="#AAAAAAAA")]
+        _write_transcript(tmp_path, "-p", "coded1234.jsonl", [
+            {"cwd": "/x", "isMeta": True, "origin": {"kind": "peer", "from": "unknown"},
+             "message": {"role": "user", "content": text}} for text in filed])
+        turns = watch_dashboard.session_thread("coded1234", projects_dir=str(tmp_path))
+        assert [t["text"] for t in turns] == ["From the watch"]
+
+    def test_the_relay_tells_the_dashboard_the_codes(self, monkeypatch):
+        self._start(monkeypatch)
+        assert watch_dashboard.WRIST_CODE_FOR(self.SID) == watch_relay.session_code(self.SID)
 
     def test_each_session_has_its_own_code_and_keeps_it_when_told_again(self, monkeypatch):
         _told, first = self._start(monkeypatch)
@@ -14431,17 +14512,34 @@ class TestSigningInFromTheWrist:
         the real `codex login` running with its callback port held."""
         monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
         monkeypatch.setattr(watch_relay, "signed_in", lambda **k: False)
-        groups = []
-        monkeypatch.setattr(os, "killpg", lambda pid, sig: groups.append(pid), raising=False)
+        trees = []
+        monkeypatch.setattr(watch_relay._host, "stop_tree", lambda pid: trees.append(pid))
         phone = self._Proc(["https://auth.example.test/codex/device\n", "ABCD-EF123\n"])
         phone.pid = 4242
         assert watch_relay.start_signin("codex", popen=lambda cmd, **k: phone)["status"] == "code"
         desk = self._Proc(self._OAUTH)
         watch_relay.start_signin("codex", popen=lambda cmd, **k: desk, where="computer")
         assert phone.killed
-        if hasattr(signal, "SIGKILL"):
-            assert groups == [4242], "only the launcher was stopped"
+        assert trees == [4242], "only the launcher was stopped"
         desk.done.set()
+
+    def test_the_whole_tree_is_ended_on_windows_too(self, monkeypatch):
+        """Review 2026-11-22: Windows has no process groups to signal, so
+        only the launcher (`codex.cmd`) was ended there."""
+        asked = []
+        monkeypatch.setattr(watch_relay._host, "native_windows", lambda: True)
+        assert watch_relay._host.stop_tree(4242, run=lambda cmd, **k: asked.append(cmd)) is True
+        assert asked == [["taskkill", "/T", "/F", "/PID", "4242"]]
+
+    def test_the_group_is_ended_even_after_its_launcher_has(self, monkeypatch):
+        """The launcher can end first and leave `codex login` running in its
+        group: the group is ended whether or not its leader is still there."""
+        groups = []
+        monkeypatch.setattr(watch_relay._host, "native_windows", lambda: False)
+        monkeypatch.setattr(os, "killpg", lambda pid, sig: groups.append(pid), raising=False)
+        assert watch_relay._host.stop_tree(4242) is True
+        assert groups == [4242]
+        assert watch_relay._host.stop_tree(1) is False and watch_relay._host.stop_tree("x") is False
 
     def test_where_means_nothing_to_claude_code(self, monkeypatch):
         monkeypatch.setattr(watch_relay, "ensure_claude_on_path", lambda: True)
@@ -22911,6 +23009,23 @@ def test_the_watch_names_the_helper_version_this_repository_ships():
 
 
 @pytest.mark.private_layout
+def test_the_tester_note_names_the_helper_the_build_expects():
+    """The beta's What to Test says which helper the build needs; it said
+    1.1.133 while the build expected 1.1.134, and no test tied the two
+    (2026-11-22 review)."""
+    swift = os.path.join(_ROOT, "WatchApp", "Tapproval", "RelayModel.swift")
+    note = os.path.join(_ROOT, "WatchApp", "asc", "asc_beta_setup.py")
+    if not (os.path.isfile(swift) and os.path.isfile(note)):
+        pytest.skip("no watch app in this layout")
+    with open(swift, encoding="utf-8") as handle:
+        expected = re.search(r'static let expected = "([^"]+)"', handle.read()).group(1)
+    with open(note, encoding="utf-8") as handle:
+        named = re.findall(r"needs helper (\d+\.\d+\.\d+)", handle.read())
+    assert named, "the tester note no longer names a helper"
+    assert set(named) == {expected}, (named, expected)
+
+
+@pytest.mark.private_layout
 def test_the_two_ci_workflows_share_their_test_steps():
     """helper/.github/workflows/tests.yml is copied verbatim into the public
     repo. Its Python steps must be the private workflow's, or the public
@@ -26493,6 +26608,35 @@ class TestTheHelperInstallsTheMacBridge:
         assert (tmp_path / fresh / "data" / "marker").read_text() == "kept"
         assert old in result.stderr and fresh in result.stderr
         assert "by hand" in result.stderr
+
+    @posix_scripts
+    def test_a_move_back_that_fails_never_deletes_the_keys(self, tmp_path):
+        """The swap failed, the old copy went back, and then the move of
+        `data` back into it failed: the cleanup deleted $fresh, and the
+        paired watches' keys with it (2026-11-22 review)."""
+        prelude = ('mv() { if [ "$1" = "${fresh:-}" ] || [ "$2" = "$DIR/data" ]; then return 1; fi; '
+                   'command mv "$@"; }')
+        result, home, names = self._update(tmp_path, clone_from="source", prelude=prelude)
+        [fresh] = [n for n in names if ".fresh-" in n]
+        assert (tmp_path / fresh / "data" / "marker").read_text() == "kept"
+        assert (home / "watch_relay.py").read_text() == "# installed\n"
+        assert fresh in result.stderr and "by hand" in result.stderr
+
+    def test_the_windows_update_puts_the_install_back_before_the_keys(self):
+        """install.ps1's rollback moved `data` back into a folder that was
+        not there yet, then put the old copy back, then deleted $fresh with
+        the keys still in it (2026-11-22 review). Read from the script: no
+        PowerShell runs here."""
+        with open(os.path.join(_ROOT, "install.ps1"), encoding="utf-8") as handle:
+            script = handle.read()
+        catch = script[script.index("} catch {"):]
+        catch = catch[:catch.index("Write-Warning")]
+        assert catch.index("Move-Item $superseded $Dir") < catch.index("foreach ($kept"), \
+            "the kept items go back before the folder they go into"
+        after = script[script.index("} catch {"):]
+        removal = after.index("Remove-Item -Recurse -Force $fresh")
+        assert "$left" in after[:removal] and "by hand" in after[:removal], \
+            "$fresh is deleted without a look at what it still holds"
 
     @posix_scripts
     def test_an_update_by_fresh_clone_keeps_the_bridge(self, tmp_path):
@@ -31711,3 +31855,106 @@ class TestReview20261122HelperLows:
         monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(settings))
         result = watch_relay.set_auto_update(True)
         assert result[0] is None and result[1]
+
+
+class TestReview20261122Classifier:
+    """The 2026-11-22 review of the 2026-11-21 fixes: each command read SAFE,
+    or one step too low, on main, and --quiet allows SAFE."""
+
+    @pytest.mark.parametrize("command", [
+        # zsh takes any delimiter after `e`, and `+name` after other qualifiers.
+        "ls *(e@id@)",
+        "ls *(e!'rm -rf ~'!)",
+        "ls *(e#id#)",
+        "ls *(N+cmd)",
+        # A quote inside a comment, or inside `$'…'`, hid what followed.
+        "echo ok # it's\nls *(e:id:)",
+        "echo $'it\\'s' && ls *(e:id:)",
+    ])
+    def test_a_glob_qualifier_that_runs_code(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk == Risk.CRITICAL, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "ls *(.)", "ls *(om[1])", "echo '*(e@x@)'", "echo hi # a comment *(e@x@)",
+    ])
+    def test_a_qualifier_that_runs_nothing_stays_a_read(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk == Risk.SAFE, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "LANG=C grep -rh . ~/.tapproval",
+        "TZ=UTC LC_ALL=C ls ~/.codex",
+        "grep -rh . ~/.azure",
+        "ls ~/.config/gcloud",
+        "cd ~/.config && grep -rh . gcloud/",
+        "cd ~/.fly && cat *",
+        "cd ~/.m2 && cat *",
+        "cd ~/.config/rclone && cat *",
+        "cd ~/.tapproval && ls data/..",
+    ])
+    def test_a_secret_store_read_another_way(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= Risk.HIGH, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", ["cd ~/.tapproval", "git -C ~/.tapproval log",
+                                         "cd src && ls */.."])
+    def test_going_to_a_store_folder_reads_nothing(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk == Risk.SAFE or "git" in command, (command, risk, rules)
+        assert risk < Risk.HIGH, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "yq -iP '.a=1' f.yml", "yq -iC '.a=1' f.yml", "yq -Pi '.a=1' f.yml",
+        # The shell unquotes `\/` and `\ ` before sed sees `s/x/y/w ../../.zshrc`.
+        r"sed s/x/y\/w\ ../../.zshrc README.md",
+    ])
+    def test_a_read_tool_that_writes(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= Risk.MEDIUM, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "yq -ojson . f.yml", "yq -ocsv . f.yml", "yq -I2 . f.yml", "yq -P . f.yml",
+        r"sed 's/a\/b/c/' f", "sed -n 's/x/y/p' f",
+    ])
+    def test_a_read_tool_that_reads_stays_a_read(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk == Risk.SAFE, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "git push --mirr origin", "git push --forc origin main", "git push --del origin main",
+    ])
+    def test_a_git_push_option_by_its_start(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk == Risk.CRITICAL, (command, risk, rules)
+
+    def test_a_wildcard_undone_by_its_next_step_does_not_crash(self):
+        # `next()` without a default raised; the hook fell back with no card.
+        risk, rules = crc.classify_bash("cd src && ls */..")
+        assert risk == Risk.SAFE, rules
+
+    @pytest.mark.parametrize("unit,read", [
+        ("UPDATE a JOIN ", lambda text: crc.classify_bash('psql -c "%s"' % text)),
+        # A database connector's statement (`_statement_risk`).
+        ("SELECT 1 UNION ", lambda text: crc._statement_risk(text)),
+    ])
+    def test_a_long_statement_is_read_in_time_proportional_to_it(self, unit, read):
+        # `[^;]*?` after every match grew with the square of the text: 1.8 s
+        # for 56 KB. A ladder: four times the text may take about four times
+        # as long, not sixteen.
+        def took(n):
+            began = time.process_time()
+            read(unit * n)
+            return time.process_time() - began
+        took(200)
+        small, large = took(1000), took(4000)
+        assert large < 8 * small + 0.05, (small, large)
+
+    def test_the_one_pass_sql_readers_still_find_their_writes(self):
+        assert crc.SQL_MUTATION.search("UPDATE t JOIN u ON t.a = u.a SET t.b = 1")
+        assert crc.SQL_MUTATION.search("update t set a = 1")
+        assert not crc.SQL_MUTATION.search("UPDATE t JOIN u ON t.a = u.a; SET x = 1")
+        assert not crc.SQL_MUTATION.search("select 1")
+        assert crc._select_writes("SELECT a INTO newtab FROM t")
+        assert not crc._select_writes("SELECT a FROM t; INTO x")
+        assert not crc._select_writes("SELECT a INTO @v FROM t")

@@ -113,7 +113,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.134"
+__version__ = "1.1.135"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -256,7 +256,11 @@ _SECRET_FILES = (
 # reads none, and the owner's own `cd ~/.tapproval` is common. And only
 # after a slash, as a path: a bare `.codex` is Swift's enum case far more
 # often than the folder (a `cd ~` before it is followed below).
-_SECRET_FOLDERS = r"(?<=[/\\])\.(?:tapproval|codex|kube|config[/\\]gh)[/\\]?(?![\w./\\-])"
+# The token stores of the 2026-11-16 list are folders too: `grep -r .
+# ~/.azure` and `ls ~/.config/gcloud` read SAFE (2026-11-22 review).
+_SECRET_FOLDERS = (r"(?<=[/\\])\.(?:tapproval|codex|kube|config[/\\]gh|config[/\\]gcloud|azure"
+                   r"|docker|fly|wrangler|supabase|twilio-cli|railway|m2|gradle"
+                   r"|config[/\\](?:glab-cli|rclone|github-copilot))[/\\]?(?![\w./\\-])")
 SECRET_PATH = re.compile(_SECRET_FILES + "|" + _SECRET_FOLDERS, re.I)
 SECRET_FILE_PATH = re.compile(_SECRET_FILES, re.I)
 
@@ -272,7 +276,10 @@ _FOLDER_READERS = frozenset(
 
 
 def _reads_a_folder(segment):
-    words = segment.lstrip("({ ").split()
+    """The command word after any env assignments: `LANG=C grep -r .
+    ~/.tapproval` read SAFE, its first word an assignment (2026-11-22
+    review). A wrapper (`sudo`, `env -u X`) is read again, unwrapped."""
+    words = _tokens(segment.lstrip("{ "))
     if not words:
         return False
     lead = os.path.basename(_QUOTING.sub("", words[0])).lower()
@@ -387,13 +394,12 @@ SQL_DESTRUCTIVE = re.compile(
     + _SQL_NAME + r"(?:\([^)]*\))?" + _SQL_END +
     r"|\bDROP\s+OWNED\s+BY\b|\bCOPY\b[^;]*\b(?:TO|FROM)\s+PROGRAM\b", re.I
 )
-SQL_MUTATION = re.compile(
+_SQL_MUTATION = re.compile(
     r"\b(INSERT\s+INTO|UPDATE\s+\S+\s+SET|DELETE\s+FROM|MERGE\s+INTO|"
     # A table alias, ONLY, a join, and the writes that replace a row: each
     # read LOW through an MCP query (2026-11-21 review). REPLACE INTO only
     # before what SQL puts there, so "replace into the text" is prose.
     r"UPDATE\s+(?:ONLY\s+)?[\w.\"`\[\]]+\s+(?:AS\s+)?\w+\s+SET\b|"
-    r"UPDATE\s+[\w.\"`]+(?:\s+(?:AS\s+)?\w+)?\s+(?:(?:INNER|LEFT|RIGHT|CROSS)\s+)?JOIN\b[^;]*?\bSET\b|"
     r"(?:REPLACE|INSERT\s+OR\s+(?:REPLACE|IGNORE|ABORT|FAIL|ROLLBACK))\s+INTO\s+[\w.\"`]+\s*(?:\(|VALUES\b|SELECT\b|SET\b|DEFAULT\b)|"
     r"ALTER\s+(TABLE|PROCEDURE)|CREATE\s+(OR\s+ALTER\s+)?PROCEDURE"
     # Who may do what, and who can log in: the same review.
@@ -401,6 +407,34 @@ SQL_MUTATION = re.compile(
     r"|(?:ALTER|CREATE)\s+(?:USER|ROLE)\s+[\w\"`'@%]+)",
     re.I,
 )
+_SQL_JOIN_UPDATE = re.compile(
+    r"\bUPDATE\s+[\w.\"`]+(?:\s+(?:AS\s+)?\w+)?\s+(?:(?:INNER|LEFT|RIGHT|CROSS)\s+)?JOIN\b",
+    re.I)
+_SQL_SET = re.compile(r"\bSET\b", re.I)
+
+
+def _set_after(pattern, text):
+    """Does a match of ``pattern`` stand before a SET in the same statement?
+    Read once over each statement, not once from every match: `[^;]*?`
+    after each `UPDATE … JOIN` took 1.8 s on 56 KB of them (2026-11-22)."""
+    for statement in text.split(";"):
+        sets = [found.start() for found in _SQL_SET.finditer(statement)]
+        if sets and any(found.end() <= sets[-1] for found in pattern.finditer(statement)):
+            return True
+    return False
+
+
+class _SqlMutation:
+    """SQL_MUTATION's one regex, and `UPDATE … JOIN … SET` (MySQL's form)
+    read in one pass."""
+
+    @staticmethod
+    def search(text):
+        text = text or ""
+        return bool(_SQL_MUTATION.search(text) or _set_after(_SQL_JOIN_UPDATE, text))
+
+
+SQL_MUTATION = _SqlMutation()
 # A stored procedure — but `exec` is also every shell's, VM's and container
 # tool's word: a list of binaries it did not mean grew to seven and still
 # read `ssh host 'exec ls'` as SQL (#872, 2026-10-24). In a command it
@@ -1167,25 +1201,44 @@ class _GlobQualifiers:
     tried on 2026-11-21, it took unquoted code (`open(`, Swift's `name:`)
     for qualifiers in 400 real commands."""
 
-    _RUNS = re.compile(r"(?:#q)?[-/.@=p*%rwxAIERWXsStfedDlUGugamcLMTNnoOY^0-9\[\],]{0,16}?"
-                       r"e[:'\"{/]")
+    # zsh takes nearly any character as the delimiter after `e`:
+    # `*(e@id@)` and `*(e!cmd!)` read SAFE (2026-11-22 review). Not `-`, `.`
+    # or `,`, which ended a Markdown link's name (`[x](app-store-sub…)`) in
+    # 40 real commands; and `+name` after `N` or `.` alone (`*(N+cmd)`),
+    # since `*(w+pad)` is a sum in Python.
+    _QUALIFIERS = r"(?:#q)?[-/.@=p*%rwxAIERWXsStfedDlUGugamcLMTNnoOY^0-9\[\],]{0,16}?"
+    _RUNS = re.compile(_QUALIFIERS + r"e[:'\"{/@!#%^|~;]")
     # `+name` only after `*`, `?` or `(#q`: after `]` it is Markdown's
     # `[+x+](+x+)` far more often than a bracket glob.
-    _CALLS = re.compile(r"(?:#q)?\.?\+[A-Za-z_]")
+    _CALLS = re.compile(r"(?:#q)?[.N]{0,3}\+[A-Za-z_]")
 
     def search(self, command):
+        command = command or ""
         quote = None
         escaped = False
-        for i, ch in enumerate(command or ""):
+        comment = False
+        for i, ch in enumerate(command):
+            # A comment runs to the end of its line, quotes and all: the
+            # `'` of `# it's` hid the next line's qualifier (2026-11-22).
+            if comment:
+                comment = ch != "\n"
+                continue
             if escaped:
                 escaped = False
                 continue
+            # `$'…'` takes a backslash as an escape, `'…'` does not.
             if ch == "\\" and quote != "'":
                 escaped = True
                 continue
             if quote:
-                if ch == quote:
+                if ch == quote[-1]:
                     quote = None
+                continue
+            if ch == "#" and (not i or command[i - 1] in " \t\n;&|"):
+                comment = True
+                continue
+            if ch == "'" and i and command[i - 1] == "$":
+                quote = "$'"
                 continue
             if ch in "'\"":
                 quote = ch
@@ -1561,10 +1614,15 @@ def _git_risk(segment):
     if sub == "push":
         # `--mirror` makes the remote what this checkout is: every branch
         # the remote has and this one lacks is deleted (2026-11-16 review).
-        if re.search(r"(^|\s)--mirror\b", rest):
+        # git takes any start of a long option: `--mirr`, `--forc` and
+        # `--del` read one step lower (2026-11-22 review).
+        words = rest.split()
+        if re.search(r"(^|\s)--mirror\b", rest) or _abbreviates(words, ("mirror",)):
             return ("git-push-mirror", Risk.CRITICAL)
+        if _abbreviates(words, ("force",)):
+            forced = True
         # Deleting a remote branch loses it as surely as overwriting it.
-        if re.search(r"(^|\s)(--delete|-d)\b|(^|\s):\S", rest):
+        if re.search(r"(^|\s)(--delete|-d)\b|(^|\s):\S", rest) or _abbreviates(words, ("delete",)):
             forced = True
         if forced and re.search(r"\b(main|master|prod|production|release)\b", rest):
             return ("git-force-push-protected", Risk.CRITICAL)
@@ -1913,7 +1971,9 @@ READ_TOOL_ESCAPES = {
     "security": re.compile(r"\b(list|default|login)-keychains?\b[^|;&]*\s-[sd]\b").search,
     # -s/--split-exp writes one file per document, named by the
     # expression, anywhere (2026-11-21 review).
-    "yq": re.compile(r"(^|\s)-[A-Za-z]*[is](\s|=|$)|(^|\s)--(inplace|split-exp)\b").search,
+    # Anywhere in a cluster, up to a letter that takes the rest as its
+    # argument (o, p, I): `-iP` read SAFE (2026-11-22 review).
+    "yq": re.compile(r"(^|\s)-[A-HJ-Za-nq-z]*[is]|(^|\s)--(inplace|split-exp)\b").search,
     "git": lambda segment: bool(re.search(r"(^|\s)--output(=|\s)", segment)
                                 or _abbreviates(_tokens(segment)[1:], ("output",))),
 }
@@ -1921,8 +1981,12 @@ for _awk in ("gawk", "nawk", "mawk"):
     READ_TOOL_ESCAPES[_awk] = READ_TOOL_ESCAPES["awk"]
 # sed takes any start of its long options too: `--in-pl` (2026-11-21 review).
 _SED_ESCAPE = READ_TOOL_ESCAPES["sed"]
+_SHELL_ESCAPE = re.compile(r"\\(.)")
+# And as the shell hands it over: `s/x/y\/w\ f` unquoted is `s/x/y/w f`,
+# which writes f, and read SAFE (2026-11-22 review). Read both ways.
 READ_TOOL_ESCAPES["sed"] = lambda segment: bool(
-    _SED_ESCAPE(segment) or _abbreviates(_tokens(segment)[1:], ("in-place", "file")))
+    _SED_ESCAPE(segment) or _SED_ESCAPE(_SHELL_ESCAPE.sub(r"\1", segment))
+    or _abbreviates(_tokens(segment)[1:], ("in-place", "file")))
 
 
 # fd's short options: those that take a value take the rest of the word.
@@ -1961,7 +2025,12 @@ _RELATIVE_NAME = re.compile(r"[\w.][\w.@%+/-]*")
 # names that are no secret on their own: `credentials` or `id_rsa` would
 # make every wildcard after every `cd` one.
 _STORE_NAMES = ("data", "data/auth.json", "auth.json", "config", "hosts.yml", "config.json",
-                "token", "access-token")
+                "token", "access-token", "config.yml", "config.yaml",
+                "settings.xml", "settings-security.xml", "gradle.properties")
+# A store whose file is a secret by its name alone, tried only in its own
+# folder: `rclone.conf` among the names above made every wildcard after
+# every `cd` a secret read, in 338 real commands (2026-11-22 review).
+_FOLDER_STORE_NAMES = {"rclone": ("rclone.conf",)}
 # A word the shell expands to file names in the current folder.
 _RELATIVE_GLOB = re.compile(r"(?=[^*?\[]*[*?\[])[\w.*?\[\]{}][\w.@%+/*?\[\]{},!-]*")
 # Words that are nothing once the shell has read them, or quotes by
@@ -2070,11 +2139,19 @@ def _secret_by_another_spelling(command):
                 # there, and a pattern in any other hidden folder, do not.
                 joined = posixpath.normpath(_plain_path(folder.rstrip("/") + "/" + word))
                 steps = joined.split("/")
-                fixed = next(i for i, step in enumerate(steps) if any(c in step for c in "*?["))
+                fixed = next((i for i, step in enumerate(steps)
+                              if any(c in step for c in "*?[")), None)
+                if fixed is None:
+                    # The step with the wildcard was undone (`*/..`): the
+                    # word names the folder itself (2026-11-22 review).
+                    if SECRET_PATH.search(joined + "/") and _reads_a_folder(segment):
+                        return True
+                    continue
                 listed = "/".join(steps[:fixed]) or "/"
+                names = _STORE_NAMES + _FOLDER_STORE_NAMES.get(posixpath.basename(listed), ())
                 if any(_glob_names(listed + "/" + name, joined)
                        and SECRET_FILE_PATH.search(listed + "/" + name)
-                       for name in _STORE_NAMES):
+                       for name in names):
                     return True
                 continue
             # A file's name, as a word on its own: `await cookies()` in a
@@ -2082,6 +2159,10 @@ def _secret_by_another_spelling(command):
             if not _RELATIVE_NAME.fullmatch(word):
                 continue
             named = posixpath.normpath(_plain_path(folder.rstrip("/") + "/" + word))
+            # normpath drops a trailing slash the store patterns need:
+            # `cd ~/.config && grep -r . gcloud/` read SAFE (2026-11-22).
+            if word.endswith("/"):
+                named += "/"
             if SECRET_FILE_PATH.search(named) or (
                     SECRET_PATH.search(named) and _reads_a_folder(segment)):
                 return True
@@ -2729,8 +2810,22 @@ _SELECT_WRITES = re.compile(
     r"\b(?:lo_export|lo_import|lo_unlink|pg_read_file|pg_read_binary_file|pg_ls_dir|"
     r"pg_stat_file|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|"
     r"pg_promote|pg_switch_wal|set_config|dblink\w*|load_file|sys_exec|sys_eval|"
-    r"nextval|setval)\s*\(|\bINTO\s+(?:OUT|DUMP)FILE\b|\bSELECT\b[^;]*\bINTO\s+(?!@)\w"
+    r"nextval|setval)\s*\(|\bINTO\s+(?:OUT|DUMP)FILE\b"
     r"|\b(?:INSERT|UPDATE|DELETE|MERGE)\b", re.I)
+_SQL_SELECT = re.compile(r"\bSELECT\b", re.I)
+_SQL_INTO = re.compile(r"\bINTO\s+(?!@)\w", re.I)
+
+
+def _select_writes(statement):
+    """_SELECT_WRITES, and `SELECT … INTO name` (a new table) read in one
+    pass: `[^;]*` from every SELECT grew with the square of the text."""
+    if _SELECT_WRITES.search(statement):
+        return True
+    for piece in statement.split(";"):
+        first = _SQL_SELECT.search(piece)
+        if first and _SQL_INTO.search(piece, first.end()):
+            return True
+    return False
 _MUTATING_STATEMENT = re.compile(
     r"^\s*(?:INSERT|UPDATE|DELETE|MERGE|REPLACE|UPSERT|ALTER|GRANT|REVOKE|COPY|CALL|EXEC"
     r"|EXECUTE|DO|LOAD|IMPORT|RENAME|SET\s+ROLE|SECURITY|REINDEX|CLUSTER|VACUUM)\b", re.I)
@@ -2759,7 +2854,7 @@ def _statement_risk(statement):
     if mongo:
         return None if mongo.group(1) in _MONGO_READS else Risk.MEDIUM
     if _READ_STATEMENT.match(statement):
-        return Risk.MEDIUM if _SELECT_WRITES.search(statement) else None
+        return Risk.MEDIUM if _select_writes(statement) else None
     first = statement.split(None, 1)[0].upper() if statement.split() else ""
     if first in _REDIS_READS:
         return None

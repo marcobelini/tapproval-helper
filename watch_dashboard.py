@@ -2636,8 +2636,23 @@ THREAD_TURNS_HELD = 160
 THREAD_TURNS_KEPT = 120
 
 
+# Set by the relay: the code a session's wrist messages carry, or None.
+# Only a message with it is shown as the wearer's words (2026-11-22).
+WRIST_CODE_FOR = None
+
+
+def _wrist_code(path):
+    """The wrist code of the session this transcript is, or None. Never raises."""
+    try:
+        name = os.path.splitext(os.path.basename(path))[0]
+        return WRIST_CODE_FOR(name) if WRIST_CODE_FOR else None
+    except Exception:   # noqa: BLE001 — a thread is read without it
+        return None
+
+
 def _parse_thread_locked(path, limit):
     state = _thread_state_for(path)
+    state["wrist_code"] = _wrist_code(path)
     if state["offset"] == 0 and not state["turns"]:
         state["offset"] = state["floor"] = _tail_start(path)
     starts = []
@@ -2650,6 +2665,7 @@ def _parse_thread_locked(path, limit):
         state = _fresh_thread_state()
         state["offset"] = offset
         _THREAD_STATE[path] = state
+        state["wrist_code"] = _wrist_code(path)
     if lines:
         # By index, not zip(): zip(strict=) is 3.10, and the helper runs on 3.9.
         for index, line in enumerate(lines):
@@ -2911,7 +2927,8 @@ def _thread_line(state, line, limit):
         if isinstance(content, list):
             content = "\n".join(str(block.get("text", "")) for block in content
                                  if isinstance(block, dict))
-        words = wire.wrist_words(content, trailer=shape("text.peer_trailer"))
+        words = wire.wrist_words(content, trailer=shape("text.peer_trailer"),
+                                 code=state.get("wrist_code"))
         if words is None:
             return
         message, inbox = {"content": words}, True
