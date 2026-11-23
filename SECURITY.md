@@ -108,6 +108,10 @@ private database, which only your Apple Account can read.
   developer's Mac, so a copy cannot be rebuilt bit for bit from the source
   in `bridge/`. The source is published so it can be read; the signature
   and Apple's notarization are what tie a download to that developer.
+  The signature names the developer as Apple knows them, the same name
+  the App Store shows for Tapproval. No other file in this repository
+  carries it, and the release checks for personal details read text
+  files, not the inside of the signed zip.
 - **Check a copy by hand:**
 
   ```bash

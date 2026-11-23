@@ -1302,6 +1302,23 @@ class TestReview20261116SqlThatDestroys:
         assert "sql-destructive" not in rules, (command, rules)
 
 
+@pytest.mark.private_layout
+class TestReview20261122bWatch:
+    """The whole-repo review of 2026-11-22 (afternoon), read in the Swift."""
+
+    def test_the_bridge_log_is_the_owners_alone(self):
+        source = (Path(__file__).parent / "WatchApp" / "Bridge" / "main.swift").read_text()
+        opening = source[source.index('appendingPathComponent("bridge.log")'):][:900]
+        assert "0o644" not in opening
+        assert "O_CREAT, 0o600" in opening and "fchmod(fd, 0o600)" in opening
+
+    def test_a_tap_in_the_pause_buzzes(self):
+        source = (Path(__file__).parent / "WatchApp" / "Tapproval" / "RelayModel.swift").read_text()
+        body = source[source.index("func answer(_ card: WristCard"):][:1600]
+        pause = body[body.index("Self.tapCounts("):]
+        assert pause.index("play(.retry)") < pause.index("return .ignored")
+
+
 class TestClassifyBashFailClosed:
     def test_unknown_command_is_not_auto_allowed(self):
         risk, rules = crc.classify_bash("some-unknown-binary --do-a-thing")
@@ -14725,6 +14742,93 @@ class TestSigningInFromTheWrist:
         monkeypatch.setattr(watch_relay, "signed_in",
                             lambda **k: False if k.get("agent") == "codex" else True)
         assert watch_relay.start_session(str(tmp_path), "hi", agent="codex") == "codex signed out"
+
+
+class TestReview20261122bRelay:
+    """The whole-repo review of 2026-11-22 (afternoon), relay side."""
+
+    class _Proc(TestSigningInFromTheWrist._Proc):
+        pid = 4242
+
+    @pytest.fixture(autouse=True)
+    def _fresh(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "_SIGNIN_RUNS", {})
+        monkeypatch.setattr(watch_relay, "_SIGNIN", {"at": 0.0, "in": None})
+        monkeypatch.setattr(watch_relay, "_SIGNIN_CODEX", {"at": 0.0, "in": None})
+        yield
+        for key in ("signin", "signin_codex"):
+            watch_relay.clear_condition(key)
+
+    def test_a_finished_sign_in_is_never_stopped_later(self, monkeypatch):
+        """A code sign-in that ended stayed in the table, and a later "on
+        this computer" tap killed its old number's whole process group."""
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
+        monkeypatch.setattr(watch_relay, "signed_in", lambda **k: False)
+        stopped = []
+        monkeypatch.setattr(watch_relay._host, "stop_tree", lambda pid, run=None: stopped.append(pid))
+        phone = self._Proc(["https://auth.example.test/codex/device\n", "ABCD-EF123\n"])
+        assert watch_relay.start_signin("codex", popen=lambda cmd, **k: phone)["code"]
+        phone.done.set()
+        deadline = time.time() + 5
+        while "codex" in watch_relay._SIGNIN_RUNS and time.time() < deadline:
+            time.sleep(0.02)
+        assert "codex" not in watch_relay._SIGNIN_RUNS, "a finished run stays in the table"
+        stopped.clear()
+        desk = self._Proc(["Starting local login server on http://localhost:1455.\n",
+                           "https://auth.example.test/oauth/authorize?x=1\n"])
+        desk.pid = 5151
+        watch_relay.start_signin("codex", popen=lambda cmd, **k: desk, where="computer")
+        assert 4242 not in stopped, stopped
+        desk.done.set()
+
+    def test_a_dead_run_left_in_the_table_is_not_signalled(self, monkeypatch):
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/x/codex")
+        monkeypatch.setattr(watch_relay, "signed_in", lambda **k: False)
+        stopped = []
+        monkeypatch.setattr(watch_relay._host, "stop_tree", lambda pid, run=None: stopped.append(pid))
+        old = self._Proc([])
+        old.done.set()
+        watch_relay._SIGNIN_RUNS["codex"] = {"proc": old, "at": time.time(), "where": None,
+                                             "answer": {"ok": True, "status": "code"}}
+        desk = self._Proc(["https://auth.example.test/oauth/authorize?x=1\n"])
+        desk.pid = 5151
+        watch_relay.start_signin("codex", popen=lambda cmd, **k: desk, where="computer")
+        assert 4242 not in stopped, stopped
+        desk.done.set()
+
+    def test_this_machines_addresses_are_asked_once_in_a_while(self, monkeypatch):
+        asked = []
+        monkeypatch.setattr(watch_relay, "_LOCAL_ADDRESSES_SEEN",
+                            {"at": 0.0, "lister": None, "found": frozenset()})
+        monkeypatch.setattr(watch_relay, "_local_addresses", lambda: asked.append(1) or {"x"})
+        for _ in range(20):
+            assert watch_relay._recent_local_addresses(now=100.0) == {"x"}
+        assert len(asked) == 1
+        watch_relay._recent_local_addresses(now=100.0 + watch_relay.LOCAL_ADDRESSES_FOR + 1)
+        assert len(asked) == 2
+
+    def test_old_receipts_are_pruned_and_pending_ones_kept(self, tmp_path):
+        receipts = watch_relay.NewReceipts(str(tmp_path / "r" / "new.sqlite3"))
+        assert receipts.claim("old", "f", now=1000.0) is None
+        receipts.finish("old", {"ok": True})
+        assert receipts.claim("crashed", "f", now=1000.0) is None
+        receipts.claim("new", "f", now=1000.0 + receipts.KEEP_FOR + 1)
+        assert receipts.read("old") is None
+        assert receipts.read("crashed") == {"ok": False, "status": "pending"}
+        assert receipts.read("new") is not None
+
+    def test_a_receipt_table_from_before_the_column_still_works(self, tmp_path):
+        import sqlite3
+        path = tmp_path / "r" / "new.sqlite3"
+        path.parent.mkdir()
+        with sqlite3.connect(str(path)) as db:
+            db.execute("CREATE TABLE receipts (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,"
+                       " answer TEXT NOT NULL)")
+            db.execute("INSERT INTO receipts VALUES ('k', 'f', '{\"ok\": true}')")
+        receipts = watch_relay.NewReceipts(str(path))
+        assert receipts.read("k") == {"ok": True}
+        assert receipts.claim("k2", "f") is None
+        assert receipts.read("k") is None, "a row from before the column is old"
 
 
 class TestPicturesReachTheWrist:
@@ -31857,6 +31961,128 @@ class TestReview20261122HelperLows:
         assert result[0] is None and result[1]
 
 
+class TestReview20261122bClassifier:
+    """The whole-repo review of 2026-11-22 (afternoon): each command read
+    SAFE or LOW on main, and --quiet allows both."""
+
+    @pytest.mark.parametrize("command", [
+        # zsh takes `[`, `<`, `*`, `?`, `=`, and `.`/`,` as delimiters too,
+        # and a qualifier after a `(group)`.
+        "ls *(e[rm -rf ~])",
+        "ls src/*(e[python3 build/x.py])",
+        "ls *(e<id>)",
+        "ls *(e*sh x.sh*)",
+        "ls *(e?sh x.sh?)",
+        "ls *(e=sh x.sh=)",
+        "ls *(e.sh x.sh.)",
+        "ls *(e,sh x,)",
+        "ls (src)(e:sh x.sh:)",
+    ])
+    def test_a_glob_qualifier_that_runs_code(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk == Risk.CRITICAL, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "ls src/*(.)", "ls *(om[1])", 'echo "[x](e.g. foo.)"',
+        "git for-each-ref --format='%(refname:short)'",
+    ])
+    def test_a_qualifier_or_link_that_runs_nothing_is_not_one(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert "glob-qualifier-runs-code" not in rules, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "xcrun --find --run python3 build/helper.py",
+        "xcrun -f clang --run python3 x.py",
+        "sed 'sxaxbxw /Users/me/.zshrc' f.txt",
+        "sed 'sxaxbxe' f.txt",
+        "yq -y --in-place '.a=1' f.yml",
+        "yq --in-pl .a=1 f.yml",
+        "pip list --python ./tools/run.sh",
+        "pip3 list --log /Users/me/.zshrc",
+        "pip show --cache-d /tmp/x requests",
+        "docker inspect db",
+    ])
+    def test_reads_that_run_or_write_are_no_longer_safe(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= Risk.MEDIUM, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", ["xcrun --find clang", "pip list", "pip3 show requests"])
+    def test_plain_reads_stay_safe(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk == Risk.SAFE, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "grep -rh . ~/.config/",
+        "grep -r oauth_token ~/.config",
+        "yq -n 'env(GITHUB_TOKEN)'",
+        "yq -n 'strenv(GITHUB_TOKEN)'",
+        "kubectl get secrets. -o yaml",
+        "kubectl get secret.v1. -o yaml",
+        "echo $PGPASSWORD",
+        "cat ~/.config/sops/age/keys.txt",
+        "cat ~/.cloudflared/0f1e2d3c.json",
+        "cat .dev.vars",
+        "cat .streamlit/secrets.toml",
+        "cat ~/.config/hub",
+        "cat ~/.bundle/config",
+        "cat ~/.circleci/cli.yml",
+        "cat ~/.config/configstore/x.json",
+        "cat ~/.config/hcloud/cli.toml",
+        "cat release.keystore",
+        "cat upload.jks",
+        "cat terraform.tfvars",
+        "cat deploy/id_ecdsa",
+        "cat ~/.zsh_sessions/A.history",
+        "cat ~/.histfile",
+    ])
+    def test_secret_reads_are_high(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= Risk.HIGH, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "cat ~/.config/foo.toml", "ls ~/.config/foo", "echo $PATH", "echo $MAX_ITEMS",
+    ])
+    def test_files_beside_the_stores_stay_reads(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk == Risk.SAFE, (command, risk, rules)
+
+    @pytest.mark.parametrize("command", [
+        "grep -ho '#[A-Z2-7]\\{8\\}' ~/.claude/projects/p/s.jsonl",
+        "cat ~/.claude/projects/p/s.jsonl",
+        "grep -rh Tapproval ~/.claude/projects",
+        "grep -r x ~/.codex/sessions",
+    ])
+    def test_another_sessions_transcript_needs_a_card(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= Risk.MEDIUM and "transcript-read" in rules, (command, risk, rules)
+
+    @pytest.mark.parametrize("event", [
+        {"tool_name": "Grep", "tool_input": {"pattern": "token", "path": "~/.config"}},
+        {"tool_name": "Read", "tool_input": {"file_path": "/Users/me/.claude/projects/p/s.jsonl"}},
+        {"tool_name": "Write", "tool_input": {"file_path": ".agents/skills/d/SKILL.md", "content": "x"}},
+        {"tool_name": "Write", "tool_input": {"file_path": ".codex/skills/d/SKILL.md", "content": "x"}},
+        {"tool_name": "mcp__filesystem__search_replace", "tool_input": {}},
+        {"tool_name": "mcp__x__searchReplace", "tool_input": {}},
+        {"tool_name": "mcp__x__fetch_page", "tool_input": {"urls": ["https://example.invalid/"]}},
+        {"tool_name": "mcp__x__fetch_page", "tool_input": {"address": "https://example.invalid/"}},
+        {"tool_name": "Bash", "tool_input": {"command": "git status"}, "cwd": "/Users/me/p/tmp/r"},
+    ])
+    def test_tool_calls_that_reach_further_than_their_names(self, event):
+        result = crc.classify(event)
+        assert result["risk"] >= Risk.MEDIUM, (event, result["risk"], result["rules"])
+
+    def test_git_outside_a_scratch_folder_stays_a_read(self):
+        result = crc.classify({"tool_name": "Bash", "tool_input": {"command": "git status"},
+                               "cwd": "/Users/me/p"})
+        assert result["risk"] == Risk.SAFE
+
+    @pytest.mark.parametrize("command", ["ls ~/.claude/projects", "du -sh ~/.codex/sessions",
+                                         "find ~/.claude/projects -name '*.jsonl'"])
+    def test_listing_transcripts_reads_no_code(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert "transcript-read" not in rules, (command, risk, rules)
+
+
 class TestReview20261122Classifier:
     """The 2026-11-22 review of the 2026-11-21 fixes: each command read SAFE,
     or one step too low, on main, and --quiet allows SAFE."""
@@ -31958,3 +32184,52 @@ class TestReview20261122Classifier:
         assert crc._select_writes("SELECT a INTO newtab FROM t")
         assert not crc._select_writes("SELECT a FROM t; INTO x")
         assert not crc._select_writes("SELECT a INTO @v FROM t")
+
+
+class TestReview20261122bHook:
+    """The whole-repo review of 2026-11-22 (afternoon): --quiet allowed a
+    call the user's own ask rule names, and two backups in one second were
+    one file."""
+
+    @pytest.fixture
+    def rules(self, tmp_path, monkeypatch):
+        settings = tmp_path / "settings.json"
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(settings))
+
+        def write(ask):
+            settings.write_text(json.dumps({"permissions": {"ask": ask}}), encoding="utf-8")
+        return write
+
+    QUIET = {"mode": "enforce", "auto_allow_at_or_below": "LOW"}
+
+    @pytest.mark.parametrize("ask, event", [
+        (["Read(~/Documents/**)"],
+         {"tool_name": "Read", "tool_input": {"file_path": "/Users/me/Documents/a.txt"}}),
+        (["Read"], {"tool_name": "Read", "tool_input": {"file_path": "README.md"}}),
+        (["Bash(git status:*)"], {"tool_name": "Bash", "tool_input": {"command": "git status"}}),
+        (["Bash(ls *)"], {"tool_name": "Bash", "tool_input": {"command": "pwd && ls -la"}}),
+    ])
+    def test_an_ask_rule_is_never_auto_allowed(self, rules, tmp_path, ask, event):
+        rules(ask)
+        event = dict(event, cwd=str(tmp_path))
+        _, audit, _ = crc.build_response(event, self.QUIET)
+        assert audit["decision"] == "escalate", (ask, event, audit)
+
+    @pytest.mark.parametrize("ask", [[], ["Bash(rm:*)"], ["Write"]])
+    def test_without_a_rule_for_the_call_quiet_still_allows(self, rules, tmp_path, ask):
+        rules(ask)
+        # Not `git`: on Linux tmp_path is under /tmp, a scratch folder, where
+        # git runs a repository's config and is never SAFE.
+        event = {"tool_name": "Bash", "tool_input": {"command": "ls -la"},
+                 "cwd": str(tmp_path)}
+        _, audit, _ = crc.build_response(event, self.QUIET)
+        assert audit["decision"] == "allow", (ask, audit)
+
+    def test_two_backups_in_one_second_are_two_files(self, tmp_path):
+        settings = tmp_path / "settings.json"
+        settings.write_text('{"model": "original"}', encoding="utf-8")
+        first = crc._backup(str(settings))
+        settings.write_text('{"model": "changed"}', encoding="utf-8")
+        second = crc._backup(str(settings))
+        assert first != second
+        assert json.loads(Path(first).read_text(encoding="utf-8")) == {"model": "original"}

@@ -113,7 +113,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.135"
+__version__ = "1.1.136"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -247,6 +247,15 @@ _SECRET_FILES = (
     r"ngrok2?[/\\]ngrok\.ya?ml|(?<![\w-])\.sentryclirc\b|(?<![\w-])\.databrickscfg\b|"
     r"(?<![\w-])\.boto(?![\w.-])|(?<![\w-])(?:logins\.json|key[34]\.db)\b|"
     r"\.local[/\\]share[/\\]keyrings\b|\.tapproval-tunnel\.json|"
+    # And these, each SAFE to `cat` and to the Read tool until the
+    # 2026-11-22b review: sops' age keys, cloudflared's tunnel credentials,
+    # wrangler's local secrets, Streamlit's, hub, Bundler, CircleCI,
+    # configstore and hcloud logins, Java keystores, Terraform's variables,
+    # an ssh key kept outside ~/.ssh, and zsh's history.
+    r"sops[/\\]age[/\\]keys\.txt\b|\.cloudflared[/\\][^\s/\\]+\.json\b|(?<![\w-])\.dev\.vars\b|"
+    r"\bsecrets?\.toml\b|\.config[/\\]hub\b|\.bundle[/\\]config\b|\.circleci[/\\]cli\.ya?ml\b|"
+    r"\.config[/\\]configstore[/\\]|\.config[/\\]hcloud[/\\]|\.(?:keystore|jks)\b|"
+    r"\.tfvars\b|\bid_(?:ecdsa|dsa)(?:_sk)?\b|\.zsh_sessions[/\\]|(?<![\w-])\.histfile\b|"
     r"(?<![\w-])\.(?:aws|ssh|gnupg|appstoreconnect)(?![\w.-])|\.tapproval[/\\]data(?![\w.-]))")
 # A folder that holds one of the stores above, named on its own: a
 # recursive search, a diff or a listing of it reads the store (`grep -r .
@@ -258,10 +267,21 @@ _SECRET_FILES = (
 # often than the folder (a `cd ~` before it is followed below).
 # The token stores of the 2026-11-16 list are folders too: `grep -r .
 # ~/.azure` and `ls ~/.config/gcloud` read SAFE (2026-11-22 review).
+# ~/.config itself holds gh's, gcloud's, rclone's and Copilot's stores: a
+# `grep -r . ~/.config/` read every one of them SAFE (2026-11-22b review).
 _SECRET_FOLDERS = (r"(?<=[/\\])\.(?:tapproval|codex|kube|config[/\\]gh|config[/\\]gcloud|azure"
-                   r"|docker|fly|wrangler|supabase|twilio-cli|railway|m2|gradle"
-                   r"|config[/\\](?:glab-cli|rclone|github-copilot))[/\\]?(?![\w./\\-])")
+                   r"|docker|fly|wrangler|supabase|twilio-cli|railway|m2|gradle|config"
+                   r"|cloudflared|config[/\\](?:glab-cli|rclone|github-copilot|sops))"
+                   r"[/\\]?(?![\w./\\-])")
 SECRET_PATH = re.compile(_SECRET_FILES + "|" + _SECRET_FOLDERS, re.I)
+# What lists names or sizes and never prints what a file says.
+_NAME_LISTERS = frozenset("ls tree du stat file find fd wc".split())
+# Every session's transcript holds its wrist code, which marks a message as
+# the wearer's own words: one session reading another's could speak for the
+# wearer (2026-11-22b review). MEDIUM, a card, not a secret: the owner reads
+# them often, and it is the code's only copy most sessions can reach.
+TRANSCRIPT_PATH = re.compile(r"\.claude[/\\]projects(?![\w.-])|\.codex[/\\](?:archived_)?sessions(?![\w.-])",
+                             re.I)
 SECRET_FILE_PATH = re.compile(_SECRET_FILES, re.I)
 
 
@@ -687,6 +707,7 @@ def _words_name_a_secret(parts):
                for i in range(len(parts) - 1))
 
 
+_SECRET_SUFFIXES = ("password", "passwd", "token", "secret", "apikey")
 _VARIABLE_IN_WORD = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
 
 
@@ -704,6 +725,11 @@ def _names_a_secret(word):
             return True
     if not (word.startswith("-") or "=" in word or bare.isupper()):
         return False
+    # `$PGPASSWORD` and `$GHTOKEN` run the word into the name with no joiner
+    # (2026-11-22b review). Upper case only: a variable's spelling.
+    name = bare.lstrip("$")
+    if name.isupper() and name.lower().endswith(_SECRET_SUFFIXES):
+        return True
     return _words_name_a_secret([p for p in _SECRET_JOINERS.split(bare.lower()) if p])
 
 
@@ -1009,7 +1035,9 @@ VERB_TOOLS_READ_ONLY = {
     "security": frozenset(
         "find-identity find-certificate list-keychains".split()),
     "defaults": frozenset("read read-type domains".split()),
-    "docker": frozenset("ps images logs inspect version info top port".split()),
+    # Not `inspect`: it prints a container's environment, passwords and
+    # all (2026-11-22b review).
+    "docker": frozenset("ps images logs version info top port".split()),
     "kubectl": frozenset("get describe logs explain top version".split()),
     "brew": frozenset("list info search deps outdated config --version".split()),
     "pip": _PIP_READ_ONLY,
@@ -1110,8 +1138,15 @@ def _subcommand_risk(segment, token):
     if token == "xcrun":
         if not words:
             return None
-        if words[0] == "--find":
-            return ("read-only-tool", Risk.SAFE)
+        if words[0] in ("--find", "-f"):
+            # A later `--run` wins: `xcrun --find --run python3 x.py` runs
+            # it, and read SAFE (2026-11-22b review).
+            runs = [i for i, w in enumerate(words) if w in ("-r", "--run")]
+            if not runs:
+                return ("read-only-tool", Risk.SAFE)
+            words = words[runs[0] + 1:]
+            if not words:
+                return None
         return _subcommand_risk(" ".join(words), words[0])
 
     flags_known = FLAG_TOOLS_READ_ONLY.get(token)
@@ -1207,7 +1242,11 @@ class _GlobQualifiers:
     # 40 real commands; and `+name` after `N` or `.` alone (`*(N+cmd)`),
     # since `*(w+pad)` is a sum in Python.
     _QUALIFIERS = r"(?:#q)?[-/.@=p*%rwxAIERWXsStfedDlUGugamcLMTNnoOY^0-9\[\],]{0,16}?"
-    _RUNS = re.compile(_QUALIFIERS + r"e[:'\"{/@!#%^|~;]")
+    # `[`, `<`, `*`, `?` and `=` delimit too, `[…]` and `<…>` as pairs:
+    # `*(e[rm -rf ~])` read SAFE (2026-11-22b review). `.` and `,` only
+    # where the closing one ends the qualifier, `(e.cmd.)`, which no
+    # Markdown link's name does.
+    _RUNS = re.compile(_QUALIFIERS + r"e(?:[:'\"{/@!#%^|~;\[<*?=]|([.,])[^)\n]*\1\))")
     # `+name` only after `*`, `?` or `(#q`: after `]` it is Markdown's
     # `[+x+](+x+)` far more often than a bracket glob.
     _CALLS = re.compile(r"(?:#q)?[.N]{0,3}\+[A-Za-z_]")
@@ -1243,9 +1282,10 @@ class _GlobQualifiers:
             if ch in "'\"":
                 quote = ch
                 continue
-            if ch == "(" and i and (command[i - 1] in "*?]" or command.startswith("(#q", i)):
+            # After `)` as well: a group is a glob, `(src)(e:cmd:)` (2026-11-22b).
+            if ch == "(" and i and (command[i - 1] in "*?])" or command.startswith("(#q", i)):
                 found = self._RUNS.match(command, i + 1)
-                if not found and command[i - 1] != "]":
+                if not found and command[i - 1] not in "])":
                     found = self._CALLS.match(command, i + 1)
                 if found:
                     return found
@@ -1942,6 +1982,11 @@ READ_TOOL_ESCAPES = {
                       # A backslash is read one way only, as an escape: read
                       # both ways, a run of them was tried every way, and a
                       # real `s/\\\\\\\\s…/` held the hook 15 s (2026-11-21).
+                      # A letter delimits too: `sxaxbxw f` writes f
+                      # (2026-11-22b review). Only where a command starts
+                      # and within one word, so `/start/,/end/p` is not one.
+                      r"|(?:^|(?<=['\";{}!\s]))s(?P<l>[A-Za-z])(?:(?!(?P=l))[^\\\s'\"])*(?P=l)"
+                      r"(?:(?!(?P=l))[^\\\s'\"])*(?P=l)[gpiImM0-9]*(?:[wW]\s|e(?=$|['\";}\s]))"
                       r"|(?<![A-Za-z])s(?P<d>[^\sA-Za-z0-9\\])(?:\\.|(?!(?P=d))[^\\])*(?P=d)"
                       r"(?:\\.|(?!(?P=d))[^\\])*(?P=d)[gpiImM0-9]*[wWe]"
                       # A script file holds the same commands, unseen.
@@ -1973,12 +2018,22 @@ READ_TOOL_ESCAPES = {
     # expression, anywhere (2026-11-21 review).
     # Anywhere in a cluster, up to a letter that takes the rest as its
     # argument (o, p, I): `-iP` read SAFE (2026-11-22 review).
-    "yq": re.compile(r"(^|\s)-[A-HJ-Za-nq-z]*[is]|(^|\s)--(inplace|split-exp)\b").search,
+    # Python's yq spells it `--in-place`, and argparse takes `--in-pl`
+    # (2026-11-22b review).
+    "yq": lambda segment: bool(
+        re.search(r"(^|\s)-[A-HJ-Za-nq-z]*[is]|(^|\s)--(inplace|in-place|split-exp)\b", segment)
+        or _abbreviates(_tokens(segment)[1:], ("inplace", "in-place", "split-exp"))),
+    # pip's general options reach past a read: `--log` appends to any file,
+    # `--python` runs the file it names, `--cache-dir` writes there; optparse
+    # takes any start of them (2026-11-22b review).
+    "pip": lambda segment: _abbreviates(_tokens(segment)[1:],
+                                        ("log", "log-file", "python", "cache-dir")),
     "git": lambda segment: bool(re.search(r"(^|\s)--output(=|\s)", segment)
                                 or _abbreviates(_tokens(segment)[1:], ("output",))),
 }
 for _awk in ("gawk", "nawk", "mawk"):
     READ_TOOL_ESCAPES[_awk] = READ_TOOL_ESCAPES["awk"]
+READ_TOOL_ESCAPES["pip3"] = READ_TOOL_ESCAPES["pip"]
 # sed takes any start of its long options too: `--in-pl` (2026-11-21 review).
 _SED_ESCAPE = READ_TOOL_ESCAPES["sed"]
 _SHELL_ESCAPE = re.compile(r"\\(.)")
@@ -2040,7 +2095,10 @@ _KUBE_SECRET = re.compile(r"(?:^|[\s,])secrets?(?:\.[\w.-]*)?(?:/|,)|,secrets?(?
                           # In an API path (`get --raw …/secrets/db`), and as
                           # a word once the shell's quotes are gone
                           # (`get se""cret db`): 2026-11-16 review.
-                          r"|/secrets?(?=/|\s|$)|(?:^|\s)secrets?(?=\s|$)", re.I)
+                          r"|/secrets?(?=/|\s|$)|(?:^|\s)secrets?(?=\s|$)"
+                          # `secrets.` is the core group's, `secret.v1.` the
+                          # whole name (2026-11-22b review).
+                          r"|(?:^|\s)secrets?\.(?:v1\.?)?(?=\s|$)", re.I)
 
 
 def _plain_path(text):
@@ -2258,7 +2316,9 @@ CREDENTIAL_READS = re.compile(
     # jq's `env` and awk's `ENVIRON` are the whole environment too; a field
     # called `.env` is not (2026-10-25 review).
     r"|\bjq\b[^|;&]*(\$ENV\b|(?<![.\w$])env\b)"
-    r"|\b[gnm]?awk\b[^|;&]*\bENVIRON\b")
+    r"|\b[gnm]?awk\b[^|;&]*\bENVIRON\b"
+    # yq's `env(NAME)` and `strenv(NAME)`, as jq's `env` (2026-11-22b review).
+    r"|\byq\b[^|;&]*\b(?:str)?env\s*\(")
 
 
 _QUOTING = re.compile(r"['\"\\]")
@@ -2452,6 +2512,9 @@ def _classify_bash(command, _depth, fragment=False):
 
         if CREDENTIAL_READS.search(segment):
             bump("credential-read", Risk.HIGH)
+        if (token in _FOLDER_READERS and token not in _NAME_LISTERS
+                and TRANSCRIPT_PATH.search(segment)):
+            bump("transcript-read", Risk.MEDIUM)
         if _searches_every_file(token, segment, folder):
             bump("home-wide-search", Risk.HIGH)
         if any(_HOME_DOT_TARGET.match(target) for target in _write_targets(token, segment)):
@@ -2539,7 +2602,10 @@ SCRATCH_PATH = re.compile(r"([/\\](tmp|scratchpad|\.cache)[/\\])", re.I)
 # agent or skill: not documentation, whatever the extension (2026-09-30).
 INSTRUCTION_PATH = re.compile(
     r"(^|[/\\])(CLAUDE(\.local)?\.md|AGENTS(\.override)?\.md)$"
-    r"|(^|[/\\])\.claude[/\\](commands|agents|skills|hooks|rules)[/\\]", re.I)
+    r"|(^|[/\\])\.claude[/\\](commands|agents|skills|hooks|rules)[/\\]"
+    # Codex loads its skills and prompts from these in later sessions: a
+    # write there read LOW (2026-11-22b review).
+    r"|(^|[/\\])\.(agents|codex)[/\\](skills|prompts)[/\\]", re.I)
 
 
 TEMP_ROOT = re.compile(r"(/private)?/tmp/", re.I)
@@ -2668,6 +2734,9 @@ def _read_tool_risk(tool, tool_input):
     where = tool_input.get("path")
     if tool == "Grep" and isinstance(where, str) and _is_everything(where.strip()):
         return Risk.HIGH, ["home-wide-search"]
+    if any(isinstance(tool_input.get(key), str) and TRANSCRIPT_PATH.search(tool_input[key])
+           for key in keys):
+        return Risk.MEDIUM, ["transcript-read"]
     return Risk.SAFE, ["read-only-tool"]
 
 
@@ -2761,8 +2830,13 @@ def _mcp_risk(tool):
         return Risk.MEDIUM, ["mcp-unknown"]
     # `search_and_delete` does both: every verb a name chains counts, and
     # `get_or_create` creates (2026-11-16 review: "or" was not a chain).
+    # Two verbs with no joiner do both too: `search_replace` replaces
+    # (2026-11-22b review). Only a second verb that is seldom a noun:
+    # `get_label` and `list_tags` read labels and tags.
     verbs = [words[0]] + [words[i + 1] for i in range(len(words) - 1)
-                          if words[i] in ("and", "then", "or")]
+                          if words[i] in ("and", "then", "or")
+                          or (words[i + 1] in _MCP_SECOND_VERBS
+                              and _mcp_verb_effect(words[i]) is not None)]
     effects = [effect for effect in map(_mcp_verb_effect, verbs) if effect is not None]
     effect = max(effects) if effects else None
     # A password manager's every answer is a credential, whatever its
@@ -2962,6 +3036,11 @@ def _patch_risk(patch, cwd):
 _READ_VERB_ENDINGS = ("", "s", "es", "ing", "ed")
 
 
+_MCP_SECOND_VERBS = frozenset(
+    "replace delete remove write overwrite erase purge drop destroy rename move insert "
+    "upsert modify".split())
+
+
 def _mcp_verb_effect(verb):
     effect = MCP_EFFECT.get(verb)
     if effect is None:
@@ -3014,6 +3093,11 @@ def classify(event):
 
     if tool in ("Bash", "BashOutput"):
         risk, rules = classify_bash(tool_input.get("command", ""))
+        # A session already inside a scratch repository runs its config on
+        # `git status`, as `cd /tmp/r && git status` does (2026-11-22b).
+        if (risk < Risk.MEDIUM and isinstance(cwd, str) and cwd and _is_scratch_folder(cwd)
+                and re.search(r"(?:^|[\s;&|(])git(?:\s|$)", str(tool_input.get("command", "")))):
+            risk, rules = Risk.MEDIUM, rules + ["git-runs-a-program"]
         if odd:
             risk, rules = max(risk, Risk.MEDIUM), rules + ["command-not-text"]
     elif tool == "apply_patch":
@@ -3055,10 +3139,11 @@ def classify(event):
         # A read that goes to an address it is handed is WebFetch by
         # another name, and WebFetch is MEDIUM: `mcp__fetch__fetch` with
         # any URL read LOW (2026-11-16 review).
+        # A list of them, or an `address`, as well (2026-11-22b review).
         if risk < Risk.MEDIUM and any(
-                isinstance(tool_input.get(key), str)
-                and re.match(r"https?://", tool_input[key].strip(), re.I)
-                for key in ("url", "uri", "href", "link")):
+                re.match(r"https?://", value.strip(), re.I)
+                for key in ("url", "uri", "href", "link", "urls", "address", "endpoint")
+                for value in _strings_in(tool_input.get(key))):
             risk, rules = Risk.MEDIUM, rules + ["network-egress"]
     elif not tool:
         risk, rules = Risk.MEDIUM, ["missing-tool-name"]
@@ -4137,6 +4222,11 @@ def build_response(event, policy, agent=None):
         if row:
             card["always_label"] = row[0]
     decision, reason = decide(risk, policy, tool=result["tool"])
+    # The user's own "ask" rule means a person answers: --quiet allowed a
+    # SAFE call Claude Code had been told to ask about (2026-11-22b review).
+    if decision == "allow" and asks_the_user(result["tool"], result["tool_input"],
+                                             (event or {}).get("cwd")):
+        decision, reason = "escalate", "%s — the user's own rule asks" % risk.name
 
     shadow = str(policy.get("mode", "shadow")).lower() != "enforce"
     effective = "escalate" if shadow else decision
@@ -4567,6 +4657,28 @@ def _pattern_matches(pattern, tool, command):
     if inner.endswith("*"):
         return command.startswith(inner[:-1])
     return command == inner
+
+
+def asks_the_user(tool, tool_input, cwd=None):
+    """Does one of the user's own ask or deny rules name this call? Before
+    any automatic allow. A Bash rule is matched per segment, as Claude Code
+    matches it; any other rule for this tool counts whatever its
+    parenthesis says (`Read(~/Documents/**)`), since a path pattern this
+    file cannot match the way Claude Code does must fail closed. Never
+    raises: unreadable settings name no rule."""
+    try:
+        rules = _user_permission_rules(cwd)
+        named = [p for p in rules["deny"] + rules["ask"]
+                 if p == tool or p.startswith(str(tool) + "(")]
+        if not named:
+            return False
+        if tool not in ("Bash", "BashOutput"):
+            return True
+        command = " ".join(str((tool_input or {}).get("command", "")).split())
+        pieces = _segments(command) if command else [""]
+        return any(_pattern_matches(p, tool, piece) for p in named for piece in pieces)
+    except Exception:   # noqa: BLE001 — a rule we cannot read asks nothing
+        return False
 
 
 def matches_user_allowlist(tool, tool_input, cwd=None):
@@ -5360,8 +5472,15 @@ def _backup(path):
     """Copy the settings file aside before touching it. Returns the path."""
     if not os.path.exists(path):
         return None
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # Microseconds, and a count past them: `--install --watch` backs up
+    # twice, and in the same second the second copy overwrote the user's
+    # original (2026-11-22b review).
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     backup = "%s.bak-%s" % (path, stamp)
+    count = 1
+    while os.path.exists(backup):
+        count += 1
+        backup = "%s.bak-%s-%d" % (path, stamp, count)
     with open(path, "r", encoding="utf-8") as src:
         content = src.read()
     with open(backup, "w", encoding="utf-8") as dst:

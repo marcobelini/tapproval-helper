@@ -2247,7 +2247,11 @@ def start_signin(agent, popen=None, where=None):
         if run and run["proc"] is not None and run.get("where") != where:
             # The other way was asked for: the code on the phone gives way
             # to the computer's browser, or back. One sign-in at a time.
-            _stop_signin(run["proc"])
+            # Only one still running: a finished one's number may since be
+            # another program's, and `stop_tree` ends its whole group or
+            # tree (2026-11-22b review).
+            if run["proc"].poll() is None:
+                _stop_signin(run["proc"])
             run = None
             _SIGNIN_RUNS.pop(agent, None)
         if run and run["proc"] is None:
@@ -2372,10 +2376,19 @@ def _launch_signin(agent, popen, where=None):
     def finish():
         try:
             proc.wait(timeout=SIGNIN_RUN_SECONDS)
-        except subprocess.TimeoutExpired:
-            _stop_signin(proc)
-        except Exception:
+        except Exception:   # noqa: BLE001 — a timeout, or a wait that failed
             pass
+        # Whatever it left running goes with it, now, while its number is
+        # still its own; and the run is forgotten, so no later tap signals
+        # a number that may by then be another program's (2026-11-22b).
+        # Not twice: a run another tap already stopped has left the table.
+        with _SIGNIN_RUNS_LOCK:
+            run = _SIGNIN_RUNS.get(agent)
+            ours = bool(run and run.get("proc") is proc)
+            if ours:
+                del _SIGNIN_RUNS[agent]
+        if ours:
+            _stop_signin(proc)
         # Whatever happened, the next question is asked afresh: a success
         # clears the condition, a failure keeps it.
         forget_signed_in(agent)
@@ -4226,6 +4239,29 @@ def _local_addresses(run=None):
     return found
 
 
+_LOCAL_ADDRESSES_SEEN = {"at": 0.0, "lister": None, "found": frozenset()}
+_LOCAL_ADDRESSES_LOCK = threading.Lock()
+LOCAL_ADDRESSES_FOR = 5.0
+
+
+def _recent_local_addresses(now=None):
+    """_local_addresses, asked at most once every few seconds. `/pair` asks
+    on every request while a pairing window is open, before its rate limit,
+    and each asking starts `ifconfig`: anyone on the Wi-Fi could keep this
+    Mac starting programs (2026-11-22b review). The limit stays where it is:
+    moved earlier, a stranger's burst would shut the owner's window."""
+    now = time.monotonic() if now is None else now
+    lister = _local_addresses
+    with _LOCAL_ADDRESSES_LOCK:
+        seen = _LOCAL_ADDRESSES_SEEN
+        if seen["lister"] is lister and 0 <= now - seen["at"] < LOCAL_ADDRESSES_FOR:
+            return seen["found"]
+    found = frozenset(lister())
+    with _LOCAL_ADDRESSES_LOCK:
+        _LOCAL_ADDRESSES_SEEN.update(at=now, lister=lister, found=found)
+    return found
+
+
 def _is_loopback(ip):
     """By address, never by prefix: "::1:2" is somebody else's machine,
     and a prefix match called it this one (2026-10-05 review)."""
@@ -4724,7 +4760,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             return True
         # Bound to one of this Mac's addresses and dialling another: still
         # this Mac (_local_addresses says how that paired a process).
-        return peer is not None and peer in _local_addresses()
+        return peer is not None and peer in _recent_local_addresses()
 
     def _proves_bootstrap(self):
         """A local process holding the bootstrap from the 0600 auth file:
@@ -6091,7 +6127,14 @@ class NewReceipts:
         try:
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute("CREATE TABLE IF NOT EXISTS receipts "
-                               "(key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, answer TEXT NOT NULL)")
+                               "(key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, answer TEXT NOT NULL,"
+                               " at REAL NOT NULL DEFAULT 0)")
+            try:
+                # A database from before the column: its rows date from 0,
+                # and are the first to go.
+                connection.execute("ALTER TABLE receipts ADD COLUMN at REAL NOT NULL DEFAULT 0")
+            except self.sqlite3.OperationalError:
+                pass
         except BaseException:
             connection.close()
             raise
@@ -6111,12 +6154,23 @@ class NewReceipts:
         finally:
             connection.close()
 
-    def claim(self, key, fingerprint):
+    # A watch asks again within minutes; a day keeps every retry's answer,
+    # and nothing older is kept at all: the table grew by every /new and
+    # /archive for good (2026-11-22b review). A claim still pending is kept,
+    # since it is what stops a crashed run starting twice.
+    KEEP_FOR = 86400
+    _PENDING = json.dumps({"ok": False, "status": "pending"})
+
+    def claim(self, key, fingerprint, now=None):
+        now = time.time() if now is None else now
         connection = self._connect()
         try:
             with connection:
-                inserted = connection.execute("INSERT OR IGNORE INTO receipts VALUES (?, ?, ?)",
-                    (key, fingerprint, json.dumps({"ok": False, "status": "pending"}))).rowcount
+                connection.execute("DELETE FROM receipts WHERE at < ? AND answer != ?",
+                                   (now - self.KEEP_FOR, self._PENDING))
+                inserted = connection.execute(
+                    "INSERT OR IGNORE INTO receipts (key, fingerprint, answer, at) VALUES (?, ?, ?, ?)",
+                    (key, fingerprint, self._PENDING, now)).rowcount
                 row = connection.execute("SELECT fingerprint, answer FROM receipts WHERE key=?", (key,)).fetchone()
                 if row[0] != fingerprint:
                     raise ValueError("request id already used")

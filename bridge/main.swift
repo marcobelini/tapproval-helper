@@ -820,8 +820,12 @@ if CommandLine.arguments.contains("--check-alerts") {
 if CommandLine.arguments.contains("--agent") {
     let logPath = Bundle.main.bundleURL.deletingLastPathComponent()
         .appendingPathComponent("bridge.log").path
-    let fd = open(logPath, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+    // The owner's alone: every card's headline, the command itself, is
+    // written here, and 0644 let any account on the Mac read them. fchmod
+    // too, for a log an earlier bridge made (2026-11-22b review).
+    let fd = open(logPath, O_WRONLY | O_APPEND | O_CREAT, 0o600)
     if fd >= 0 {
+        fchmod(fd, 0o600)
         dup2(fd, STDOUT_FILENO)
         dup2(fd, STDERR_FILENO)
         close(fd)
