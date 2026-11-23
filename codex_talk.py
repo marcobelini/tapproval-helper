@@ -152,6 +152,46 @@ def _archive_thread(thread_id, method):
             client.close()
 
 
+def interrupt_codex_turn(thread_id):
+    """Stop the turn Codex is working on in this thread, as Esc does in its
+    own window; the thread stays. Only on the one server that has the
+    thread loaded: a thread loaded nowhere has no turn to stop. Never
+    retried: an interrupt that may have landed is reported as uncertain."""
+    client = None
+    try:
+        try:
+            client = _owner_client(thread_id, None)
+        except (OSError, EOFError, ValueError, TypeError, KeyError, AttributeError) as error:
+            reason = ("Codex is open on two servers" if "multiple Codex servers" in str(error)
+                      else "Can't reach Codex on this Mac" if isinstance(error, (OSError, EOFError))
+                      else "Can't verify which Codex server owns this chat")
+            return {"ok": False, "reason": reason}
+        if client is None:
+            return {"ok": False, "reason": "Codex isn't running this chat"}
+        try:
+            page = client.rpc("thread/turns/list", {"threadId": thread_id, "limit": 1},
+                              timeout=ARCHIVE_TIMEOUT)
+            turns = page.get("data") if isinstance(page, dict) else None
+            turn = turns[0] if isinstance(turns, list) and turns else None
+            if not isinstance(turn, dict) or turn.get("status") != "inProgress" or not turn.get("id"):
+                return {"ok": False, "reason": "Nothing is running to stop"}
+        except RpcRefused:
+            return {"ok": False, "reason": "Codex refused to say what is running"}
+        except (OSError, EOFError, ValueError, TypeError, KeyError, AttributeError):
+            return {"ok": False, "reason": "Can't reach Codex on this Mac"}
+        try:
+            client.rpc("turn/interrupt", {"threadId": thread_id, "turnId": turn["id"]},
+                       timeout=ARCHIVE_TIMEOUT)
+            return {"ok": True}
+        except RpcRefused:
+            return {"ok": False, "reason": "Codex refused to stop"}
+        except (OSError, EOFError, ValueError, TypeError, KeyError, AttributeError):
+            return {"ok": False, "uncertain": True, "reason": "Couldn't confirm the stop; check Codex"}
+    finally:
+        if client is not None:
+            client.close()
+
+
 def archive_codex_thread(thread_id):
     """Archive on the single owner, or the default socket if loaded nowhere."""
     return _archive_thread(thread_id, "thread/archive")

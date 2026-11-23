@@ -6398,6 +6398,9 @@ class TestTextFollowsTheTextSize:
             'Image(systemName: "archivebox")',      # Archive session
             'Text("Archive session")',
             'Text("Here and on your computer")',
+            'Image(systemName: "stop.circle")',     # Stop, above Archive
+            'Text("Stop")',
+            'Text("The session stays")',
             'Image(systemName: "pencil")',          # a command in More
             'Text(command.description ?? command.text)',
             'Image(systemName: "chevron.left.forwardslash.chevron.right")',  # a code block's link
@@ -18116,6 +18119,7 @@ class TestTheRelayRefusesASimulator:
         ("/new-agent", {"path": "/x", "text": "hi", "agent": "codex"}),
         ("/end", {"session_id": "x"}),
         ("/archive", {"session_id": "x"}),
+        ("/stop", {"session_id": "x"}),
         ("/restore", {"session_id": "x", "agent": "codex"}),
         # A simulator's tap must not change the owner's Claude Code settings.
         ("/auto-update", {"on": True}),
@@ -18133,6 +18137,8 @@ class TestTheRelayRefusesASimulator:
                             lambda *a, **k: ran.append("end") or "ended")
         monkeypatch.setattr(watch_relay, "archive_session",
                             lambda *a, **k: ran.append("archive") or "archived")
+        monkeypatch.setattr(watch_relay, "stop_session",
+                            lambda *a, **k: ran.append("stop") or "stopped")
         monkeypatch.setattr(watch_relay, "restore_session",
                             lambda *a, **k: ran.append("restore") or "restored")
         monkeypatch.setattr(watch_relay, "start_session",
@@ -18202,7 +18208,7 @@ class TestTheRelayRefusesASimulator:
         post = watch_relay.RelayHandler.ROUTES["POST"]
         guarded = {p for p, (_, rules) in post.items() if rules.get("no_simulator")}
         assert guarded == {"/decision", "/say", "/new", "/new-agent", "/end", "/archive",
-                           "/restore", "/auto-update", "/signin"}
+                           "/stop", "/restore", "/auto-update", "/signin"}
 
     @pytest.mark.parametrize("tag", ["1", "yes"])
     @pytest.mark.parametrize("path,body", GUARDED)
@@ -27943,6 +27949,115 @@ class TestTheWatchCatchesUp:
         threading.Timer(0.3, asked.set).start()
         watch_relay.thread_news(path, mark, 10, still=lambda: not asked.is_set())
         assert time.monotonic() - started < 1.0
+
+
+class TestASessionCanBeStoppedFromTheWrist:
+    """2026-11-23: Stop is the wrist's Esc: what the session is doing ends,
+    the session stays. A probe that day showed a signal from outside closes
+    Claude Code rather than interrupting it, so only Codex's own interrupt
+    and the background replies the wrist started are ever stopped."""
+
+    SID = "e0e0e0e0-1111-4000-8000-0000000stop1"
+
+    @pytest.fixture
+    def stage(self, monkeypatch):
+        procs = []
+
+        def start():
+            proc = subprocess.Popen(["sleep", "30"])
+            procs.append(proc)
+            return proc
+
+        def arrange(entry=None, ours=()):
+            monkeypatch.setattr(watch_relay, "session_registry",
+                                lambda: {self.SID: entry} if entry else {})
+            monkeypatch.setattr(watch_relay, "resolve_session",
+                                lambda prefix, registry=None: (self.SID, "/tmp")
+                                if self.SID.startswith(prefix) else (None, None))
+            monkeypatch.setattr(watch_relay, "_our_claude_processes", lambda: list(ours))
+        yield start, arrange
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    def test_a_wrist_reply_is_stopped_and_the_session_is_not(self, stage):
+        start, arrange = stage
+        live, reply = start(), start()
+        arrange({"status": "Terminal", "pid": live.pid},
+                [(live.pid, "claude"), (reply.pid, "claude --resume %s -p -- hi" % self.SID)])
+        assert watch_relay.stop_session(self.SID[:12]) == "stopped"
+        _wait_until(lambda: reply.poll() is not None, what="the reply to be gone")
+        assert live.poll() is None, "the session the wearer may be using is never signalled"
+
+    def test_a_terminal_session_alone_is_never_signalled(self, stage):
+        start, arrange = stage
+        live = start()
+        arrange({"status": "Terminal", "pid": live.pid}, [(live.pid, "claude")])
+        assert watch_relay.stop_session(self.SID[:12]) == "Only the computer can stop this session"
+        assert live.poll() is None
+
+    def test_an_unknown_session(self, stage):
+        _, arrange = stage
+        arrange(None, [])
+        assert watch_relay.stop_session("ffffffff") == "Unknown session"
+
+    def test_codex_goes_through_its_own_interrupt(self, monkeypatch):
+        import codex_sessions
+        import codex_talk
+        monkeypatch.setattr(codex_sessions, "find_rollout", lambda prefix: "/x/rollout.jsonl")
+        monkeypatch.setattr(codex_sessions, "_rollout_meta", lambda path: {"session_id": "thread-1"})
+        asked = []
+        monkeypatch.setattr(codex_talk, "interrupt_codex_turn",
+                            lambda tid: asked.append(tid) or {"ok": True})
+        assert watch_relay.stop_session("thread", agent="codex") == "stopped"
+        assert asked == ["thread-1"]
+        monkeypatch.setattr(codex_talk, "interrupt_codex_turn",
+                            lambda tid: {"ok": False, "reason": "Nothing is running to stop"})
+        assert watch_relay.stop_session("thread", agent="codex") == "Nothing is running to stop"
+
+    def test_codex_interrupts_only_the_turn_in_progress(self, monkeypatch):
+        import codex_talk
+        calls = []
+
+        class Fake:
+            def __init__(self, status):
+                self.status = status
+
+            def rpc(self, method, params, timeout=3):
+                calls.append((method, params))
+                if method == "thread/turns/list":
+                    return {"data": [{"id": "turn-9", "status": self.status}]}
+                return {}
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(codex_talk, "_owner_client", lambda tid, connect: Fake("inProgress"))
+        assert codex_talk.interrupt_codex_turn("thread-1") == {"ok": True}
+        assert ("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-9"}) in calls
+        calls.clear()
+        monkeypatch.setattr(codex_talk, "_owner_client", lambda tid, connect: Fake("completed"))
+        assert codex_talk.interrupt_codex_turn("thread-1")["ok"] is False
+        assert not any(method == "turn/interrupt" for method, _ in calls)
+        monkeypatch.setattr(codex_talk, "_owner_client", lambda tid, connect: None)
+        assert codex_talk.interrupt_codex_turn("thread-1") == {
+            "ok": False, "reason": "Codex isn't running this chat"}
+
+    def test_the_list_says_where_stop_reaches(self, monkeypatch):
+        monkeypatch.setattr(watch_relay, "_our_claude_processes",
+                            lambda: [(7, "claude --resume %s -p -- hi" % self.SID)])
+        rows = watch_relay.mark_stoppable([
+            {"session_id": self.SID, "state": "running"},
+            {"session_id": "other", "state": "running"},
+            {"session_id": "cx", "state": "running", "agent": "codex"},
+            {"session_id": "quiet", "state": "idle", "agent": "codex"},
+        ])
+        assert [row.get("can_stop") for row in rows] == [True, None, True, None]
+
+    def test_stop_needs_a_device_key(self):
+        _, rules = watch_relay.RelayHandler.ROUTES["POST"]["/stop"]
+        assert rules.get("token") and rules.get("no_simulator")
 
 
 class TestASessionCanBeEndedFromTheWrist:

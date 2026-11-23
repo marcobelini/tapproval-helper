@@ -2749,6 +2749,76 @@ def end_session(prefix, waiting=()):
     return "still running"
 
 
+def _wrist_runs(session_id, ours=None):
+    """Pids of the background replies the wrist started for this session
+    (`claude --resume <id> -p`): never the session's own interactive
+    process, which the registry names and the wearer may be using."""
+    ours = _our_claude_processes() if ours is None else ours
+    return [pid for pid, command in ours
+            if "--resume " + session_id in command and " -p" in " " + command]
+
+
+def stop_session(prefix, agent=None):
+    """Stop what a session is doing and keep the session (the wrist's Esc).
+    Codex: its own turn/interrupt. Claude Code: only the background replies
+    the wrist started, which end with nothing lost. A terminal or Claude
+    app session is never signalled: from outside, a signal closes Claude
+    Code rather than interrupting it (probe, 2026-11-23). Returns "stopped"
+    or a sentence for the wrist; never raises."""
+    if agent == "codex":
+        from codex_sessions import find_rollout, _rollout_meta
+        try:
+            path = find_rollout(prefix)
+            meta = _rollout_meta(path) if path else None
+        except (OSError, ValueError):
+            meta = None
+        if not meta:
+            return "Unknown Codex chat"
+        from codex_talk import interrupt_codex_turn
+        answer = interrupt_codex_turn(meta["session_id"])
+        return "stopped" if answer.get("ok") else str(answer.get("reason") or "Codex did not stop")
+    registry = session_registry()
+    session_id, _ = resolve_session(prefix, registry=registry)
+    if not session_id:
+        return "Unknown session"
+    pids = _wrist_runs(session_id)
+    if not pids:
+        return "Only the computer can stop this session"
+    started = time.monotonic()
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return "Only the computer can stop this session"
+    while time.monotonic() - started < END_WAIT_SECONDS:
+        if all(_gone(pid) for pid in pids):
+            print("relay: stop %s (%d run%s)" % (session_id[:8], len(pids),
+                                                 "" if len(pids) == 1 else "s"), file=sys.stderr)
+            return "stopped"
+        time.sleep(0.1)
+    return "Still running; try again"
+
+
+def mark_stoppable(rows):
+    """Say on each row whether Stop can reach it: a running Codex chat, or
+    a Claude Code session with a wrist reply running. One process listing
+    for the whole list."""
+    ours = None
+    for row in rows:
+        if not isinstance(row, dict) or row.get("state") != "running":
+            continue
+        if row.get("agent") == "codex":
+            row["can_stop"] = True
+            continue
+        if ours is None:
+            ours = _our_claude_processes()
+        if _wrist_runs(str(row.get("session_id") or ""), ours):
+            row["can_stop"] = True
+    return rows
+
+
 # Where Claude Code puts a session's inbox socket: its own directory under
 # the temp folder, or the per-user runtime folder on Linux. Anything else in
 # a registry file is not posted to.
@@ -5146,6 +5216,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             "/say": ("_post_say", dict(token=True, no_simulator=True)),
             "/end": ("_post_end", dict(token=True, no_simulator=True)),
             "/archive": ("_post_archive", dict(token=True, no_simulator=True)),
+            # The wrist's Esc. token and no_simulator, like /end: it stops
+            # work on this computer.
+            "/stop": ("_post_stop", dict(token=True, no_simulator=True)),
             "/restore": ("_post_restore", dict(token=True, no_simulator=True)),
             "/auto-update": ("_post_auto_update", dict(token=True, no_simulator=True)),
             # The wrist's Sign in button. token, like /new: a local process
@@ -5416,8 +5489,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         _codex_catalog_status(catalog["status"])
         waiting = {card["session_id"] for card in self.queue.pending() if card.get("session_id")}
         paged = query.get("paged") == ["1"]
-        rows = active_sessions(limit=None if paged else 12, waiting=waiting,
-                               codex_rows=catalog["sessions"])
+        rows = mark_stoppable(active_sessions(limit=None if paged else 12, waiting=waiting,
+                                              codex_rows=catalog["sessions"]))
         if paged:
             self._send_json(_SESSION_PAGES.page(rows, catalog["status"], waiting))
         else:
@@ -5765,6 +5838,11 @@ class RelayHandler(BaseHTTPRequestHandler):
         waiting = [card["session_id"] for card in self.queue.pending() if card.get("session_id")]
         self._serialised_send(lambda body: (
             end_session(str(body.get("session_id", ""))[:64], waiting), "ended"), path)
+
+    def _post_stop(self, path, query):
+        self._serialised_send(lambda body: (stop_session(
+            str(body.get("session_id", ""))[:64],
+            agent="codex" if body.get("agent") == "codex" else None), "stopped"), path)
 
     def _post_archive(self, path, query):
         # Archives a session where it lives, under the budget and gate a
