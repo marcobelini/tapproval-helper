@@ -113,7 +113,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.137"
+__version__ = "1.1.138"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -419,7 +419,10 @@ _SQL_MUTATION = re.compile(
     # A table alias, ONLY, a join, and the writes that replace a row: each
     # read LOW through an MCP query (2026-11-21 review). REPLACE INTO only
     # before what SQL puts there, so "replace into the text" is prose.
-    r"UPDATE\s+(?:ONLY\s+)?[\w.\"`\[\]]+\s+(?:AS\s+)?\w+\s+SET\b|"
+    # The alias is never an English joining word: "update docs to set X"
+    # and "update README and set the flag" are prose (2026-11-22 review).
+    r"UPDATE\s+(?:ONLY\s+)?[\w.\"`\[\]]+\s+(?:AS\s+)?"
+    r"(?!(?:to|and|or|then|so|with|for|by|in|at|of|also|again|it|this|that|them|now)\s)\w+\s+SET\b|"
     r"(?:REPLACE|INSERT\s+OR\s+(?:REPLACE|IGNORE|ABORT|FAIL|ROLLBACK))\s+INTO\s+[\w.\"`]+\s*(?:\(|VALUES\b|SELECT\b|SET\b|DEFAULT\b)|"
     r"ALTER\s+(TABLE|PROCEDURE)|CREATE\s+(OR\s+ALTER\s+)?PROCEDURE"
     # Who may do what, and who can log in: the same review.
@@ -1894,6 +1897,13 @@ _HOME_DOT_TARGET = re.compile(
 _REDIRECT_TARGET = re.compile(r"(?<![<>&])(?:\d|&)?>>?\|?\s*(?!&)([^\s;|&<>]+)")
 
 
+def _collapsed(target):
+    """``~/.Trash/../.zshrc`` as the file it names, ``~/.zshrc``: a step
+    back out of a folder must not hide a home dotfile (2026-11-22 review).
+    Read beside the target as written, so it can only add a match."""
+    return posixpath.normpath(target) if ".." in target else target
+
+
 def _write_targets(token, segment):
     """The files this segment writes, as far as its words say: what a
     redirect, tee, cp/mv/ln/install, curl's -o, wget's -O and dd's of=
@@ -2517,7 +2527,8 @@ def _classify_bash(command, _depth, fragment=False):
             bump("transcript-read", Risk.MEDIUM)
         if _searches_every_file(token, segment, folder):
             bump("home-wide-search", Risk.HIGH)
-        if any(_HOME_DOT_TARGET.match(target) for target in _write_targets(token, segment)):
+        if any(_HOME_DOT_TARGET.match(target) or _HOME_DOT_TARGET.match(_collapsed(target))
+               for target in _write_targets(token, segment)):
             bump("writes-home-dotfile", Risk.HIGH)
         # kubectl's `kind/name` and `kind,kind`: the word `secret` joined to
         # a neighbour the word list never splits on.

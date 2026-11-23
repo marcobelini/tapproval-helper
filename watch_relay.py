@@ -1399,9 +1399,11 @@ def _write_private_atomic(path, text):
     """Write ``text`` to ``path`` (0600) whole or not at all: a temporary
     file beside it, flushed, then renamed over. Raises on failure, with the
     old file intact and no temporary left behind."""
-    tmp = "%s.%d.tmp" % (path, os.getpid())
+    # Unique per call and created exclusively: two writers in one relay
+    # must never share, or truncate, each other's half-written file.
+    tmp = "%s.%d.%s.tmp" % (path, os.getpid(), uuid.uuid4().hex[:8])
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()

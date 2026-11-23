@@ -265,7 +265,7 @@ def send(entry, count, settings=None, opener=None):
 
 
 def deliver(subject, text, settings=None, opener=None, html=None,
-            timeout=None):
+            timeout=None, attachments=None):
     """POST one e-mail to Resend. Returns a reason string, never raises.
 
     The crash reporter's door, opened for the desk's fortnightly report
@@ -283,6 +283,11 @@ def deliver(subject, text, settings=None, opener=None, html=None,
     message = {"from": sender, "to": [to], "subject": subject, "text": text}
     if html:
         message["html"] = html
+    if attachments:
+        # [{"filename", "content" (base64), "content_id"}]: a content_id
+        # makes it a picture the HTML shows inline as <img src="cid:…">,
+        # which is how the desk's charts reach the e-mail (2026-11-23).
+        message["attachments"] = list(attachments)
     payload = json.dumps(message).encode("utf-8")
     request = urllib.request.Request(
         "https://api.resend.com/emails", data=payload,

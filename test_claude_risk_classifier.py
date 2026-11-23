@@ -29908,6 +29908,32 @@ class TestWordsMeanTheSameForEveryTool:
         risk, rules = crc.classify_bash(command)
         assert risk == tier and "sql-mutation" not in rules, (risk, rules)
 
+    # Review 2026-11-22 Lows: an English joining word read as a table alias,
+    # and a step back out of a folder hid a home dotfile.
+    @pytest.mark.parametrize("text", [
+        "Update docs to set the timeout",
+        "Please update README and set the flag",
+        "update users to set x",
+    ])
+    def test_prose_with_update_and_set_is_not_sql(self, text):
+        assert not crc.SQL_MUTATION.search(text)
+
+    @pytest.mark.parametrize("text", [
+        "UPDATE users u SET a=1", "UPDATE users AS u SET a=1",
+        "UPDATE ONLY users x SET a=1", "UPDATE users SET a=1",
+    ])
+    def test_an_aliased_update_is_still_sql(self, text):
+        assert crc.SQL_MUTATION.search(text)
+
+    @pytest.mark.parametrize("command", [
+        "echo x >> ~/.Trash/../.zshrc",
+        "echo x > $HOME/Projects/../.bash_profile",
+        "cp evil ~/a/b/../../.zprofile",
+    ])
+    def test_a_step_back_does_not_hide_a_home_dotfile(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= Risk.HIGH and "writes-home-dotfile" in rules, (risk, rules)
+
     @pytest.mark.parametrize("command, tier", [
         ("sqlcmd -Q 'EXEC sp_x'", Risk.HIGH),
         ("echo 'EXEC sp_x' | sqlcmd -S db", Risk.HIGH),
@@ -32026,6 +32052,31 @@ class TestReview20261122HelperLows:
         assert path.read_text() == before, "a failed write emptied the travel address"
         assert not [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")], \
             "a temp file was left"
+
+    def test_two_writers_never_share_a_temporary_file(self, tmp_path):
+        # Review 2026-11-22 Low: the temp file was named by pid alone and
+        # opened with O_TRUNC, so a second writer in the same relay would
+        # truncate the first one's half-written file. A stale file of the
+        # old name must not be reused either.
+        path = tmp_path / "record.json"
+        stale = tmp_path / ("record.json.%d.tmp" % os.getpid())
+        stale.write_text("half")
+        seen = []
+        real_replace = watch_relay.os.replace
+
+        def spying(src, dst):
+            seen.append(src)
+            return real_replace(src, dst)
+        watch_relay.os.replace = spying
+        try:
+            watch_relay._write_private_atomic(str(path), "one")
+            watch_relay._write_private_atomic(str(path), "two")
+        finally:
+            watch_relay.os.replace = real_replace
+        assert path.read_text() == "two"
+        assert len(set(seen)) == 2, "two writes used the same temporary name"
+        assert str(stale) not in seen, "a leftover temporary file was written into"
+        assert stale.read_text() == "half"
 
     # L5 -------------------------------------------------------------------
     def test_usage_reads_past_a_model_that_is_not_a_word(self, tmp_path):
