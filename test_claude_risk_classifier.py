@@ -1303,6 +1303,19 @@ class TestReview20261116SqlThatDestroys:
 
 
 @pytest.mark.private_layout
+class TestEverySwitchHasAName:
+    """#1384 C4: three switches in Settings were Toggle(""), so VoiceOver
+    said "switch, on" and never what it switched. The name stays hidden on
+    screen (labelsHidden), where the row already says it."""
+
+    def test_no_watch_switch_is_nameless(self):
+        folder = Path(__file__).parent / "WatchApp" / "Tapproval"
+        nameless = [path.name for path in sorted(folder.glob("*.swift"))
+                    if 'Toggle("",' in path.read_text()]
+        assert nameless == [], "a switch VoiceOver cannot name: %s" % nameless
+
+
+@pytest.mark.private_layout
 class TestReview20261122bWatch:
     """The whole-repo review of 2026-11-22 (afternoon), read in the Swift."""
 
@@ -4783,6 +4796,26 @@ class TestSelfStartingRelay:
         assert len(spawned) == 1 and "--tunnel" in spawned[0]
         assert "already running" not in capsys.readouterr().err
 
+    def test_an_answer_that_hides_the_card_count_is_not_an_empty_relay(self, monkeypatch,
+                                                                       capsys):
+        """#1371: with the key file unreadable, /health answers unsigned:
+        the version, never the card count. --ensure read the missing count
+        as "nothing waiting" and could stop a relay holding someone's
+        approval. Not knowing is no permission: the update waits."""
+        monkeypatch.setattr(watch_relay, "_self_update", lambda: None)
+        monkeypatch.setattr(watch_relay, "_probe_relay", lambda timeout=2: {
+            "ok": True, "version": watch_relay.RELAY_VERSION, "helper": "1.0.0"})
+        monkeypatch.setattr(watch_relay, "_admin_call", lambda path, timeout=2: None)
+        stopped = []
+        monkeypatch.setattr(watch_relay, "_stop_relay",
+                            lambda deadline=8.0: stopped.append(True) or True)
+        spawned = []
+        monkeypatch.setattr(watch_relay.subprocess, "Popen",
+                            lambda cmd, **k: spawned.append(cmd) or object())
+        assert watch_relay.ensure_running() == 0
+        assert stopped == [] and spawned == [], "a relay that may hold a card was replaced"
+        assert "cannot see whether a card is waiting" in capsys.readouterr().err
+
     def test_the_retry_still_waits_for_a_card(self, monkeypatch, capsys):
         """Trying again is not permission to interrupt: a relay holding a
         card is holding someone's approval, on the second try as on the
@@ -6361,13 +6394,15 @@ class TestTextFollowsTheTextSize:
             'Image(systemName: "archivebox")',      # Archive behind a swipe
             'Image(systemName: "plus")',            # the New session row
             'Text("New session")',
+            'Text("Check connection ›")',           # the stored list's way to Connection
         },
         "NewSession.swift": {
             '"checkmark" : "folder.fill"',          # a project's row (owner: fixed)
             'Text(project.name)',
             'Text(project.minutes_ago',
-            'Image(systemName: "chevron.right")',   # a row's arrow; the Use row
+            'Image(systemName: "chevron.right")',   # a row's arrow; the Use and Model rows
             '.font(.system(size: 15))',             # the field you tap to type in
+            '"chevron.up" : "chevron.down"',        # More models' fold mark
         },
         "DiagnosticsView.swift": {
             'image.font(.system(size: 15))',        # a check's glyph column
@@ -15692,6 +15727,37 @@ class TestTheHelperReportsItsOwnCrashes:
                                         settings=(None, "to@x", "from@x"))
         assert reason == "mail_not_configured"
 
+    def test_the_same_crash_on_two_threads_at_once_is_one_mail(self, tmp_path):
+        """#1371: the check for "already mailed" and the mark came either side
+        of the send, outside one lock, so two request threads crashing the
+        same way together both mailed. The first claims it; the second is a
+        duplicate while the first is still sending."""
+        gate, started, calls = threading.Event(), threading.Event(), []
+
+        class SlowPost(self._Post):
+            def __call__(self, request, timeout=None):
+                calls.append(1)
+                started.set()
+                gate.wait(5)
+                return super().__call__(request, timeout)
+        post, log, results = SlowPost(), str(tmp_path / "c"), []
+
+        def crash():
+            results.append(crash_report.report(
+                "ValueError: boom", 'File "a.py", line 1', path=log,
+                settings=self.SETTINGS, opener=post)[0])
+        first = threading.Thread(target=crash)
+        first.start()
+        assert started.wait(5)
+        second = threading.Thread(target=crash)
+        second.start()
+        second.join(1)
+        gate.set()
+        first.join(5)
+        second.join(5)
+        assert len(calls) == 1, "one crash, two mails"
+        assert sorted(results) == ["duplicate", "sent"], results
+
     def test_a_configured_machine_sends_one_and_counts_the_rest(self, tmp_path):
         post = self._Post()
         log = str(tmp_path / "c")
@@ -16735,9 +16801,16 @@ class TestTwoRelaysOnePort:
         assert "started in the background" not in said
 
     def test_a_slow_relay_running_older_code_is_still_replaced(
-            self, relay, monkeypatch):
+            self, relay, fresh_auth, monkeypatch):
         """2026-09-24: kickstart after an update left the old relay serving,
-        because a slow /health skipped the replace decision entirely."""
+        because a slow /health skipped the replace decision entirely.
+        Signed with the relay's key, as --ensure on a real Mac is: an
+        unsigned answer hides the card count, and then nothing is replaced
+        (#1371)."""
+        monkeypatch.setattr(watch_relay, "_admin_signature",
+                            lambda path, body, auth_file=None, method="POST": {
+                                "X-Tapproval-Signature": watch_relay.wire.signed_header(
+                                    fresh_auth.bootstrap, method, path, body)[0]})
         monkeypatch.setattr(watch_relay, "signed_in", lambda *a, **k: time.sleep(2.5) or True)
         monkeypatch.setattr(watch_relay, "DEFAULT_PORT", relay.server_address[1])
         monkeypatch.setattr(watch_relay, "_self_update", lambda: None)
@@ -21299,6 +21372,26 @@ class TestTheLocalFallbackRunsWhatCiRuns:
 
 
 @pytest.mark.private_layout
+class TestLogsAreTheOwners:
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX modes; Windows is restrict_to_owner's")
+    def test_the_say_and_relay_logs_are_the_owners_alone(self, tmp_path, monkeypatch):
+        """#1414: say.log holds Claude's replies to the wrist, relay.log the
+        cards' headlines, and both were 0644 on the owner's Mac: any account
+        on it could read them. A log is made 0600, and one made earlier is
+        put right the next time it is opened."""
+        import stat
+        monkeypatch.setattr(watch_relay._host, "popen_detached", lambda *a, **k: None)
+        fresh = tmp_path / "say.log"
+        assert watch_relay._spawn_detached(["true"], str(fresh)) == ""
+        assert stat.S_IMODE(os.stat(fresh).st_mode) == 0o600
+        old = tmp_path / "relay.log"
+        old.write_text("earlier\n")
+        os.chmod(old, 0o644)
+        assert watch_relay._spawn_detached(["true"], str(old)) == ""
+        assert stat.S_IMODE(os.stat(old).st_mode) == 0o600
+        assert old.read_text() == "earlier\n", "making it private emptied it"
+
+
 class TestSwift6WarningsFailCi:
     """2026-10-02: "Watch: no Swift 6 concurrency warnings" cleared every
     one, and the proof-covers-answer work put two back. Nothing noticed
@@ -21702,10 +21795,29 @@ class TestWatchSimulatorsAreChosenBySize:
 
     @pytest.mark.private_layout
     def test_the_watch_scripts_look_simulators_up_in_one_place(self):
-        for name in ("watch-flows.sh", "watch-shots.sh", "demo-film.sh"):
+        for name in ("watch-flows.sh", "watch-shots.sh", "demo-film.sh", "e2e-lib.sh"):
             script = open(os.path.join(_ROOT, "WatchApp", name), encoding="utf-8").read()
             assert "simctl list devices available" not in script, name
-            assert "./sim-udid.sh" in script, name
+            # Directly, or through e2e-lib.sh's e2e_one_face.
+            assert "sim-udid.sh" in script or "e2e_one_face " in script, name
+
+    # Every script that runs a watch simulator by hand; one asking for
+    # Apple's own models by name kept a second copy of each size on an
+    # older runtime, and that runtime installed for them alone (2026-11-23).
+    FACE_SCRIPTS = ("watch-shots.sh", "demo-film.sh", "encryption-e2e.sh", "tls-e2e.sh",
+                    "auto-update-e2e.sh")
+
+    @pytest.mark.private_layout
+    def test_no_watch_script_asks_for_one_of_apples_models_by_name(self):
+        """The shared faces ("Tapproval Watch NNmm", sim-shared.sh) are the
+        hand-run faces; a script may still be pointed at any simulator by
+        its own *_SIM override, but none names a model of its own."""
+        for name in self.FACE_SCRIPTS:
+            script = open(os.path.join(_ROOT, "WatchApp", name), encoding="utf-8").read()
+            code = "\n".join(line for line in script.splitlines()
+                              if not line.lstrip().startswith("#"))
+            assert not re.search(r"Apple Watch [^\"]*\(\d+mm\)", code), name
+            assert "e2e_one_face " in code, name
 
     OURS = {"com.apple.CoreSimulator.SimRuntime.watchOS-27-0": [
         ("Tapproval Watch 41mm", "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", "Shutdown"),
@@ -21718,12 +21830,13 @@ class TestWatchSimulatorsAreChosenBySize:
         ("Apple Watch Ultra 5 (50mm)", "22222222-2222-2222-2222-222222222222", "Shutdown")]}
 
     @staticmethod
-    def _simctl(tmp_path, devices, events, create=True):
-        """A stand-in xcrun serving RUNTIMES and these devices, as JSON and
-        as text, and writing every create, shutdown, erase and delete to
-        events. With create=False, making a simulator fails."""
+    def _simctl(tmp_path, devices, events, create=True, runtimes=None):
+        """A stand-in xcrun serving RUNTIMES (or these runtimes) and these
+        devices, as JSON and as text, and writing every create, shutdown,
+        erase and delete to events. With create=False, making a simulator
+        fails."""
         (tmp_path / "runtimes.json").write_text(json.dumps(
-            TestWatchSimulatorsAreChosenBySize.RUNTIMES))
+            TestWatchSimulatorsAreChosenBySize.RUNTIMES if runtimes is None else runtimes))
         (tmp_path / "devices.json").write_text(json.dumps({"devices": {
             rt: [{"name": n, "udid": u, "state": st, "isAvailable": True} for n, u, st in sims]
             for rt, sims in devices.items()}}))
@@ -22021,33 +22134,44 @@ class TestScreenshotsBuildOnceAndShootTwoFacesAtATime:
     faces SHOTS_PARALLEL at a time (2026-10-17). These run the real script
     against a stand-in Xcode whose test runs take two seconds each."""
 
-    FACES = (("Apple Watch SE 3 (40mm)", "40404040-0000-0000-0000-000000000040"),
-             ("Apple Watch Series 11 (42mm)", "42424242-0000-0000-0000-000000000042"),
-             ("Apple Watch Series 11 (46mm)", "46464646-0000-0000-0000-000000000046"),
-             ("Apple Watch Ultra 3 (49mm)", "49494949-0000-0000-0000-000000000049"))
+    # The shared faces the script takes (sim-shared.sh), one per size, on
+    # the newest runtime; the faces' model names come from that runtime.
+    RT = "com.apple.CoreSimulator.SimRuntime.watchOS-27-0"
+    MODELS = (("Apple Watch SE 3 (40mm)", "se3-40"), ("Apple Watch Series 11 (42mm)", "s11-42"),
+              ("Apple Watch Series 11 (46mm)", "s11-46"), ("Apple Watch Ultra 3 (49mm)", "u3-49"))
+    FACES = (("Tapproval Watch 40mm", "40404040-0000-0000-0000-000000000040"),
+             ("Tapproval Watch 42mm", "42424242-0000-0000-0000-000000000042"),
+             ("Tapproval Watch 46mm", "46464646-0000-0000-0000-000000000046"),
+             ("Tapproval Watch 49mm", "49494949-0000-0000-0000-000000000049"))
 
-    def _shots(self, tmp_path, parallel=None, fail_udid=None):
+    def _shots(self, tmp_path, parallel=None, fail_udid=None, only=None, faces=None):
         import shutil
         app = tmp_path / "WatchApp"
         app.mkdir()
-        for name in ("watch-shots.sh", "sim-udid.sh", "sim-devtype.sh", "sim-turn.sh"):
+        for name in ("watch-shots.sh", "e2e-lib.sh", "sim-udid.sh", "sim-devtype.sh",
+                     "sim-turn.sh", "sim-runtime.sh", "sim-shared.sh", "sim-own.sh",
+                     "sim-retire.sh", "sim-tidy.sh"):
             shutil.copy(os.path.join(_ROOT, "WatchApp", name), app / name)
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
         events = tmp_path / "events"
         events.write_text("")
-        listing = "".join('echo "    %s (%s) (Shutdown)"\n' % face for face in self.FACES)
-        (bin_dir / "xcrun").write_text(
+        runtimes = {"runtimes": [{
+            "platform": "watchOS", "isAvailable": True, "version": "27.0",
+            "identifier": self.RT, "supportedDeviceTypes": [
+                {"name": n, "identifier": i} for n, i in self.MODELS]}]}
+        devices = {self.RT: [(n, u, "Shutdown") for n, u in
+                             (self.FACES if faces is None else faces)]}
+        simctl = TestWatchSimulatorsAreChosenBySize._simctl(
+            tmp_path, devices, events, runtimes=runtimes)
+        (bin_dir / "xcrun").write_text(simctl.replace("#!/bin/bash\n", (
             '#!/bin/bash\n'
-            'if [ "$*" = "simctl list devices available" ]; then\n'
-            'echo "-- watchOS 27.0 --"\n' + listing + 'exit 0; fi\n'
             'if [ "$1 $2 $3" = "xcresulttool export attachments" ]; then\n'
             '  out=$(printf "%s\\n" "$@" | grep -A1 -x -- --output-path | tail -1)\n'
             '  mkdir -p "$out"; echo png > "$out/a1.png"\n'
             '  echo \'[{"attachments": [{"exportedFileName": "a1.png",'
             ' "suggestedHumanReadableName": "screen.png"}]}]\' > "$out/manifest.json"\n'
-            '  exit 0; fi\n'
-            'exit 1\n')
+            '  exit 0; fi\n'), 1))
         (bin_dir / "xcodebuild").write_text(
             '#!/bin/bash\n'
             'dest=$(printf "%%s\\n" "$@" | grep -m1 "^id=")\n'
@@ -22065,9 +22189,13 @@ class TestScreenshotsBuildOnceAndShootTwoFacesAtATime:
         for fake in bin_dir.iterdir():
             fake.chmod(0o755)
         env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ["PATH"]),
-                   TMPDIR=str(tmp_path), ALL_SIZES="1")
-        for key in ("SHOTS_PARALLEL", "ONLY_SIZE", "CONTENT_SIZE", "FAIL_UDID"):
+                   TMPDIR=str(tmp_path), ALL_SIZES="1", SIM_LOCK_DIR=str(tmp_path / "locks"),
+                   SIM_DEVICES_DIR=str(tmp_path / "Devices"))
+        for key in ("SHOTS_PARALLEL", "ONLY_SIZE", "CONTENT_SIZE", "FAIL_UDID", "SIM_LOCK_WAIT",
+                    "SIM_TURN_WAIT"):
             env.pop(key, None)
+        if only is not None:
+            env["ONLY_SIZE"] = only
         if parallel is not None:
             env["SHOTS_PARALLEL"] = str(parallel)
         if fail_udid:
@@ -22111,6 +22239,38 @@ class TestScreenshotsBuildOnceAndShootTwoFacesAtATime:
         assert "the test FAILED on Apple Watch Series 11 (42mm)" in run.stderr
         for size in ("40mm", "42mm", "46mm", "49mm"):
             assert (out / size / "screen.png").exists(), size
+
+    @pytest.mark.private_layout
+    def test_the_faces_are_the_shared_ones_given_back_switched_off(self, tmp_path):
+        """Each face is the shared one of its size, held while the pictures
+        are taken and then shut down and given back, so a flow waiting for
+        it gets it; the lock folder is empty again at the end."""
+        run, lines, spans, _ = self._shots(tmp_path)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert sorted(spans) == sorted("id=" + udid for _, udid in self.FACES), spans
+        for _, udid in self.FACES:
+            assert "simctl shutdown " + udid in lines, (udid, lines)
+        assert not [p for p in (tmp_path / "locks").iterdir() if p.name.endswith(".lock")]
+
+    @pytest.mark.private_layout
+    def test_one_size_by_its_size_or_by_a_models_name(self, tmp_path):
+        for only in ("40mm", "Apple Watch SE 3 (40mm)"):
+            case = tmp_path / only.replace(" ", "_").replace("(", "").replace(")", "")
+            case.mkdir()
+            run, _, spans, out = self._shots(case, only=only)
+            assert run.returncode == 0, run.stdout + run.stderr
+            assert list(spans) == ["id=" + self.FACES[0][1]], (only, spans)
+            assert (out / "40mm" / "screen.png").exists(), only
+
+    @pytest.mark.private_layout
+    def test_a_missing_face_is_made_on_the_newest_runtime(self, tmp_path):
+        """No shared 42 mm yet: it is made from that size's model on the
+        newest runtime (sim-own.sh), never looked for under a model name."""
+        faces = [face for face in self.FACES if not face[0].endswith("42mm")]
+        run, lines, spans, out = self._shots(tmp_path, faces=faces)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert "simctl create Tapproval Watch 42mm s11-42 " + self.RT in lines, lines
+        assert (out / "42mm" / "screen.png").exists()
 
 
 class TestTheDocumentsDoNotRestateTheReviewState:
@@ -26265,6 +26425,35 @@ class TestTheHelperInstallsTheMacBridge:
         finally:
             watch_relay.clear_condition("login_item_off")
 
+    def test_health_never_waits_on_the_login_item_check(self, monkeypatch):
+        """#1371: /health asked the bridge inline, and a bridge that hangs
+        is given 30 s; the watch gives /health 5. Once every five minutes
+        the Connection screen read a working Mac as no answer. The check
+        now runs beside the answer, and its word lands when it comes."""
+        monkeypatch.setattr(watch_relay, "_LOGIN_ITEM", {"at": 0.0})
+        self._install_v("1.1.0")
+        self.mac.switched_off = True
+        gate = threading.Event()
+
+        def slow(*_args, **_kwargs):
+            gate.wait(5)
+            return "requires-approval"
+        monkeypatch.setattr(bridge_install, "login_item", slow)
+        started = time.monotonic()
+        watch_relay.check_login_item(now=1e12, background=True)
+        try:
+            assert time.monotonic() - started < 1, "the check held the answer"
+            gate.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not [
+                    c for c in watch_relay.conditions() if c["key"] == "login_item_off"]:
+                time.sleep(0.02)
+            assert [c for c in watch_relay.conditions() if c["key"] == "login_item_off"], \
+                "the word that came later was never said"
+        finally:
+            gate.set()
+            watch_relay.clear_condition("login_item_off")
+
     # -- the bridge wakes the relay, and the relay's own job goes ---------------
 
     def _relay_here(self, tmp_path, monkeypatch, place=".tapproval"):
@@ -27482,12 +27671,16 @@ class TestOneSimulatorRunAtATimeOnThisMac:
     # no ticket numbers. Now each waiter takes a ticket (the folder
     # "queue"), and the oldest goes next.
 
-    def _waiter(self, tmp_path, pid, what, poll):
+    def _waiter(self, tmp_path, pid, what, poll, first=False):
         """A `take` left waiting in the background, once it says it waits."""
+        env = dict(os.environ, SIM_TURN_DIR=str(tmp_path / "turn"), SIM_TURN_POLL=str(poll),
+                   SIM_TURN_WAIT="60")
+        env.pop("SIM_TURN_FIRST", None)
+        if first:
+            env["SIM_TURN_FIRST"] = "1"
         proc = subprocess.Popen(
             ["bash", self.TURN, "take", str(pid), what],
-            env=dict(os.environ, SIM_TURN_DIR=str(tmp_path / "turn"), SIM_TURN_POLL=str(poll),
-                     SIM_TURN_WAIT="60"),
+            env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         assert "waiting for a turn" in proc.stderr.readline()
         return proc
@@ -27518,6 +27711,46 @@ class TestOneSimulatorRunAtATimeOnThisMac:
                 if proc is not None:
                     proc.kill()
                     proc.communicate()
+
+    def test_mains_ci_goes_to_the_front_of_the_line(self, tmp_path):
+        """#1513: main's run waited behind Tapmerge and runs by hand until
+        its hour ran out, and main read red for nothing. Its ticket goes
+        first, but the run that has the turn keeps it."""
+        holder, waiting, main = (subprocess.Popen(["sleep", "300"]) for _ in range(3))
+        early = late = None
+        try:
+            assert self._turn(tmp_path, "take", holder.pid, "Tapmerge's CI").returncode == 0
+            early = self._waiter(tmp_path, waiting.pid, "a run by hand", poll=1)
+            time.sleep(1.1)
+            late = self._waiter(tmp_path, main.pid, "main's CI", poll=4, first=True)
+            names = sorted(os.listdir(tmp_path / "turn" / "queue"))
+            assert names[0].startswith("0."), names
+            time.sleep(1.5)
+            assert self._turn(tmp_path, "who").stdout.strip() == \
+                "Tapmerge's CI (pid %d)" % holder.pid, "main's run took a turn that was held"
+            self._turn(tmp_path, "give", holder.pid)
+            assert late.wait(timeout=30) == 0
+            assert self._turn(tmp_path, "who").stdout.strip() == "main's CI (pid %d)" % main.pid
+            assert early.poll() is None, "the run that came first went ahead of main's"
+            self._turn(tmp_path, "give", main.pid)
+            assert early.wait(timeout=30) == 0
+        finally:
+            for proc in (early, late, holder, waiting, main):
+                if proc is not None:
+                    proc.kill()
+                    proc.communicate()
+
+    def test_only_a_push_to_main_goes_first(self):
+        """The front of the line is main's alone (#1513): a pull request,
+        the weekly run and a release branch take a ticket like anyone."""
+        flow = open(os.path.join(_ROOT, ".github", "workflows", "tests.yml"),
+                    encoding="utf-8").read()
+        assert flow.count("SIM_TURN_FIRST") == 1, "set in more than one place"
+        line = next(row for row in flow.splitlines() if "SIM_TURN_FIRST:" in row)
+        assert "github.event_name == 'push'" in line and \
+            "github.ref == 'refs/heads/main'" in line, line
+        mini = flow[flow.index("\n  mini:"):flow.index("\n  pytest:")]
+        assert "SIM_TURN_FIRST" in mini, "set outside the job that waits for the simulators"
 
     def test_a_waiter_that_is_gone_does_not_hold_up_the_line(self, tmp_path):
         holder, first, second = (subprocess.Popen(["sleep", "300"]) for _ in range(3))
@@ -27577,7 +27810,8 @@ class TestOneSimulatorRunAtATimeOnThisMac:
             text = open(os.path.join(app, name), encoding="utf-8").read()
             assert call in text, name
             first_sim = min(i for i in (text.find("sim-shared.sh take"), text.find("sim-udid.sh "),
-                                        text.find("sim-own.sh ")) if i >= 0)
+                                        text.find("sim-own.sh "), text.find("e2e_one_face "))
+                            if i >= 0)
             first_sim = text.find("sim-shared.sh take") if name == "auto-update-e2e.sh" else first_sim
             code = "\n".join(line for line in text[:first_sim].splitlines()
                               if not line.lstrip().startswith("#"))
@@ -27585,6 +27819,11 @@ class TestOneSimulatorRunAtATimeOnThisMac:
         lib = open(os.path.join(app, "e2e-lib.sh"), encoding="utf-8").read()
         pick = lib[lib.index("e2e_pick_faces() {"):]
         assert pick.index("e2e_take_turn") < pick.index("sim-shared.sh"), "e2e-lib.sh"
+        # One face, named by hand or shared: the turn before the lookup.
+        one = lib[lib.index("e2e_one_face() {"):]
+        one = one[:one.index("\n}\n")]
+        assert one.index("e2e_take_turn") < one.index("sim-udid.sh"), "e2e_one_face"
+        assert "e2e_pick_faces" in one, "e2e_one_face"
         assert '"$E2E_WATCHAPP/sim-turn.sh" give $$' in lib
         (ci,) = _ci_files("ci-local.sh")
         assert ci.index("WatchApp/sim-turn.sh take $$") < ci.index("Compile the watch app")
@@ -27596,10 +27835,12 @@ class TestOneSimulatorRunAtATimeOnThisMac:
             text = open(os.path.join(app, name), encoding="utf-8").read()
             if "simctl boot" in text or "e2e_boot" in text:
                 assert ("sim-turn.sh take" in text or "e2e_take_turn" in text
-                        or "e2e_pick_faces" in text or name in self.NOT_QUEUED), name
+                        or "e2e_pick_faces" in text or "e2e_one_face " in text
+                        or name in self.NOT_QUEUED), name
 
-    # demo-film.sh records the owner's film on a simulator he chose, by hand.
-    NOT_QUEUED = ("demo-film.sh", "e2e-lib.sh")
+    # The library is where the turn is taken (above); demo-film.sh takes it
+    # through e2e_one_face since 2026-11-23, like every other script.
+    NOT_QUEUED = ("e2e-lib.sh",)
 
     def test_the_flows_wait_their_turn_and_give_it_back(self, tmp_path):
         mac = TestFlowsShareOneSimulatorPerKind()
@@ -29908,6 +30149,32 @@ class TestWordsMeanTheSameForEveryTool:
         risk, rules = crc.classify_bash(command)
         assert risk == tier and "sql-mutation" not in rules, (risk, rules)
 
+    # Review 2026-11-22 Lows: an English joining word read as a table alias,
+    # and a step back out of a folder hid a home dotfile.
+    @pytest.mark.parametrize("text", [
+        "Update docs to set the timeout",
+        "Please update README and set the flag",
+        "update users to set x",
+    ])
+    def test_prose_with_update_and_set_is_not_sql(self, text):
+        assert not crc.SQL_MUTATION.search(text)
+
+    @pytest.mark.parametrize("text", [
+        "UPDATE users u SET a=1", "UPDATE users AS u SET a=1",
+        "UPDATE ONLY users x SET a=1", "UPDATE users SET a=1",
+    ])
+    def test_an_aliased_update_is_still_sql(self, text):
+        assert crc.SQL_MUTATION.search(text)
+
+    @pytest.mark.parametrize("command", [
+        "echo x >> ~/.Trash/../.zshrc",
+        "echo x > $HOME/Projects/../.bash_profile",
+        "cp evil ~/a/b/../../.zprofile",
+    ])
+    def test_a_step_back_does_not_hide_a_home_dotfile(self, command):
+        risk, rules = crc.classify_bash(command)
+        assert risk >= Risk.HIGH and "writes-home-dotfile" in rules, (risk, rules)
+
     @pytest.mark.parametrize("command, tier", [
         ("sqlcmd -Q 'EXEC sp_x'", Risk.HIGH),
         ("echo 'EXEC sp_x' | sqlcmd -S db", Risk.HIGH),
@@ -32026,6 +32293,59 @@ class TestReview20261122HelperLows:
         assert path.read_text() == before, "a failed write emptied the travel address"
         assert not [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")], \
             "a temp file was left"
+
+    def test_a_travel_address_that_could_not_be_saved_says_so(self, tmp_path, monkeypatch,
+                                                              capsys):
+        """#1371: the save failed with no line in the log, so a travel address
+        lost at the next restart had nothing to explain it."""
+        def broken(*_args, **_kwargs):
+            raise OSError("disk full")
+        monkeypatch.setattr(watch_relay, "_write_private_atomic", broken)
+        watch_relay._remember_tunnel(43, "https://c.example.test", 8977,
+                                     path=str(tmp_path / "tunnel.json"))
+        said = capsys.readouterr().err
+        assert "travel address" in said and "disk full" in said, said
+
+    def test_a_read_whose_path_is_not_text_is_asked_about(self):
+        """#1371: a Read, Glob or Grep whose path is a list or a number read
+        SAFE, so a secret named inside it slipped past the secret check.
+        Claude Code validates its own tools first, but anything that is not
+        what we can read escalates (hard constraint 3)."""
+        for tool, key in (("Read", "file_path"), ("Glob", "pattern"), ("Grep", "path"),
+                          ("NotebookRead", "notebook_path")):
+            for value in (["~/.ssh/id_rsa"], 5, {"p": "~/.aws/credentials"}):
+                result = crc.classify({"tool_name": tool, "tool_input": {key: value}})
+                assert result["risk"] >= crc.Risk.MEDIUM, (tool, value, result)
+                assert "path-not-text" in result["rules"], (tool, value, result)
+        plain = crc.classify({"tool_name": "Read", "tool_input": {"file_path": "README.md"}})
+        assert plain["risk"] == crc.Risk.SAFE, plain
+        empty = crc.classify({"tool_name": "Read", "tool_input": {"file_path": None}})
+        assert empty["risk"] == crc.Risk.SAFE, empty
+
+    def test_two_writers_never_share_a_temporary_file(self, tmp_path):
+        # Review 2026-11-22 Low: the temp file was named by pid alone and
+        # opened with O_TRUNC, so a second writer in the same relay would
+        # truncate the first one's half-written file. A stale file of the
+        # old name must not be reused either.
+        path = tmp_path / "record.json"
+        stale = tmp_path / ("record.json.%d.tmp" % os.getpid())
+        stale.write_text("half")
+        seen = []
+        real_replace = watch_relay.os.replace
+
+        def spying(src, dst):
+            seen.append(src)
+            return real_replace(src, dst)
+        watch_relay.os.replace = spying
+        try:
+            watch_relay._write_private_atomic(str(path), "one")
+            watch_relay._write_private_atomic(str(path), "two")
+        finally:
+            watch_relay.os.replace = real_replace
+        assert path.read_text() == "two"
+        assert len(set(seen)) == 2, "two writes used the same temporary name"
+        assert str(stale) not in seen, "a leftover temporary file was written into"
+        assert stale.read_text() == "half"
 
     # L5 -------------------------------------------------------------------
     def test_usage_reads_past_a_model_that_is_not_a_word(self, tmp_path):

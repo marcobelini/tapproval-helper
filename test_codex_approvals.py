@@ -1792,3 +1792,19 @@ def test_a_question_too_long_for_the_wrist_stays_with_codex():
         "confirmed": {"type": "boolean", "title": "Confirm"}}, "required": ["confirmed"]})
     message["params"]["message"] = "Delete " + "x" * (classifier.TEXT_CHARS + 10) + "?"
     assert native_consent(message) is None
+
+
+def test_a_reply_cut_short_leaves_the_question_with_codex(monkeypatch):
+    """#1371: an http.client error (a reply cut short, a bad status line) is
+    not an OSError, so it escaped prepare_codex_sync and the hook lost its
+    audit line. It is a failed attachment like any other: False."""
+    import http.client
+    import urllib.request
+
+    def cut_short(*_args, **_kwargs):
+        raise http.client.IncompleteRead(b"{")
+    monkeypatch.setattr(urllib.request, "urlopen", cut_short)
+    monkeypatch.setattr(classifier, "_relay_key", lambda _policy: "ab" * 32)
+    assert classifier.prepare_codex_sync(
+        {"session_id": "s1", "tool_name": "shell"},
+        {"relay": "http://127.0.0.1:9"}) is False

@@ -431,7 +431,7 @@ def _thread_defaults(cwd):
             "exclude_tmpdir_env_var": True, "exclude_slash_tmp": True}}}
 
 
-def start(cwd, text, connect=None, binary=None):
+def start(cwd, text, connect=None, binary=None, model=None):
     """Begin a wrist session on the shared server; return its thread id.
 
     A Terminal started with ``flags()`` runs a private server of its own:
@@ -442,13 +442,18 @@ def start(cwd, text, connect=None, binary=None):
     whoever types it. A missing shared service is started idempotently;
     failure is an explicit refusal, never a Terminal-only private chat.
     Raises ValueError in words; a lost receipt is never retried.
+
+    ``model`` is one Codex's own model/list offered (the relay checks);
+    None names none, so the person's own setting decides.
     """
     client = _shared_client(binary=binary, connect=connect)
     try:
         limits = {"approvalPolicy": "on-request", "approvalsReviewer": "user",
                   "runtimeWorkspaceRoots": [cwd]}
-        thread = client.rpc("thread/start", dict(_thread_defaults(cwd), cwd=cwd),
-            timeout=START_TIMEOUT)
+        opening = dict(_thread_defaults(cwd), cwd=cwd)
+        if model is not None:
+            opening["model"] = model
+        thread = client.rpc("thread/start", opening, timeout=START_TIMEOUT)
         sid = ((thread or {}).get("thread") or {}).get("id") if isinstance(thread, dict) else None
         if not isinstance(sid, str) or not sid:
             raise ValueError("Codex returned an invalid receipt")

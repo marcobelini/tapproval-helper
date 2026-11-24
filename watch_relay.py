@@ -621,11 +621,27 @@ def _spawn_detached(command, log_path, cwd=None):
         # The first spawn on a new install may come before the relay ever
         # made ~/.tapproval/logs.
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        _private_log(log_path)
         with open(log_path, "a") as log:
             _host.popen_detached(command, cwd=cwd, stdout=log, stderr=log)
     except OSError as error:
         return str(error)
     return ""
+
+
+def _private_log(path):
+    """Make a log this user's alone (0600), creating it so if it is not
+    there yet. say.log holds Claude's replies to the wrist and relay.log
+    the cards' headlines; both were readable by every account on the Mac
+    (#1414). Only the file: a log may lie loose in the home folder, whose
+    mode is not ours to change. Never raises."""
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.close(descriptor)
+        os.chmod(path, 0o600)
+        _host.restrict_to_owner(path)
+    except OSError:
+        pass
 
 
 def _loopback_json(path, data=None, timeout=5, port=None, headers=None):
@@ -1309,6 +1325,14 @@ def _ensure_running(updated=False):
             # before stopping it; the hook re-posts a card cut off in what
             # little window remains.
             running = _probe_relay() or running
+        if "pending" not in running:
+            # An unsigned answer (the key file unreadable) never carries the
+            # card count, and its absence read as "nothing waiting": an
+            # update could stop a relay holding someone's approval (#1371).
+            # Not knowing is no permission.
+            print("relay: update deferred — cannot see whether a card is waiting "
+                  "(the key file could not be read)", file=sys.stderr)
+            return 0
         if running.get("pending"):
             print("relay: update deferred — a card is waiting", file=sys.stderr)
             # Say it where it can be seen: the running relay records the
@@ -1399,9 +1423,11 @@ def _write_private_atomic(path, text):
     """Write ``text`` to ``path`` (0600) whole or not at all: a temporary
     file beside it, flushed, then renamed over. Raises on failure, with the
     old file intact and no temporary left behind."""
-    tmp = "%s.%d.tmp" % (path, os.getpid())
+    # Unique per call and created exclusively: two writers in one relay
+    # must never share, or truncate, each other's half-written file.
+    tmp = "%s.%d.%s.tmp" % (path, os.getpid(), uuid.uuid4().hex[:8])
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()
@@ -3815,9 +3841,313 @@ def trust_folder(path, config=None):
     return True
 
 
+# ---- The models a session started from the wrist may run on -------------
+#
+# Claude Code and Codex each say which models they offer, in their own
+# words and order: Claude Code in its SDK `initialize` answer (the list its
+# /model picker shows), Codex in its app-server's `model/list`. Neither
+# list is copied here, so a release that adds a model reaches the wrist the
+# day it is installed, with no Tapproval update. A list is kept until the
+# program on disk changes or SESSION_MODELS_MAX_AGE passes (an account's
+# plan can change what it is offered). Seen on 2026-11-23 with Claude Code
+# 2.1.330 (14 models, half a second) and Codex 0.169 (10, three seconds).
+#
+# "Default" is never a model id: it starts the session with no model
+# named, so the person's own setting decides, as it would at the computer.
+# Every failure is an empty list, which leaves the wrist with Default.
+
+SESSION_MODELS_MAX_AGE = 6 * 3600
+SESSION_MODELS_RETRY_AFTER = 60
+SESSION_MODELS_PROBE_SECONDS = 10
+# The watch gives up on a request at 5 s, through the phone.
+SESSION_MODELS_WAIT = 3.0
+# What a model id may look like before it is checked against the list:
+# the list is the authority, this only keeps junk out of a lookup.
+SESSION_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\[\]/-]{0,79}$")
+_SESSION_MODELS = {}
+_SESSION_MODELS_LOCK = threading.Lock()
+
+
+def _json_lines_exchange(argv, messages, pick, timeout=SESSION_MODELS_PROBE_SECONDS,
+                         env=None, cwd=None):
+    """Run ``argv``, write ``messages`` as JSON lines, and return the first
+    non-None ``pick(value)`` of what it prints, or None. A reader thread,
+    not select(): select cannot wait on a pipe on Windows."""
+    import queue as _queue
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                errors="replace", env=env, cwd=cwd)
+    except (OSError, ValueError):
+        return None
+    lines = _queue.Queue()
+
+    def read():
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        except (OSError, ValueError):
+            pass
+        lines.put(None)
+    threading.Thread(target=read, daemon=True, name="models-read").start()
+    try:
+        for message in messages:
+            proc.stdin.write(json.dumps(message) + "\n")
+        proc.stdin.flush()
+        deadline = time.monotonic() + timeout
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            try:
+                line = lines.get(timeout=left)
+            except _queue.Empty:
+                return None
+            if line is None:
+                return None
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            got = pick(value) if isinstance(value, dict) else None
+            if got is not None:
+                return got
+    except (OSError, ValueError):
+        return None
+    finally:
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        for pipe in (proc.stdin, proc.stdout):
+            try:
+                pipe.close()
+            except (OSError, ValueError):
+                pass
+
+
+def _model_row(model_id, name, note=""):
+    if not (isinstance(model_id, str) and SESSION_MODEL_ID.match(model_id)):
+        return None
+    name = name if isinstance(name, str) and name.strip() else model_id
+    note = note if isinstance(note, str) else ""
+    return {"id": model_id, "name": name.strip()[:40], "note": note.strip()[:120]}
+
+
+def _claude_model_setting(home=None, environ=None):
+    """The model the person chose for Claude Code themselves, or None."""
+    env = os.environ if environ is None else environ
+    if env.get("ANTHROPIC_MODEL", "").strip() not in ("", "default"):
+        return env["ANTHROPIC_MODEL"].strip()
+    try:
+        with open(os.path.join(home or os.path.expanduser("~"), ".claude",
+                               "settings.json"), encoding="utf-8") as handle:
+            chosen = json.load(handle).get("model")
+    except (OSError, ValueError, AttributeError):
+        return None
+    # "default" is what /model writes for the recommended choice: no choice.
+    if not isinstance(chosen, str) or chosen.strip() in ("", "default"):
+        return None
+    return chosen.strip()
+
+
+def claude_session_models(binary, home=None, environ=None, exchange=None):
+    """Claude Code's own list, or None when it could not be read.
+
+    `--safe-mode` leaves out hooks, plugins and MCP servers, so asking
+    starts nothing of the person's (Tapproval's own hooks included), and
+    `--no-session-persistence` leaves no session behind. Auth and model
+    selection work as usual, so the list is the one this account gets."""
+    env = dict(os.environ if environ is None else environ)
+    for name in HOST_SESSION_MARKERS:
+        env.pop(name, None)
+    for name in [n for n in env if n.startswith("CLAUDE_RISK_")]:
+        env.pop(name)
+    home = home or os.path.expanduser("~")
+    reply = (exchange or _json_lines_exchange)(
+        [binary, "-p", "--safe-mode", "--no-session-persistence",
+         "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
+        [{"type": "control_request", "request_id": "tapproval-models",
+          "request": {"subtype": "initialize"}}],
+        lambda value: ((value.get("response") or {}).get("response") or {})
+        if value.get("type") == "control_response" else None,
+        env=env, cwd=home)
+    rows = reply.get("models") if isinstance(reply, dict) else None
+    if not isinstance(rows, list):
+        return None
+    rows = [row for row in rows if isinstance(row, dict)]
+    recommended = next((row for row in rows if row.get("value") == "default"), {})
+    models, resolved = [], {}
+    for row in rows:
+        if row.get("value") == "default":
+            continue
+        entry = _model_row(row.get("value"), row.get("displayName"), row.get("description"))
+        if entry and entry["id"] not in resolved:
+            models.append(entry)
+            resolved[entry["id"]] = row.get("resolvedModel") or entry["id"]
+    # Which model Default turns out to be: the person's own setting when
+    # there is one, else the one Claude Code recommends.
+    chosen = _claude_model_setting(home, environ)
+    target = chosen or recommended.get("resolvedModel")
+    default = next((m["name"] for m in models
+                    if target and target in (m["id"], resolved[m["id"]])), None)
+    if default is None and chosen:
+        default = chosen[:40]
+    if default is None and isinstance(recommended.get("description"), str):
+        default = recommended["description"].split(" · ")[0].strip()[:40] or None
+    return {"default": default, "models": models}
+
+
+def codex_session_models(binary, exchange=None):
+    """Codex's own list, or None. A private app-server, never the shared
+    one, so asking cannot touch a chat the phone or a Terminal holds."""
+    answers = {}
+
+    def pick(value):
+        if value.get("id") in (2, 3):
+            answers[value["id"]] = value.get("result")
+        return answers if len(answers) == 2 else None
+    got = (exchange or _json_lines_exchange)(
+        [binary, "app-server"],
+        [{"id": 1, "method": "initialize",
+          "params": {"clientInfo": {"name": "tapproval_models", "version": "1"}}},
+         {"method": "initialized"},
+         {"id": 2, "method": "model/list", "params": {}},
+         {"id": 3, "method": "config/read", "params": {}}],
+        pick)
+    listed = (got or {}).get(2)
+    rows = listed.get("data") if isinstance(listed, dict) else None
+    if not isinstance(rows, list):
+        return None
+    models, marked = [], None
+    for row in rows:
+        if not isinstance(row, dict) or row.get("hidden"):
+            continue
+        entry = _model_row(row.get("id") or row.get("model"), row.get("displayName"),
+                           row.get("description"))
+        if entry and all(m["id"] != entry["id"] for m in models):
+            models.append(entry)
+            if row.get("isDefault"):
+                marked = entry["name"]
+    config = (got.get(3) or {}).get("config") if isinstance(got.get(3), dict) else None
+    chosen = config.get("model") if isinstance(config, dict) else None
+    default = next((m["name"] for m in models if m["id"] == chosen), None)
+    if default is None:
+        default = chosen[:40] if isinstance(chosen, str) and chosen.strip() else marked
+    return {"default": default, "models": models}
+
+
+def _session_model_program(agent):
+    if agent == "codex":
+        from ClaudeRiskClassifier import ensure_codex_on_path
+        return ensure_codex_on_path()
+    # The way every other claude run finds it: a relay started on
+    # launchd's bare PATH, before Claude Code was installed, still does.
+    ensure_claude_on_path()
+    return shutil.which("claude")
+
+
+_SESSION_MODEL_READERS = {"claude": claude_session_models, "codex": codex_session_models}
+
+
+def _program_stamp(binary):
+    """What changes when the program is updated: its real file."""
+    try:
+        real = os.path.realpath(binary)
+        facts = os.stat(real)
+    except (OSError, TypeError, ValueError):
+        return None
+    return (real, facts.st_mtime_ns, facts.st_size)
+
+
+def session_models(agent, wait=SESSION_MODELS_WAIT, now=None, locate=None, read=None,
+                   current=False):
+    """``{"default": name or None, "models": [{"id", "name", "note"}]}``.
+
+    A fresh list comes from the cache. A stale one is answered while a
+    new one is asked for in the background; with none at all this waits
+    up to ``wait`` seconds and then answers empty, which the wrist shows
+    as Default alone. ``current`` waits for the list of the program on
+    disk now, never one read before it was updated: what a start is
+    checked against."""
+    empty = {"default": None, "models": []}
+    binary = (locate or _session_model_program)(agent)
+    if not binary:
+        return empty
+    stamp = _program_stamp(binary) or (binary,)
+    at = time.time() if now is None else now
+    with _SESSION_MODELS_LOCK:
+        state = _SESSION_MODELS.setdefault(agent, {})
+        age = SESSION_MODELS_RETRY_AFTER if state.get("failed") else SESSION_MODELS_MAX_AGE
+        if state.get("stamp") == stamp and at - state.get("at", 0) < age:
+            return state["value"]
+        asking = state.get("asking")
+        if asking is None:
+            asking = state["asking"] = threading.Event()
+            threading.Thread(target=_refresh_session_models,
+                             args=(agent, binary, stamp, at, asking,
+                                   read or _SESSION_MODEL_READERS[agent]),
+                             daemon=True, name="models-" + agent).start()
+        last = state.get("value")
+        same_program = state.get("stamp") == stamp
+    if last is not None and last["models"] and (same_program or not current):
+        return last
+    asking.wait(wait)
+    with _SESSION_MODELS_LOCK:
+        return _SESSION_MODELS.get(agent, {}).get("value") or empty
+
+
+def _refresh_session_models(agent, binary, stamp, at, asking, read):
+    try:
+        value = read(binary)
+    except Exception as error:  # a reader must never take the relay down
+        print("relay: models: %s list failed (%s)" % (agent, error), file=sys.stderr)
+        value = None
+    if value is None:
+        print("relay: models: %s gave no list; Default only" % agent, file=sys.stderr)
+    with _SESSION_MODELS_LOCK:
+        state = _SESSION_MODELS.get(agent, {})
+        # Only the question still being waited for may answer: one begun
+        # before a forget_session_models() would otherwise land in the
+        # fresh state and take the next question's place.
+        if state.get("asking") is asking:
+            state.update(stamp=stamp, at=at, failed=value is None,
+                         value=value or {"default": None, "models": []})
+            state.pop("asking", None)
+    asking.set()
+
+
+def forget_session_models():
+    """Ask afresh next time. Tests, and nothing else."""
+    with _SESSION_MODELS_LOCK:
+        _SESSION_MODELS.clear()
+
+
+def all_session_models(wait=SESSION_MODELS_WAIT):
+    """Both lists, asked for together so one wait covers both."""
+    deadline = time.monotonic() + wait
+    for agent in _SESSION_MODEL_READERS:
+        session_models(agent, wait=0)
+    return {agent: session_models(agent, wait=max(0.0, deadline - time.monotonic()))
+            for agent in _SESSION_MODEL_READERS}
+
+
+def session_model_offered(agent, model):
+    """Whether ``model`` is on ``agent``'s own list right now."""
+    if not (isinstance(model, str) and SESSION_MODEL_ID.match(model)):
+        return False
+    listed = session_models(agent, wait=SESSION_MODELS_PROBE_SECONDS, current=True)
+    return any(row["id"] == model for row in listed["models"])
+
+
 def start_session_from_request(body):
     """Preserve legacy launches while honoring an explicit assistant choice."""
     choice = {"agent": body["agent"]} if "agent" in body else {}
+    # A model only from a watch that has seen the list (GET /models); one
+    # that predates it sends none and starts on the person's own default.
+    if "model" in body:
+        choice["model"] = body["model"]
     # Only an explicit false turns the window off: a watch that predates
     # the setting sends nothing and gets the window it always got.
     if body.get("window") is False:
@@ -3826,7 +4156,7 @@ def start_session_from_request(body):
 
 
 def start_session(path, text, projects_dir=None, platform=None, agent=None,
-                  window=True):
+                  window=True, model=None):
     """Open a REAL Claude Code session on this computer, in ``path``, with ``text``
     as its first message. Returns a short status; "started" on success.
 
@@ -3848,6 +4178,11 @@ def start_session(path, text, projects_dir=None, platform=None, agent=None,
     needs its terminal — run without one, it is a headless run, which the
     session list and the phone leave out — so on a Mac its window goes
     straight to the Dock instead (owner, 2026-11-01).
+
+    ``model`` is one the program itself offers (``session_models``); None
+    is Default, which names none and leaves the person's own setting to
+    decide. Anything not on the program's list right now is refused
+    before a window opens: the list is the authority, never the wrist.
     """
     if agent not in (None, "claude", "codex"):
         return "unknown agent"
@@ -3868,6 +4203,8 @@ def start_session(path, text, projects_dir=None, platform=None, agent=None,
     if project is None:
         return "unknown project"
     codex = (agent or project.get("agent")) == "codex"
+    if model is not None and not session_model_offered("codex" if codex else "claude", model):
+        return "unknown model"
     if codex:
         from ClaudeRiskClassifier import ensure_codex_on_path
         from codex_talk import flags
@@ -3903,7 +4240,8 @@ def start_session(path, text, projects_dir=None, platform=None, agent=None,
         if not program or not program.lower().endswith(".exe"):
             return "new sessions need %s's own installer on Windows" % (
                 "Codex" if codex else "Claude Code")
-    words = [program, "--settings", BRIEF_REPLY_SETTINGS, "--", text]
+    chosen = ["--model", model] if model is not None else []
+    words = [program, "--settings", BRIEF_REPLY_SETTINGS] + chosen + ["--", text]
     thread = None
     if codex:
         # Started on the shared server, the chat is one the phone and the
@@ -3912,7 +4250,7 @@ def start_session(path, text, projects_dir=None, platform=None, agent=None,
         # as "used by another session" (2026-11-01).
         from codex_talk import attach_flags, shared_socket, start as start_codex
         try:
-            thread = start_codex(path, text)
+            thread = start_codex(path, text, **({"model": model} if model is not None else {}))
         except ValueError as error:
             return str(error)
         if thread is None:
@@ -3921,11 +4259,16 @@ def start_session(path, text, projects_dir=None, platform=None, agent=None,
                 "started from your watch opens only in Terminal and your "
                 "iPhone cannot open it. Opening Codex once in Terminal on "
                 "your computer starts the service.")
-            words = [program] + flags() + ["--", text]
+            words = [program] + flags() + chosen + ["--", text]
         else:
             clear_condition("codex_shared_service")
+            # The Terminal that shows the chat carries the model too, so
+            # its own config (the person's default) has nothing to apply.
+            # Insurance: Codex 0.169 kept the chat's model without it as
+            # well (e2e_codex_model.py, 2026-11-23).
+            keep = ["-c", "model=" + json.dumps(model)] if model is not None else []
             words = ([program, "resume", "--remote", "unix://" + shared_socket()]
-                     + attach_flags() + [thread])
+                     + attach_flags() + keep + [thread])
     script = 'unset %s; cd %s && %s' % (
         " ".join(HOST_SESSION_MARKERS), shlex.quote(path), shlex.join(words))
     if thread and not window:
@@ -5179,6 +5522,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             "/projects": ("_get_projects", {}),
             "/new-receipt": ("_get_new_receipt", dict(token=True, no_simulator=True)),
             "/skills": ("_get_skills", {}),
+            "/models": ("_get_models", dict(token=True)),
             "/sessions": ("_get_sessions", {}),
             "/activity": ("_get_activity", {}),
             "/recap": ("_get_recap", {}),
@@ -5423,7 +5767,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                 # Nobody asks about a Codex that is not wired, so a row
                 # from before stayed until a restart (2026-11-09 review).
                 clear_condition("signin_codex")
-            check_login_item()
+            check_login_item(background=True)
             # Only a plugin install has the switch to show. A terminal
             # install updates itself and says so, or Settings had no
             # Auto-update section at all and read as missing (2026-10-24).
@@ -5460,6 +5804,12 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def _get_projects(self, path, query):
         self._send_json({"projects": known_projects()})
+
+    def _get_models(self, path, query):
+        # The models a new session may start on, per program, in its own
+        # words. A watch that gets no answer here (a helper before this)
+        # shows no Model row and sends no model.
+        self._send_json({"agents": all_session_models()})
 
     def _get_skills(self, path, query):
         # The slash commands this machine can answer for one session:
@@ -5800,7 +6150,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     # after Terminal accepted the command. Keep new and
                     # unclassified outcomes conservative by default.
                     answer["retry_safe"] = status in {
-                        "empty", "unknown project", "unknown agent", "claude not on PATH", "signed out", "codex signed out",
+                        "empty", "unknown project", "unknown agent", "unknown model", "claude not on PATH", "signed out", "codex signed out",
                         "Codex is not installed on your computer",
                         "a first message cannot start with ! or #",
                         "new sessions need Codex's own installer on Windows",
@@ -7081,32 +7431,50 @@ LOGIN_ITEM_EVERY = 300.0
 _LOGIN_ITEM = {"at": 0.0}
 
 
-def check_login_item(now=None):
+def check_login_item(now=None, background=False):
     """Say on the wrist when the user switched Tapproval off in Login Items:
     the bridge then never starts, so a closed watch stops buzzing, and
     nothing else would tell them why. Their switch is respected — the
-    helper never turns it back on — so the sentence says where it is."""
+    helper never turns it back on — so the sentence says where it is.
+
+    ``background``: /health's way in. Asking the bridge may take up to
+    30 s and the watch gives /health 5, so the answer goes out with the
+    word the last check saw, and the new word is said when it comes
+    (#1371)."""
     now = time.time() if now is None else now
     if now - _LOGIN_ITEM["at"] >= LOGIN_ITEM_EVERY:
         _LOGIN_ITEM["at"] = now
-        try:
-            import bridge_install
-            app = bridge_install.app_path()
-            word = None
-            if os.path.isdir(app) and bridge_install.registers_itself(app):
-                word = bridge_install.login_item("login-status", app)
-                if word is None:
-                    # Timed out: the same as a check that broke, so the
-                    # word stays what the last one saw (2026-10-26 review).
-                    raise OSError("the bridge did not answer")
-            _LOGIN_ITEM["word"] = word
-        except Exception as error:
-            # A check that broke changes nothing: the word stays what the
-            # last check saw, so a condition it noted stands. Resetting it
-            # here read a bridge that could not be asked as "Login Items
-            # is fine" (2026-10-25 review).
-            print("relay: could not ask the bridge's login item: %s" % error,
-                  file=sys.stderr)
+        if background:
+            threading.Thread(target=_ask_login_item, name="login-item",
+                             daemon=True).start()
+        else:
+            _ask_login_item()
+    _say_login_item()
+
+
+def _ask_login_item():
+    """Ask the bridge once and say what it answered. Never raises."""
+    try:
+        import bridge_install
+        app = bridge_install.app_path()
+        word = None
+        if os.path.isdir(app) and bridge_install.registers_itself(app):
+            word = bridge_install.login_item("login-status", app)
+            if word is None:
+                # Timed out: the same as a check that broke, so the
+                # word stays what the last one saw (2026-10-26 review).
+                raise OSError("the bridge did not answer")
+        _LOGIN_ITEM["word"] = word
+    except Exception as error:
+        # A check that broke changes nothing: the word stays what the
+        # last check saw, so a condition it noted stands. Resetting it
+        # here read a bridge that could not be asked as "Login Items is
+        # fine" (2026-10-25 review).
+        _log("relay: could not ask the bridge's login item: %s" % error)
+    _say_login_item()
+
+
+def _say_login_item():
     if _LOGIN_ITEM.get("word") == "requires-approval":
         note_condition(
             "login_item_off",
@@ -7305,8 +7673,10 @@ def _remember_tunnel(pid, url, port, path=None):
                                                 "port": int(port)}))
         os.chmod(path, 0o600)
         _host.restrict_to_owner(path)
-    except (OSError, ValueError, TypeError):
-        pass
+    except (OSError, ValueError, TypeError) as exc:
+        # Said, not swallowed: a travel address lost at the next restart
+        # had nothing in the log to explain it (#1371).
+        _log("relay: the travel address could not be saved for the next start: %s" % exc)
 
 
 def _adoptable_tunnel(port):
@@ -8175,6 +8545,11 @@ def main(argv=None):
             handle.write(str(os.getpid()))
     except OSError:
         pass                                            # lsof still finds us
+    # A relay the bridge started at login writes a log it opened itself;
+    # put it, and the say log, right here (#1414).
+    for log_path in (RELAY_LOG, SAY_LOG):
+        if os.path.exists(log_path):
+            _private_log(log_path)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

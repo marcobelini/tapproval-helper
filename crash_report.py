@@ -364,13 +364,21 @@ def report(message, stack, source="process", helper=None, now=None,
             key = fingerprint(entry["message"], entry["stack"])
             seen = _seen.setdefault(key, {"count": 0, "notified": False})
             seen["count"] += 1
-            if seen["notified"]:
+            # Claimed here, inside the lock: the check and the mark used to
+            # sit either side of the send, so two threads crashing the same
+            # way at once both mailed (#1371).
+            if seen["notified"] or seen.get("sending"):
                 return "duplicate", entry
             if _sent_in_window >= MAX_SENDS_PER_WINDOW:
                 return "rate_limited", entry
             count = seen["count"]
+            seen["sending"] = True
 
-        reason = send(entry, count, settings=settings, opener=opener)
+        try:
+            reason = send(entry, count, settings=settings, opener=opener)
+        finally:
+            with _state_lock:
+                seen["sending"] = False
         with _state_lock:
             if reason == "sent":
                 seen["notified"] = True
