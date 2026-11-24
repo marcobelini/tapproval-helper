@@ -20,6 +20,18 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__ccd_session_mgmt__archive_session",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CLAUDE_RISK_MODE=enforce CLAUDE_RISK_RELAY=http://127.0.0.1:8977 CLAUDE_RISK_RELAY_WAIT=86400 python3 \"${CLAUDE_PLUGIN_ROOT}/ClaudeRiskClassifier.py\"",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }
