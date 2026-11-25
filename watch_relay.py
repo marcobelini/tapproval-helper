@@ -1800,7 +1800,7 @@ class DashboardUnavailable(OSError):
 _DASHBOARD_ERROR = None
 try:
     from watch_dashboard import (  # noqa: E402
-        activity_summary, archive_asked, card_session_title, claude_app_archived,
+        activity_summary, archive_ask_refused, archive_asked, card_session_title, claude_app_archived,
         forget_archive_ask, note_archive_asked, recap_summary,
         _find_transcript, image_bytes, inbox_ready,
         _message_of, _parse_thread, _read_appended,
@@ -1840,6 +1840,9 @@ except Exception as _error:  # noqa: BLE001 — any import-time failure, not onl
 
     def archive_asked(*_args, **_kwargs):
         return False            # nothing remembered: every tap asks
+
+    def archive_ask_refused(*_args, **_kwargs):
+        return False            # no word on the mode: ask, as before
 
     def note_archive_asked(*_args, **_kwargs):
         return None
@@ -3102,8 +3105,11 @@ def inbox_command(text, cwd=None):
     """Whether a slash command from the wrist is a skill the open session
     can run when the inbox message asks it to: a skill or command file on
     this computer for that folder, or one of INBOX_BUILTINS. A command only
-    the app itself runs (/compact, /recap) and a name nobody knows are not,
-    and keep the headless route. Never raises."""
+    the app itself runs (/compact, /recap), a name nobody knows, and a skill
+    only a person may start (``disable-model-invocation``: the Skill tool
+    refuses it, which is how /wrap-up from the wrist did nothing on
+    2026-11-25) are not, and keep the headless route, which starts it as if
+    typed. Never raises."""
     name = str(text or "").split(" ", 1)[0]
     if len(name) < 2 or not name.startswith("/"):
         return False
@@ -3113,6 +3119,8 @@ def inbox_command(text, cwd=None):
         return False
     for row in rows:
         if row.get("name") == name:
+            if row.get("user_only"):
+                return False
             return row.get("source") != "builtin" or name[1:] in INBOX_BUILTINS
     return False
 
@@ -3277,9 +3285,16 @@ def _archive_claude(prefix, waiting, projects_dir=None):
             print("relay: archive claude %s already asked, nothing new sent"
                   % session_id[:8], file=sys.stderr)
             return session_id, "asked"
+        transcript = _find_transcript(session_id, projects_dir)
+        # In auto mode the ask would only be refused (no card, the app's
+        # own check says no): say at once where it can be archived.
+        if archive_ask_refused(entry, transcript):
+            print("relay: archive claude %s auto mode, not asked" % session_id[:8],
+                  file=sys.stderr)
+            return session_id, "open it in the Claude app"
         # Its inbox or nothing. The headless route is another process: it
         # cannot archive the app's session, and would only add a turn.
-        if (inbox_ready(entry, _find_transcript(session_id, projects_dir))
+        if (inbox_ready(entry, transcript)
                 and post_to_inbox(entry, ARCHIVE_ASK, brief=True)):
             note_archive_asked(session_id)
             return session_id, "asked"
@@ -3360,9 +3375,10 @@ def _frontmatter(path):
     """The handful of frontmatter keys the wrist uses from a skill or
     command file — ``description`` (the sentence its author wrote for
     exactly this use, or the first line of prose when there is none),
-    ``argument-hint`` (what to say after the name) and ``user-invocable``
+    ``argument-hint`` (what to say after the name), ``user-invocable``
     (``false`` keeps a skill out of the slash menu, so out of the More
-    list too). Stdlib only: the frontmatter is ``key: value`` lines, not
+    list too) and ``disable-model-invocation`` (``true``: only a person
+    may start it, so Claude cannot run it when an inbox message asks). Stdlib only: the frontmatter is ``key: value`` lines, not
     full YAML. Never raises; an unreadable file is an empty dict."""
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
@@ -3375,7 +3391,8 @@ def _frontmatter(path):
             if line.strip() == "---":
                 break
             key, sep, value = line.partition(":")
-            if sep and key.strip() in ("description", "argument-hint", "user-invocable"):
+            if sep and key.strip() in ("description", "argument-hint", "user-invocable",
+                                       "disable-model-invocation"):
                 found[key.strip()] = " ".join(value.strip().strip("'\"").split())[:300]
     if not found.get("description"):
         for line in lines:
@@ -3510,6 +3527,8 @@ def known_skills(cwd=None, home=None, now=None):
             found[name] = {"description": meta.get("description", ""), "source": source,
                            "plugin": plugin,
                            "argument_hint": required_argument(meta.get("argument-hint"))}
+            if meta.get("disable-model-invocation", "").lower() == "true":
+                found[name]["user_only"] = True
     rows = [dict(name="/" + name, **meta) for name, meta in sorted(found.items())]
     with _SKILLS_CACHE_LOCK:
         _SKILLS_CACHE[key] = (now + SKILLS_CACHE_SECONDS, rows)

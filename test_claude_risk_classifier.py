@@ -1846,6 +1846,29 @@ class TestCardFacts:
         assert header.count("badge\n") == 3
         assert header.count("jumpButton(proxy)") == 3
 
+    @pytest.mark.private_layout
+    def test_a_permission_card_answers_on_the_first_screen_from_42_mm(self):
+        """Design proposal 3 (owner, 2026-11-25): a plain permission card
+        says what it needs in less room, so Deny and Allow show without
+        scrolling on 42 mm and up; what was cut above the answers is said
+        in full below them. 40 mm keeps the whole text: there a CRITICAL
+        command cut to "git push --force o…" hid where it pushed."""
+        swift = Path(__file__).with_name("WatchApp").joinpath(
+            "Tapproval", "Cards.swift").read_text()
+        detail = swift[swift.index("struct CardDetail"):]
+        tight = detail[detail.index("private var tight: Bool"):]
+        tight = tight[:tight.index("\n    }\n")]
+        for kept in ("card.isQuestion", "card.isHandoff", "card.planSource", "card.facts"):
+            assert kept in tight, f"{kept} no longer keeps the full layout"
+        assert "screenBounds.height >= 200" in tight, "40 mm lost its full text"
+        body = detail[detail.index("    var body: some View {"):]
+        assert "tightTop(proxy)" in body
+        assert "if tight && (headlineCut || commandCut)" in body, \
+            "cut text is no longer said in full below the answers"
+        top = detail[detail.index("func tightTop("):]
+        top = top[:top.index("private func projectLabel")]
+        assert top.count("jumpButton(proxy)") == 2, "a tight card lost its jump"
+
     def test_short_string_lists_are_spelled_out(self):
         assert crc._fact_value(["a", "b"], 32) == "a, b"
         assert crc._fact_value([], 32) == "none"
@@ -2468,6 +2491,72 @@ class TestTheShortCommand:
         done = subprocess.run([str(bin_dir / "tapproval"), "help"], capture_output=True,
                               text=True, env=env, timeout=30)
         assert done.returncode == 0 and "tapproval uninstall" in done.stdout
+
+
+class TestArchiveAsksThePersonInEveryMode:
+    """Archive on the wrist did nothing in auto mode: the Claude app's own
+    safety check refused the session's archive call, asked through another
+    session's message, and no card came (2026-11-24). A PreToolUse "ask"
+    for that one tool puts it to the person in every mode; the
+    PermissionRequest hook then brings it to the wrist. It never answers."""
+
+    def _pre(self, tool, agent=None):
+        out = io.StringIO()
+        event = {"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": {"session_id": "self"}}
+        assert crc.run_hook(stdin=io.StringIO(json.dumps(event)), stdout=out, agent=agent) == 0
+        return out.getvalue()
+
+    def test_the_archive_tool_is_put_to_the_person(self):
+        said = json.loads(self._pre(crc.ARCHIVE_TOOL))
+        assert said == crc.ARCHIVE_ASK_OUTPUT
+        out = said["hookSpecificOutput"]
+        assert out["hookEventName"] == "PreToolUse"
+        assert out["permissionDecision"] == "ask"
+
+    @pytest.mark.parametrize("tool", ["Bash", "mcp__ccd_session_mgmt__send_message", "Write", ""])
+    def test_any_other_tool_gets_no_word(self, tool):
+        assert self._pre(tool) == ""
+
+    def test_codex_pre_tool_use_still_gets_no_word(self):
+        assert self._pre(crc.ARCHIVE_TOOL, agent="codex") == ""
+
+    def test_the_hook_and_the_relay_name_the_same_tool(self):
+        assert crc.ARCHIVE_TOOL == watch_dashboard.ARCHIVE_TOOL
+
+    def test_the_plugin_wires_it_to_that_tool_alone(self):
+        wiring = _helper_manifest("hooks", "hooks.json")
+        entries = wiring["hooks"]["PreToolUse"]
+        assert [e["matcher"] for e in entries] == [crc.ARCHIVE_TOOL]
+        commands = [h["command"] for h in entries[0]["hooks"]]
+        assert commands == [h["command"] for e in wiring["hooks"]["PermissionRequest"]
+                            for h in e["hooks"]]
+
+    def _pre_tool_use(self, path):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data.get("hooks", {}).get("PreToolUse", [])
+
+    def test_the_installer_writes_it_once_and_uninstall_takes_it_out(self, settings, capsys):
+        settings.write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "/other/guard.sh"}]}]}}))
+        for _ in range(3):
+            assert crc.run_install() == 0
+        entries = self._pre_tool_use(settings)
+        ours = [e for e in entries if e.get("matcher") == crc.ARCHIVE_TOOL]
+        assert len(ours) == 1 and len(ours[0]["hooks"]) == 1
+        assert "ClaudeRiskClassifier.py" in ours[0]["hooks"][0]["command"]
+        assert watch_dashboard._archive_hook_wired(str(settings), "/nonexistent") is True
+        assert crc.run_uninstall() == 0
+        capsys.readouterr()
+        assert self._pre_tool_use(settings) == [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "/other/guard.sh"}]}]
+        assert watch_dashboard._archive_hook_wired(str(settings), "/nonexistent") is False
+
+    def test_the_relay_reads_the_plugin_manifest_as_wired(self, tmp_path):
+        manifest = tmp_path / "hooks.json"
+        manifest.write_text(json.dumps(_helper_manifest("hooks", "hooks.json")))
+        assert watch_dashboard._archive_hook_wired(str(tmp_path / "none.json"), str(manifest)) is True
+        manifest.write_text("{broken")
+        assert watch_dashboard._archive_hook_wired(str(tmp_path / "none.json"), str(manifest)) is False
 
 
 class TestInstallerCLI:
@@ -9785,7 +9874,9 @@ class TestAWristMessageGoesIntoTheInbox:
         monkeypatch.setattr(watch_relay, "known_skills", lambda cwd=None, **k: [
             {"name": "/code-review", "source": "builtin"},
             {"name": "/design", "source": "builtin"},
-            {"name": "/wrap-up", "source": "project"},
+            {"name": "/deploy-notes", "source": "project"},
+            # disable-model-invocation: the Skill tool refuses it.
+            {"name": "/wrap-up", "source": "user", "user_only": True},
             {"name": "/small-business:restock", "source": "plugin"}])
         spawned = []
         monkeypatch.setattr(watch_relay, "_spawn_detached",
@@ -9829,7 +9920,7 @@ class TestAWristMessageGoesIntoTheInbox:
         something Claude itself can run, so the inbox message asks it to
         (seen 2026-11-15 on Claude Code 2.1.325: /code-review, and a disk
         skill with its argument)."""
-        for text in ("/code-review", "/wrap-up short note", "/small-business:restock"):
+        for text in ("/code-review", "/deploy-notes short note", "/small-business:restock"):
             spawned = self._stage(monkeypatch, posted=True)
             assert watch_relay.say_to_session("abcdef12", text) == "sent"
             assert spawned == [], text
@@ -9838,6 +9929,21 @@ class TestAWristMessageGoesIntoTheInbox:
         self._stage(monkeypatch, posted=True)
         watch_relay.say_to_session("abcdef12", "What's left?")
         assert self.commands == [False]
+
+    def test_a_skill_only_a_person_may_start_runs_beside(self, monkeypatch, capsys):
+        """2026-11-25: /wrap-up from the wrist went into the open session's
+        inbox, and Claude Code refused it: the skill says
+        disable-model-invocation, so the Skill tool may not start it. The
+        wrist said "sent" and nothing ran. A headless run starts it as if
+        typed (seen 2026-11-25, Claude Code, `claude -p -- /marker`)."""
+        for text in ("/wrap-up", "/wrap-up short note"):
+            spawned = self._stage(monkeypatch, posted=True)
+            assert watch_relay.say_to_session("abcdef12", text) == "live"     # asks first
+            assert self.sent == [] and spawned == [], text
+            assert watch_relay.say_to_session("abcdef12", text, force=True) == "sent beside"
+            assert self.sent == [] and spawned[0][0][-1] == text
+            assert "say abcdef12 headless" in capsys.readouterr().err
+        assert watch_relay.inbox_command("/wrap-up") is False
 
     def test_a_skill_the_session_would_hold_or_cannot_take_runs_beside(self, monkeypatch):
         spawned = self._stage(monkeypatch, posted=True)
@@ -10139,6 +10245,13 @@ class TestTheMoreListIsWhatThisMachineCanAnswer:
             "---\ndescription: Internal.\nuser-invocable: false\n---\n")
         (synced / "commands" / "money").mkdir(parents=True)
         (synced / "commands" / "money" / "close.md").write_text("Closes the month.\n")
+        # Two only a person may start (disable-model-invocation), as
+        # /wrap-up is: a skill and a command.
+        (synced / "skills" / "wrap").mkdir()
+        (synced / "skills" / "wrap" / "SKILL.md").write_text(
+            "---\nname: wrap\ndisable-model-invocation: true\ndescription: Wraps up.\n---\n")
+        (synced / "commands" / "money" / "pay.md").write_text(
+            "---\ndescription: Pays the bills.\ndisable-model-invocation: \"true\"\n---\n")
         (home / ".claude" / "plugins" / "synced" / ".bucket-old" / "ghost" / "skills" / "ghost").mkdir(parents=True)
         (home / ".claude" / "plugins" / "synced" / ".bucket-old" / "ghost" / "skills" / "ghost" / "SKILL.md").write_text("---\ndescription: Stale.\n---\n")
         # The marketplace catalogue: skills nobody enabled.
@@ -10216,6 +10329,10 @@ class TestTheMoreListIsWhatThisMachineCanAnswer:
         assert rows["/smb:payroll"]["plugin"] == "smb"            # ~g2 dropped
         assert rows["/smb:money:close"]["description"] == "Closes the month."   # a folder is a namespace
         assert "/smb:router" not in rows                          # user-invocable: false
+        # Listed, but marked: Claude cannot start these when asked to.
+        assert rows["/smb:wrap"]["user_only"] is True
+        assert rows["/smb:money:pay"]["user_only"] is True
+        assert "user_only" not in rows["/smb:payroll"]
         assert "/ghost:ghost" not in rows                         # a .bucket the app left behind
         assert not any("shiny" in name for name in rows)         # marketplaces/ is a catalogue
 
@@ -28486,6 +28603,93 @@ class TestASessionCanBeArchivedFromTheWrist:
         assert watch_relay.archive_session(self.SID) == "asked"
         assert acted == [("inbox", watch_relay.ARCHIVE_ASK)]
         assert watch_relay.ARCHIVE_ASK == "Archive this session with your session tool."
+
+    def _auto_mode(self, monkeypatch, tmp_path, mode="auto", allow=None, where="user", cwd=None):
+        """After ``arrange``: a transcript whose latest turn ran in ``mode``,
+        and settings that allow ``allow`` (nothing when None), in the
+        user's file or the project's (``tmp_path/project``)."""
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text('{"type":"user","permissionMode":"%s"}\n' % mode)
+        monkeypatch.setattr(watch_relay, "_find_transcript", lambda *a, **k: str(transcript))
+        user = tmp_path / "user-settings.json"
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(user))
+        # An install without the PreToolUse ask, unless a test wires it.
+        monkeypatch.setattr(watch_dashboard, "_archive_hook_wired", lambda *a, **k: False)
+        project = tmp_path / "project"
+        (project / ".claude").mkdir(parents=True)
+        if allow is not None:
+            target = user if where == "user" else project / ".claude" / "settings.local.json"
+            target.write_text(json.dumps({"permissions": {"allow": [allow]}}))
+        return str(project)
+
+    def test_in_auto_mode_the_ask_is_not_sent_and_the_app_is_named(self, stage, monkeypatch,
+                                                                    tmp_path, capsys):
+        """Auto mode puts no card on the wrist: the app's own safety check
+        judges the archive call and refuses one asked through another
+        session's message (2026-11-24). The watch used to say "Archiving"
+        for minutes and then put the row back; now it is told at once."""
+        arrange, acted, _ = stage
+        arrange({"status": "Desktop", "pid": 1, "cwd": str(tmp_path / "project")}, archived=False)
+        self._auto_mode(monkeypatch, tmp_path)
+        assert watch_relay.archive_session(self.SID) == "open it in the Claude app"
+        assert acted == []
+        assert "auto mode, not asked" in capsys.readouterr().err
+
+    def test_auto_mode_is_found_behind_a_long_run_of_wrist_messages(self, stage, monkeypatch,
+                                                                       tmp_path):
+        """Only a typed turn records the mode: the session this was found in
+        had its last one 815 KB from the end, past what a poll reads."""
+        arrange, acted, _ = stage
+        arrange({"status": "Desktop", "pid": 1, "cwd": str(tmp_path / "project")}, archived=False)
+        self._auto_mode(monkeypatch, tmp_path)
+        transcript = tmp_path / "t.jsonl"
+        filler = '{"type":"user","message":"%s"}\n' % ("x" * 1000)
+        with open(transcript, "a") as handle:
+            handle.write(filler * 1000)
+        assert watch_dashboard.permission_mode(str(transcript)) == ""
+        assert watch_relay.archive_session(self.SID) == "open it in the Claude app"
+        assert acted == []
+
+    @pytest.mark.parametrize("rule,where", [
+        ("mcp__ccd_session_mgmt__archive_session", "user"),
+        ("mcp__ccd_session_mgmt", "user"),
+        ("mcp__ccd_session_mgmt__*", "project"),
+    ])
+    def test_in_auto_mode_an_allowed_archive_tool_is_still_asked(self, stage, monkeypatch,
+                                                                 tmp_path, rule, where):
+        """The person's own allow rule lets the call through auto mode."""
+        arrange, acted, _ = stage
+        arrange({"status": "Desktop", "pid": 1, "cwd": str(tmp_path / "project")}, archived=False)
+        self._auto_mode(monkeypatch, tmp_path, allow=rule, where=where)
+        assert watch_relay.archive_session(self.SID) == "asked"
+        assert acted == [("inbox", watch_relay.ARCHIVE_ASK)]
+
+    def test_in_auto_mode_with_the_ask_hook_wired_the_session_is_asked(self, stage, monkeypatch,
+                                                                         tmp_path):
+        """The PreToolUse ask brings the archive to the wrist in auto mode:
+        the relay asks as it does in ask-first mode."""
+        arrange, acted, _ = stage
+        arrange({"status": "Desktop", "pid": 1, "cwd": str(tmp_path / "project")}, archived=False)
+        self._auto_mode(monkeypatch, tmp_path)
+        monkeypatch.setattr(watch_dashboard, "_archive_hook_wired", lambda *a, **k: True)
+        assert watch_relay.archive_session(self.SID) == "asked"
+        assert acted == [("inbox", watch_relay.ARCHIVE_ASK)]
+
+    def test_another_rule_allows_nothing_and_a_broken_file_allows_nothing(
+            self, stage, monkeypatch, tmp_path):
+        arrange, acted, _ = stage
+        arrange({"status": "Desktop", "pid": 1, "cwd": str(tmp_path / "project")}, archived=False)
+        self._auto_mode(monkeypatch, tmp_path, allow="Bash(ls:*)")
+        (tmp_path / "project" / ".claude" / "settings.json").write_text("{not json")
+        assert watch_relay.archive_session(self.SID) == "open it in the Claude app"
+        assert acted == []
+
+    def test_in_ask_first_mode_the_session_is_asked_as_before(self, stage, monkeypatch, tmp_path):
+        arrange, acted, _ = stage
+        arrange({"status": "Desktop", "pid": 1, "cwd": str(tmp_path / "project")}, archived=False)
+        self._auto_mode(monkeypatch, tmp_path, mode="default")
+        assert watch_relay.archive_session(self.SID) == "asked"
+        assert acted == [("inbox", watch_relay.ARCHIVE_ASK)]
 
     def test_a_second_tap_asks_the_app_nothing_new(self, stage, capsys):
         """The row came back while the app's Claude was still busy, so the
