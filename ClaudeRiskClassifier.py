@@ -113,7 +113,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.139"
+__version__ = "1.1.140"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -4627,6 +4627,20 @@ def _permission_output(behavior, message="", mode=None, updated_input=None,
 # breakage was invisible for months has exactly one constructor.
 ESCALATE_FALLBACK = {"hookSpecificOutput": _permission_output("escalate")}
 
+# The Claude app's tool a session archives itself with, when the wrist asks
+# it to. In auto mode no prompt came: the app's own safety check refused a
+# call asked through another session's message (2026-11-24), so Archive on
+# the watch did nothing. A PreToolUse "ask" for this one tool puts the
+# question to the person, as in ask-first mode, and the PermissionRequest
+# hook carries it to the wrist. It never answers for them. Spelled here
+# because the hook cannot import watch_dashboard; a test holds the two equal.
+ARCHIVE_TOOL = "mcp__ccd_session_mgmt__archive_session"
+ARCHIVE_ASK_OUTPUT = {"hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "ask",
+    "permissionDecisionReason": "Archive asked from the watch: approve it there or here.",
+}}
+
 
 def _user_permission_rules(cwd=None):
     """The user's own permissions rules, user + project scope.
@@ -4812,6 +4826,13 @@ def run_hook(stdin=None, stdout=None, agent=None):
         event = json.loads(raw) if raw and raw.strip() else {}
         if not isinstance(event, dict):
             raise ValueError("event is not a JSON object")
+        if agent != "codex" and event.get("hook_event_name") == "PreToolUse":
+            # Only the archive tool is ever matched to this hook; anything
+            # else says nothing, which leaves Claude Code's own decision.
+            if event.get("tool_name") == ARCHIVE_TOOL:
+                json.dump(ARCHIVE_ASK_OUTPUT, stdout)
+                stdout.write("\n")
+            return 0
         if agent == "codex" and event.get("hook_event_name") not in (None, "PermissionRequest"):
             # Codex fires PreToolUse for every call, its memory job's
             # included. Only a PermissionRequest is a question; an empty
@@ -5599,10 +5620,10 @@ def _sync_hook(entry_list, wanted, matcher, marker):
 
 
 def _remove_our_hooks(hooks):
-    """Drop our handlers from both events, keeping everyone else's. Empty
+    """Drop our handlers from every event we wire, keeping everyone else's. Empty
     events disappear. Returns how many handlers went."""
     removed = 0
-    for event in ("PermissionRequest", "SessionStart"):
+    for event in ("PermissionRequest", "SessionStart", "PreToolUse"):
         entries = hooks.get(event)
         if entries is None:
             continue
@@ -5960,12 +5981,15 @@ def run_install(then_watch=False, bridge=None):
     relay_command = _relay_command() if os.path.exists(_relay_path()) else None
     entries = _event_list(data, "PermissionRequest")
     starters = _event_list(data, "SessionStart")
-    if entries is None or starters is None:
+    archivers = _event_list(data, "PreToolUse")
+    if entries is None or starters is None or archivers is None:
         _left_alone(path)
         return 1
     hooks = data["hooks"]
 
     changed = _sync_hook(entries, command, "*", os.path.basename(__file__))
+    changed = _sync_hook(archivers, command, ARCHIVE_TOOL,
+                         os.path.basename(__file__)) or changed
     if relay_command:
         changed = _sync_hook(starters, relay_command, None,
                              "watch_relay.py") or changed

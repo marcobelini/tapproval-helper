@@ -779,6 +779,88 @@ def side_reason(entry, transcript):
     return ""
 
 
+# Only a turn the person typed records its mode, so a session driven from
+# the wrist and by other sessions' messages can go a long way without one:
+# this one's last was 815 KB from the end (2026-11-24). A tap on Archive is
+# rare, so it reads further back than a poll does.
+ARCHIVE_MODE_TAIL_BYTES = 8 * 1024 * 1024
+
+# The Claude app's tool a session archives itself with, and the server it
+# belongs to: an allow rule may name either (Claude Code's rule syntax).
+ARCHIVE_TOOL = "mcp__ccd_session_mgmt__archive_session"
+_ARCHIVE_TOOL_RULES = (ARCHIVE_TOOL, "mcp__ccd_session_mgmt", "mcp__ccd_session_mgmt__*")
+
+
+def _archive_tool_allowed(cwd, user_settings=None):
+    """Whether the person's own settings let the archive tool run without
+    asking: its name, or its server's, in ``permissions.allow`` of the user
+    settings or the project's ``.claude/settings.json`` or
+    ``settings.local.json``. Read-only, and an unreadable file allows
+    nothing. Never raises."""
+    if user_settings is None:
+        user_settings = os.path.expanduser(os.environ.get(
+            "CLAUDE_SETTINGS_PATH", os.path.join("~", ".claude", "settings.json")))
+    paths = [user_settings]
+    if cwd:
+        paths += [os.path.join(cwd, ".claude", name)
+                  for name in ("settings.json", "settings.local.json")]
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                data = json.load(handle)
+            allow = (data.get("permissions") or {}).get("allow") or []
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(allow, list) and any(rule in _ARCHIVE_TOOL_RULES for rule in allow):
+            return True
+    return False
+
+
+def _archive_hook_wired(user_settings=None, manifest=None):
+    """Whether this install puts the archive call to the person in every
+    mode: the hook's PreToolUse "ask" for the archive tool, in the user's
+    settings (a terminal install) or in the plugin's own hooks.json beside
+    this file. Read-only; never raises."""
+    if user_settings is None:
+        user_settings = os.path.expanduser(os.environ.get(
+            "CLAUDE_SETTINGS_PATH", os.path.join("~", ".claude", "settings.json")))
+    if manifest is None:
+        manifest = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "hooks.json")
+    for path in (user_settings, manifest):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                entries = (json.load(handle).get("hooks") or {}).get("PreToolUse") or []
+        except (OSError, ValueError, AttributeError):
+            continue
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict) or entry.get("matcher") != ARCHIVE_TOOL:
+                continue
+            if any(isinstance(h, dict) and "ClaudeRiskClassifier.py" in str(h.get("command", ""))
+                   for h in (entry.get("hooks") or [])):
+                return True
+    return False
+
+
+def archive_ask_refused(entry, transcript, user_settings=None, manifest=None):
+    """Whether asking this Claude app session to archive itself would only
+    be refused. In auto mode no card comes to the wrist: the app's own
+    safety check judges the call, and it refuses a request that came
+    through another session's message ("Unsanctioned Communication",
+    2026-11-24), so the watch said "Archiving" for minutes and then put
+    the row back. The hook's PreToolUse "ask" now puts that call to the
+    person in auto mode too, so only an install without it (or a person
+    who has not allowed the tool) is told at once to archive in the app.
+    Never raises."""
+    try:
+        if permission_mode(transcript, tail=ARCHIVE_MODE_TAIL_BYTES) != shape("mode.auto"):
+            return False
+        if _archive_hook_wired(user_settings, manifest):
+            return False
+        return not _archive_tool_allowed(str((entry or {}).get("cwd") or ""), user_settings)
+    except Exception:  # noqa: BLE001 — an archive tap must not fail over a read
+        return False
+
+
 def inbox_ready(entry, transcript):
     """Whether a wrist message can go into this live session's own inbox:
     side_reason has nothing against it. One decision, so the row the watch
@@ -1147,6 +1229,10 @@ UPSTREAM_SHAPES = {
     "key.permission_mode":
         ("permissionMode", "The mode a turn ran in, on each transcript "
          "line; the hook watches for \"auto\".", "2026-10-17"),
+    "mode.auto":
+        ("auto", "Auto mode: no permission card, the app's own safety check "
+         "decides, and it refuses an archive asked through another "
+         "session's message.", "2026-11-24"),
     "mode.bypass":
         ("bypassPermissions", "The permission mode that skips every prompt. "
          "Claude Code holds a message from outside for a click in such a "
