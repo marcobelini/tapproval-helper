@@ -826,7 +826,13 @@ def _archive_hook_wired(user_settings=None, manifest=None):
             "CLAUDE_SETTINGS_PATH", os.path.join("~", ".claude", "settings.json")))
     if manifest is None:
         manifest = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "hooks.json")
-    for path in (user_settings, manifest):
+    paths = [user_settings]
+    # The manifest counts only for a plugin install. A terminal install is a
+    # checkout that carries hooks.json too, which Claude Code never reads:
+    # on the owner's Mac the relay took it as wired, and asked (2026-11-26).
+    if not os.path.exists(os.path.join(os.path.dirname(os.path.dirname(manifest)), ".git")):
+        paths.append(manifest)
+    for path in paths:
         try:
             with open(path, encoding="utf-8") as handle:
                 entries = (json.load(handle).get("hooks") or {}).get("PreToolUse") or []

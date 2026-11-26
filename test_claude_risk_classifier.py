@@ -2551,6 +2551,57 @@ class TestArchiveAsksThePersonInEveryMode:
             {"matcher": "Bash", "hooks": [{"type": "command", "command": "/other/guard.sh"}]}]
         assert watch_dashboard._archive_hook_wired(str(settings), "/nonexistent") is False
 
+    def test_an_update_adds_it_to_a_terminal_install_once(self, settings, capsys):
+        """A terminal install pulls new code but never re-runs --install, so
+        the owner's own Mac ran 1.1.140 without the ask (2026-11-26). The
+        session start adds it beside our PermissionRequest handler, once."""
+        assert crc.run_install() == 0
+        capsys.readouterr()
+        data = json.loads(settings.read_text())
+        data["hooks"].pop("PreToolUse")
+        data["hooks"]["Stop"] = [{"hooks": [{"type": "command", "command": "say done"}]}]
+        settings.write_text(json.dumps(data))
+        assert crc.ensure_archive_hook() is True
+        assert crc.ensure_archive_hook() is False
+        after = json.loads(settings.read_text())
+        ours = [e for e in after["hooks"]["PreToolUse"] if e.get("matcher") == crc.ARCHIVE_TOOL]
+        assert len(ours) == 1
+        assert ours[0]["hooks"][0]["command"] == after["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
+        assert after["hooks"]["Stop"] == data["hooks"]["Stop"]
+        assert watch_dashboard._archive_hook_wired(str(settings), "/nonexistent") is True
+
+    def test_an_update_leaves_a_plugin_install_and_strangers_alone(self, settings, tmp_path):
+        """No handler of ours in settings: a plugin install (hooks.json
+        carries it) or not installed here. Nothing is written."""
+        settings.write_text(json.dumps({"hooks": {"Stop": []}}))
+        before = settings.read_text()
+        assert crc.ensure_archive_hook() is False
+        assert settings.read_text() == before
+        settings.write_text("{not json")
+        assert crc.ensure_archive_hook() is False
+        assert crc.ensure_archive_hook(str(tmp_path / "missing.json")) is False
+
+    def test_a_checkouts_own_manifest_is_not_taken_as_wired(self, tmp_path):
+        """A terminal install is a checkout that carries hooks.json too,
+        which Claude Code never reads: on the owner's Mac the relay took it
+        as wired and asked a session that could only refuse (2026-11-26)."""
+        root = tmp_path / "checkout"
+        (root / "hooks").mkdir(parents=True)
+        manifest = root / "hooks" / "hooks.json"
+        manifest.write_text(json.dumps(_helper_manifest("hooks", "hooks.json")))
+        none = str(tmp_path / "none.json")
+        assert watch_dashboard._archive_hook_wired(none, str(manifest)) is True
+        (root / ".git").mkdir()
+        assert watch_dashboard._archive_hook_wired(none, str(manifest)) is False
+
+    def test_a_session_start_wires_it(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(crc, "ensure_archive_hook", lambda: called.append(1) or True)
+        watch_relay._wire_archive_hook()
+        assert called == [1]
+        monkeypatch.setattr(crc, "ensure_archive_hook", lambda: 1 / 0)
+        watch_relay._wire_archive_hook()        # never raises
+
     def test_the_relay_reads_the_plugin_manifest_as_wired(self, tmp_path):
         manifest = tmp_path / "hooks.json"
         manifest.write_text(json.dumps(_helper_manifest("hooks", "hooks.json")))
@@ -6493,6 +6544,9 @@ class TestTextFollowsTheTextSize:
             '.font(.system(size: 15))',             # the field you tap to type in
             '"chevron.up" : "chevron.down"',        # More models' fold mark
         },
+        # The Unlock screen's buttons already follow the text size; its
+        # reading lines do too (design item 7, owner, 2026-11-25).
+        "PaywallView.swift": set(),
         "DiagnosticsView.swift": {
             'image.font(.system(size: 15))',        # a check's glyph column
             'Text("Check again")',
@@ -6556,7 +6610,7 @@ class TestTextFollowsTheTextSize:
 
     @pytest.mark.parametrize("name", ["SettingsScreens.swift", "SessionDetail.swift",
                                       "Sessions.swift", "NewSession.swift",
-                                      "DiagnosticsView.swift"])
+                                      "DiagnosticsView.swift", "PaywallView.swift"])
     def test_only_marks_buttons_and_the_keypad_keep_a_fixed_size(self, name):
         left = [(line, view) for line, view in self._fixed(name)
                 if not any(mark in view for mark in self.FIXED[name])]
@@ -6715,6 +6769,25 @@ class TestAnICloudCardIsTheWholeCard:
             before = body[:body.index(line)].rstrip().splitlines()[-1]
             assert "if missingMeansGone" in line or "if missingMeansGone" in before, line
 
+    def test_the_route_that_worked_stays_on_this_watch_and_proves_nothing(self):
+        """Design item 4 (owner, 2026-11-25): the watch remembers which
+        route reached its computer, for the next launch. It is this
+        watch's own fact, kept in local defaults beside the last list and
+        never in iCloud's shared store; a remembered home address joins as
+        a found computer, so it opens no pairing and carries no words
+        before a proven answer; and it is never taken as the proven route."""
+        model = self._read("Tapproval", "RelayModel.swift")
+        start = model.index("// MARK: - The route that worked, kept for the next launch")
+        section = model[start:model.index("private func provenCloudCards()", start)]
+        assert "NSUbiquitousKeyValueStore" not in section
+        assert "persist(" not in section
+        assert "defaults: UserDefaults = .standard" in section
+        assert "Candidate(kind: .bonjour, url: url)" in section
+        assert "activeBase" not in section.split("enum LastRoute")[1]
+        drop = model[model.index("func dropLastList()"):]
+        drop = drop[:drop.index("\n    }\n")]
+        assert "Self.forgetLastRoute()" in drop, "unpairing forgets the route"
+
     def test_a_poll_that_was_out_when_the_demo_began_is_dropped(self):
         """2026-11-15 review: refreshOnce looked at the demo once, before
         waits of up to fifteen seconds each. Every wait for an answer is
@@ -6735,17 +6808,18 @@ class TestAnICloudCardIsTheWholeCard:
         assert fetch.index("listMayBeUsed") < fetch.index("PendingResponse.self"), \
             "asked before the list is read"
 
-    def test_more_chats_asks_again_when_its_page_did_not_arrive(self):
+    def test_more_sessions_asks_again_when_its_page_did_not_arrive(self):
         """2026-11-16 review: the row asked once per cursor and
         loadMoreSessions said nothing when the request failed, so one lost
         request left "More chats" spinning until the whole list was
-        fetched again."""
+        fetched again. The label says "More sessions" since design item
+        8 (owner, 2026-11-25): the word the rest of the watch uses."""
         model = self._read("Tapproval", "RelayModel.swift")
         start = model.index("func loadMoreSessions() async -> Bool")
         body = model[start:model.index("\n    }\n", start)]
         assert body.count("return false") == 2 and "return true" in body
         row = self._read("Tapproval", "Sessions.swift")
-        start = row.index('ProgressView("More chats")')
+        start = row.index('ProgressView("More sessions")')
         task = row[start:start + 500]
         assert "while !Task.isCancelled, await !relay.loadMoreSessions()" in task
         assert "Task.sleep(for: RelayModel.moreSessionsRetry)" in task
@@ -27515,7 +27589,8 @@ esac
     @staticmethod
     def _started(pid):
         out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
-                             capture_output=True, text=True).stdout
+                             capture_output=True, text=True,
+                             env=dict(os.environ, LC_ALL="C", TZ="UTC")).stdout
         return " ".join(out.split())
 
     def test_a_reused_process_number_does_not_hold_a_simulator(self, tmp_path):
@@ -27547,6 +27622,24 @@ esac
             busy = self._take(app, env, wait=1)
             assert busy.returncode == 3 and "in use" in busy.stderr, busy.stderr
             assert busy.stdout == "" and events.read_text() == "", events.read_text()
+            assert (lock / "pid").read_text().strip() == str(holder.pid)
+        finally:
+            holder.kill()
+
+    def test_a_holder_started_in_another_language_is_still_waited_for(self, tmp_path):
+        """ps writes a start time in the reader's language and time zone. A
+        flow from a shell wrote "Wed 25 Nov", one from the CI service read
+        "Wed Nov 25", took the holder for gone and took its simulator (the
+        same fault as the Mac's turn, 25 November)."""
+        app, env, _ = self._mac(tmp_path)
+        holder = subprocess.Popen(["sleep", "300"])
+        try:
+            took = self._take(app, dict(env, LC_ALL="en_GB.UTF-8", LANG="en_GB.UTF-8",
+                                        TZ="Pacific/Auckland"), holder=holder.pid)
+            assert took.returncode == 0, took.stderr
+            busy = self._take(app, dict(env, LC_ALL="C", LANG="C", TZ="UTC"), wait=1)
+            assert busy.returncode == 3, "a live holder's simulator was taken: " + busy.stderr
+            lock = tmp_path / "locks" / "Tapproval-Watch-41mm.lock"
             assert (lock / "pid").read_text().strip() == str(holder.pid)
         finally:
             holder.kill()
@@ -28020,6 +28113,28 @@ class TestOneSimulatorRunAtATimeOnThisMac:
         wait = int(re.search(r"limit=\$\{SIM_TURN_WAIT:-(\d+)\}", turn).group(1))
         assert minutes * 60 >= wait + 25 * 60, "the job is cancelled while it waits its turn"
 
+    def test_a_run_started_in_another_language_still_holds_its_turn(self, tmp_path):
+        """A waiter compares the holder's start time with what it reads
+        itself, and ps writes it in the reader's language and time zone. On
+        25 November a run from a shell wrote "Wed 25 Nov" and one from the
+        CI service read "Wed Nov 25": each took the other for gone and both
+        ran on the simulators, cutting four Tapmerge runs off."""
+        holder = subprocess.Popen(["sleep", "300"])
+        try:
+            env = dict(os.environ, SIM_TURN_DIR=str(tmp_path / "turn"), SIM_TURN_POLL="1")
+            took = subprocess.run(["bash", self.TURN, "take", str(holder.pid), "a run by hand"],
+                                  env=dict(env, LC_ALL="en_GB.UTF-8", LANG="en_GB.UTF-8",
+                                           TZ="Pacific/Auckland"),
+                                  capture_output=True, text=True, timeout=60)
+            assert took.returncode == 0, took.stderr
+            waiter = subprocess.run(["bash", self.TURN, "take", str(os.getpid()), "a run by CI"],
+                                    env=dict(env, LC_ALL="C", LANG="C", TZ="UTC", SIM_TURN_WAIT="1"),
+                                    capture_output=True, text=True, timeout=60)
+            assert waiter.returncode == 3, "the waiter took a turn that was still held: " + waiter.stderr
+        finally:
+            holder.kill()
+            holder.wait()
+
     def test_tapmerge_and_tapproval_wait_at_the_same_door(self):
         """Tapmerge carries the same script. Two keys to the same room are
         no lock: the folder, the name and the holder's form are fixed here."""
@@ -28027,7 +28142,7 @@ class TestOneSimulatorRunAtATimeOnThisMac:
         assert 'dir="${SIM_TURN_DIR:-${SIM_LOCK_DIR:-/tmp/mac-simulator-turn}}"' in turn
         assert 'lock="$dir/turn"' in turn
         assert 'ln -sn "$me|$what" "$lock"' in turn
-        assert "printf '%s@%s' \"$1\" \"$(ps -p \"$1\" -o lstart=" in turn
+        assert "printf '%s@%s' \"$1\" \"$(LC_ALL=C TZ=UTC ps -p \"$1\" -o lstart=" in turn
         # The line at the door is shared too: its folder, a ticket's name
         # (when it arrived, then the waiting script's process number) and
         # what it holds (that script, as a holder is written).
