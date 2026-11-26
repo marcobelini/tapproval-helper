@@ -113,7 +113,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.141"
+__version__ = "1.1.142"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -6058,8 +6058,9 @@ def run_install(then_watch=False, bridge=None):
     print("Installed.")
     print("  Settings : %s" % path)
     print("  Command  : %s" % command)
+    agents = "Claude Code or Codex" if codex else "Claude Code"
     if relay_command:
-        print("  Relay    : starts itself with every Claude Code session")
+        print("  Relay    : starts itself with every %s session" % agents)
     if agent:
         print("  Reboot   : the relay wakes again at login")
     if backup:
@@ -6075,7 +6076,7 @@ def run_install(then_watch=False, bridge=None):
     print("shadow mode, so every permission prompt still reaches you exactly")
     print("as before. It only writes down what it would have done.")
     print("")
-    print("Next: start a new Claude Code session, work normally for a week,")
+    print("Next: start a new %s session, work normally for a week," % agents)
     print("then run this script again with --report.")
     return 0
 
@@ -6119,10 +6120,10 @@ def _bridge_step(choice=None):
         bridge_install.install(pin)
     except bridge_install.InstallError as error:
         return ("  Closed watch : the iCloud bridge could not be installed "
-                "(%s). It tries again when Claude Code next starts." % error)
+                "(%s). It tries again when your agent next starts." % error)
     except OSError as error:
         return ("  Closed watch : the iCloud bridge could not be installed "
-                "(%s). It tries again when Claude Code next starts."
+                "(%s). It tries again when your agent next starts."
                 % error.strerror)
     said = ("  Closed watch : buzzes through your own iCloud (bridge %s, "
             "just installed)" % pin["version"])
@@ -6364,7 +6365,7 @@ def run_watch(enable=True):
             env.update(WATCH_ENV)
             _set_hook_timeout(data, WATCH_HOOK_TIMEOUT)
             return (
-                "Wrist approvals are ON for every new Claude Code session.\n"
+                "Wrist approvals are ON for every new Claude Code or Codex session.\n"
                 "  Settings : %(path)s\n"
                 "  Relay    : " + WATCH_ENV["CLAUDE_RISK_RELAY"] + "\n"
                 "  Wait     : a card stays on the watch until answered —\n"
@@ -6376,8 +6377,9 @@ def run_watch(enable=True):
                 "\n"
                 "Every risky prompt goes to your watch first. Nothing is\n"
                 "auto-allowed — add --quiet if you want the SAFE and LOW\n"
-                "tiers handled for you. Ignore a card and the prompt still\n"
-                "appears in the terminal as usual; nothing is ever blocked.\n"
+                "tiers handled for you in Claude Code (Codex's own settings\n"
+                "decide what it asks). Ignore a card and the prompt still\n"
+                "appears as usual; nothing is ever blocked.\n"
                 "Turn it off again with --no-watch.\n"
                 "\n"
                 "Already-running sessions keep their old setting until restarted.")

@@ -98,7 +98,7 @@ if ($LASTEXITCODE -ne 0) { throw "the hook could not be installed (exit $LASTEXI
 
 Write-Host ""
 Write-Host "TAPPROVAL_BASE_READY"
-Write-Host "OK: Tapproval Base is ready. Start a new Claude Code session,"
+Write-Host "OK: Tapproval Base is ready. Start a new Claude Code or Codex session,"
 Write-Host "    then open Tapproval on your watch - it connects by itself."
 Write-Host "    No watch app yet? https://apps.apple.com/app/tapproval/id6805869018"
 Write-Host "    or the beta, where the unlock is free: https://testflight.apple.com/join/dW1tYBQG"

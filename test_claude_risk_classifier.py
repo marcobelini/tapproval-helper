@@ -5094,6 +5094,21 @@ class TestStatusRelayAwareness:
         assert "starts itself with every Claude Code session" in out
         assert "Relay         :" in out
 
+    @pytest.mark.parametrize("codex, said", [("installed", "Claude Code or Codex session"),
+                                             (None, "Claude Code session")])
+    def test_install_names_codex_only_where_it_wired_codex(self, codex, said, tmp_path,
+                                                           monkeypatch, capsys):
+        """Readers use Claude Code, Codex or both (owner, 2026-11-26): a
+        Codex user is not told to start a Claude Code session."""
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / "s.json"))
+        monkeypatch.setenv("CLAUDE_RISK_AUDIT_LOG", str(tmp_path / "a.jsonl"))
+        monkeypatch.setattr(crc, "install_codex", lambda: codex)
+        monkeypatch.setattr(crc, "_say_codex", lambda state: None)
+        crc.run_install()
+        out = capsys.readouterr().out
+        assert "Relay    : starts itself with every " + said in out
+        assert "Next: start a new " + said in out
+
     def test_status_flags_missing_relay_hook(self, tmp_path, monkeypatch, capsys):
         settings = tmp_path / "s.json"
         settings.write_text(json.dumps({"hooks": {"PermissionRequest": [
