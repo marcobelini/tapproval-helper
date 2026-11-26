@@ -113,7 +113,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.140"
+__version__ = "1.1.141"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -5959,6 +5959,36 @@ def run_command(words):
               % (script, PLUGIN_NAME), file=sys.stderr)
         return 1
     return subprocess.call(call)
+
+
+def ensure_archive_hook(path=None):
+    """A terminal install's settings get the archive ask beside our
+    PermissionRequest handler, when an update brought it and the settings
+    lack it: updates pull new code but never re-run --install, so the
+    owner's own Mac ran 1.1.140 without it (2026-11-26). Owner's decision,
+    that day: an update may add this one Tapproval line. It only ever asks
+    the person; it approves nothing. A plugin install carries it in
+    hooks.json and is left alone, and so is a file not ours to read.
+    Backed up before writing. True when the line was added. Never raises."""
+    try:
+        path = path or _settings_path()
+        if not os.path.exists(path):
+            return False
+        data = _read_settings(path)
+        ours = _settings_handlers(data)
+        if not ours:
+            return False        # a plugin install, or not installed here
+        archivers = _event_list(data, "PreToolUse")
+        if archivers is None:
+            return False        # the user's hooks, in a shape we never wrote
+        if not _sync_hook(archivers, str(ours[0].get("command", "")), ARCHIVE_TOOL,
+                          os.path.basename(__file__)):
+            return False
+        _backup(path)
+        _write_settings(path, data)
+        return True
+    except Exception:  # noqa: BLE001 — a session start must never fail on this
+        return False
 
 
 def run_install(then_watch=False, bridge=None):

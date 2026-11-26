@@ -1246,6 +1246,18 @@ def _serving_older_code(running):
                                    or installed.startswith(serving)))
 
 
+def _wire_archive_hook():
+    """Give a terminal install the archive ask an update brought
+    (ClaudeRiskClassifier.ensure_archive_hook), saying so once in the log.
+    Never raises."""
+    try:
+        import ClaudeRiskClassifier as classifier
+        if classifier.ensure_archive_hook():
+            print("relay: added the archive ask to Claude Code's settings", file=sys.stderr)
+    except Exception as error:  # noqa: BLE001 — never in the way of a session start
+        print("relay: archive ask not added (%s)" % type(error).__name__, file=sys.stderr)
+
+
 def ensure_running(updated=False):
     """Serialize starts from either agent without blocking a session hook."""
     wait = PORT_TAKEN_WAIT + RELAY_START_WAIT + 5 if updated else 0
@@ -1270,6 +1282,7 @@ def _ensure_running(updated=False):
     """
     if not updated:
         _self_update()
+    _wire_archive_hook()
     _maybe_update_bridge()
     _rename_old_login_file()
     running = _probe_relay()
