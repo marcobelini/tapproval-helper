@@ -50,6 +50,11 @@ longer. A problem that is not yet fixed is not described in public.
   then runs under that session's permission mode and hook. It is never
   posted to a session in bypass or plan mode, and a command is never
   posted there.
+- **With Codex, a message from the wrist goes into the chat through
+  Codex's own local server,** only the one that has that chat open. It is
+  words only, never a command, and the turn runs without network access,
+  with writes limited to the workspace and anything else sent back to you
+  for approval. A chat that connection cannot limit this way is refused.
 - **Cards travel through your own private iCloud or a tunnel** when you
   are away from home. The tunnel carries them in transit only; in iCloud a
   card waits in your own private database until it is answered.
@@ -78,9 +83,9 @@ longer. A problem that is not yet fixed is not described in public.
   could therefore answer a prompt. Protect it with two-factor
   authentication. A second key stored beside the first would add nothing,
   and a key kept anywhere else would end automatic pairing.
-- **Once the watch shows the terminal's row (the helper is ready since
-  1.1.57), "don't ask again" on the watch writes what the terminal's
-  would.** The terminal's words appear only where Claude Code itself
+- **For Claude Code, once the watch shows the terminal's row (the helper
+  is ready since 1.1.57), "don't ask again" on the watch writes what the
+  terminal's would.** The terminal's words appear only where Claude Code itself
   offers the row, and the tap writes only what that row applies: a rule
   for the exact command (or the web host) in the project's
   `.claude/settings.local.json`, or a switch to accept edits for this
@@ -88,6 +93,8 @@ longer. A problem that is not yet fixed is not described in public.
   CRITICAL card, and never anything Base cannot read word for word. Until
   then the watch offers "Always allow for this session", which the relay
   remembers until it restarts and which writes nothing.
+  Codex cards are answered once: the watch offers no "don't ask again"
+  for Codex.
 
 ## The Mac bridge
 

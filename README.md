@@ -9,35 +9,55 @@ risk. This is the computer half of Tapproval.
 [![Or try the beta on TestFlight](https://img.shields.io/badge/TestFlight-Beta-555555?logo=apple&logoColor=white&style=for-the-badge)](https://testflight.apple.com/join/dW1tYBQG)
 [![Website](https://img.shields.io/badge/Website-tapproval.thoughtfulsteward.org-2f7f56?style=for-the-badge)](https://tapproval.thoughtfulsteward.org)
 
+<p align="center">
+  <img src="docs/img/tapproval-demo.gif" width="560"
+       alt="Tapproval on an Apple Watch: the list shows which session needs you, a CRITICAL force-push arrives marked by its risk, nothing runs until you tap, and one tap answers a HIGH-risk delete.">
+</p>
+
+**Three steps, about two minutes:**
+
+1. **Get the watch app:** [Tapproval on the App Store](https://apps.apple.com/app/tapproval/id6805869018), on your Apple Watch.
+2. **Add Base to your computer:** for Claude Code, two lines typed into Claude Code; for Codex, or both, one line in a terminal ([Install](#install), below). macOS, Linux and Windows.
+3. **Open Tapproval on the watch, on the same Wi-Fi.** It finds the computer and pairs by itself; click **Allow** if the computer asks. From then on, what your agent asks comes to your wrist, marked by its risk, at home or away.
+
 On the App Store: 100 answers free, then $5 once per agent (Claude Code, Codex). No subscription.
 In the TestFlight beta the unlock is free.
 
 Privacy policy: https://tapproval.thoughtfulsteward.org/privacy.html · Support: tapproval@thoughtfulsteward.org
 
-When Claude Code works on your computer, it stops and asks before doing
-anything that needs permission. The Tapproval watch app puts those
+When Claude Code or Codex works on your computer, it stops and asks before
+doing anything that needs permission. The Tapproval watch app puts those
 questions on your wrist; **Base** is the small helper on the computer
 that makes it possible. It is open source on purpose: a tool that reads
 your sessions and carries your approvals should be auditable — every
 line of it is in this repository.
 
 **One conversation, everywhere.** A message you send from the watch to a
-session open on your computer goes into that session, so its terminal and
-the Claude app on your phone show it: the app as a message of its own,
-"⌚" and your words, and a terminal by Claude's answer opening with
-"*⌚ …*" and your words. What you type in the terminal or on the phone shows
-on the watch. If what you asked for needs your yes first, Claude asks it
-back as a question card on your wrist. You can end a session from the
-watch too (Reply › More › End session): Claude Code stops on the computer,
-and the conversation stays there to pick up later.
-That small watch is the only mark Base leaves: it says the words came
-from your wrist. Base writes nothing into your commits, and no name or
-link anywhere in the conversation.
+session open on your computer goes into that same session, and what you
+type at the computer or on the phone shows on the watch. If what you asked
+for needs your yes first, your agent asks it back as a question card on
+your wrist. You can put a session away from the watch too (More › Archive
+session).
+- **Claude Code:** the message goes into the session's own inbox, so its
+  terminal and the Claude app on your phone show it, as "⌚" and your words.
+  That small watch is the only mark Base leaves.
+- **Codex:** the message goes into the same chat through Codex's own local
+  server, so wherever you follow that chat shows it. It runs without
+  network access, and anything else it wants to do asks you first. An
+  archived Codex chat can be brought back from the watch's Settings →
+  Archived.
+
+Base writes nothing into your commits, and no name or link anywhere in the
+conversation.
 
 *(Technical id: `tapproval-helper` — the repo and plugin keep that name;
 the product name is Tapproval Base.)*
 
-## Install — no terminal, no downloads
+## Install
+
+Pick the line for the agent you use; using both is fine.
+
+### Claude Code: no terminal
 
 Two lines, typed into Claude Code itself:
 
@@ -55,11 +75,19 @@ session; there is nothing to keep running and nothing to maintain.
 
 > Install the Tapproval plugin from marcobelini/tapproval-helper
 
-**Prefer a terminal?** One command, then forget it:
+### Codex, or both: one line in a terminal
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash
 ```
+
+It finds Codex's folder (`~/.codex`, or wherever `CODEX_HOME` points; run
+Codex once first if you never have) and adds Tapproval's hook there, and
+sets up Claude Code in the same run if you have it. Then open `codex` in a
+terminal once and choose **Trust all and continue**: Codex runs no hook you
+have not trusted, and the helper never trusts one for you. The Claude Code
+plugin above sets up Claude Code only; this line also suits Claude Code
+users who prefer a terminal.
 
 **On Windows (preview).** The helper runs on Windows too: approving and
 denying from the wrist, pairing, waking after a restart and starting a
@@ -138,21 +166,76 @@ your iCloud and your watch. Writing to iCloud straight from the helper,
 through Apple's web sign-in, would work on any computer, and remains the way
 to bring the buzz to Linux and Windows; Apple's sign-in did not complete in our tests.
 
+## What Base is
+
+### The journey of one approval, in plain words
+
+1. Your agent, Claude Code or Codex, wants to run something that needs
+   permission, so it pauses and runs Base.
+2. Base reads the command, works out how risky it is, and gives it a colour.
+   By default the colour is a label for your glance — nothing is decided
+   for you.
+3. Base checks whether you would even have been asked. If your own settings
+   already permit this command, no card is sent: the wrist only ever shows
+   what your agent would have asked you.
+4. The card goes to the relay, a small always-listening part of Base on the
+   same computer.
+5. Your watch finds that computer on your own network by itself — it is not
+   told where to look — and asks every couple of seconds whether anything
+   is waiting.
+6. You tap. The answer travels back, and Base hands it to your agent. With
+   Codex, the same question also shows in Codex's own prompt, and answering
+   either place clears the other.
+7. If your answer never arrives, Base says nothing, and your agent asks you
+   exactly as it would without any of this.
+
+Step 7 is the rule the whole design bends around: **an unanswered question
+is never a granted one.**
+
+| File | Purpose |
+|------|---------|
+| `ClaudeRiskClassifier.py` | The permission hook for Claude Code and Codex: mirrors exactly the prompts your agent shows, labels each with a risk tier, and offers them to the watch |
+| `watch_relay.py` | The relay: the hook posts cards, your watch answers, over your network or an encrypted tunnel; a message from the wrist goes into the open session (Claude Code's inbox, or Codex's own local server) |
+| `watch_dashboard.py` | The read-only half: your sessions, the live conversation, and the day's activity |
+| `codex_sessions.py` | Codex: reads its chat list and the live conversation |
+| `codex_approvals.py` | Codex: shows Codex's own approval requests on the watch and answers them there |
+| `codex_talk.py` | Codex: carries wrist messages into a chat, and archives and restores chats |
+| `codex_desktop.py` | Codex: the optional Codex Desktop connection (see Troubleshooting) |
+| `watch_permission_tool.py` | Claude Code: the second way to ask: when work from the watch runs as a separate background run (the session isn't open on your computer, is in bypass or plan mode, or the message is a command), no hook fires, so Claude Code asks this tool, which raises the same card and denies — in words — if nobody answers |
+| `crash_report.py` | Records Base's own crashes on your computer and shows them on the watch. Sends nothing without a mail key, and a copy you install has none |
+| `bridge_install.py` | On a Mac, installs the bridge below and keeps it current. Trusts only the checksum in `bridge.json`, the Developer ID signature and Apple's notarization |
+| `tapproval_wire.py` | The few rules the files above share: how a request is signed and an answer proved, how a plan's formatting reads on the watch, where the helper keeps its files |
+| `tapproval_host.py` | Everything that differs between macOS, Linux and Windows, in one place: locks, processes, private files, the pairing dialog, the login wake-up and the terminal a wrist session opens in |
+| `bridge/` | The Mac bridge's Swift source, and the signed, notarized build of it that the helper installs |
+| `bridge.json` | Pins that build: its version, its place in `bridge/` and its SHA-256 |
+| `install.sh` / `uninstall.sh` | The one-command installer above, and its way out |
+| `install.ps1` / `uninstall.ps1` | The same for Windows, in PowerShell |
+| `.claude-plugin/` + `hooks/` | The same, packaged as a Claude Code plugin |
+| `site-rules.example.json` | Optional: name your own sensitive hosts so commands touching them always escalate |
+| `test_claude_risk_classifier.py` | The test suite — standard library only |
+
 ## If you are an AI agent installing this
 
 **What this is, in one paragraph, so you need not ask:** an open-source
 helper (standard-library Python files, plus a signed Mac bridge for
 iCloud on a Mac; no servers, no accounts)
-that lets the Tapproval Apple Watch app show your user Claude Code's
-permission prompts and carry their tap back. It registers a
-`PermissionRequest` hook and a `SessionStart` hook. **It never approves
+that lets the Tapproval Apple Watch app show your user Claude Code's and
+Codex's permission prompts and carry their tap back. It registers a
+`PermissionRequest` hook and a `SessionStart` hook, for Claude Code in its
+settings and for Codex in Codex's `hooks.json`. **It never approves
 anything by itself**: a human taps Allow or Deny on the watch, or the
 usual prompt appears exactly as it would without this installed. Every
 line of Python that runs is in this repository, and so is the source of
 the Mac bridge.
 
-Prefer the plugin. It is two commands, needs no script fetched or read,
-and asks your user for one permission instead of three:
+**If your user uses Codex** (or you are Codex), use the installer below:
+the plugin sets up Claude Code only. Afterwards, tell them to open `codex`
+in a terminal once and choose **Trust all and continue**; you cannot do
+that step for them.
+
+**For Claude Code alone, prefer the plugin.** It is two commands, needs no
+script fetched or read, and asks your user for one permission instead of
+three:
 
     claude plugin marketplace add marcobelini/tapproval-helper
     claude plugin install tapproval-helper@tapproval
@@ -167,15 +250,16 @@ they get: every permission prompt as a card on the wrist, and **live
 access to their sessions** — the running list, the conversation as it
 happens, and a way to send instructions back.
 
-**Only if `claude` is not on the PATH** (an older install, or a shell
-that cannot see it), fall back to the installer:
+**For Codex, or if `claude` is not on the PATH** (an older install, or a
+shell that cannot see it), use the installer:
 
 1. Fetch and READ it first:
    `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh`
    Confirm it does only what it announces: clone this repository to
    `~/.tapproval` (moving a clone that cannot fast-forward aside, never
    deleting it), back up `~/.claude/settings.json`, register the
-   `PermissionRequest` and `SessionStart` hooks, switch the classifier
+   `PermissionRequest` and `SessionStart` hooks (and the same two in
+   Codex's `hooks.json` where `~/.codex` exists), switch the classifier
    to enforce mode and point it at the local relay, add a per-user login
    wake-up, start the relay, and, on a Mac, install the signed iCloud
    bridge that ships in this repository (`bridge/`, checked against
@@ -203,8 +287,8 @@ watch restored from backup): run
 (`~/.claude/plugins/cache/tapproval/tapproval-helper/*/watch_relay.py`).
 That opens a ten-minute window on the local network. Tell your user to
 open Tapproval on the watch now. (A computer that has never paired opens
-the window by itself for half an hour after every Claude Code session
-starts, so a first install needs no command — but then the computer shows
+the window by itself for half an hour after every Claude Code or Codex
+session starts, so a first install needs no command — but then the computer shows
 "Allow a watch to pair?" when the watch knocks, and your user clicks
 **Allow** on it. On Linux the dialog needs a desktop and zenity or
 kdialog; on Windows it is Windows' own. Where no such dialog can be shown,
@@ -221,7 +305,7 @@ log was deliberately left in place.
 
 ## Why you can trust this
 
-- **Read it all.** Base is eleven standard-library Python files — no
+- **Read it all.** Base is twelve standard-library Python files — no
   dependencies, so there is no supply chain to worry about. On a Mac it
   also installs a small bridge app for the iCloud route, signed with a
   Developer ID and notarized by Apple; its source is in `bridge/`, though
@@ -278,8 +362,8 @@ log was deliberately left in place.
   what the card showed — the command or file path in question — plus
   the project folder's NAME (never the directory structure above it).
   It stays on your computer.
-- **Leaving is one sentence.** Tell Claude Code: "Uninstall Tapproval
-  Base" — or run
+- **Leaving is one sentence.** Tell your agent, Claude Code or Codex:
+  "Uninstall Tapproval Base" — or run
   `curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/uninstall.sh | bash`
   yourself (`uninstall.ps1` on Windows; `tapproval uninstall` runs the
   same script from your own copy). It restores your settings (backup kept), removes the login
@@ -295,7 +379,7 @@ reaches a server of ours; there is none.
 
 **Runs on your computer**
 
-- The hook, `ClaudeRiskClassifier.py`, each time Claude Code asks
+- The hook, `ClaudeRiskClassifier.py`, each time Claude Code or Codex asks
   permission. It labels the prompt and offers it to the watch. With no
   watch paired it changes nothing.
 - The relay, `watch_relay.py`, started with each session. It listens on
@@ -303,6 +387,9 @@ reaches a server of ours; there is none.
   travel address's local end) and carries cards out and answers back. The
   dashboard reader, `watch_dashboard.py`, gives the watch your session
   list and the live thread.
+- If you use Codex: Base talks to Codex's own local server on this
+  computer, for the chat list, the approvals and wrist messages, and starts
+  it if a wrist message needs it.
 - Bonjour (`dns-sd`), so your watch finds this computer on your own Wi-Fi
   without being told an address. Tailscale is used only if you already run
   it.
@@ -338,11 +425,12 @@ reaches a server of ours; there is none.
 **Reads and writes**
 
 - Reads `~/.claude/settings.json`, to know your own permission rules so the
-  wrist shows only what the terminal would have asked; Claude Code's
+  wrist shows only what Claude Code would have asked; Claude Code's
   transcripts under `~/.claude/projects` and `~/.claude/sessions`, for the
   session list and the live thread; and `~/.codex`, if Codex is in use.
 - Writes the audit log `~/.claude/risk-audit.jsonl`, its own files under
-  `~/.tapproval`, the hook entry in your Claude Code settings, and a login
+  `~/.tapproval`, the hook entries in Claude Code's settings and in Codex's
+  `hooks.json`, and a login
   wake-up: on a Mac a login job in `~/Library/LaunchAgents` and the
   bridge's login item, on Linux `~/.config/autostart/tapproval-base.desktop`,
   and on Windows `Tapproval Base.cmd` in your Startup folder.
@@ -352,56 +440,14 @@ reaches a server of ours; there is none.
   two-line `tapproval` launcher there (`tapproval.cmd` on Windows), never
   over a `tapproval` that is not ours. The uninstall removes it.
 
-## What Base is
-
-### The journey of one approval, in plain words
-
-1. Claude Code wants to run something that needs permission, so it pauses
-   and runs Base.
-2. Base reads the command, works out how risky it is, and gives it a colour.
-   By default the colour is a label for your glance — nothing is decided
-   for you.
-3. Base checks whether you would even have been asked. If your own settings
-   already permit this command, no card is sent: the wrist only ever shows
-   what the terminal would have shown.
-4. The card goes to the relay, a small always-listening part of Base on the
-   same computer.
-5. Your watch finds that computer on your own network by itself — it is not
-   told where to look — and asks every couple of seconds whether anything
-   is waiting.
-6. You tap. The answer travels back, and Base hands it to Claude Code.
-7. If your answer never arrives, Base says nothing, and Claude Code asks you
-   in the terminal exactly as it would without any of this.
-
-Step 7 is the rule the whole design bends around: **an unanswered question
-is never a granted one.**
-
-| File | Purpose |
-|------|---------|
-| `ClaudeRiskClassifier.py` | A Claude Code `PermissionRequest` hook: mirrors exactly the prompts the phone shows, labels each with a risk tier, and offers them to the watch |
-| `watch_relay.py` | The relay: the hook posts cards, your watch answers, over your network or an encrypted tunnel; a message from the wrist goes into an open session's own inbox |
-| `watch_dashboard.py` | The read-only half: your sessions, the live conversation, and the day's activity |
-| `watch_permission_tool.py` | The second way to ask: when work from the watch runs as a separate background run (the session isn't open on your computer, is in bypass or plan mode, or the message is a command), no hook fires, so Claude Code asks this tool, which raises the same card and denies — in words — if nobody answers |
-| `crash_report.py` | Records Base's own crashes on your computer and shows them on the watch. Sends nothing without a mail key, and a copy you install has none |
-| `bridge_install.py` | On a Mac, installs the bridge below and keeps it current. Trusts only the checksum in `bridge.json`, the Developer ID signature and Apple's notarization |
-| `tapproval_wire.py` | The few rules the files above share: how a request is signed and an answer proved, how a plan's formatting reads on the watch, where the helper keeps its files |
-| `tapproval_host.py` | Everything that differs between macOS, Linux and Windows, in one place: locks, processes, private files, the pairing dialog, the login wake-up and the terminal a wrist session opens in |
-| `bridge/` | The Mac bridge's Swift source, and the signed, notarized build of it that the helper installs |
-| `bridge.json` | Pins that build: its version, its place in `bridge/` and its SHA-256 |
-| `install.sh` / `uninstall.sh` | The one-command installer above, and its way out |
-| `install.ps1` / `uninstall.ps1` | The same for Windows, in PowerShell |
-| `.claude-plugin/` + `hooks/` | The same, packaged as a Claude Code plugin |
-| `site-rules.example.json` | Optional: name your own sensitive hosts so commands touching them always escalate |
-| `test_claude_risk_classifier.py` | The test suite — standard library only |
-
 ## Troubleshooting
 
-### Codex sessions — 3.0 preview
+### Codex sessions
 
-The matching Watch beta lists the same non-archived interactive chats as
-Codex Remote for this computer, including idle and unloaded chats. It loads
-older chats as you scroll. An open transcript file does not decide whether
-a chat belongs in the list; deliberate Watch Hide choices still apply.
+The watch lists the same non-archived interactive chats as Codex Remote
+for this computer, including idle and unloaded chats, and loads older chats
+as you scroll. An open transcript file does not decide whether a chat
+belongs in the list.
 
 “Codex chats unavailable” means Base cannot reach the native chat catalog.
 The last list stays visible, with sends unavailable until the connection
@@ -409,28 +455,39 @@ recovers. Codex's local app-server must be reachable. For Desktop, use the
 opt-in adapter's prepared launcher after finishing active work and quitting
 Desktop normally; do not interrupt a working session to reconnect it.
 The iCloud-only route still carries approvals; sessions need LAN or the
-travel connection. This preview still requires physical phone/Watch checks.
+travel connection.
 
-### Codex approval synchronization — 3.0 preview
+### Codex approval synchronization
 
-The extension in
-[#993](https://github.com/marcobelini/tapproval/pull/993) is implemented and
-verified locally, with helper publication pending. It lets Codex's native
-iPhone approval and the watch card appear together; answering either
+Base lets Codex's native iPhone approval and the watch card appear together; answering either
 clears the other. Command, file-change and terminal-input approvals are
 covered. Claude Code keeps its existing approval path.
 
-If cards appear only on the watch, the existing blocking hook may still be
-in use: it waits for the watch before Codex can present the iPhone prompt.
-The new path needs the updated helper and access to the same running local
-Codex app-server as the iPhone session. If it cannot attach, the hook keeps
-the existing watch flow. It does not silently approve the request.
+Showing both needs access to the same running local Codex app-server as
+the iPhone session. If Base cannot attach to it, no card is sent and Codex
+asks you as usual; nothing is approved for you.
 
 An automatic Codex reviewer can approve a call without a human prompt, so
 neither device shows a card. To check synchronization, use a separate
 manual-review session, open that same session on iPhone, and answer once
 on each device while observing the other. Answer any older pending cards
 before replacing the helper; a new helper does not answer them for you.
+
+### Codex Desktop transport (optional)
+
+Base includes an opt-in Desktop CLI adapter for builds that keep
+Desktop's native server separate from the managed daemon. It preserves
+startup arguments and permission settings and uses a private Unix socket;
+Claude Code behavior and pairing are unchanged. This is a Tapproval
+integration, not an official Desktop extension.
+
+Set `TAPPROVAL_CODEX_REAL_CLI` to Desktop's bundled Codex executable, then
+run `python3 ~/.tapproval/codex_desktop.py --prepare-launcher` followed by
+the installed application path. Finish active work and quit Desktop, then
+open `~/.tapproval/data/codex-desktop-launcher/Launch Codex.command`.
+Preparation does not launch or stop anything; the launcher refuses while
+Desktop is running. Use it for bridged launches. A normal application
+launch restores the ordinary transport without changing saved sessions.
 
 ### Connection and helper status
 
@@ -486,23 +543,5 @@ is nothing to sign up for and nothing to buy here — the whole computer
 half is in this repository.
 
 If it earns its place in your setup, the useful thing is to tell one
-other person who leaves Claude running unattended:
+other person who leaves Claude Code or Codex running unattended:
 https://tapproval.thoughtfulsteward.org
-
-
-### Codex Desktop transport — internal 3.0 beta
-
-Helper 1.1.98 includes an opt-in Desktop CLI adapter for builds that keep
-Desktop's native server separate from the managed daemon. It preserves
-startup arguments and permission settings and uses a private Unix socket;
-Claude Code behavior and pairing are unchanged. This is a Tapproval
-integration, not an official Desktop extension.
-
-Set `TAPPROVAL_CODEX_REAL_CLI` to Desktop's bundled Codex executable, then
-run `python3 ~/.tapproval/codex_desktop.py --prepare-launcher` followed by
-the installed application path. Finish active work and quit Desktop, then
-open `~/.tapproval/data/codex-desktop-launcher/Launch Codex.command`.
-Preparation does not launch or stop anything; the launcher refuses while
-Desktop is running. Use it for bridged launches. A normal application
-launch restores the ordinary transport without changing saved sessions.
-Actual Desktop/Watch approval validation still gates public 3.0.
