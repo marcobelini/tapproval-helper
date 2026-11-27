@@ -77,19 +77,26 @@ session; there is nothing to keep running and nothing to maintain.
 
 ### Codex: from Codex's plugin list
 
-In the Codex app, open its plugins, choose **Add marketplace**, enter
-`marcobelini/tapproval-helper`, and install **tapproval-helper**. In a
-terminal it is two lines:
+In the ChatGPT app (Codex's desktop app, renamed in 2026): choose
+**Plugins** in the sidebar, then **Add** and **Add a marketplace**, enter
+`marcobelini/tapproval-helper` as the source and choose **Add
+marketplace**. Open **tapproval-helper** and choose **Install plugin**. In
+a terminal it is two lines:
 
 ```bash
 codex plugin marketplace add marcobelini/tapproval-helper
 codex plugin add tapproval-helper@tapproval
 ```
 
-Then start a new Codex chat. Codex asks you once to review the plugin's
-hooks: choose **Trust all and continue**. Codex runs no hook you have not
-trusted, and Base never trusts one for you. That first start downloads
-Base into `~/.tapproval` (it needs git and a connection) and starts it,
+Then allow the plugin's two hooks, once. In the app: start a new chat,
+choose **Review hooks** by the message box, then **Allow all**. In `codex`
+in a terminal: choose **Trust all and continue** when it asks. Codex runs
+no hook you have not allowed, and Base never allows one for you.
+
+Then start one more new chat and send a message: hooks run only in a chat
+started after you allowed them. That chat downloads Base into
+`~/.tapproval` (it needs git and a connection), starts it, and says it is
+set up,
 and from then on Base updates itself without asking for your trust again:
 the plugin's own folder (`codex-plugin/`) holds only its two hooks and one
 small script, which a Base update leaves alone. On the rare release that
@@ -104,11 +111,11 @@ curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/i
 
 It finds Codex's folder (`~/.codex`, or wherever `CODEX_HOME` points; run
 Codex once first if you never have) and adds Tapproval's hook there, and
-sets up Claude Code in the same run if you have it. Then open `codex` in a
-terminal once and choose **Trust all and continue**: Codex runs no hook you
-have not trusted, and the helper never trusts one for you. The Claude Code
-plugin above sets up Claude Code only; this line also suits Claude Code
-users who prefer a terminal.
+sets up Claude Code in the same run if you have it. Then allow Tapproval's
+hook in Codex once: open `codex` in a terminal and choose **Trust all and
+continue**, or in the ChatGPT app choose **Review hooks**, then **Allow
+all**. Codex runs no hook you have not allowed, and the helper never allows
+one for you. This line also suits Claude Code users who prefer a terminal.
 
 **On Windows (preview).** The helper runs on Windows too: approving and
 denying from the wrist, pairing, waking after a restart and starting a
@@ -250,10 +257,13 @@ usual prompt appears exactly as it would without this installed. Every
 line of Python that runs is in this repository, and so is the source of
 the Mac bridge.
 
-**If your user uses Codex** (or you are Codex), use the installer below:
-the plugin sets up Claude Code only. Afterwards, tell them to open `codex`
-in a terminal once and choose **Trust all and continue**; you cannot do
-that step for them.
+**If your user uses Codex** (or you are Codex), add Codex's plugin:
+`codex plugin marketplace add marcobelini/tapproval-helper`, then
+`codex plugin add tapproval-helper@tapproval` (or use the installer
+below). Afterwards, tell them to allow the hooks once, which you cannot do
+for them: in the ChatGPT app, a new chat, **Review hooks**, then **Allow
+all**, and then one more new chat; in `codex` in a terminal, **Trust all
+and continue**.
 
 **For Claude Code alone, prefer the plugin.** It is two commands, needs no
 script fetched or read, and asks your user for one permission instead of

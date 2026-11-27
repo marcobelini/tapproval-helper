@@ -113,7 +113,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.143"
+__version__ = "1.1.144"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -6294,7 +6294,7 @@ def _say_command(short):
 def _say_codex(codex):
     if codex == "installed":
         print("  Codex    : wired too; open codex in Terminal once and choose "
-              "\"Trust all and continue\"")
+              "\"Trust all and continue\" (or in the ChatGPT app choose \"Review hooks\", then \"Allow all\")")
     elif codex == "current":
         # An unchanged hooks.json says nothing about trust: ask Codex's own
         # record, and keep the instruction until it says trusted.
@@ -6302,7 +6302,7 @@ def _say_codex(codex):
             print("  Codex    : wired and trusted")
         else:
             print("  Codex    : wired, not trusted yet; open codex in Terminal once "
-                  "and choose \"Trust all and continue\"")
+                  "and choose \"Trust all and continue\" (or in the ChatGPT app choose \"Review hooks\", then \"Allow all\")")
 
 
 def _settings_or_explain():
@@ -6802,14 +6802,15 @@ def run_status():
         if _codex_plugin_trusted():
             print("Codex         : the Codex plugin, trusted")
         else:
-            print("Codex         : the Codex plugin, not trusted yet; choose \"Trust all "
-                  "and continue\" when Codex asks you to review hooks")
+            print("Codex         : the Codex plugin, not trusted yet; in the ChatGPT app choose \"Review hooks\", then \"Allow all\", "
+                  "then start a new chat (in codex in a terminal: \"Trust all and "
+                  "continue\")")
     if codex_wired:
         if _codex_hooks_json_trusted() is True:
             print("Codex         : wired and trusted")
         else:
             print("Codex         : wired, not trusted yet; open codex in Terminal once "
-                  "and choose \"Trust all and continue\"")
+                  "and choose \"Trust all and continue\" (or in the ChatGPT app choose \"Review hooks\", then \"Allow all\")")
     elif os.path.isdir(_codex_home()) and not codex_plugin_enabled():
         print("Codex         : not wired \u2014 re-run --install to add it")
     print("Version       : %s" % __version__)

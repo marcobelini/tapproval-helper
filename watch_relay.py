@@ -7960,9 +7960,9 @@ def check_codex_hook():
     if trusted is False:
         note_condition(
             "codex",
-            "Codex asks its questions on the computer until you trust "
-            "Tapproval in Codex: choose \"Trust all and continue\" when "
-            "Codex asks you to review hooks.")
+            "Codex asks its questions on the computer until you allow "
+            "Tapproval's hooks: in the ChatGPT app, Review hooks, then Allow "
+            "all, and start a new chat; in a terminal, \"Trust all and continue\".")
         return False
     clear_condition("codex")
     return True

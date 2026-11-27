@@ -25393,6 +25393,9 @@ class TestCodexAgent:
         crc._say_codex("installed")
         said = capsys.readouterr().out
         assert "Trust all and continue" in said and "/hooks" not in said
+        # The ChatGPT app (Codex's desktop app since 2026-07) has its own
+        # buttons: an app user is never told the terminal's words alone.
+        assert "Review hooks" in said and "Allow all" in said
 
 
 class TestTheWatchLearnsWhichAgentsAreWired:
@@ -25580,7 +25583,10 @@ class TestCodexPluginInTheHelper:
     def test_status_says_the_plugin_and_its_trust(self, capsys):
         self._config()
         crc.run_status()
-        assert "Codex         : the Codex plugin, not trusted yet" in capsys.readouterr().out
+        said = capsys.readouterr().out
+        assert "Codex         : the Codex plugin, not trusted yet" in said
+        # The plugin's hooks run only in a chat started after allowing them.
+        assert "Allow all" in said and "new chat" in said
         self._config(trusted=True)
         crc.run_status()
         assert "Codex         : the Codex plugin, trusted" in capsys.readouterr().out
@@ -25761,6 +25767,8 @@ class TestCodexHookTrust:
         assert watch_relay.check_codex_hook() is False
         said = [c for c in watch_relay.conditions() if c["key"] == "codex"]
         assert said and "Trust all and continue" in said[0]["detail"], said
+        assert "Review hooks" in said[0]["detail"] and "Allow all" in said[0]["detail"]
+        assert "new chat" in said[0]["detail"], said   # setup runs only in the next chat
         self._trust(key)
         assert watch_relay.check_codex_hook() is True
         assert not [c for c in watch_relay.conditions() if c["key"] == "codex"]
