@@ -7968,6 +7968,24 @@ def check_codex_hook():
     return True
 
 
+def keep_codex_desktop_shared():
+    """Have every launch of the ChatGPT app join the shared Codex engine,
+    so its chats can ask on the watch (codex_desktop.keep_every_launch).
+    Run once as the relay starts, which is at login and after an update."""
+    try:
+        from ClaudeRiskClassifier import codex_hook_trusted
+        import codex_desktop
+    except ImportError:                # no helper beside us: `helper` says so
+        return None
+    try:
+        said = codex_desktop.keep_every_launch(codex_hook_trusted() is not None)
+    except Exception as error:         # noqa: BLE001 — the relay must start regardless
+        said = "could not set up the ChatGPT app's connection: %s" % error
+    if said:
+        print("relay: " + said, file=sys.stderr)
+    return said
+
+
 def watch_bridge(queue, sleep=time.sleep, checks=None):
     """Look at the bridge once a minute for as long as the relay runs."""
     started = time.monotonic()
@@ -8538,6 +8556,7 @@ def main(argv=None):
     check_helper_is_visible()
     check_dashboard_is_loaded()
     check_codex_hook()
+    keep_codex_desktop_shared()
     ensure_claude_on_path()
     helper_provenance()
     install_crash_reporting()

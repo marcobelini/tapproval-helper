@@ -113,7 +113,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.144"
+__version__ = "1.1.145"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -6321,6 +6321,18 @@ def _settings_or_explain():
         return None
 
 
+def _forget_codex_desktop_launch():
+    """Take back the login setting that sends the ChatGPT app through
+    Tapproval (codex_desktop.keep_every_launch): its wrapper is about to go
+    with ~/.tapproval. False when there was none, or nothing to ask."""
+    try:
+        import codex_desktop
+        return codex_desktop.forget_every_launch()
+    except Exception as error:  # noqa: BLE001 — uninstall goes on regardless
+        print("Could not check the ChatGPT app's launch setting: %s" % error, file=sys.stderr)
+        return False
+
+
 def run_uninstall():
     """Remove our hook entry, leaving everything else in settings untouched."""
     # The short command and the login entry are ours whatever settings.json
@@ -6328,6 +6340,8 @@ def run_uninstall():
     # the uninstall before either was looked for (2026-11-14 review).
     remove_command()
     login_removed = remove_launch_agent()
+    if _forget_codex_desktop_launch():
+        print("The ChatGPT app opens with its own Codex again (reopen it once).")
     plugin_removal = remove_codex_plugin()
     if plugin_removal == "removed":
         print("Removed the Codex plugin.")

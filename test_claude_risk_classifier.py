@@ -20194,6 +20194,47 @@ class TestTheReleaseWritesTheWebsite:
         changelog = git(bare, "show", "main:src/content/pages/changelog.ts")
         assert "/changelog.html" in changelog and "changelog.html one" in changelog
 
+    def test_it_carries_the_beta_count_onto_the_home_page(self, tmp_path):
+        """The count beside "Or try the beta" stood at 82 for nine days
+        after the move to Lovable, because it was only ever written into
+        the old copy of the page (2026-11-27)."""
+        product, bare, env, git = self._setup(tmp_path)
+        # A stand-in for the real script, which asks App Store Connect:
+        # it records its arguments and rewrites the page it is pointed at.
+        asc = product / "WatchApp" / "asc"
+        asc.mkdir(parents=True)
+        (asc / "beta_spots.py").write_text(
+            "import sys\n"
+            "page = sys.argv[sys.argv.index('--page') + 1]\n"
+            "text = open(page).read().replace('82 spots left', '26 spots left')\n"
+            "open(page, 'w').write(text)\n")
+        git(product, "add", "-A")
+        git(product, "commit", "-q", "-m", "count")
+        work = tmp_path / "site-home"
+        git(tmp_path, "clone", "-q", str(bare), str(work))
+        (work / "src" / "content" / "pages" / "home.ts").write_text(
+            'body: "<!-- beta-spots -->82 spots left<!-- /beta-spots -->"\n')
+        git(work, "add", "-A")
+        git(work, "commit", "-q", "-m", "home")
+        git(work, "push", "-q", "origin", "HEAD:main")
+        done = self._run(product, env)
+        assert done.returncode == 0, done.stderr
+        home = git(bare, "show", "main:src/content/pages/home.ts")
+        assert "26 spots left" in home and "82" not in home
+
+    def test_a_count_that_fails_holds_back_nothing_else(self, tmp_path):
+        product, bare, env, git = self._setup(tmp_path)
+        asc = product / "WatchApp" / "asc"
+        asc.mkdir(parents=True)
+        (asc / "beta_spots.py").write_text("raise SystemExit('no key here')\n")
+        git(product, "add", "-A")
+        git(product, "commit", "-q", "-m", "count")
+        done = self._run(product, env)
+        assert done.returncode == 0, done.stderr
+        assert "beta count was not refreshed" in done.stderr
+        files = git(bare, "show", "--name-only", "--format=", "main").split()
+        assert "src/content/pages/changelog.ts" in files
+
     def test_nothing_new_is_no_commit(self, tmp_path):
         product, bare, env, git = self._setup(tmp_path)
         assert self._run(product, env).returncode == 0
@@ -25772,6 +25813,51 @@ class TestCodexHookTrust:
         self._trust(key)
         assert watch_relay.check_codex_hook() is True
         assert not [c for c in watch_relay.conditions() if c["key"] == "codex"]
+
+
+class TestTheChatGPTAppJoinsTheSharedEngine:
+    """Every launch of the ChatGPT app goes through Tapproval's adapter, so
+    its chats can ask on the watch; a plain launch kept a private engine the
+    watch could not reach (2026-11-27, #1010)."""
+
+    def test_the_relay_hands_over_whether_codex_has_our_hook(self, monkeypatch, capsys):
+        import codex_desktop
+        seen = []
+        monkeypatch.setattr(crc, "codex_hook_trusted", lambda: False)
+        monkeypatch.setattr(codex_desktop, "keep_every_launch",
+                            lambda wired: seen.append(wired) or "it changed")
+        assert watch_relay.keep_codex_desktop_shared() == "it changed"
+        monkeypatch.setattr(crc, "codex_hook_trusted", lambda: None)
+        assert watch_relay.keep_codex_desktop_shared() == "it changed"
+        assert seen == [True, False]
+        assert capsys.readouterr().err.count("relay: it changed") == 2
+
+    def test_a_failure_is_said_and_the_relay_goes_on(self, monkeypatch, capsys):
+        import codex_desktop
+        def broken(wired):
+            raise RuntimeError("boom")
+        monkeypatch.setattr(codex_desktop, "keep_every_launch", broken)
+        said = watch_relay.keep_codex_desktop_shared()
+        assert "could not set up the ChatGPT app" in said and "boom" in said
+        assert "could not set up" in capsys.readouterr().err
+
+    def test_the_relay_does_it_as_it_starts(self):
+        source = Path(watch_relay.__file__).read_text()
+        start = source.index("    check_codex_hook()\n    keep_codex_desktop_shared()")
+        assert start < source.index("server, queue = serve(args.host")
+
+    def test_uninstall_takes_the_setting_back(self, monkeypatch, capsys):
+        import codex_desktop
+        monkeypatch.setattr(codex_desktop, "forget_every_launch", lambda: True)
+        assert crc._forget_codex_desktop_launch() is True
+        def broken():
+            raise OSError("no launchctl")
+        monkeypatch.setattr(codex_desktop, "forget_every_launch", broken)
+        assert crc._forget_codex_desktop_launch() is False
+        assert "no launchctl" in capsys.readouterr().err
+        source = Path(crc.__file__).read_text()
+        body = source[source.index("def run_uninstall():"):]
+        assert "_forget_codex_desktop_launch()" in body[:body.index("_settings_or_explain()")]
 
 
 class TestCardsAnsweredAtTheDeskLeave:

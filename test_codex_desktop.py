@@ -1024,3 +1024,180 @@ def test_one_untranslatable_request_is_refused_alone(monkeypatch):
     assert sent == [good], "the connection ended at the bad request"
     answer = json.loads(out.getvalue().decode().splitlines()[0])
     assert answer['id'] == 7 and answer['error']['code'] == -32602
+
+
+# ---- every launch of the ChatGPT app (2026-11-27, #1010) ---------------------
+
+def _fake_app(root, bundle='com.openai.codex', name='ChatGPT.app'):
+    app = root / name
+    (app / 'Contents').mkdir(parents=True)
+    (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(
+        {'CFBundleIdentifier': bundle, 'CFBundleExecutable': 'ChatGPT'}))
+    cli = app / desktop.DESKTOP_CLI
+    cli.parent.mkdir(parents=True)
+    cli.write_text('#!/bin/sh\n')
+    cli.chmod(0o700)
+    return app, cli
+
+
+@pytest.fixture
+def login(tmp_path, monkeypatch):
+    """A stand-in for this login's launchctl environment."""
+    if not hasattr(os, 'getuid'):
+        pytest.skip('the launcher needs a POSIX host')
+    store, calls = {}, []
+    def launchctl(*args):
+        calls.append(args)
+        verb, name = args[0], args[1]
+        if verb == 'getenv':
+            return store.get(name, '')
+        if verb == 'setenv':
+            store[name] = args[2]
+        elif verb == 'unsetenv':
+            store.pop(name, None)
+        return ''
+    monkeypatch.setattr(desktop, '_launchctl', launchctl)
+    monkeypatch.setattr(desktop.host, 'is_mac', lambda: True)
+    monkeypatch.setattr(desktop.Path, 'home', lambda: tmp_path)
+    return store, calls
+
+
+def test_every_launch_of_the_app_joins_the_shared_engine(tmp_path, login):
+    store, _ = login
+    app, cli = _fake_app(tmp_path / 'Applications')
+    said = desktop.keep_every_launch(True, candidates=[app])
+    assert 'now opens with Tapproval' in said
+    wrapper = desktop.launcher_wrapper()
+    assert store == {'CODEX_CLI_PATH': wrapper, 'TAPPROVAL_CODEX_REAL_CLI': str(cli.resolve())}
+    assert desktop.Path(wrapper).is_file() and str(cli.resolve()) in desktop.Path(wrapper).read_text()
+    # Already so: nothing to say, nothing written again.
+    assert desktop.keep_every_launch(True, candidates=[app]) is None
+
+
+def test_the_setting_is_taken_back_without_the_hook_or_the_app(tmp_path, login):
+    store, _ = login
+    app, _cli = _fake_app(tmp_path / 'Applications')
+    desktop.keep_every_launch(True, candidates=[app])
+    assert 'its own Codex again' in desktop.keep_every_launch(False, candidates=[app])
+    assert store == {}
+    desktop.keep_every_launch(True, candidates=[app])
+    assert 'its own Codex again' in desktop.keep_every_launch(True, candidates=[])
+    assert store == {}
+
+
+def test_someone_elses_codex_cli_path_is_left_alone(tmp_path, login):
+    store, _ = login
+    store['CODEX_CLI_PATH'] = '/opt/their/codex'
+    app, _cli = _fake_app(tmp_path / 'Applications')
+    assert 'something else' in desktop.keep_every_launch(True, candidates=[app])
+    assert store == {'CODEX_CLI_PATH': '/opt/their/codex'}
+    assert desktop.keep_every_launch(False, candidates=[app]) is None
+    assert desktop.forget_every_launch() is False
+    assert store == {'CODEX_CLI_PATH': '/opt/their/codex'}
+
+
+def test_an_app_that_is_not_codexs_is_not_taken(tmp_path, login):
+    store, _ = login
+    other, _cli = _fake_app(tmp_path / 'Applications', bundle='com.example.other')
+    assert desktop.keep_every_launch(True, candidates=[other]) is None
+    assert store == {}
+
+
+def test_a_setting_launchctl_did_not_keep_is_said(tmp_path, login, monkeypatch):
+    store, _ = login
+    monkeypatch.setattr(desktop, '_launchctl', lambda *args: '')
+    app, _cli = _fake_app(tmp_path / 'Applications')
+    assert 'could not give this login' in desktop.keep_every_launch(True, candidates=[app])
+
+
+def test_off_a_mac_nothing_is_set(tmp_path, login, monkeypatch):
+    store, calls = login
+    monkeypatch.setattr(desktop.host, 'is_mac', lambda: False)
+    app, _cli = _fake_app(tmp_path / 'Applications')
+    assert desktop.keep_every_launch(True, candidates=[app]) is None
+    assert desktop.forget_every_launch() is False
+    assert store == {} and calls == []
+
+
+def test_no_test_reaches_the_real_login(monkeypatch):
+    """The relay's main() runs in the suite; its setenv must not outlive it."""
+    monkeypatch.setattr(desktop.subprocess, 'run',
+                        lambda *args, **kwargs: pytest.fail('ran the real launchctl'))
+    assert desktop._launchctl('setenv', 'CODEX_CLI_PATH', '/x') == ''
+
+
+def _record_own_engine(monkeypatch):
+    started = []
+    monkeypatch.setattr(desktop.os, 'execve',
+                        lambda path, argv, env: started.append((path, argv, env)))
+    return started
+
+
+def test_an_unreachable_shared_engine_starts_the_apps_own(tmp_path, monkeypatch, capsys):
+    """Every launch comes through the adapter now: a refusal would leave the
+    app with no Codex at all."""
+    monkeypatch.setattr(desktop.host, 'native_windows', lambda: False)
+    real = tmp_path / 'codex'
+    real.touch()
+    def unreachable(**kwargs):
+        raise OSError('no shared Codex')
+    monkeypatch.setattr(talk, '_shared_client', unreachable, raising=False)
+    monkeypatch.setattr(desktop, 'proxy_stdio', lambda *a, **k: pytest.fail('joined anyway'))
+    monkeypatch.setenv('TAPPROVAL_CODEX_REAL_CLI', str(real))
+    started = _record_own_engine(monkeypatch)
+    desktop.run(str(real), ['app-server', '--analytics-default-enabled'])
+    [(path, argv, env)] = started
+    assert path == str(real.resolve())
+    assert argv == [str(real.resolve()), 'app-server', '--analytics-default-enabled']
+    assert env['CODEX_CLI_PATH'] == str(real.resolve()) and 'TAPPROVAL_CODEX_REAL_CLI' not in env
+    assert "app's own Codex" in capsys.readouterr().err
+
+
+def test_an_untranslatable_startup_option_starts_the_apps_own(tmp_path, monkeypatch):
+    monkeypatch.setattr(desktop.host, 'native_windows', lambda: False)
+    real = tmp_path / 'codex'
+    real.touch()
+    monkeypatch.setattr(talk, '_shared_client', lambda **k: pytest.fail('asked the shared engine'),
+                        raising=False)
+    started = _record_own_engine(monkeypatch)
+    desktop.run(str(real), ['app-server', '--code-mode-host', 'http://a-host'])
+    assert [argv[1:] for _path, argv, _env in started] == [
+        ['app-server', '--code-mode-host', 'http://a-host']]
+
+
+def test_a_socket_that_will_not_open_starts_the_apps_own(tmp_path, monkeypatch):
+    import codex_approvals
+    monkeypatch.setattr(desktop.host, 'native_windows', lambda: False)
+    real = tmp_path / 'codex'
+    real.touch()
+    class Shared:
+        def close(self):
+            pass
+    monkeypatch.setattr(talk, '_shared_client', lambda **k: Shared(), raising=False)
+    def closed(*args, **kwargs):
+        raise ConnectionRefusedError('socket gone')
+    monkeypatch.setattr(codex_approvals, 'LocalWebSocket', closed)
+    started = _record_own_engine(monkeypatch)
+    desktop.run(str(real), ['app-server'])
+    assert len(started) == 1
+
+
+def test_the_wrapper_runs_the_apps_codex_when_tapproval_is_gone(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    if not hasattr(os, 'getuid'):
+        pytest.skip('the launcher needs a POSIX host')
+    monkeypatch.setattr(desktop.host, 'is_mac', lambda: True)
+    monkeypatch.setattr(desktop.Path, 'home', lambda: tmp_path)
+    monkeypatch.setattr(desktop, '__file__', str(tmp_path / 'gone' / 'codex_desktop.py'))
+    cli = tmp_path / 'codex'
+    cli.write_text('#!%s\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n' % sys.executable)
+    cli.chmod(0o700)
+    app = tmp_path / 'Desktop.app'
+    (app / 'Contents').mkdir(parents=True)
+    (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable': 'Desktop'}))
+    wrapper = desktop.prepare_launcher(str(cli), str(app)).parent / 'codex'
+    result = subprocess.run([str(wrapper), 'app-server', 'two words'],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ['app-server', 'two words']

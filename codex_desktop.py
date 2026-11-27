@@ -265,7 +265,10 @@ def proxy_stdio(path, overrides=None):
     """One shared owner, preserving framing and the connection's thread defaults."""
     from codex_approvals import LocalWebSocket
     limit = 16 * 1024 * 1024
-    wire = LocalWebSocket(path, max_message=limit)
+    try:
+        wire = LocalWebSocket(path, max_message=limit)
+    except (OSError, ValueError) as error:
+        raise NotJoined(error) from error
     done = threading.Event()
     failed = threading.Event()
     written = threading.Lock()
@@ -324,8 +327,29 @@ def proxy_stdio(path, overrides=None):
         reader.join(timeout=2)
 
 
+class NotJoined(Exception):
+    """The shared engine could not be reached before Desktop sent anything."""
+
+
+def own_engine(cli, args, env, why):
+    """Start the app's own Codex engine, as a launch without Tapproval does.
+
+    Since every launch of the ChatGPT app comes through here (2026-11-27),
+    a refusal would leave the app with no Codex at all. The chat then
+    cannot ask on the watch, which is today's state for a plain launch,
+    so it is said once on stderr and nothing else changes."""
+    print("Tapproval Desktop adapter: %s. Starting the app's own Codex, so "
+          "its questions stay on this computer and the phone." % why, file=sys.stderr)
+    os.execve(cli, [cli, *args], env)
+
+
 def run(cli, args):
-    """Join the phone's owner; never spawn a competing Desktop app-server."""
+    """Join the phone's owner; never spawn a competing Desktop app-server.
+
+    Anything that stops the join before Desktop's first message falls back
+    to the app's own engine (own_engine). Once messages flow, a failure
+    ends this connection as before: Desktop restarts its engine, and the
+    next start falls back if the shared one is still out of reach."""
     cli = str(Path(cli).resolve(strict=True))
     env = dict(os.environ)
     # Child tools must resolve the real CLI rather than recurse into the adapter.
@@ -334,20 +358,27 @@ def run(cli, args):
     env["CODEX_APP_RUNTIME_CLI_PATH"] = cli
     if not bridge_args(args):
         return subprocess.call([cli, *args], env=env)
-    if host.native_windows():
-        raise ValueError("The Desktop socket adapter currently requires a POSIX host")
-    overrides = shared_overrides(args, env)
-    from codex_talk import _shared_client, shared_socket
-    # Should this start the shared service, the service outlives this
-    # Desktop and serves the phone and the watch: it gets the real CLI and
-    # none of this connection's own bindings, which go per thread above
-    # and go stale once Desktop quits (2026-11-09 review).
-    service_env = {key: value for key, value in env.items() if key not in DESKTOP_BINDINGS}
-    client = _shared_client(binary=cli, env=service_env)
-    client.close()
+    try:
+        if host.native_windows():
+            raise ValueError("The Desktop socket adapter currently requires a POSIX host")
+        overrides = shared_overrides(args, env)
+        from codex_talk import _shared_client, shared_socket
+        # Should this start the shared service, the service outlives this
+        # Desktop and serves the phone and the watch: it gets the real CLI and
+        # none of this connection's own bindings, which go per thread above
+        # and go stale once Desktop quits (2026-11-09 review).
+        service_env = {key: value for key, value in env.items() if key not in DESKTOP_BINDINGS}
+        client = _shared_client(binary=cli, env=service_env)
+        client.close()
+        path = shared_socket()
+    except Exception as error:  # noqa: BLE001 — nothing sent yet: the app's own engine
+        return own_engine(cli, args, env, error)
     # Disconnecting the Desktop closes only its client, never the shared
     # server or a phone/watch turn. No writer ownership needs transferring.
-    return proxy_stdio(shared_socket(), overrides=overrides)
+    try:
+        return proxy_stdio(path, overrides=overrides)
+    except NotJoined as error:
+        return own_engine(cli, args, env, error)
 
 
 def prepare_launcher(cli, app):
@@ -364,9 +395,14 @@ def prepare_launcher(cli, app):
     module = str(Path(__file__).resolve())
     wrapper, launcher = root / "codex", root / "Launch Codex.command"
     common = "%s %s" % (shlex.quote(sys.executable), shlex.quote(module))
+    real = shlex.quote(str(cli))
     contents = {
-        wrapper: ('#!/bin/sh\nexport TAPPROVAL_CODEX_REAL_CLI=%s\nexec %s "$@"\n'
-                  % (shlex.quote(str(cli)), common)),
+        # With Python or this file gone, the app still gets its own Codex:
+        # every launch comes through here (keep_every_launch).
+        wrapper: ('#!/bin/sh\nexport TAPPROVAL_CODEX_REAL_CLI=%s\n'
+                  'if [ -x %s ] && [ -f %s ]; then exec %s "$@"; fi\n'
+                  'exec %s "$@"\n'
+                  % (real, shlex.quote(sys.executable), shlex.quote(module), common, real)),
         launcher: ("#!/bin/sh\nexport CODEX_CLI_PATH=%s\nexport TAPPROVAL_CODEX_REAL_CLI=%s\n"
                    "exec %s --launch %s\n") % (
                        shlex.quote(str(wrapper)), shlex.quote(str(cli)), common, shlex.quote(str(app))),
@@ -394,6 +430,99 @@ def launch(app, cli):
     if os.environ.get("CODEX_HOME"):
         args += ["--env", "CODEX_HOME=" + os.environ["CODEX_HOME"]]
     return subprocess.call(args + ["-a", str(app)])
+
+
+#: The ChatGPT app (Codex's desktop app until its 2026 rename) keeps this
+#: bundle identifier, and the Codex it runs at this place inside it.
+DESKTOP_BUNDLE_ID = "com.openai.codex"
+DESKTOP_CLI = "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+#: What the prepared launcher hands the app, made permanent for the login.
+LAUNCH_VARIABLES = ("CODEX_CLI_PATH", "TAPPROVAL_CODEX_REAL_CLI")
+
+
+def desktop_app(candidates=None):
+    """The installed ChatGPT app and the Codex inside it, or None."""
+    if candidates is None:
+        candidates = [base / name for base in (Path("/Applications"), Path.home() / "Applications")
+                      for name in ("ChatGPT.app", "Codex.app")]
+    for app in candidates:
+        try:
+            with (Path(app) / "Contents/Info.plist").open("rb") as source:
+                info = plistlib.load(source)
+        except (OSError, ValueError):
+            continue
+        cli = Path(app) / DESKTOP_CLI
+        if (isinstance(info, dict) and info.get("CFBundleIdentifier") == DESKTOP_BUNDLE_ID
+                and cli.is_file() and os.access(cli, os.X_OK)):
+            return Path(app), cli
+    return None
+
+
+def _launchctl(*args):
+    """launchctl, for this login's environment. Tests replace this, and a
+    test that forgets cannot reach the real login: the relay's main() runs
+    in the suite, and its setenv would outlive the run (as crash_report's
+    hooks once did)."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return ""
+    done = subprocess.run(["launchctl", *args], capture_output=True, text=True, timeout=10)
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
+def launcher_wrapper():
+    return str(Path.home() / ".tapproval/data/codex-desktop-launcher/codex")
+
+
+def keep_every_launch(wired, candidates=None):
+    """Make every launch of the ChatGPT app join the shared Codex engine.
+
+    In plain words: the prepared launcher's two settings, given to this
+    login rather than to one launch, so the Dock, Spotlight and a login
+    item open the app the launcher's way too, and its chats can ask on the
+    watch (#1010). The app reads them only when it starts, so one already
+    open keeps its own engine until it is reopened. If the join fails, the
+    adapter starts the app's own engine (own_engine).
+
+    ``wired`` says Codex has Tapproval's hook. Without it, or without the
+    app, the settings are taken back if they are ours. A CODEX_CLI_PATH
+    someone else set is left alone. Returns a sentence for the relay log
+    when something changed or was left alone, else None."""
+    if not host.is_mac():
+        return None
+    wrapper = launcher_wrapper()
+    current = _launchctl("getenv", "CODEX_CLI_PATH")
+    found = desktop_app(candidates) if wired else None
+    if found is None:
+        if current != wrapper:
+            return None
+        forget_every_launch()
+        return "the ChatGPT app opens with its own Codex again"
+    if current and current != wrapper:
+        return ("CODEX_CLI_PATH is set to something else, so the ChatGPT app "
+                "opens with that, not with Tapproval's connection")
+    app, cli = found
+    # Written on every start, so an update's wrapper (its fallback among
+    # it) reaches a login whose settings are already in place.
+    prepare_launcher(str(cli), str(app))
+    real = str(cli.resolve())
+    if current == wrapper and _launchctl("getenv", "TAPPROVAL_CODEX_REAL_CLI") == real:
+        return None
+    _launchctl("setenv", "TAPPROVAL_CODEX_REAL_CLI", real)
+    _launchctl("setenv", "CODEX_CLI_PATH", wrapper)
+    if _launchctl("getenv", "CODEX_CLI_PATH") != wrapper:
+        return ("could not give this login Tapproval's connection for the "
+                "ChatGPT app, so its chats ask on this computer and the phone only")
+    return ("the ChatGPT app now opens with Tapproval's connection, so its "
+            "chats can ask on the watch (one already open: reopen it once)")
+
+
+def forget_every_launch():
+    """Take keep_every_launch's settings back, if they are ours. True if so."""
+    if not host.is_mac() or _launchctl("getenv", "CODEX_CLI_PATH") != launcher_wrapper():
+        return False
+    for name in LAUNCH_VARIABLES:
+        _launchctl("unsetenv", name)
+    return True
 
 
 def main():
