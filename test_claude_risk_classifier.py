@@ -20351,9 +20351,18 @@ class TestTheBetaIsOfferedWherePeopleAlreadyAre:
     """Launch plan, 2026-10-05: everyone who installs the helper or reads
     its listing is the exact audience for the beta, so the way in sits
     next to every App Store link. The installer's machine-read lines must
-    not move for it."""
+    not move for it.
 
-    BETA = "https://testflight.apple.com/join/dW1tYBQG"
+    Since 2026-11-27 each place has a link of its own, one TestFlight
+    group each, so the desk can say which place brings testers (Apple
+    counts per link). A page must carry its own door, not a neighbour's:
+    the wrong link still works, and would quietly count under another
+    place."""
+
+    WEBSITE = "https://testflight.apple.com/join/dW1tYBQG"   # "Public beta"
+    GITHUB = "https://testflight.apple.com/join/q512M3Qp"    # "Beta from GitHub"
+    INSTALLER = "https://testflight.apple.com/join/DWQq5jqa"  # "Beta from the installer"
+    DOORS = (WEBSITE, GITHUB, INSTALLER)
 
     @staticmethod
     def _read(relative):
@@ -20367,15 +20376,23 @@ class TestTheBetaIsOfferedWherePeopleAlreadyAre:
         script = self._read("install.sh")
         ready = 'echo "TAPPROVAL_BASE_READY"\necho "OK: Tapproval Base is ready.'
         assert ready in script, "callers match these lines exactly"
-        assert script.index(self.BETA) > script.index("TAPPROVAL_BASE_READY")
+        assert script.index(self.INSTALLER) > script.index("TAPPROVAL_BASE_READY")
+
+    @pytest.mark.parametrize("relative", ["install.sh", "install.ps1"])
+    def test_each_installer_offers_the_installers_own_door(self, relative):
+        text = self._read(relative)
+        assert self.INSTALLER in text
+        assert [d for d in self.DOORS if d != self.INSTALLER and d in text] == []
 
     @pytest.mark.private_layout
-    @pytest.mark.parametrize("relative", [
-        "helper/README.md", "helper/docs/index.html",
-        "helper/docs/apple-watch-claude-code.html"])
-    def test_every_page_with_the_app_store_offers_the_beta(self, relative):
+    @pytest.mark.parametrize("relative, door", [
+        ("helper/README.md", GITHUB),
+        ("helper/docs/index.html", WEBSITE),
+        ("helper/docs/apple-watch-claude-code.html", WEBSITE)])
+    def test_every_page_with_the_app_store_offers_its_own_door(self, relative, door):
         text = self._read(relative)
-        assert self.BETA in text and "unlock is free" in text
+        assert door in text and "unlock is free" in text
+        assert [d for d in self.DOORS if d != door and d in text] == []
 
     @pytest.mark.private_layout
     @pytest.mark.parametrize("relative", [
