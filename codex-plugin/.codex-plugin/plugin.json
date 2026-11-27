@@ -1,0 +1,14 @@
+{
+  "name": "tapproval-helper",
+  "version": "1.0.0",
+  "description": "Tapproval Base for Codex: Codex's questions on your Apple Watch, marked by risk, answered with a tap. Needs the Tapproval watch app.",
+  "author": {
+    "name": "Tapproval",
+    "email": "tapproval@thoughtfulsteward.org"
+  },
+  "homepage": "https://tapproval.thoughtfulsteward.org",
+  "repository": "https://github.com/marcobelini/tapproval-helper",
+  "license": "MIT",
+  "keywords": ["apple-watch", "approvals", "permissions", "hooks", "codex"],
+  "hooks": "./hooks/hooks.json"
+}

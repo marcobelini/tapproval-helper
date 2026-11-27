@@ -55,6 +55,14 @@ longer. A problem that is not yet fixed is not described in public.
   words only, never a command, and the turn runs without network access,
   with writes limited to the workspace and anything else sent back to you
   for approval. A chat that connection cannot limit this way is refused.
+- **The Codex plugin downloads Base, then steps aside.** Its first session
+  start clones this repository into `~/.tapproval` over HTTPS, as the
+  terminal installer does, and from then on its two hooks only hand over to
+  that copy, which updates itself. Codex runs the plugin's hooks only after
+  you trust them, and asks again if the plugin's own folder changes; it
+  does not ask when Base updates, because Base's code is outside that
+  folder. That is the trade: one trust click for every update, in exchange
+  for trusting what this repository publishes, as a terminal install does.
 - **Cards travel through your own private iCloud or a tunnel** when you
   are away from home. The tunnel carries them in transit only; in iCloud a
   card waits in your own private database until it is answered.

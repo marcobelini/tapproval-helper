@@ -17,7 +17,7 @@ risk. This is the computer half of Tapproval.
 **Three steps, about two minutes:**
 
 1. **Get the watch app:** [Tapproval on the App Store](https://apps.apple.com/app/tapproval/id6805869018), on your Apple Watch.
-2. **Add Base to your computer:** for Claude Code, two lines typed into Claude Code; for Codex, or both, one line in a terminal ([Install](#install), below). macOS, Linux and Windows.
+2. **Add Base to your computer:** for Claude Code, two lines typed into Claude Code; for Codex, install it from Codex's own plugin list; or one line in a terminal for either or both ([Install](#install), below). macOS, Linux and Windows.
 3. **Open Tapproval on the watch, on the same Wi-Fi.** It finds the computer and pairs by itself; click **Allow** if the computer asks. From then on, what your agent asks comes to your wrist, marked by its risk, at home or away.
 
 On the App Store: 100 answers free, then $5 once per agent (Claude Code, Codex). No subscription.
@@ -75,7 +75,28 @@ session; there is nothing to keep running and nothing to maintain.
 
 > Install the Tapproval plugin from marcobelini/tapproval-helper
 
-### Codex, or both: one line in a terminal
+### Codex: from Codex's plugin list
+
+In the Codex app, open its plugins, choose **Add marketplace**, enter
+`marcobelini/tapproval-helper`, and install **tapproval-helper**. In a
+terminal it is two lines:
+
+```bash
+codex plugin marketplace add marcobelini/tapproval-helper
+codex plugin add tapproval-helper@tapproval
+```
+
+Then start a new Codex chat. Codex asks you once to review the plugin's
+hooks: choose **Trust all and continue**. Codex runs no hook you have not
+trusted, and Base never trusts one for you. That first start downloads
+Base into `~/.tapproval` (it needs git and a connection) and starts it,
+and from then on Base updates itself without asking for your trust again:
+the plugin's own folder (`codex-plugin/`) holds only its two hooks and one
+small script, which a Base update leaves alone. On the rare release that
+changes that folder, Codex asks once more, and the release notes say so.
+`uninstall.sh` takes the plugin out with everything else.
+
+### Or one line in a terminal: Codex, Claude Code, or both
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/marcobelini/tapproval-helper/main/install.sh | bash
@@ -211,6 +232,7 @@ is never a granted one.**
 | `install.sh` / `uninstall.sh` | The one-command installer above, and its way out |
 | `install.ps1` / `uninstall.ps1` | The same for Windows, in PowerShell |
 | `.claude-plugin/` + `hooks/` | The same, packaged as a Claude Code plugin |
+| `.agents/plugins/` + `codex-plugin/` | The same for Codex: its marketplace entry, and the plugin's own small folder. `codex-plugin/tapproval.py` downloads Base into `~/.tapproval` the first time and hands each of the plugin's two hooks over to it |
 | `site-rules.example.json` | Optional: name your own sensitive hosts so commands touching them always escalate |
 | `test_claude_risk_classifier.py` | The test suite — standard library only |
 
@@ -305,8 +327,8 @@ log was deliberately left in place.
 
 ## Why you can trust this
 
-- **Read it all.** Base is twelve standard-library Python files — no
-  dependencies, so there is no supply chain to worry about. On a Mac it
+- **Read it all.** Base is twelve standard-library Python files, and the
+  Codex plugin adds one small script — no dependencies, so there is no supply chain to worry about. On a Mac it
   also installs a small bridge app for the iCloud route, signed with a
   Developer ID and notarized by Apple; its source is in `bridge/`, though
   the signed build cannot be reproduced bit for bit (see `SECURITY.md`).

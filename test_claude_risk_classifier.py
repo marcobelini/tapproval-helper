@@ -6539,6 +6539,13 @@ class TestTextFollowsTheTextSize:
             'Text("Write to Marco")',
             'Image(systemName: "paperplane.fill")', # Send them a link
             'Text("Send them a link")',
+            'Image(systemName: "hand.raised")',     # Privacy policy, in How it works
+            'Text("Privacy policy")',
+            'Text(TextSize.names[index])',          # a choice in the Text size list
+            'Image(systemName: "checkmark")',       # the choice ticked
+            'Text("Prompts and replies look like this.")',  # the sample: sized by the choice
+                                            # being shown, which the app's own
+                                            # setting does not redraw in time
             'Image(systemName: "star.fill")',       # Rate Tapproval
             'Text("Rate Tapproval")',
             'Text(address.isEmpty',                 # the keypad's display
@@ -13930,6 +13937,41 @@ class TestOneValueEverywhere:
         with open(os.path.join(_ROOT, "uninstall.sh"), encoding="utf-8") as handle:
             script = handle.read()
         assert "127.0.0.1:%d" % watch_relay.TUNNEL_PORT in script
+
+
+@pytest.mark.private_layout
+class TestPluginInstallHarnessAimsAwayFromTheLiveRelay:
+    """e2e_plugin_install.py rewrites the live port out of a copy of the
+    tree before any agent installs it. A rewrite that no longer finds its
+    line must stop that run, and a source change that moves the line must
+    fail here first, not in CI's install run."""
+
+    def _tree(self, tmp_path):
+        tree = tmp_path / "tree"
+        (tree / "hooks").mkdir(parents=True)
+        for name in ("ClaudeRiskClassifier.py", "watch_relay.py"):
+            shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), name), tree / name)
+        shutil.copy(os.path.join(HELPER_DIR, "hooks", "hooks.json"), tree / "hooks" / "hooks.json")
+        return tree
+
+    def test_every_rewrite_finds_its_line_and_8977_is_gone(self, tmp_path):
+        import e2e_plugin_install as harness
+        tree = self._tree(tmp_path)
+        harness.aim(str(tree), 41001, 41002, 41003)
+        assert "8977" not in (tree / "hooks" / "hooks.json").read_text(encoding="utf-8")
+        assert "RELAY_PORT = 41001\n" in (tree / "ClaudeRiskClassifier.py").read_text(encoding="utf-8")
+        relay = (tree / "watch_relay.py").read_text(encoding="utf-8")
+        assert "DEFAULT_PORT = 41001 " in relay
+        assert '"--host", "0.0.0.0", "--tunnel"]' not in relay
+
+    def test_a_rewrite_that_finds_nothing_stops_the_run(self, tmp_path):
+        import e2e_plugin_install as harness
+        tree = self._tree(tmp_path)
+        source = tree / "ClaudeRiskClassifier.py"
+        source.write_text(source.read_text(encoding="utf-8").replace(
+            "RELAY_PORT = 8977\n", "RELAY_PORT = int('8977')\n"), encoding="utf-8")
+        with pytest.raises(SystemExit):
+            harness.aim(str(tree), 41001, 41002, 41003)
 
 
 class TestPluginManifest:
@@ -25375,6 +25417,233 @@ class TestTheWatchLearnsWhichAgentsAreWired:
     def test_health_carries_it(self):
         import inspect
         assert '"agents": wired_agents()' in inspect.getsource(watch_relay.RelayHandler._get_health)
+
+
+def _codex_plugin_fingerprint(folder):
+    """One hash over the Codex plugin's files: names and contents, line
+    endings folded, so a checkout on Windows reads the same."""
+    import hashlib
+    files = sorted(os.path.relpath(os.path.join(d, f), folder).replace(os.sep, "/")
+                   for d, _dirs, names in os.walk(folder) for f in names
+                   if "__pycache__" not in d and not f.endswith(".pyc"))
+    digest = hashlib.sha256()
+    for name in files:
+        with open(os.path.join(folder, name), "rb") as handle:
+            data = handle.read().replace(b"\r\n", b"\n")
+        digest.update(name.encode() + b"\0" + hashlib.sha256(data).hexdigest().encode() + b"\n")
+    return digest.hexdigest()
+
+
+CODEX_PLUGIN_DIR = os.path.join(HELPER_DIR, "codex-plugin")
+
+
+def _codex_plugin_script():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "tapproval_codex_plugin", os.path.join(CODEX_PLUGIN_DIR, "tapproval.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestTheCodexPluginFolderChangesOnlyOnPurpose:
+    """Codex hashes every file of a plugin's folder into its trust, and a
+    changed folder is "modified": its hooks stop until the person trusts
+    them again (seen 2026-11-26, Codex 0.169). So a change to
+    codex-plugin/ asks every Codex user to trust Tapproval once more. If
+    that is what you mean: move the version in its plugin.json, say so in
+    the release notes, and record the new pair here."""
+
+    VERSION = "1.0.0"
+    FINGERPRINT = "11e14605bab7edcb6c64e63017b5f6ea12ce4525702e7700523b502803d60361"
+
+    def test_the_folder_is_the_one_recorded_with_its_version(self):
+        with open(os.path.join(CODEX_PLUGIN_DIR, ".codex-plugin", "plugin.json"),
+                  encoding="utf-8") as handle:
+            version = json.load(handle)["version"]
+        assert (version, _codex_plugin_fingerprint(CODEX_PLUGIN_DIR)) == (
+            self.VERSION, self.FINGERPRINT), self.__doc__
+
+    def test_the_fingerprint_sees_a_one_byte_change(self, tmp_path):
+        copy = tmp_path / "codex-plugin"
+        shutil.copytree(CODEX_PLUGIN_DIR, copy)
+        before = _codex_plugin_fingerprint(str(copy))
+        with open(copy / "tapproval.py", "a", encoding="utf-8") as handle:
+            handle.write(" ")
+        assert _codex_plugin_fingerprint(str(copy)) != before
+
+
+class TestCodexPlugin:
+    """The Codex plugin: a small folder whose two hooks hand over to the
+    helper in ~/.tapproval, and the marketplace file Codex reads."""
+
+    def _manifest(self, *parts):
+        with open(os.path.join(HELPER_DIR, *parts), encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_the_marketplace_points_codex_at_the_small_folder(self):
+        market = self._manifest(".agents", "plugins", "marketplace.json")
+        assert market["name"] == "tapproval"
+        entry, = market["plugins"]
+        assert entry["name"] == crc.CODEX_PLUGIN.split("@")[0]
+        assert entry["source"] == {"source": "local", "path": "./codex-plugin"}
+        assert crc.CODEX_PLUGIN == "%s@%s" % (entry["name"], market["name"])
+
+    def test_the_manifest_names_its_hooks(self):
+        plugin = self._manifest("codex-plugin", ".codex-plugin", "plugin.json")
+        assert plugin["name"] == crc.CODEX_PLUGIN.split("@")[0]
+        assert plugin["hooks"] == "./hooks/hooks.json"
+        assert crc.CODEX_PLUGIN_HOOK_KEY.split(":")[1] == "hooks/hooks.json"
+
+    def test_two_hooks_a_session_start_and_a_question(self):
+        hooks = self._manifest("codex-plugin", "hooks", "hooks.json")["hooks"]
+        assert set(hooks) == {"SessionStart", "PermissionRequest"}
+        start, = hooks["SessionStart"][0]["hooks"]
+        ask, = hooks["PermissionRequest"][0]["hooks"]
+        assert start["command"].endswith('/tapproval.py" session-start')
+        assert ask["command"].endswith('/tapproval.py" permission')
+        assert ask["timeout"] == crc.WATCH_HOOK_TIMEOUT
+        assert hooks["PermissionRequest"][0]["matcher"] == "*"
+
+    def test_the_script_switches_the_wrist_on_as_the_claude_plugin_does(self):
+        assert _codex_plugin_script().WRIST == crc.WATCH_ENV
+
+    def test_claude_codes_plugin_hooks_stay_claude_codes(self):
+        text = json.dumps(self._manifest("hooks", "hooks.json"))
+        assert "--agent codex" not in text and "codex-plugin" not in text
+
+    def test_a_missing_helper_leaves_codex_asking(self, tmp_path, monkeypatch, capsys):
+        script = _codex_plugin_script()
+        monkeypatch.setattr(script, "HELPER", str(tmp_path / "nothing.py"))
+        assert script.main(["tapproval.py", "permission"]) == 0
+        assert capsys.readouterr().out == ""
+
+    def test_a_failed_download_says_why_and_never_blocks(self, tmp_path, monkeypatch, capsys):
+        script = _codex_plugin_script()
+        monkeypatch.setattr(script, "HELPER", str(tmp_path / "nothing.py"))
+        monkeypatch.setattr(script, "fetch", lambda: False)
+        assert script.main(["tapproval.py", "session-start"]) == 0
+        out = capsys.readouterr()
+        assert json.loads(out.out) == {} and "could not download" in out.err
+
+    @pytest.mark.parametrize("knows", [True, False])
+    def test_an_older_helper_gets_the_commands_it_has(self, knows, tmp_path, monkeypatch):
+        script = _codex_plugin_script()
+        helper = tmp_path / "ClaudeRiskClassifier.py"
+        helper.write_text("# --codex-plugin-start\n" if knows else "# old\n")
+        monkeypatch.setattr(script, "HELPER", str(helper))
+        calls = []
+        monkeypatch.setattr(script.subprocess, "call", lambda argv, **kw: calls.append(argv) or 0)
+        script.main(["tapproval.py", "permission"])
+        assert ("--from-codex-plugin" in calls[0]) is knows
+
+
+class TestCodexPluginInTheHelper:
+    """What the helper does for the Codex plugin: read its trust, stand
+    its question down beside a trusted terminal hook, start the relay and
+    say once that Base is set up, and take it out on --uninstall."""
+
+    @pytest.fixture(autouse=True)
+    def _home(self, tmp_path, monkeypatch):
+        self.home = tmp_path / "codex"
+        self.home.mkdir()
+        monkeypatch.setenv("CODEX_HOME", str(self.home))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv("CLAUDE_SETTINGS_PATH", str(tmp_path / ".claude" / "settings.json"))
+
+    def _config(self, enabled=True, trusted=False):
+        lines = ['[plugins."%s"]' % crc.CODEX_PLUGIN, "enabled = %s" % str(enabled).lower()]
+        if trusted:
+            lines += ['[hooks.state."%s"]' % crc.CODEX_PLUGIN_HOOK_KEY,
+                      'trusted_hash = "sha256:aa"', 'trusted_content_hash = "sha256:bb"']
+        (self.home / "config.toml").write_text("\n".join(lines) + "\n")
+
+    def test_the_plugin_untrusted_is_said(self):
+        self._config()
+        assert crc.codex_plugin_enabled() and crc.codex_hook_trusted() is False
+
+    def test_the_plugin_trusted_is_trusted(self):
+        self._config(trusted=True)
+        assert crc.codex_hook_trusted() is True
+
+    def test_a_disabled_plugin_is_nothing_to_trust(self):
+        self._config(enabled=False, trusted=True)
+        assert not crc.codex_plugin_enabled() and crc.codex_hook_trusted() is None
+
+    def test_half_a_trust_entry_is_not_trust(self):
+        self._config()
+        with open(self.home / "config.toml", "a") as handle:
+            handle.write('[hooks.state."%s"]\ntrusted_hash = "sha256:aa"\n' % crc.CODEX_PLUGIN_HOOK_KEY)
+        assert crc.codex_hook_trusted() is False
+
+    def test_status_says_the_plugin_and_its_trust(self, capsys):
+        self._config()
+        crc.run_status()
+        assert "Codex         : the Codex plugin, not trusted yet" in capsys.readouterr().out
+        self._config(trusted=True)
+        crc.run_status()
+        assert "Codex         : the Codex plugin, trusted" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("terminal_trusted", [True, False])
+    def test_the_question_stands_down_only_beside_a_trusted_terminal_hook(
+            self, terminal_trusted, monkeypatch):
+        monkeypatch.setattr(crc, "_codex_hooks_json_trusted", lambda: terminal_trusted)
+        ran = []
+        monkeypatch.setattr(crc, "run_hook", lambda **kw: ran.append(kw) or 0)
+        out = io.StringIO()
+        assert crc.run_codex_plugin_hook(stdin=io.StringIO("{}"), stdout=out) == 0
+        assert out.getvalue() == ""
+        assert bool(ran) is not terminal_trusted
+        if ran:
+            assert ran[0]["agent"] == "codex"
+
+    def test_main_routes_the_plugins_two_commands(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(crc, "run_codex_plugin_hook", lambda: seen.append("ask") or 0)
+        monkeypatch.setattr(crc, "run_codex_plugin_start", lambda: seen.append("start") or 0)
+        crc.main(["--agent", "codex", "--from-codex-plugin"])
+        crc.main(["--codex-plugin-start"])
+        assert seen == ["ask", "start"]
+
+    @pytest.mark.parametrize("claude_waits", [True, False])
+    def test_the_first_start_says_it_once_and_offers_claude_code_only_if_it_waits(
+            self, claude_waits, monkeypatch):
+        import subprocess
+        started = []
+        monkeypatch.setattr(subprocess, "run", lambda argv, **kw: started.append(argv))
+        monkeypatch.setattr(crc, "_claude_code_waiting", lambda: claude_waits)
+        first, second = io.StringIO(), io.StringIO()
+        crc.run_codex_plugin_start(stdin=io.StringIO("{}"), stdout=first)
+        crc.run_codex_plugin_start(stdin=io.StringIO("{}"), stdout=second)
+        said = json.loads(first.getvalue())
+        assert "set up for Codex" in said["systemMessage"]
+        assert ("Claude Code too" in said["systemMessage"]) is claude_waits
+        assert said["hookSpecificOutput"]["additionalContext"] == said["systemMessage"]
+        assert json.loads(second.getvalue()) == {}
+        assert all(argv[-1] == "--ensure" for argv in started) and len(started) == 2
+
+    def test_uninstall_takes_the_plugin_out_through_codex(self, monkeypatch):
+        import subprocess
+        self._config()
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: "/bin/codex-standin")
+        removed = []
+
+        def codex(argv, **kw):
+            removed.append(argv)
+            self._config(enabled=False)
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        monkeypatch.setattr(subprocess, "run", codex)
+        assert crc.remove_codex_plugin() == "removed"
+        assert removed == [["/bin/codex-standin", "plugin", "remove", crc.CODEX_PLUGIN]]
+
+    def test_uninstall_without_codex_to_ask_says_how(self, monkeypatch):
+        self._config()
+        monkeypatch.setattr(crc, "ensure_codex_on_path", lambda: None)
+        assert crc.remove_codex_plugin() == "manual"
+
+    def test_no_plugin_nothing_to_remove(self):
+        assert crc.remove_codex_plugin() is None
 
 
 class TestCodexHookTrust:

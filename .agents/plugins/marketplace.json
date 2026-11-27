@@ -1,0 +1,21 @@
+{
+  "name": "tapproval",
+  "owner": {
+    "name": "Tapproval",
+    "email": "tapproval@thoughtfulsteward.org"
+  },
+  "plugins": [
+    {
+      "name": "tapproval-helper",
+      "description": "Tapproval Base for Codex: Codex's questions on your Apple Watch.",
+      "source": {
+        "source": "local",
+        "path": "./codex-plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

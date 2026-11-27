@@ -113,7 +113,7 @@ class Risk(IntEnum):
 # One number the whole install can be identified by. Surfaced by --status
 # and by the relay's /health, so a support question ("what are you
 # running?") has an answer that does not depend on the user knowing.
-__version__ = "1.1.142"
+__version__ = "1.1.143"
 
 # The project's own public page. Not a deployment hostname — those belong
 # in site-rules.json — but a constant of the project itself, the same way
@@ -5725,9 +5725,74 @@ def _codex_hook_hash(event_label, matcher, handler):
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# The Codex plugin (codex-plugin/ in the public repo): its id in Codex's
+# config.toml, and the trust key Codex gives its question hook (seen
+# 2026-11-26, Codex 0.169: "<plugin>@<marketplace>:<hooks file>:<event>:<i>:<j>").
+CODEX_PLUGIN = "tapproval-helper@tapproval"
+CODEX_PLUGIN_HOOK_KEY = CODEX_PLUGIN + ":hooks/hooks.json:permission_request:0:0"
+
+
+def _codex_config_sections():
+    """Codex's config.toml as {section line: {key: raw value}}, by a line
+    scan (Python 3.9 has no tomllib). {} when there is none; None when it
+    cannot be read."""
+    try:
+        with open(os.path.join(_codex_home(), "config.toml"), encoding="utf-8") as handle:
+            lines = [line.strip() for line in handle]
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError):
+        return None
+    sections, section = {}, None
+    for line in lines:
+        if line.startswith("["):
+            section = line
+            sections.setdefault(section, {})
+        elif section and "=" in line and not line.startswith("#"):
+            key, value = line.split("=", 1)
+            sections[section][key.strip()] = value.strip().strip('"')
+    return sections
+
+
+def codex_plugin_enabled():
+    """True when Codex has the Tapproval plugin installed and switched on."""
+    sections = _codex_config_sections() or {}
+    return sections.get('[plugins."%s"]' % CODEX_PLUGIN, {}).get("enabled") == "true"
+
+
+def _codex_plugin_trusted():
+    """Whether the person has trusted the plugin's question hook.
+
+    Codex keeps two hashes for a plugin's hook: its definition, and the
+    files of the plugin's folder (seen 2026-11-26). The second is Codex's
+    own reckoning over files this helper does not read, so an entry with
+    both reads as trusted. The folder changes only on purpose, with its
+    version (TestTheCodexPluginFolderChangesOnlyOnPurpose), which is the
+    one case this cannot see."""
+    sections = _codex_config_sections()
+    if sections is None:
+        return False
+    entry = sections.get('[hooks.state."%s"]' % CODEX_PLUGIN_HOOK_KEY, {})
+    return bool(entry.get("trusted_hash") and entry.get("trusted_content_hash"))
+
+
 def codex_hook_trusted():
-    """Whether Codex will run our hook: True, False, or None when there is
-    nothing to trust (no Codex here, or our hook is not in its hooks.json).
+    """Whether Codex will run a hook of ours: True, False, or None when
+    there is nothing to trust (no Codex here, or no hook of ours: neither
+    in its hooks.json nor as the Codex plugin).
+
+    Either route will do: the terminal install's hook in hooks.json, or
+    the Codex plugin's own. Anything unreadable is False."""
+    terminal = _codex_hooks_json_trusted()
+    if terminal is True or not codex_plugin_enabled():
+        return terminal
+    return True if _codex_plugin_trusted() else False
+
+
+def _codex_hooks_json_trusted():
+    """Whether Codex will run our hook in its hooks.json: True, False, or
+    None when there is nothing to trust (no Codex here, or our hook is not
+    in its hooks.json).
 
     Codex runs a hook only once the person has trusted it on the CLI's
     "Hooks need review" screen, and keeps that in config.toml as
@@ -5764,6 +5829,92 @@ def codex_hook_trusted():
         elif section and line.split("=", 1)[0].strip() == "trusted_hash" and "=" in line:
             stored[section] = line.split("=", 1)[1].strip().strip('"')
     return any(stored.get(section) == current for section, current in ours)
+
+
+def run_codex_plugin_hook(stdin=None, stdout=None):
+    """The Codex plugin's question hook (codex-plugin/tapproval.py).
+
+    Where a terminal install's hook is in Codex's hooks.json and trusted,
+    Codex runs that one too, and it answers: this one stands down with an
+    empty stdout, Codex's "no decision", so a question is mirrored once.
+    Otherwise it is the Codex hook, unchanged."""
+    if _codex_hooks_json_trusted() is True:
+        (sys.stdin if stdin is None else stdin).read()
+        return 0
+    return run_hook(stdin=stdin, stdout=stdout, agent="codex")
+
+
+def _claude_code_waiting():
+    """True when Claude Code is on this computer but Base is not in it."""
+    import shutil
+    if not (shutil.which("claude") or os.path.isdir(os.path.dirname(_settings_path()))):
+        return False
+    return not (_settings_handlers(_read_settings_quietly(_settings_path()))
+                or _plugin_install())
+
+
+CODEX_PLUGIN_WELCOME = ("Tapproval Base is set up for Codex. Open Tapproval on your "
+                        "Apple Watch: it finds this computer by itself, and Codex's "
+                        "questions come to your wrist.")
+CLAUDE_CODE_OFFER = (" Tapproval works with Claude Code too: in Claude Code, type "
+                     "/plugin marketplace add marcobelini/tapproval-helper and then "
+                     "/plugin install tapproval-helper@tapproval.")
+
+
+def run_codex_plugin_start(stdin=None, stdout=None):
+    """The Codex plugin's session start, once its script has put the
+    helper in ~/.tapproval: start the relay as every session start does,
+    and the first time, say so, offering Claude Code where it waits.
+
+    Never in the session's way: the relay's own words go to stderr, its
+    stdout (a Claude Code briefing) is dropped, and stdout carries one JSON
+    object, empty after the first time."""
+    import subprocess
+    stdout = sys.stdout if stdout is None else stdout
+    try:
+        (sys.stdin if stdin is None else stdin).read()
+    except (OSError, ValueError):
+        pass
+    try:
+        subprocess.run([sys.executable, _relay_path(), "--ensure"],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=110)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print("Tapproval: the relay did not start (%s)" % error, file=sys.stderr)
+    output = {}
+    stamp = os.path.join(os.path.expanduser("~"), ".tapproval", "data", "codex-plugin-welcomed")
+    if not os.path.exists(stamp):
+        note = CODEX_PLUGIN_WELCOME + (CLAUDE_CODE_OFFER if _claude_code_waiting() else "")
+        output = {"systemMessage": note, "hookSpecificOutput": {
+            "hookEventName": "SessionStart", "additionalContext": note}}
+        try:
+            os.makedirs(os.path.dirname(stamp), exist_ok=True)
+            with open(stamp, "w", encoding="utf-8") as handle:
+                handle.write(__version__ + "\n")
+        except OSError:
+            pass
+    json.dump(output, stdout)
+    stdout.write("\n")
+    return 0
+
+
+def remove_codex_plugin():
+    """Take the Codex plugin out through Codex itself. "removed", "manual"
+    (it is installed, but Codex could not be asked) or None (not installed).
+    An uninstall that left it would set everything up again at the next
+    Codex session."""
+    if not codex_plugin_enabled():
+        return None
+    import subprocess
+    codex = ensure_codex_on_path()
+    if codex:
+        try:
+            done = subprocess.run([codex, "plugin", "remove", CODEX_PLUGIN],
+                                  capture_output=True, timeout=60)
+            if done.returncode == 0 and not codex_plugin_enabled():
+                return "removed"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return "manual"
 
 
 def install_codex():
@@ -6147,7 +6298,7 @@ def _say_codex(codex):
     elif codex == "current":
         # An unchanged hooks.json says nothing about trust: ask Codex's own
         # record, and keep the instruction until it says trusted.
-        if codex_hook_trusted() is True:
+        if _codex_hooks_json_trusted() is True:
             print("  Codex    : wired and trusted")
         else:
             print("  Codex    : wired, not trusted yet; open codex in Terminal once "
@@ -6177,6 +6328,12 @@ def run_uninstall():
     # the uninstall before either was looked for (2026-11-14 review).
     remove_command()
     login_removed = remove_launch_agent()
+    plugin_removal = remove_codex_plugin()
+    if plugin_removal == "removed":
+        print("Removed the Codex plugin.")
+    elif plugin_removal == "manual":
+        print("The Codex plugin is still installed: remove it in Codex (Plugins,")
+        print("Tapproval, Uninstall), or with: codex plugin remove %s" % CODEX_PLUGIN)
     found = _settings_or_explain()
     if found is None:
         return 1
@@ -6641,13 +6798,19 @@ def run_status():
         print("Relay hook    : not wired \u2014 re-run --install to add it")
     codex_wired = bool(os.path.exists(_codex_hooks_path()) and _settings_handlers(
         _read_settings_quietly(_codex_hooks_path())))
+    if codex_plugin_enabled():
+        if _codex_plugin_trusted():
+            print("Codex         : the Codex plugin, trusted")
+        else:
+            print("Codex         : the Codex plugin, not trusted yet; choose \"Trust all "
+                  "and continue\" when Codex asks you to review hooks")
     if codex_wired:
-        if codex_hook_trusted() is True:
+        if _codex_hooks_json_trusted() is True:
             print("Codex         : wired and trusted")
         else:
             print("Codex         : wired, not trusted yet; open codex in Terminal once "
                   "and choose \"Trust all and continue\"")
-    elif os.path.isdir(_codex_home()):
+    elif os.path.isdir(_codex_home()) and not codex_plugin_enabled():
         print("Codex         : not wired \u2014 re-run --install to add it")
     print("Version       : %s" % __version__)
     if f["login_item"]:
@@ -6693,6 +6856,11 @@ def main(argv=None):
     if not argv or (len(argv) == 2 and argv[0] == "--agent"
                     and argv[1] in ("claude", "codex")):
         return _guarded(run_hook, agent=argv[1] if argv else None)
+    # The Codex plugin's two hooks (codex-plugin/tapproval.py).
+    if argv == ["--agent", "codex", "--from-codex-plugin"]:
+        return _guarded(run_codex_plugin_hook)
+    if argv == ["--codex-plugin-start"]:
+        return _guarded(run_codex_plugin_start)
     # ``tapproval <word>`` through its launcher, or the word typed after
     # this file's own name.
     if argv[0] == COMMAND_FLAG:

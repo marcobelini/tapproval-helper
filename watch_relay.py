@@ -7960,8 +7960,9 @@ def check_codex_hook():
     if trusted is False:
         note_condition(
             "codex",
-            "Codex asks its questions on the computer until you open codex "
-            "in Terminal once and choose \"Trust all and continue\".")
+            "Codex asks its questions on the computer until you trust "
+            "Tapproval in Codex: choose \"Trust all and continue\" when "
+            "Codex asks you to review hooks.")
         return False
     clear_condition("codex")
     return True
