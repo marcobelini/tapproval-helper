@@ -1059,6 +1059,7 @@ def login(tmp_path, monkeypatch):
     monkeypatch.setattr(desktop, '_launchctl', launchctl)
     monkeypatch.setattr(desktop.host, 'is_mac', lambda: True)
     monkeypatch.setattr(desktop.Path, 'home', lambda: tmp_path)
+    monkeypatch.setattr(desktop, 'installed_copy', lambda: True)
     return store, calls
 
 
@@ -1201,3 +1202,42 @@ def test_the_wrapper_runs_the_apps_codex_when_tapproval_is_gone(tmp_path, monkey
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == ['app-server', 'two words']
+
+
+def test_a_copy_that_is_not_the_installed_one_leaves_the_login_alone(tmp_path, login, monkeypatch):
+    """A CI run of e2e_plugin_install.py gave the real login a test home's
+    wrapper (2026-11-27): launchctl's settings are the login's, not HOME's."""
+    store, calls = login
+    monkeypatch.undo()
+    monkeypatch.setattr(desktop, '_launchctl', lambda *a: calls.append(a) or '')
+    monkeypatch.setattr(desktop.host, 'is_mac', lambda: True)
+    app, _cli = _fake_app(tmp_path / 'Applications')
+    # This very file, run from a checkout, is not the installed copy.
+    assert desktop.installed_copy() is False
+    assert desktop.keep_every_launch(True, candidates=[app]) is None
+    assert calls == [] and store == {}
+
+
+def test_only_the_accounts_own_home_and_install_count(tmp_path, monkeypatch):
+    if not hasattr(os, 'getuid'):
+        pytest.skip('needs a POSIX account')
+    import pwd
+    home = tmp_path / 'home'
+    install = home / '.tapproval'
+    install.mkdir(parents=True)
+    class Account:
+        pw_dir = str(home)
+    monkeypatch.setattr(pwd, 'getpwuid', lambda uid: Account())
+    monkeypatch.setattr(desktop, '__file__', str(install / 'codex_desktop.py'))
+    monkeypatch.setattr(desktop.Path, 'home', lambda: home)
+    assert desktop.installed_copy() is True
+    plugin = home / '.claude/plugins/cache/tapproval/tapproval-helper/1.1.146'
+    plugin.mkdir(parents=True)
+    monkeypatch.setattr(desktop, '__file__', str(plugin / 'codex_desktop.py'))
+    assert desktop.installed_copy() is True
+    # The same files under a test HOME: the login is still the real one's.
+    monkeypatch.setattr(desktop.Path, 'home', lambda: tmp_path / 'test-home')
+    assert desktop.installed_copy() is False
+    monkeypatch.setattr(desktop.Path, 'home', lambda: home)
+    monkeypatch.setattr(desktop, '__file__', str(tmp_path / 'work' / 'codex_desktop.py'))
+    assert desktop.installed_copy() is False

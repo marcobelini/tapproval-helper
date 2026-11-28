@@ -473,6 +473,28 @@ def launcher_wrapper():
     return str(Path.home() / ".tapproval/data/codex-desktop-launcher/codex")
 
 
+def installed_copy():
+    """True only for Base as installed for this account: this file inside
+    the account's own ~/.tapproval (or a Claude Code plugin's copy), with
+    HOME the account's real home.
+
+    launchctl's settings belong to the whole login, whatever HOME says. A
+    copy run from a test home, a CI checkout or a work folder would hand
+    the login a wrapper that is about to vanish, and the next ChatGPT
+    launch would find no Codex: e2e_plugin_install.py did exactly that on
+    the Mac mini on 2026-11-27."""
+    try:
+        import pwd
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        if Path.home().resolve() != home:
+            return False
+        here = Path(__file__).resolve().parent
+    except (ImportError, KeyError, OSError):
+        return False
+    return any(here == root or root in here.parents
+               for root in (home / ".tapproval", home / ".claude" / "plugins"))
+
+
 def keep_every_launch(wired, candidates=None):
     """Make every launch of the ChatGPT app join the shared Codex engine.
 
@@ -487,7 +509,7 @@ def keep_every_launch(wired, candidates=None):
     app, the settings are taken back if they are ours. A CODEX_CLI_PATH
     someone else set is left alone. Returns a sentence for the relay log
     when something changed or was left alone, else None."""
-    if not host.is_mac():
+    if not host.is_mac() or not installed_copy():
         return None
     wrapper = launcher_wrapper()
     current = _launchctl("getenv", "CODEX_CLI_PATH")
