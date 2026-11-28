@@ -54,16 +54,17 @@
 <p><em>2026-11-27</em></p>
 <p><strong>New: a Codex plugin.</strong> Codex users can now install Tapproval Base from Codex's own plugin list, with no terminal:</p>
 <ol>
-<li>In Codex, add the marketplace <code>marcobelini/tapproval-helper</code>.</li>
+<li>In Codex (the ChatGPT app): Plugins → Add → Add a marketplace, and enter <code>marcobelini/tapproval-helper</code>. In a terminal: <code>codex plugin marketplace add marcobelini/tapproval-helper</code>.</li>
 <li>Install <strong>tapproval-helper</strong>.</li>
-<li>When Codex asks you to review hooks, choose <strong>Trust all and continue</strong>. Once is enough: updates to Tapproval don't ask again.</li>
+<li>Allow its hooks once. In the app, open a new chat and choose <strong>Review hooks</strong>, then <strong>Allow all</strong>. In a terminal, choose <strong>Trust all and continue</strong>. Updates to Tapproval don't ask again.</li>
 </ol>
-<p>The first Codex session sets up Tapproval Base in <code>~/.tapproval</code> (the same self-updating copy the one-line install makes) and then hands every question to it. If you also use Claude Code, it tells you the one step to add Tapproval there; it never changes Claude Code on its own.</p>
+<p>Your next new chat after that sets up Tapproval Base in <code>~/.tapproval</code> (the same self-updating copy the one-line install makes) and then hands every question to it. If you also use Claude Code, it tells you the one step to add Tapproval there; it never changes Claude Code on its own.</p>
 <ul>
 <li>Already installed with the terminal line? Nothing changes; if you add the plugin too, each question still reaches your wrist once.</li>
 <li><code>--status</code> now names the Codex plugin and whether it is trusted, and <code>--uninstall</code> removes it.</li>
 <li>The Codex plugin's own version is 1.0.0. It changes only when its own small folder changes, which would ask you to trust it again; such a release will say so.</li>
 </ul>
+<p><em>(Corrected 2026-11-28: the app's own words for the trust step.)</em></p>
 <h2><a href="https://github.com/marcobelini/tapproval-helper/releases/tag/v1.1.142">1.1.142</a></h2>
 <p><em>2026-11-26</em></p>
 <p>The installer now speaks to Codex users too.</p>
